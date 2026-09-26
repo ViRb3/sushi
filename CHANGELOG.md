@@ -4,6 +4,13 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **Long prompts after a busy moment**: a long prompt that fits once the RAM prompt cache is emptied is no longer
+  refused while the GPU is still finishing earlier work.
+
+---
+
 ## v1.0.4 — Faster prompts and browser chat
 
 - **Faster prompts on M1–M4**: Macs without the M5's neural accelerators read prompts about 4x faster on the EXL3
