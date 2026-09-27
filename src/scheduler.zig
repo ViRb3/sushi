@@ -2088,6 +2088,10 @@ pub const Scheduler = struct {
         // A slot whose module-head release is armed but not landed still holds the head.
         if (slotReleasePending(slot)) return .head_release_pending;
         if (slot.sampling.constraint != null) return .grammar;
+        // The batched tick samples every slot's successor; a forced call decides its own.
+        if (slot.sampling.call_force) |cf| {
+            if (cf.pending()) return .forced_call;
+        }
         if (slot.logprobs_n > 0) return .logprobs;
         const cfg = slot.model.config orelse return .arch;
         if (modelBatchable(cfg)) return .ok;
@@ -2107,6 +2111,7 @@ pub const BatchVerdict = enum {
     spec_active,
     head_release_pending,
     grammar,
+    forced_call,
     logprobs,
     arch,
     pad_waste,
@@ -2402,6 +2407,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
+    config.preserve_thinking_override = o.preserve_thinking;
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.streamsExperts()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
@@ -3392,6 +3398,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         mtp_acceptance_mod.name(acceptance.value),     model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
     });
     const mtp_enabled = mtp.on and !mtp_streaming_off;
+    if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
+        const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
+        log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", model_settings.sourceLabel(keep.source, "--preserve-thinking") });
+    }
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }

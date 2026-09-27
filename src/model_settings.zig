@@ -1,5 +1,5 @@
 //! Per-model settings (`~/.sushi/model-settings.json`): context size, KV
-//! quant and MTP that follow the MODEL, applied at every load construction
+//! quant, MTP and `preserve_thinking` that follow the MODEL, applied at every load construction
 //! site. Keyed by the model's absolute path (dir, or the `.gguf` file).
 //! The app edits the file; the server owns applying it. A malformed file is
 //! logged and treated as empty: a settings typo must never stop a load.
@@ -29,6 +29,10 @@ pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
         .default => "default",
     };
 }
+
+/// `--preserve-thinking on|off`; null = not given. Read per render, where a
+/// request's `chat_template_kwargs.preserve_thinking` outranks it.
+pub var preserve_thinking_flag: ?bool = null;
 
 /// A launch value counts as a flag only when the operator passed it.
 pub fn launchFlag(comptime T: type, value: T, explicit: bool) ?T {
@@ -86,10 +90,11 @@ pub const Override = struct {
     mtp: ?bool = null,
     mtp_acceptance: ?mtp_acceptance.Mode = null,
     ssd_budget_gb: ?u32 = null,
+    preserve_thinking: ?bool = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
-            o.mtp_acceptance == null and o.ssd_budget_gb == null;
+            o.mtp_acceptance == null and o.ssd_budget_gb == null and o.preserve_thinking == null;
     }
 };
 
@@ -150,6 +155,10 @@ fn fromValue(v: std.json.Value) Override {
         },
         else => {},
     };
+    if (obj.get("preserve_thinking")) |p| switch (p) {
+        .bool => |b| o.preserve_thinking = b,
+        else => {},
+    };
     return o;
 }
 
@@ -181,13 +190,14 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} ssd_budget_gb={d}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} ssd_budget_gb={d} preserve_thinking={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
         if (o.mtp) |m| (if (m) "on" else "off") else "default",
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         o.ssd_budget_gb orelse 0,
+        if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
     });
     return o;
 }
@@ -287,4 +297,15 @@ test "an explicit --mtp-typical / --mtp-tokenv3 outranks the per-model mtp_accep
     const engine = pick(Mode, null, null, .exact);
     try t.expect(engine.value == .exact);
     try t.expectEqual(Source.default, engine.source);
+}
+
+test "model_settings: preserve_thinking is a bool, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"preserve_thinking": false}, "/m/b": {"preserve_thinking": true}, "/m/c": {"preserve_thinking": "off"}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?bool, false), s.lookup("/m/a").preserve_thinking);
+    try std.testing.expect(!s.lookup("/m/a").isEmpty());
+    try std.testing.expectEqual(@as(?bool, true), s.lookup("/m/b").preserve_thinking);
+    try std.testing.expect(s.lookup("/m/c").isEmpty());
 }

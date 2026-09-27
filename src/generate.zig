@@ -857,6 +857,100 @@ pub const ThinkBound = struct {
     }
 };
 
+/// A forced tool call (`tool_choice` required or named) enforced while
+/// decoding: the thought runs free, and the position after its closer (or
+/// token 0 when the prompt already closed it) is `forced` instead of a sample.
+/// For `required` the name follows as one of `names`, the model choosing among
+/// the ids that continue one. Handler-owned like `ThinkBound`; every successor
+/// decision consults `decide`, which reads the published tokens incrementally.
+pub const CallForce = struct {
+    /// Separator ids, then the call's; `call_at` indexes the call, which alone
+    /// is committed when whitespace already follows the closer.
+    forced: []const u32,
+    call_at: usize,
+    closer_id: ?u32,
+    /// Committed at token 0 in `.open`, where the template leaves the think
+    /// opener to the model.
+    opener: [1]u32 = .{0},
+    phase: Phase,
+    /// The token before the next position: the last prompt id until one is published.
+    last: u32,
+    /// Each declared function's name and closing delimiter as ids; empty when
+    /// `forced` already names the function.
+    names: []const []const u32 = &.{},
+    /// The storage `names` slice into, when allocated.
+    names_flat: []const u32 = &.{},
+    /// Scratch for a branch's choices, at least `names.len` long.
+    choice_buf: []u32 = &.{},
+    name_from: ?usize = null,
+    cursor: usize = 0,
+    queue: []const u32 = &.{},
+
+    pub const Phase = enum { open, thinking, answer, name, done };
+    pub const Decision = union(enum) { sample, force: u32, choose: []const u32 };
+
+    pub fn pending(self: *const CallForce) bool {
+        return self.phase != .done or self.queue.len > 0;
+    }
+
+    /// What the next position must be.
+    pub fn decide(self: *CallForce, published: []const u32) Decision {
+        while (self.cursor < published.len) : (self.cursor += 1) {
+            const id = published[self.cursor];
+            if (self.phase == .thinking and self.closer_id != null and id == self.closer_id.?) self.phase = .answer;
+            self.last = id;
+        }
+        if (self.queue.len == 0) switch (self.phase) {
+            .open => {
+                self.queue = &self.opener;
+                self.phase = .thinking;
+            },
+            .answer => {
+                const after_closer = self.closer_id != null and self.last == self.closer_id.?;
+                self.queue = if (after_closer) self.forced else self.forced[self.call_at..];
+                self.phase = if (self.names.len > 0) .name else .done;
+            },
+            .name => return self.nextNameToken(published),
+            .thinking, .done => return .sample,
+        };
+        if (self.queue.len == 0) return .sample;
+        const id = self.queue[0];
+        self.queue = self.queue[1..];
+        return .{ .force = id };
+    }
+
+    fn nextNameToken(self: *CallForce, published: []const u32) Decision {
+        const from = self.name_from orelse published.len;
+        self.name_from = from;
+        const typed = published[from..];
+        var n: usize = 0;
+        var complete = false;
+        for (self.names) |name| {
+            if (name.len < typed.len or !std.mem.eql(u32, name[0..typed.len], typed)) continue;
+            if (name.len == typed.len) {
+                complete = true;
+                break;
+            }
+            if (std.mem.indexOfScalar(u32, self.choice_buf[0..n], name[typed.len]) == null) {
+                self.choice_buf[n] = name[typed.len];
+                n += 1;
+            }
+        }
+        if (!complete and n == 1) return .{ .force = self.choice_buf[0] };
+        if (!complete and n > 1) return .{ .choose = self.choice_buf[0..n] };
+        self.phase = .done;
+        return .sample;
+    }
+
+    /// Frees what `server.armCallForce` allocated.
+    pub fn deinit(self: *CallForce, allocator: std.mem.Allocator) void {
+        allocator.free(self.forced);
+        allocator.free(self.names_flat);
+        allocator.free(self.names);
+        allocator.free(self.choice_buf);
+    }
+};
+
 pub fn isGreedyTemperature(temperature: f32) bool {
     return temperature < 0.01;
 }
@@ -878,6 +972,9 @@ pub const SamplingParams = struct {
     /// In-stream thinking budget (`ThinkBound`), owned by the request handler
     /// like `constraint`; null = no bound.
     think_bound: ?*ThinkBound = null,
+    /// Forced tool call (`CallForce`), owned by the request handler like
+    /// `think_bound`; null = the model chooses whether to call.
+    call_force: ?*CallForce = null,
     /// Reserved-token suppression mask: `[vocab]` bool, true = the sampler
     /// must never draw this id (reserved specials like `<|fim_hole|>`, which
     /// a degenerate distribution can rank top-5 at a collapsed position — a
@@ -1055,7 +1152,12 @@ fn verifyArgmax(logits: mlx.mlx_array, mask: ?mlx.mlx_array, s: mlx.mlx_stream) 
 /// this real, release-enforced check and return `error.SpecDecodeUnsupported`
 /// instead of asserting.
 fn specDecodeUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
-    return sampling.constraint != null or logprobs_n != 0;
+    return draftsRefused(sampling) or logprobs_n != 0;
+}
+
+/// A grammar mask or a forced tool call decides tokens a draft run would skip past.
+pub fn draftsRefused(sampling: SamplingParams) bool {
+    return sampling.constraint != null or sampling.call_force != null;
 }
 
 /// Generation result (for non-streaming use).
@@ -3254,13 +3356,26 @@ pub const Generator = struct {
             return gen;
         }
 
+        // A forced tool call decides each successor after its predecessor is
+        // known, which no draft path does: drafts never start for it.
+        if (sampling.call_force != null) {
+            if (mtp_cache) |*mc| {
+                mc.deinit();
+                mtp_cache = null;
+            }
+            if (dflash_ctx) |*dc| {
+                dc.deinit();
+                dflash_ctx = null;
+            }
+        }
+
         // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
         // pre-forward the sampled token. The first nextDrafter / nextPld /
         // nextMtp call needs the cache at exactly prompt_len (last prompt
         // token forwarded; first sampled token deferred). The lazy
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
-        if (drafter_active or pld_active or mtp_active or dspark_active or dflash_active) {
+        if (sampling.call_force == null and (drafter_active or pld_active or mtp_active or dspark_active or dflash_active)) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -3347,7 +3462,7 @@ pub const Generator = struct {
         // PLD / drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
         if (options.skip_lazy_preforward) {
-            const sample_lazy = sampleTokenLazy(logits, sampling, s);
+            const sample_lazy = firstTokenLazy(logits, sampling, s);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
@@ -3391,7 +3506,7 @@ pub const Generator = struct {
         }
 
         // Regular path: sample first token lazily, then build the next forward pass
-        const lazy_token = sampleTokenLazy(logits, sampling, s);
+        const lazy_token = firstTokenLazy(logits, sampling, s);
 
         const next_logits = try lazyForward(xfm, &ctx, lazy_token);
 
@@ -3766,6 +3881,34 @@ pub const Generator = struct {
     pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) mlx.mlx_array {
         defer self.sampling.draw +%= 1;
         return sampleTokenLazy(logits, self.sampling, self.xfm.s);
+    }
+
+    /// What a forced tool call makes of the next position.
+    fn forcedNext(self: *Generator) CallForce.Decision {
+        const cf = self.sampling.call_force orelse return .sample;
+        return cf.decide(self.generated_ids.items);
+    }
+
+    /// A sample restricted to `ids`, the branch of a forced call's name.
+    fn sampleAmong(self: *Generator, allocator: std.mem.Allocator, logits: mlx.mlx_array, ids: []const u32) !mlx.mlx_array {
+        const shape = mlx.getShape(logits);
+        const mask = try allocator.alloc(bool, @intCast(shape[shape.len - 1]));
+        defer allocator.free(mask);
+        @memset(mask, false);
+        for (ids) |id| {
+            if (id < mask.len) mask[id] = true;
+        }
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        try applyGrammarMask(allocator, &masked, logits, mask, self.xfm.s);
+        return self.sampleLazy(masked);
+    }
+
+    /// While a forced call is armed every successor is decided AFTER its
+    /// predecessor is known, so the pipelined fast path stands aside.
+    fn callForcePending(self: *const Generator) bool {
+        const cf = self.sampling.call_force orelse return false;
+        return cf.pending();
     }
 
     fn resolvePendingToken(self: *Generator) !void {
@@ -10716,7 +10859,7 @@ pub const Generator = struct {
         // ── Phase 1: Build and submit the NEXT step FIRST ──
         // This forces the GPU to compute the pending token as a dependency,
         // so when we eval it in Phase 2, it's already ready.
-        if (self.has_pending_logits and self.logprobs_n == 0 and self.step + 1 < self.max_tokens) {
+        if (self.has_pending_logits and self.logprobs_n == 0 and self.step + 1 < self.max_tokens and !self.callForcePending()) {
             const step_logits = self.pending_logits;
             self.has_pending_logits = false;
 
@@ -10806,7 +10949,19 @@ pub const Generator = struct {
         if (self.logprobs_n > 0) {
             defer _ = mlx.mlx_array_free(step_logits);
             const t_sample = tick_prof.mark();
-            const result = try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.xfm.s);
+            const result: SampleResult = switch (self.forcedNext()) {
+                .sample => try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.xfm.s),
+                .force => |id| .{ .token_id = id, .logprob_result = try firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.s) },
+                .choose => |ids| blk: {
+                    const lazy = try self.sampleAmong(allocator, step_logits, ids);
+                    defer _ = mlx.mlx_array_free(lazy);
+                    try mlx.check(mlx.mlx_array_eval(lazy));
+                    var v: i32 = 0;
+                    try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+                    const id: u32 = @intCast(v);
+                    break :blk .{ .token_id = id, .logprob_result = try firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.s) };
+                },
+            };
             tick_prof.add(.sample, t_sample);
             self.sampling.draw +%= 1;
             self.next_token_id = result.token_id;
@@ -10821,7 +10976,11 @@ pub const Generator = struct {
 
         // Last token or pipeline bootstrap
         const t_sample = tick_prof.mark();
-        const lazy_token = self.sampleLazy(step_logits);
+        const lazy_token = switch (self.forcedNext()) {
+            .sample => self.sampleLazy(step_logits),
+            .force => |id| tokenArray(id),
+            .choose => |ids| try self.sampleAmong(allocator, step_logits, ids),
+        };
         tick_prof.add(.sample, t_sample);
         _ = mlx.mlx_array_free(step_logits);
 
@@ -11839,6 +11998,22 @@ fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.ml
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, key, s));
     return sampled;
+}
+
+/// A committed token as the `[1]` int32 array a sample would be.
+fn tokenArray(id: u32) mlx.mlx_array {
+    const v: i32 = @intCast(id);
+    const shape = [_]c_int{1};
+    return mlx.mlx_array_new_data(&v, &shape, 1, .int32);
+}
+
+/// Prefill's first token: a forced call's when it owns token 0, else a sample.
+fn firstTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
+    if (sampling.call_force) |cf| switch (cf.decide(&.{})) {
+        .force => |id| return tokenArray(id),
+        .sample, .choose => {},
+    };
+    return sampleTokenLazy(logits, sampling, s);
 }
 
 pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
@@ -13909,6 +14084,13 @@ test "specDecodeUnsupported: release-enforced guard for spec + constraint/logpro
     try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }, 3));
 }
 
+test "specDecodeUnsupported: a forced tool call keeps every draft path off" {
+    // Drafts are accepted in runs, so no draft path can hand the position after
+    // the think closer to the forced call.
+    var cf = CallForce{ .forced = &.{1}, .call_at = 0, .closer_id = null, .phase = .answer, .last = 0 };
+    try testing.expect(specDecodeUnsupported(.{ .call_force = &cf }, 0));
+}
+
 test "GenerationResult fields" {
     // Just verifying the struct shape compiles correctly with all fields
     const result = GenerationResult{
@@ -14594,6 +14776,101 @@ test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
         while (k < degenerate_loop_min_span + 1) : (k += 1) try ids.append(testing.allocator, 42);
         try testing.expect(isDegenerateTailLoop(ids.items, P, R));
     }
+}
+
+/// Ids a CallForce commits after `published`, each published in turn, until it samples.
+fn drainCallForce(cf: *CallForce, published: []const u32) ![]u32 {
+    var gen = std.ArrayList(u32).empty;
+    defer gen.deinit(std.testing.allocator);
+    try gen.appendSlice(std.testing.allocator, published);
+    while (true) switch (cf.decide(gen.items)) {
+        .force => |id| try gen.append(std.testing.allocator, id),
+        .sample => break,
+        .choose => return error.UnexpectedChoice,
+    };
+    return std.testing.allocator.dupe(u32, gen.items[published.len..]);
+}
+
+test "CallForce: the call follows the closed thought, every other position samples" {
+    const OPEN: u32 = 900;
+    const CLOSE: u32 = 901;
+    const NL2: u32 = 271;
+    const forced = [_]u32{ NL2, 10, 11, 12 }; // separator, then the call
+    const call = forced[1..];
+    const t = std.testing;
+
+    // A prompt-opened thought runs free; the closer brings the separator and the call.
+    {
+        var cf = CallForce{ .forced = &forced, .call_at = 1, .closer_id = CLOSE, .phase = .thinking, .last = 5 };
+        try t.expect(cf.pending());
+        try t.expect(cf.decide(&.{ 1, 2 }) == .sample);
+        const got = try drainCallForce(&cf, &.{ 1, 2, CLOSE });
+        defer t.allocator.free(got);
+        try t.expectEqualSlices(u32, &forced, got);
+        try t.expect(!cf.pending());
+    }
+    // A thought the prompt closed on the closer itself: from token 0, separator first.
+    {
+        var cf = CallForce{ .forced = &forced, .call_at = 1, .closer_id = CLOSE, .phase = .answer, .last = CLOSE };
+        const got = try drainCallForce(&cf, &.{});
+        defer t.allocator.free(got);
+        try t.expectEqualSlices(u32, &forced, got);
+    }
+    // The prompt already wrote the separator: only the call.
+    {
+        var cf = CallForce{ .forced = &forced, .call_at = 1, .closer_id = CLOSE, .phase = .answer, .last = NL2 };
+        const got = try drainCallForce(&cf, &.{});
+        defer t.allocator.free(got);
+        try t.expectEqualSlices(u32, call, got);
+    }
+    // A reasoning-budget commit already wrote the separator after the closer.
+    {
+        var cf = CallForce{ .forced = &forced, .call_at = 1, .closer_id = CLOSE, .phase = .thinking, .last = 5 };
+        const got = try drainCallForce(&cf, &.{ 1, CLOSE, NL2 });
+        defer t.allocator.free(got);
+        try t.expectEqualSlices(u32, call, got);
+    }
+    // The template leaves the opener to the model: it is committed at token 0,
+    // the thought then runs free until its closer.
+    {
+        var cf = CallForce{ .forced = &forced, .call_at = 1, .closer_id = CLOSE, .opener = .{OPEN}, .phase = .open, .last = 5 };
+        const first = try drainCallForce(&cf, &.{});
+        defer t.allocator.free(first);
+        try t.expectEqualSlices(u32, &.{OPEN}, first);
+        try t.expect(cf.decide(&.{ OPEN, 1, 2 }) == .sample);
+        const got = try drainCallForce(&cf, &.{ OPEN, 1, 2, CLOSE });
+        defer t.allocator.free(got);
+        try t.expectEqualSlices(u32, &forced, got);
+    }
+}
+
+test "CallForce: a required call names one of the declared functions, the model picking among them" {
+    const CLOSE: u32 = 901;
+    const t = std.testing;
+    const head = [_]u32{ 10, 11 }; // the call up to the name
+    // Each declared name as ids, its closing delimiter included.
+    const get_time = [_]u32{ 20, 21, 30 };
+    const get_weather = [_]u32{ 20, 22, 30 };
+    const list_files = [_]u32{ 23, 30 };
+    const names = [_][]const u32{ &get_time, &get_weather, &list_files };
+    var choices: [names.len]u32 = undefined;
+    var cf = CallForce{ .forced = &head, .call_at = 0, .closer_id = CLOSE, .phase = .answer, .last = CLOSE, .names = &names, .choice_buf = &choices };
+
+    var gen = std.ArrayList(u32).empty;
+    defer gen.deinit(t.allocator);
+    for (head) |want| {
+        try t.expectEqual(want, cf.decide(gen.items).force);
+        try gen.append(t.allocator, want);
+    }
+    try t.expectEqualSlices(u32, &.{ 20, 23 }, cf.decide(gen.items).choose);
+    try gen.append(t.allocator, 20); // the model's pick
+    try t.expectEqualSlices(u32, &.{ 21, 22 }, cf.decide(gen.items).choose);
+    try gen.append(t.allocator, 22);
+    try t.expect(cf.pending());
+    try t.expectEqual(@as(u32, 30), cf.decide(gen.items).force);
+    try gen.append(t.allocator, 30);
+    try t.expect(cf.decide(gen.items) == .sample);
+    try t.expect(!cf.pending());
 }
 
 test "ThinkBound: counts only tokens inside the think block and fires at the budget" {

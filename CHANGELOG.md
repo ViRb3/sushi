@@ -38,6 +38,19 @@ earlier history is mlx-serve's, in that project's changelog.
   instead of three, about 2% faster decode on an M5 Max with identical output (ported from mlx-serve #517).
 - **Leaner Flash-Next decoding**: the sparse-attention indexer updates its block keys in one GPU kernel instead of a
   chain of about ten, and the output is token-for-token the same.
+- **`--preserve-thinking on|off`**: choose whether Qwen3.8 keeps every turn's thinking in the prompt (the default) or
+  only the latest turn's, per model in model-settings.json or per request with `chat_template_kwargs.preserve_thinking`.
+- **Continuing a reply with thinking on**: a continued assistant reply on Qwen3.8 and MiMo now resumes after the
+  closed think block their templates write, instead of a malformed or missing one.
+- **Files written through MiMo tool calls keep their last line break**: a tool argument's leading and trailing
+  newlines now reach the client unchanged on MiMo.
+- **Prompt reuse across Codex and Claude Code turns on MiMo**: a system or developer message sent mid-conversation now
+  stays where it was sent, so the next turn still reuses the cached prompt instead of processing it all again.
+- **Forced tool calls**: `tool_choice` `required` (Anthropic `any`) or a named function now makes Qwen3.8 and MiMo
+  call one of the declared tools on every API, after their thinking when it is on, and naming a function missing from
+  `tools` is a 400.
+- **Streamed thinking matches the non-streamed reply**: a thought's trailing line break no longer rides out on the
+  stream, so streamed and non-streamed reasoning are the same text on every API.
 
 ---
 

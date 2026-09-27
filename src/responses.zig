@@ -366,10 +366,10 @@ const ImageSink = struct {
 };
 
 /// Translate a Responses `input` value (string or array of input items) into
-/// `chat_mod.Message`s. Optionally prepends `instructions` as the single leading
-/// `system` msg. If `previous_messages` already contains a stored system message
-/// and fresh instructions are provided, the fresh instructions replace it so
-/// templates like Qwen's never see a non-leading/duplicate system message.
+/// `chat_mod.Message`s. Optionally prepends `instructions` as the leading
+/// `system` msg, replacing the stored history's leading one. A system or
+/// developer turn later in the conversation stays where it was sent; the render
+/// folds it only for a template that cannot place it.
 /// `previous_messages` are deep-referenced (not copied) into the result if
 /// non-null — caller must keep them alive.
 pub fn parseInput(
@@ -398,8 +398,8 @@ pub fn parseInput(
     }
 
     if (previous_messages) |prev| {
-        for (prev) |m| {
-            if (fresh_instructions != null and std.mem.eql(u8, m.role, "system")) {
+        for (prev, 0..) |m, i| {
+            if (fresh_instructions != null and i == 0 and std.mem.eql(u8, m.role, "system")) {
                 continue;
             }
             try pi.messages.append(allocator, m);
@@ -440,13 +440,6 @@ pub fn parseInput(
             }
         },
         else => {},
-    }
-
-    // The same unconditional fold /v1/messages applies: Qwen's template raises on a
-    // system turn that is not first, and the raise is the silent generic fallback.
-    if (try chat_mod.foldSystemMessages(allocator, &pi.messages)) |joined| {
-        errdefer allocator.free(joined);
-        try pi.owned_strings.append(allocator, joined);
     }
 
     return pi;
@@ -675,38 +668,6 @@ fn appendCompactionInputItem(
             .role = role_owned,
             .content = content_owned,
         });
-    }
-}
-
-// ─── tool_choice → instruction string ────────────────────────────────────
-
-pub const ToolChoice = struct {
-    /// When false, tools are dropped from the request entirely.
-    include_tools: bool,
-    /// Owned by the caller (free with allocator) when non-null.
-    instruction: ?[]const u8,
-};
-
-pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value) !ToolChoice {
-    const v = choice_val orelse return .{ .include_tools = true, .instruction = null };
-    switch (v) {
-        .string => |s| {
-            if (std.mem.eql(u8, s, "none")) return .{ .include_tools = false, .instruction = null };
-            if (std.mem.eql(u8, s, "required")) {
-                const ins = try allocator.dupe(u8, "\nYou MUST call one of the available functions. Do not respond with text.");
-                return .{ .include_tools = true, .instruction = ins };
-            }
-            return .{ .include_tools = true, .instruction = null }; // "auto" default
-        },
-        .object => |obj| {
-            const t = if (obj.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
-            if (!std.mem.eql(u8, t, "function")) return .{ .include_tools = true, .instruction = null };
-            const name = if (obj.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
-            if (name.len == 0) return .{ .include_tools = true, .instruction = null };
-            const ins = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name});
-            return .{ .include_tools = true, .instruction = ins };
-        },
-        else => return .{ .include_tools = true, .instruction = null },
     }
 }
 
@@ -1058,19 +1019,40 @@ test "parseInput replaces stored system when fresh instructions are provided" {
     }
 }
 
-test "parseInput folds a non-leading system into the leading one" {
-    // Codex sends a mid-input `developer` turn beside `instructions`.
+test "parseInput keeps a mid-input developer turn where it was sent" {
+    // Codex sends a mid-input `developer` turn beside `instructions`; the render
+    // folds it only for a template that cannot place it.
     const allocator = testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\[{"role":"developer","content":"mid"},{"role":"user","content":"hi"}]
+        \\[{"role":"user","content":"hi"},{"role":"developer","content":"mid"},{"role":"user","content":"again"}]
     , .{});
     defer parsed.deinit();
     var pi = try parseInput(allocator, parsed.value, "You are S.", null, null, .{});
     defer pi.deinit();
-    try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
-    try testing.expectEqualStrings("system", pi.messages.items[0].role);
-    try testing.expectEqualStrings("You are S.\n\nmid", pi.messages.items[0].content);
-    try testing.expectEqualStrings("user", pi.messages.items[1].role);
+    const want = [_][2][]const u8{ .{ "system", "You are S." }, .{ "user", "hi" }, .{ "system", "mid" }, .{ "user", "again" } };
+    try testing.expectEqual(want.len, pi.messages.items.len);
+    for (want, pi.messages.items) |w, m| {
+        try testing.expectEqualStrings(w[0], m.role);
+        try testing.expectEqualStrings(w[1], m.content);
+    }
+}
+
+test "parseInput: fresh instructions replace only the leading stored system turn" {
+    const v: std.json.Value = .{ .string = "next" };
+    const prev = [_]chat_mod.Message{
+        .{ .role = "system", .content = "old instructions" },
+        .{ .role = "user", .content = "first" },
+        .{ .role = "system", .content = "mid" },
+        .{ .role = "assistant", .content = "answer" },
+    };
+    var pi = try parseInput(testing.allocator, v, "new instructions", &prev, null, .{});
+    defer pi.deinit();
+    const want = [_][2][]const u8{ .{ "system", "new instructions" }, .{ "user", "first" }, .{ "system", "mid" }, .{ "assistant", "answer" }, .{ "user", "next" } };
+    try testing.expectEqual(want.len, pi.messages.items.len);
+    for (want, pi.messages.items) |w, m| {
+        try testing.expectEqualStrings(w[0], m.role);
+        try testing.expectEqualStrings(w[1], m.content);
+    }
 }
 
 test "parseInput function_call + function_call_output round-trip" {
@@ -1135,23 +1117,6 @@ test "compaction with malformed envelope is silently skipped" {
         var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
         defer pi.deinit();
         try testing.expectEqual(@as(usize, 0), pi.messages.items.len);
-    }
-}
-
-test "parseToolChoice none drops tools, required emits instruction" {
-    {
-        const v: std.json.Value = .{ .string = "none" };
-        const tc = try parseToolChoice(testing.allocator, v);
-        defer if (tc.instruction) |i| testing.allocator.free(i);
-        try testing.expectEqual(false, tc.include_tools);
-    }
-    {
-        const v: std.json.Value = .{ .string = "required" };
-        const tc = try parseToolChoice(testing.allocator, v);
-        defer if (tc.instruction) |i| testing.allocator.free(i);
-        try testing.expectEqual(true, tc.include_tools);
-        try testing.expect(tc.instruction != null);
-        try testing.expect(std.mem.indexOf(u8, tc.instruction.?, "MUST") != null);
     }
 }
 

@@ -120,6 +120,10 @@ fn printUsage(io: std.Io) void {
         \\                      WITHOUT producing a token (default: 300, 0=none). A request
         \\                      that keeps generating never times out, however long it runs.
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
+        \\  --preserve-thinking on|off  Templates that read `preserve_thinking` (Qwen3.8)
+        \\                      keep every turn's thinking (on, the template default)
+        \\                      or only the latest user turn's (off). Request
+        \\                      chat_template_kwargs > this flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
@@ -741,6 +745,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--preserve-thinking") and i + 1 < args.len) {
+            i += 1;
+            model_settings_mod.preserve_thinking_flag = server_mod.parseOnOff(args[i]) orelse {
+                log.err("--preserve-thinking: expected on or off; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {

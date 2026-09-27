@@ -1059,6 +1059,12 @@ test "PldDefaults: ServerConfig built from it reports the CLI values" {
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
+pub fn parseOnOff(word: []const u8) ?bool {
+    if (std.mem.eql(u8, word, "on")) return true;
+    if (std.mem.eql(u8, word, "off")) return false;
+    return null;
+}
+
 /// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
 /// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
 /// Default 1 = legacy single-slot behavior (no scheduler engagement, every
@@ -1178,6 +1184,121 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
     log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
     return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
+}
+
+const TOOL_CHOICE_UNDECLARED = "tool_choice names a function that is not in tools";
+
+/// Arm the decode-time half of a forced tool_choice (required or named), or
+/// null when the choice forces nothing or the call cannot be committed: no
+/// call markup the template writes after a closed thought, a prompt-opened
+/// thought whose closer is not one token, or `required` with no declared name.
+/// The prompt instruction then stands alone. The caller `deinit`s the result.
+fn armCallForce(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    prompt_ids: []const u32,
+    enable_thinking: bool,
+    choice: chat_mod.ToolChoice,
+    tools_json: ?[]const u8,
+) ?generate_mod.CallForce {
+    const name: ?[]const u8 = switch (choice) {
+        .auto, .none => return null,
+        .required => null,
+        .named => |n| n,
+    };
+    if (prompt_ids.len == 0) return null;
+    var text = (chat_mod.forcedCallText(allocator, chat_config, name) catch null) orelse {
+        log.info("  [tool-choice] forced call is prompt-only: no call markup after a closed thought in the template\n", .{});
+        return null;
+    };
+    defer text.deinit(allocator);
+    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
+    const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
+    const phase: generate_mod.CallForce.Phase = if (promptOpensThink(allocator, tok, prompt_ids)) blk: {
+        if (closer == null) {
+            log.info("  [tool-choice] forced call is prompt-only: the think closer is not one token\n", .{});
+            return null;
+        }
+        break :blk .thinking;
+    } else if (enable_thinking and opener != null and closer != null and templateThinkOpener(chat_config.chat_template) != null)
+        .open
+    else
+        .answer;
+
+    var names: NameIds = .{};
+    var armed = false;
+    defer if (!armed) names.deinit(allocator);
+    if (name == null) {
+        names = nameIds(allocator, tok, tools_json orelse "[]", text.name_tail) catch return null;
+        if (names.slices.len == 0) {
+            log.info("  [tool-choice] forced call is prompt-only: no declared function to name\n", .{});
+            return null;
+        }
+    }
+    const sep_ids: []u32 = if (text.sep.len == 0) &.{} else tok.encode(allocator, text.sep) catch return null;
+    defer if (sep_ids.len > 0) allocator.free(sep_ids);
+    const call_ids = tok.encode(allocator, text.call) catch return null;
+    defer allocator.free(call_ids);
+    const forced = std.mem.concat(allocator, u32, &.{ sep_ids, call_ids }) catch return null;
+    const choice_buf = allocator.alloc(u32, names.slices.len) catch {
+        allocator.free(forced);
+        return null;
+    };
+    armed = true;
+    log.info("  [tool-choice] forced call {s}: committed {s}\n", .{ name orelse "(any declared)", switch (phase) {
+        .open => "after the opener at token 0 and the closed thought",
+        .thinking => "once the thought closes",
+        .answer, .name, .done => "at token 0",
+    } });
+    return .{
+        .forced = forced,
+        .call_at = sep_ids.len,
+        .closer_id = closer,
+        .opener = .{opener orelse 0},
+        .phase = phase,
+        .last = prompt_ids[prompt_ids.len - 1],
+        .names = names.slices,
+        .names_flat = names.flat,
+        .choice_buf = choice_buf,
+    };
+}
+
+const NameIds = struct {
+    flat: []const u32 = &.{},
+    slices: []const []const u32 = &.{},
+
+    fn deinit(self: *NameIds, allocator: std.mem.Allocator) void {
+        allocator.free(self.flat);
+        allocator.free(self.slices);
+    }
+};
+
+/// Every declared function name followed by `tail`, tokenized.
+fn nameIds(allocator: std.mem.Allocator, tok: *const Tokenizer, tools_json: []const u8, tail: []const u8) !NameIds {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const declared = try chat_mod.declaredToolNames(arena, tools_json);
+    const per_name = try arena.alloc([]u32, declared.len);
+    var total: usize = 0;
+    for (declared, per_name) |n, *ids| {
+        const text = try std.mem.concat(arena, u8, &.{ n, tail });
+        const encoded = try tok.encode(allocator, text);
+        defer allocator.free(encoded);
+        ids.* = try arena.dupe(u32, encoded);
+        total += ids.len;
+    }
+    const flat = try allocator.alloc(u32, total);
+    errdefer allocator.free(flat);
+    const slices = try allocator.alloc([]const u32, declared.len);
+    var at: usize = 0;
+    for (per_name, slices) |ids, *slice| {
+        @memcpy(flat[at..][0..ids.len], ids);
+        slice.* = flat[at..][0..ids.len];
+        at += ids.len;
+    }
+    return .{ .flat = flat, .slices = slices };
 }
 
 fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
@@ -7960,11 +8081,10 @@ fn handleChatCompletions(
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
     var has_tools = root.get("tools") != null;
-    var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    const tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
+    if (tool_choice == .none) has_tools = false;
+    const tool_choice_instruction: ?[]const u8 = if (has_tools) try tool_choice.instruction(allocator) else null;
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
     // per response (the SDK sets false in strict structured-output mode).
@@ -7974,35 +8094,14 @@ fn handleChatCompletions(
         true;
 
     if (has_tools) {
-        // Parse tool_choice: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
-        if (root.get("tool_choice")) |tc| {
-            if (tc == .string) {
-                if (std.mem.eql(u8, tc.string, "none")) {
-                    has_tools = false; // Don't inject tools at all
-                } else if (std.mem.eql(u8, tc.string, "required")) {
-                    tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
-                }
-                // "auto" is the default behavior
-            } else if (tc == .object) {
-                // Specific function: {"type":"function","function":{"name":"fn_name"}}
-                if (tc.object.get("function")) |func| {
-                    if (func == .object) {
-                        if (func.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
-                        }
-                    }
-                }
-            }
+        // Find the tools array in the raw JSON body and extract it
+        if (extractJsonField(body, "tools")) |tools_str| {
+            tools_json = tools_str;
         }
-
-        if (has_tools) {
-            // Find the tools array in the raw JSON body and extract it
-            if (extractJsonField(body, "tools")) |tools_str| {
-                tools_json = tools_str;
-            }
+        if (chat_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
+            log.warn("POST /v1/chat/completions -> 400 (tool_choice names an undeclared function)\n", .{});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
+            return;
         }
     }
 
@@ -8259,7 +8358,8 @@ fn handleChatCompletions(
     // that into a prefill would change what every one of them gets back.
     const continue_final = continueFinalMessageRequested(root, messages.items);
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
+    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -8277,7 +8377,7 @@ fn handleChatCompletions(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -8420,6 +8520,12 @@ fn handleChatCompletions(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+    var call_force = if (has_tools and lm.transformer != null and !continue_final)
+        armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, tool_choice, tools_json)
+    else
+        null;
+    defer if (call_force) |*cf| cf.deinit(allocator);
+    if (call_force) |*cf| sampling.call_force = cf;
 
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
@@ -8680,7 +8786,7 @@ fn handleNonStreamingCompletion(
     // Spec dispatch: `requestSpecModes` (DFlash > MTP > drafter > PLD).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -8771,7 +8877,7 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -9309,7 +9415,7 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -9988,7 +10094,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -10108,6 +10214,7 @@ fn handleStreamingGeneration(
     // trimStart (chat.streamContentLead).
     var content_started = false;
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
+    var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>"; // will be updated if Gemma 4 format detected
     var skipped_think_open = false; // track if we've skipped the initial think tag
@@ -10276,9 +10383,10 @@ fn handleStreamingGeneration(
                         if (!budget_exhausted) {
                             const so_far = chat_mod.splitThinkBlock(buf, true, opens_think);
                             if (so_far.reasoning_content) |rc| {
-                                if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                const settled = chat_mod.settledReasoning(rc);
+                                if (chat_mod.unstreamedReasoning(settled, reasoning_streamed)) |fresh| {
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
-                                    reasoning_streamed = rc.len;
+                                    reasoning_streamed = settled.len;
                                     reasoning_tokens_sent += 1;
                                     if (reasoning_budget >= 0 and reasoning_tokens_sent >= @as(usize, @intCast(reasoning_budget))) {
                                         budget_exhausted = true;
@@ -10517,8 +10625,10 @@ fn handleStreamingGeneration(
             };
 
             if (close_match) |m| {
-                if (m.pos > 0 and !budget_exhausted) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null, null, .{});
+                const last = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                thought_shipped = false;
+                if (last.len > 0 and !budget_exhausted) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = last }, null, null, null, .{});
                 }
                 const after = m.pos + m.len;
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
@@ -10566,18 +10676,15 @@ fn handleStreamingGeneration(
                 in_think_block = false;
                 think_close_tag = if (m.is_channel) "<channel|>" else "</think>";
             } else if (skipped_think_open) {
-                // Flush reasoning tokens that can't be part of a close tag.
-                // Hold back a still-growing partial close tag (suffixed forms
-                // like `</think:opensource>` included), then back the cut off
-                // to a UTF-8 boundary — a flush cut mid-codepoint ships a lone
-                // continuation byte in the delta JSON (live hy_v3 2026-07-14:
-                // `"reasoning_content":"2\xc2"` — '²' split across deltas).
-                var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
-                while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
+                // Flush what the closed thought will certainly deliver: a partial
+                // close tag, a trailing "\n " run and a split code point wait.
+                const flush = chat_mod.openThoughtFlush(think_buf.items, thought_shipped);
+                const safe_len = flush.skip + flush.ship;
                 if (safe_len > 0) {
-                    if (!budget_exhausted) {
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{});
+                    if (flush.ship > 0 and !budget_exhausted) {
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[flush.skip..safe_len] }, null, null, null, .{});
                     }
+                    if (flush.ship > 0) thought_shipped = true;
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -12122,6 +12229,28 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
 /// encoder. On hit the returned slice is a fresh allocation owned by the
 /// caller (drop-in replacement for the engine encoders). On miss it
 /// stores a copy of the result in the cache.
+/// A bool the client set in `chat_template_kwargs` (the vLLM/SGLang spelling for
+/// template variables); null when absent or not a bool. The one reader of that object.
+fn chatTemplateKwargBool(root: std.json.ObjectMap, key: []const u8) ?bool {
+    const kwargs = root.get("chat_template_kwargs") orelse return null;
+    if (kwargs != .object) return null;
+    const v = kwargs.object.get(key) orelse return null;
+    return if (v == .bool) v.bool else null;
+}
+
+/// The template's `preserve_thinking`: request > `--preserve-thinking` >
+/// model-settings.json; null leaves the template's own default.
+fn resolvePreserveThinking(request: ?bool, flag: ?bool, setting: ?bool) ?bool {
+    return request orelse flag orelse setting;
+}
+
+/// The model's chat config as this request renders it.
+fn renderConfigFor(chat_config: *const chat_mod.ChatConfig, root: std.json.ObjectMap, flag: ?bool, setting: ?bool) chat_mod.ChatConfig {
+    var cfg = chat_config.*;
+    cfg.preserve_thinking = resolvePreserveThinking(chatTemplateKwargBool(root, "preserve_thinking"), flag, setting);
+    return cfg;
+}
+
 fn cachedFormatChat(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -12138,7 +12267,7 @@ fn cachedFormatChat(
 ) ![]u32 {
     const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
     const key_opt: ?u64 = if (cache_ptr != null)
-        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
+        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, chat_config.preserve_thinking)
     else
         null;
     if (cache_ptr) |cache| if (key_opt) |key| {
@@ -12805,6 +12934,28 @@ fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: ch
             .reasoning_content = msg_reasoning,
         });
     }
+}
+
+/// A /v1/messages conversation: the top-level `system` first, then every message.
+fn readAnthropicConversation(wire: *WireMessages, system: ?std.json.Value, items: []const std.json.Value, vp: chat_mod.VisionPreproc) !void {
+    const allocator = wire.allocator;
+    // Array form JOINS every text block — Claude Code sends 2+ (identity + the
+    // instructions block), and first-wins dropped everything after the first.
+    if (system) |sys_val| {
+        const sys_text: []const u8 = switch (sys_val) {
+            .string => |s| s,
+            .array => |arr| blk: {
+                const joined = try joinedTextParts(allocator, arr.items);
+                if (joined.owned) try wire.texts.append(allocator, joined.text);
+                break :blk joined.text;
+            },
+            else => "",
+        };
+        if (sys_text.len > 0) {
+            try wire.messages.append(allocator, .{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
+        }
+    }
+    try readAnthropicMessages(wire, items, vp);
 }
 
 /// Every message of a /v1/messages body. A user message's `tool_result`
@@ -14349,10 +14500,10 @@ test "tokenize cache keyFor: a media part's position keys the render, its pixels
     const with_b = [_]chat_mod.Message{.{ .role = "user", .content = "what's in this?", .images = &b, .media_parts = &lead }};
     const moved = [_]chat_mod.Message{.{ .role = "user", .content = "what's in this?", .images = &a, .media_parts = &tail }};
     const text = [_]chat_mod.Message{.{ .role = "user", .content = "what's in this?" }};
-    const k_a = tokenize_cache_mod.TokenizeCache.keyFor(&with_a, null, null, false, null, false).?;
-    try std.testing.expectEqual(k_a, tokenize_cache_mod.TokenizeCache.keyFor(&with_b, null, null, false, null, false).?);
-    try std.testing.expect(k_a != tokenize_cache_mod.TokenizeCache.keyFor(&moved, null, null, false, null, false).?);
-    try std.testing.expect(k_a != tokenize_cache_mod.TokenizeCache.keyFor(&text, null, null, false, null, false).?);
+    const k_a = tokenize_cache_mod.TokenizeCache.keyFor(&with_a, null, null, false, null, false, null).?;
+    try std.testing.expectEqual(k_a, tokenize_cache_mod.TokenizeCache.keyFor(&with_b, null, null, false, null, false, null).?);
+    try std.testing.expect(k_a != tokenize_cache_mod.TokenizeCache.keyFor(&moved, null, null, false, null, false, null).?);
+    try std.testing.expect(k_a != tokenize_cache_mod.TokenizeCache.keyFor(&text, null, null, false, null, false, null).?);
 }
 
 fn testGridImage(grid_h: u32, grid_w: u32, pixels: []const u8) chat_mod.ImageData {
@@ -14656,27 +14807,7 @@ fn handleAnthropicMessages(
     defer wire.deinit();
     const messages = &wire.messages;
 
-    // System prompt (Anthropic puts it at top level). Array form JOINS every
-    // text block — Claude Code sends 2+ (identity + the instructions block),
-    // and first-wins dropped everything after the first.
-    if (root.get("system")) |sys_val| {
-        const sys_text: []const u8 = switch (sys_val) {
-            .string => |s| s,
-            .array => |arr| blk: {
-                const joined = try joinedTextParts(allocator, arr.items);
-                if (joined.owned) try wire.texts.append(allocator, joined.text);
-                break :blk joined.text;
-            },
-            else => "",
-        };
-        if (sys_text.len > 0) {
-            try messages.append(allocator, .{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
-        }
-    }
-
-    try readAnthropicMessages(&wire, messages_val.array.items, visionPreprocFromConfig(config));
-
-    if (try chat_mod.foldSystemMessages(allocator, messages)) |joined| try wire.texts.append(allocator, joined);
+    try readAnthropicConversation(&wire, root.get("system"), messages_val.array.items, visionPreprocFromConfig(config));
 
     if (wire.media.refusal()) |fault| {
         log.warn("POST /v1/messages -> 400 ({s})\n", .{fault.text()});
@@ -14703,11 +14834,9 @@ fn handleAnthropicMessages(
     defer if (tools_json_allocated) allocator.free(tools_json.?);
     var has_tools = false;
     var allow_parallel_tools = true;
+    var tool_choice: chat_mod.ToolChoice = .auto;
     var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     if (root.get("tools")) |tools_val| {
         if (tools_val == .array and tools_val.array.items.len > 0) {
@@ -14716,27 +14845,21 @@ fn handleAnthropicMessages(
             tools_json = try buildOpenAIToolsJson(allocator, tools_val.array);
             tools_json_allocated = true;
 
-            // Parse tool_choice
             if (root.get("tool_choice")) |tc| {
                 if (tc == .object) {
                     // Anthropic spelling of the parallel clamp.
                     if (tc.object.get("disable_parallel_tool_use")) |d| {
                         if (d == .bool and d.bool) allow_parallel_tools = false;
                     }
-                    const tc_type = if (tc.object.get("type")) |t| (if (t == .string) t.string else "auto") else "auto";
-                    if (std.mem.eql(u8, tc_type, "none")) {
-                        has_tools = false;
-                    } else if (std.mem.eql(u8, tc_type, "any")) {
-                        tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
-                    } else if (std.mem.eql(u8, tc_type, "tool")) {
-                        if (tc.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
-                        }
-                    }
                 }
+            }
+            tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
+            if (tool_choice == .none) has_tools = false;
+            tool_choice_instruction = try tool_choice.instruction(allocator);
+            if (chat_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
+                log.warn("POST /v1/messages -> 400 (tool_choice names an undeclared tool)\n", .{});
+                try sendAnthropicError(allocator, stream, "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
+                return;
             }
         }
     }
@@ -14890,7 +15013,8 @@ fn handleAnthropicMessages(
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
+    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (output_cfg.schema != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -14908,7 +15032,7 @@ fn handleAnthropicMessages(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -15035,6 +15159,12 @@ fn handleAnthropicMessages(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+    var call_force = if (has_tools and lm.transformer != null and !continue_final)
+        armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, tool_choice, tools_json)
+    else
+        null;
+    defer if (call_force) |*cf| cf.deinit(allocator);
+    if (call_force) |*cf| sampling.call_force = cf;
 
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = req_media.embeddings;
@@ -15102,7 +15232,7 @@ fn handleAnthropicNonStreaming(
 
     // Speculative decoding dispatch — same `requestSpecModes` as
     // chat-completions (DFlash > MTP > drafter > PLD).
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -15364,7 +15494,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -15468,6 +15598,7 @@ fn handleAnthropicStreaming(
     defer muse_head.deinit(allocator);
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
+    var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
     var think_close_tag: []const u8 = "</think>";
     var skipped_think_open = false;
     var think_tokens: i32 = 0;
@@ -15832,8 +15963,10 @@ fn handleAnthropicStreaming(
             };
 
             if (close_match) |m| {
-                if (thinking_block_open and m.pos > 0) {
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..m.pos]);
+                const last = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                thought_shipped = false;
+                if (thinking_block_open and last.len > 0) {
+                    try emitAnthropicThinkingDelta(allocator, stream, block_index, last);
                 }
                 if (thinking_block_open) {
                     try closeAnthropicThinkingBlock(allocator, stream, block_index);
@@ -15878,13 +16011,13 @@ fn handleAnthropicStreaming(
                 in_think_block = false;
                 think_close_tag = if (m.is_channel) "<channel|>" else "</think>";
             } else if (skipped_think_open) {
-                // Hold back a still-growing partial close tag (suffixed forms
-                // included), then back off to a UTF-8 boundary — a cut mid-
-                // codepoint ships a lone continuation byte in the delta JSON.
-                var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
-                while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
+                // Flush what the closed thought will certainly deliver: a partial
+                // close tag, a trailing "\n " run and a split code point wait.
+                const flush = chat_mod.openThoughtFlush(think_buf.items, thought_shipped);
+                const safe_len = flush.skip + flush.ship;
                 if (safe_len > 0) {
-                    if (thinking_block_open) try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
+                    if (thinking_block_open and flush.ship > 0) try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[flush.skip..safe_len]);
+                    if (flush.ship > 0) thought_shipped = true;
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -16566,9 +16699,10 @@ fn handleResponsesInner(
     };
     var has_tools = root.get("tools") != null;
 
-    const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"));
-    defer if (tool_choice.instruction) |ins| allocator.free(ins);
-    if (!tool_choice.include_tools) has_tools = false;
+    const tool_choice = chat_mod.parseToolChoice(root.get("tool_choice"));
+    const tool_choice_instruction = try tool_choice.instruction(allocator);
+    defer if (tool_choice_instruction) |ins| allocator.free(ins);
+    if (tool_choice == .none) has_tools = false;
 
     if (has_tools) {
         if (root.get("tools")) |tools_val| if (tools_val == .array) {
@@ -16578,6 +16712,11 @@ fn handleResponsesInner(
             if (reshaped.len <= 2) has_tools = false; // "[]" — no function tools
         };
     }
+    if (has_tools and chat_mod.toolChoiceNamesUndeclared(allocator, tool_choice, tools_json)) {
+        log.warn("POST /v1/responses -> 400 (tool_choice names an undeclared function)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", TOOL_CHOICE_UNDECLARED, 400);
+        return;
+    }
 
     // Once tool outputs are supplied for a structured-output request, this turn
     // must produce the final JSON answer. Keeping tools available lets local
@@ -16585,7 +16724,7 @@ fn handleResponsesInner(
     const final_answer_mode = wants_json and has_current_tool_output;
     const active_has_tools = has_tools and !final_answer_mode;
     const active_tools_json: ?[]const u8 = if (active_has_tools) tools_json else null;
-    const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice.instruction else null;
+    const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice_instruction else null;
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
@@ -16652,7 +16791,8 @@ fn handleResponsesInner(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
@@ -16670,7 +16810,7 @@ fn handleResponsesInner(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -16770,6 +16910,12 @@ fn handleResponsesInner(
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
+    var call_force = if (active_has_tools and lm.transformer != null)
+        armCallForce(allocator, tok, chat_config, prompt_ids, enable_thinking, tool_choice, active_tools_json)
+    else
+        null;
+    defer if (call_force) |*cf| cf.deinit(allocator);
+    if (call_force) |*cf| sampling.call_force = cf;
 
     // ── pre-allocate response id (used in streaming envelopes too) ──
     const resp_id = try responses_mod.makeId(stream.io, allocator, "resp");
@@ -16915,7 +17061,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -16985,6 +17131,7 @@ fn handleResponsesInner(
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
+        var thought_shipped = false; // this thought has streamed a delta (`chat.openThoughtFlush`)
         var skipped_think_open = false;
         // Inkling thinking message seen — its close is <|end_message|>.
         var inkling_think = false;
@@ -17141,7 +17288,8 @@ fn handleResponsesInner(
                 };
 
                 if (close_match) |m| {
-                    const before = think_buf.items[0..m.pos];
+                    const before = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
+                    thought_shipped = false;
                     if (before.len > 0) {
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -17176,18 +17324,21 @@ fn handleResponsesInner(
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
                 } else if (skipped_think_open) {
-                    // Hold back the longest possible partial-tag suffix (max 9 bytes
-                    // covers both "</think>" and "<channel|>").
-                    const max_partial: usize = 9;
-                    const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
+                    // Flush what the closed thought will certainly deliver: a partial
+                    // close tag, a trailing "\n " run and a split code point wait.
+                    const flush = chat_mod.openThoughtFlush(think_buf.items, thought_shipped);
+                    const safe_len = flush.skip + flush.ship;
                     if (safe_len > 0) {
-                        if (!streamed_reasoning_started) {
-                            streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
-                            streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
-                            streamed_reasoning_started = true;
+                        if (flush.ship > 0) {
+                            if (!streamed_reasoning_started) {
+                                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
+                                streamed_reasoning_index = live_output_index;
+                                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                                streamed_reasoning_started = true;
+                            }
+                            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[flush.skip..safe_len]);
+                            thought_shipped = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
                         const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                         think_buf.clearRetainingCapacity();
                         try think_buf.appendSlice(allocator, remaining);
@@ -17262,7 +17413,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         const use_pld = spec.use_pld;
@@ -23961,4 +24112,255 @@ test "MiMo MTP state bill is constant and follows retained storage" {
     cfg.sliding_window = 64;
     const smaller: u64 = 2 * (3 * (2 * 64 - 1) * 4 * (192 + 128) * 2 + 256 * 2048 * 2) + 3 * 64 * 2048 * 2;
     try t.expectEqual(smaller, prefillRequestTerms(&cfg, 1024, 2048, 4, 512, .{}).state_bytes);
+}
+
+/// A byte-level tokenizer spelling every byte as its own token, plus `specials`
+/// as atomic ids from 256 up. Strings live in `arena`.
+fn byteTokenizerForTests(a: std.mem.Allocator, arena: std.mem.Allocator, specials: []const []const u8) !Tokenizer {
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    for (0..256) |b| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
+        const s = try arena.dupe(u8, buf[0..n]);
+        try tok.vocab.put(s, @intCast(b));
+        try tok.id_to_token.put(@intCast(b), s);
+        try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
+    }
+    for (specials, 0..) |sp, i| {
+        const id: u32 = @intCast(256 + i);
+        try tok.special_tokens.put(sp, id);
+        try tok.id_to_token.put(id, sp);
+    }
+    return tok;
+}
+
+fn deinitTestTokenizer(tok: *Tokenizer) void {
+    tok.vocab.deinit();
+    tok.id_to_token.deinit();
+    tok.merge_ranks.deinit();
+    tok.special_tokens.deinit();
+    tok.unicode_to_byte.deinit();
+}
+
+/// One surface's forced tool_choice, end to end without a model: its wire
+/// shapes parse, the prompt renders through each family's template, the force
+/// arms, and a model that thinks "hmm" (when the turn thinks) meets the call.
+fn expectSurfaceForcesCall(tool_choice_json: []const u8, openai_tools: []const u8, forced_name: ?[]const u8) !void {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>" });
+    defer deinitTestTokenizer(&tok);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, tool_choice_json, .{});
+    defer parsed.deinit();
+    const choice = chat_mod.parseToolChoice(parsed.value);
+    const instruction = try choice.instruction(a);
+    defer if (instruction) |i| a.free(i);
+
+    const Family = struct { tpl: []const u8, head: []const u8, name_tail: []const u8, sep: []const u8 };
+    const families = [_]Family{
+        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .head = "<tool_call>\n<function=", .name_tail = ">\n", .sep = "\n\n" },
+        .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .head = "<tool_call><function=", .name_tail = ">", .sep = "" },
+    };
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "What time is it?" }};
+    for (families) |f| {
+        var config = chat_mod.ChatConfig{ .chat_template = f.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        // `required` commits the only declared name too: the call names a declared function.
+        const call = try std.mem.concat(a, u8, &.{ f.head, forced_name orelse "get_time", f.name_tail });
+        defer a.free(call);
+        for ([_]bool{ true, false }) |thinking| {
+            const rendered = try chat_mod.renderChatTemplate(a, &messages, &config, openai_tools, instruction, thinking, null, false);
+            defer a.free(rendered);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "You MUST call") != null);
+            const prompt_ids = try tok.encode(a, rendered);
+            defer a.free(prompt_ids);
+
+            var cf = armCallForce(a, &tok, &config, prompt_ids, thinking, choice, openai_tools) orelse return error.ForceNotArmed;
+            defer cf.deinit(a);
+            var published = std.ArrayList(u32).empty;
+            defer published.deinit(a);
+            var thought = false;
+            while (true) {
+                const next = cf.decide(published.items);
+                if (next == .force) {
+                    try published.append(a, next.force);
+                } else if (next == .choose) {
+                    try published.append(a, next.choose[0]);
+                } else if (!cf.pending()) {
+                    break;
+                } else {
+                    if (thought) return error.ForceNeverFired;
+                    thought = true;
+                    const ids = try tok.encode(a, "hmm</think>");
+                    defer a.free(ids);
+                    try published.appendSlice(a, ids);
+                }
+            }
+            const text = try tok.decode(a, published.items, false);
+            defer a.free(text);
+            // Qwen's template opens the thought in the prompt; MiMo's leaves the opener to the model.
+            const opener: []const u8 = if (thinking and f.sep.len == 0) "<think>" else "";
+            const want = if (thinking)
+                try std.mem.concat(a, u8, &.{ opener, "hmm</think>", f.sep, call })
+            else
+                try a.dupe(u8, call);
+            defer a.free(want);
+            try std.testing.expectEqualStrings(want, text);
+        }
+    }
+}
+
+test "chat completions: a forced tool_choice is committed at the answer boundary on both families" {
+    const tools =
+        \\[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}}}}},
+        \\ {"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    ;
+    try expectSurfaceForcesCall("{\"type\":\"function\",\"function\":{\"name\":\"get_time\"}}", tools, "get_time");
+    try expectSurfaceForcesCall("\"required\"", tools, null);
+}
+
+test "anthropic messages: a forced tool_choice is committed at the answer boundary on both families" {
+    const a = std.testing.allocator;
+    const wire =
+        \\[{"name":"get_time","description":"Get time","input_schema":{"type":"object","properties":{"timezone":{"type":"string"}}}},
+        \\ {"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, wire, .{});
+    defer parsed.deinit();
+    const tools = try buildOpenAIToolsJson(a, parsed.value.array);
+    defer a.free(tools);
+    try expectSurfaceForcesCall("{\"type\":\"tool\",\"name\":\"get_time\"}", tools, "get_time");
+    try expectSurfaceForcesCall("{\"type\":\"any\"}", tools, null);
+}
+
+test "responses: a forced tool_choice is committed at the answer boundary on both families" {
+    const a = std.testing.allocator;
+    const wire =
+        \\[{"type":"function","name":"get_time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}}}},
+        \\ {"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, wire, .{});
+    defer parsed.deinit();
+    const tools = try responses_mod.buildToolsJson(a, parsed.value.array);
+    defer a.free(tools);
+    try expectSurfaceForcesCall("{\"type\":\"function\",\"name\":\"get_time\"}", tools, "get_time");
+    try expectSurfaceForcesCall("\"required\"", tools, null);
+}
+
+test "tool_choice auto and none arm no forced call" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    defer deinitTestTokenizer(&tok);
+    var config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    const ids = try tok.encode(a, "<|im_start|>assistant\n<think>\n");
+    defer a.free(ids);
+    try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .auto, null) == null);
+    try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .none, null) == null);
+}
+
+/// Render one turn as the surface builds it: Responses input (with `instructions`)
+/// or a /v1/messages body.
+fn renderSurfaceTurnForTests(a: std.mem.Allocator, tpl: []const u8, surface: enum { responses, messages }, body_json: []const u8) ![]const u8 {
+    var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body_json, .{});
+    defer parsed.deinit();
+    switch (surface) {
+        .responses => {
+            var pi = try responses_mod.parseInput(a, parsed.value, "I", null, null, .{});
+            defer pi.deinit();
+            return chat_mod.renderChatTemplate(a, pi.messages.items, &config, null, null, true, null, false);
+        },
+        .messages => {
+            var wire = WireMessages.init(a);
+            defer wire.deinit();
+            try readAnthropicConversation(&wire, parsed.value.object.get("system"), parsed.value.object.get("messages").?.array.items, .{});
+            return chat_mod.renderChatTemplate(a, wire.messages.items, &config, null, null, true, null, false);
+        },
+    }
+}
+
+test "a late system turn keeps each turn's prompt a prefix of the next where the template places it" {
+    const a = std.testing.allocator;
+    // Codex sends the whole input each turn, with a new developer turn mid-conversation;
+    // Claude Code's hook output arrives as a system message between turns.
+    const responses_n =
+        \\[{"role":"developer","content":"env: /repo"},{"role":"user","content":"u1"}]
+    ;
+    const responses_next =
+        \\[{"role":"developer","content":"env: /repo"},{"role":"user","content":"u1"},
+        \\ {"type":"message","role":"assistant","content":[{"type":"output_text","text":"a1"}]},
+        \\ {"role":"developer","content":"approvals: never"},{"role":"user","content":"u2"}]
+    ;
+    const messages_n =
+        \\{"system":"S","messages":[{"role":"user","content":"u1"}]}
+    ;
+    const messages_next =
+        \\{"system":"S","messages":[{"role":"user","content":"u1"},{"role":"assistant","content":"a1"},
+        \\ {"role":"system","content":"hook: started"},{"role":"user","content":"u2"}]}
+    ;
+    const Template = struct { tpl: []const u8, places_late_system: bool };
+    const templates = [_]Template{
+        .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .places_late_system = true },
+        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .places_late_system = false },
+    };
+    for (templates) |t| {
+        inline for (.{ .{ .responses, responses_n, responses_next, "approvals: never" }, .{ .messages, messages_n, messages_next, "hook: started" } }) |c| {
+            const turn_n = try renderSurfaceTurnForTests(a, t.tpl, c[0], c[1]);
+            defer a.free(turn_n);
+            const turn_next = try renderSurfaceTurnForTests(a, t.tpl, c[0], c[2]);
+            defer a.free(turn_next);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, turn_next, c[3]));
+            if (t.places_late_system) try std.testing.expect(std.mem.startsWith(u8, turn_next, turn_n));
+        }
+    }
+}
+
+test "preserve_thinking: request > --preserve-thinking > model-settings.json > the template's default" {
+    const t = std.testing;
+    try t.expectEqual(@as(?bool, false), resolvePreserveThinking(false, true, true));
+    try t.expectEqual(@as(?bool, true), resolvePreserveThinking(true, false, false));
+    try t.expectEqual(@as(?bool, true), resolvePreserveThinking(null, true, false));
+    try t.expectEqual(@as(?bool, false), resolvePreserveThinking(null, null, false));
+    try t.expectEqual(@as(?bool, null), resolvePreserveThinking(null, null, null));
+}
+
+test "chat_template_kwargs is read in one place, and only a bool counts" {
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, want: ?bool };
+    const cases = [_]Case{
+        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":false}}", .want = false },
+        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":true}}", .want = true },
+        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":\"off\"}}", .want = null },
+        .{ .body = "{\"chat_template_kwargs\":[1]}", .want = null },
+        .{ .body = "{\"preserve_thinking\":false}", .want = null },
+        .{ .body = "{}", .want = null },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(c.want, chatTemplateKwargBool(parsed.value.object, "preserve_thinking"));
+    }
+}
+
+test "--preserve-thinking takes on or off" {
+    try std.testing.expectEqual(@as(?bool, true), parseOnOff("on"));
+    try std.testing.expectEqual(@as(?bool, false), parseOnOff("off"));
+    try std.testing.expectEqual(@as(?bool, null), parseOnOff("yes"));
+}
+
+test "a request renders with its own preserve_thinking and leaves the model's config alone" {
+    const a = std.testing.allocator;
+    var model_config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"chat_template_kwargs\":{\"preserve_thinking\":false}}", .{});
+    defer parsed.deinit();
+    const per_request = renderConfigFor(&model_config, parsed.value.object, null, true);
+    try std.testing.expectEqual(@as(?bool, false), per_request.preserve_thinking);
+    try std.testing.expectEqual(@as(?bool, null), model_config.preserve_thinking);
+    const empty = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(?bool, true), renderConfigFor(&model_config, empty.value.object, null, true).preserve_thinking);
+    try std.testing.expectEqual(@as(?bool, false), renderConfigFor(&model_config, empty.value.object, false, true).preserve_thinking);
 }

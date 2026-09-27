@@ -470,6 +470,7 @@ pub const ModelConfig = struct {
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
     /// Per-model `ssd_budget_gb` (GiB, the `--ssd-budget-gb` unit) from model-settings.json; 0 = none.
     ssd_budget_gb_override: u32 = 0,
+    preserve_thinking_override: ?bool = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the

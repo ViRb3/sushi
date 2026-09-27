@@ -1823,6 +1823,18 @@ const corpus = [_]Expect{
         .tool_name = "list_files",
         .tool_count = 1,
     },
+    .{
+        // MiMo-V2.6 writes a value between the tags with no framing newline, so a
+        // file's final newline is the value's own byte and must reach the client.
+        .family = "mimo",
+        .name = "unframed file content keeps its final newline",
+        .raw = "<think>Write the notes file.</think><tool_call><function=write_file><parameter=path>notes.txt</parameter>" ++
+            "<parameter=content>first line\nlast line\n</parameter></function></tool_call>",
+        .thinking = true,
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "first line\nlast line\n",
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of
@@ -2747,5 +2759,245 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "LEAD_SYS"));
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "LATE_SYS"));
         try testing.expectEqual(c.system_headers, std.mem.count(u8, rendered, "<|im_start|>system"));
+    }
+}
+
+test "format corpus: a forced tool_choice reaches the prompt once, on every template" {
+    // A template that renders `tools` itself dropped the instruction, which only
+    // the generic fallback carried; the fallback must keep carrying it.
+    const tools =
+        \\[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const no_tools_chatml = "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>' }}{% endfor %}" ++
+        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
+    const Case = struct { name: []const u8, tpl: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
+        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "no tools (fallback injection)", .tpl = no_tools_chatml },
+    };
+    const choices = [_]chat.ToolChoice{ .required, .{ .named = "get_time" } };
+    const messages = [_]chat.Message{.{ .role = "user", .content = "What time is it?" }};
+    for (cases) |c| {
+        var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+        for (choices) |choice| {
+            const instr = (try choice.instruction(testing.allocator)).?;
+            defer testing.allocator.free(instr);
+            const rendered = try chat.renderChatTemplate(testing.allocator, &messages, &config, tools, instr, true, null, false);
+            defer testing.allocator.free(rendered);
+            errdefer std.debug.print("\n[{s}]\n{s}\n", .{ c.name, rendered });
+            try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, std.mem.trim(u8, instr, "\n")));
+        }
+    }
+}
+
+test "format corpus: a forced call is the family's own call markup and parses back to its name" {
+    // What the decoder commits at the answer boundary must be the bytes the family
+    // itself writes after a closed thought, or the parse chain meets a dialect the
+    // template never taught the model.
+    const allocator = testing.allocator;
+    const Case = struct { name: []const u8, tpl: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
+        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+    };
+    const calls = [_]chat.ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const history = [_]chat.Message{
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "check the clock" },
+    };
+    for (cases) |c| {
+        var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        var named = (try chat.forcedCallText(allocator, &config, "get_time")) orelse {
+            std.debug.print("\n[{s}] no forced call read from the template\n", .{c.name});
+            return error.NoForcedCall;
+        };
+        defer named.deinit(allocator);
+        var any = (try chat.forcedCallText(allocator, &config, null)).?;
+        defer any.deinit(allocator);
+        // `required` writes a declared name and its delimiter after the head: the named bytes exactly.
+        const required_named = try std.mem.concat(allocator, u8, &.{ any.call, "get_time", any.name_tail });
+        defer allocator.free(required_named);
+        try testing.expectEqualStrings(named.call, required_named);
+
+        const rendered = try chat.renderChatTemplate(allocator, &history, &config, null, null, true, null, false);
+        defer allocator.free(rendered);
+        const answer_at = std.mem.lastIndexOf(u8, rendered, "</think>").? + "</think>".len;
+        const answer = rendered[answer_at .. answer_at + std.mem.indexOf(u8, rendered[answer_at..], "<|im_end|>").?];
+        const forced = try std.mem.concat(allocator, u8, &.{ named.sep, named.call });
+        defer allocator.free(forced);
+        errdefer std.debug.print("\n[{s}] forced {s}\n answer {s}\n", .{ c.name, forced, answer });
+        try testing.expect(std.mem.startsWith(u8, answer, forced));
+
+        const parsed = (try chat.parseToolCalls(allocator, answer)) orelse return error.ForcedCallNotParsed;
+        defer {
+            for (parsed) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(parsed);
+        }
+        try testing.expectEqual(@as(usize, 1), parsed.len);
+        try testing.expectEqualStrings("get_time", parsed[0].name);
+        const args = try std.json.parseFromSlice(std.json.Value, allocator, parsed[0].arguments, .{});
+        defer args.deinit();
+        try testing.expectEqualStrings("UTC", args.value.object.get("timezone").?.string);
+    }
+}
+
+test "format corpus: a string value parses back byte-exact from each family's own call rendering" {
+    // Qwen3.8 frames a value with one newline per side; MiMo writes it bare. The
+    // parser may remove only what the family's template added.
+    const allocator = testing.allocator;
+    const Case = struct { name: []const u8, tpl: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
+        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+    };
+    const values = [_][]const u8{ "plain", "last line\n", "\nafter a blank line", "two blank lines\n\n", "  indented\n", "\n" };
+    for (cases) |c| {
+        var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        for (values) |value| {
+            var args_buf: std.Io.Writer.Allocating = .init(allocator);
+            defer args_buf.deinit();
+            try std.json.Stringify.value(.{ .path = "a.txt", .content = value }, .{}, &args_buf.writer);
+            const calls = [_]chat.ToolCall{.{ .id = "tc_0", .name = "write_file", .arguments = args_buf.written() }};
+            const history = [_]chat.Message{
+                .{ .role = "user", .content = "Write it." },
+                .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "r" },
+            };
+            const rendered = try chat.renderChatTemplate(allocator, &history, &config, null, null, true, null, false);
+            defer allocator.free(rendered);
+            const start = std.mem.indexOf(u8, rendered, "<tool_call>").?;
+            const end = std.mem.indexOf(u8, rendered, "</tool_call>").? + "</tool_call>".len;
+            const parsed = (try chat.parseToolCalls(allocator, rendered[start..end])) orelse return error.CallNotParsed;
+            defer {
+                for (parsed) |tc| {
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                }
+                allocator.free(parsed);
+            }
+            const args = try std.json.parseFromSlice(std.json.Value, allocator, parsed[0].arguments, .{});
+            defer args.deinit();
+            errdefer std.debug.print("\n[{s}] value {any}\n call {s}\n args {s}\n", .{ c.name, value, rendered[start..end], parsed[0].arguments });
+            try testing.expectEqualStrings("a.txt", args.value.object.get("path").?.string);
+            try testing.expectEqualStrings(value, args.value.object.get("content").?.string);
+        }
+    }
+}
+
+test "format corpus: a continuation ends on the family's own rendering of the partial turn" {
+    // Continuing a reply must hand the model the bytes its template writes for that
+    // turn. The thinking-on prompt plus a bare closer gave Qwen3.8 `<think>\n</think>`
+    // with no separator and gave MiMo no think block at all.
+    const allocator = testing.allocator;
+    const Case = struct { name: []const u8, tpl: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
+        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+        .{ .name = "muse", .tpl = @embedFile("fixtures/muse_chat_template.jinja") },
+    };
+    const partial = "It is half past";
+    const messages = [_]chat.Message{
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = partial },
+    };
+    for (cases) |c| {
+        var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        for ([_]bool{ true, false }) |thinking| {
+            const history = try chat.renderChatTemplate(allocator, &messages, &config, null, null, thinking, null, false);
+            defer allocator.free(history);
+            const cont = try chat.renderChatTemplate(allocator, &messages, &config, null, null, thinking, null, true);
+            defer allocator.free(cont);
+            const want = history[0 .. std.mem.lastIndexOf(u8, history, partial).? + partial.len];
+            errdefer std.debug.print("\n[{s}] thinking={}\n want tail {s}\n got tail  {s}\n", .{ c.name, thinking, want[want.len -| 60..], cont[cont.len -| 60..] });
+            try testing.expectEqualStrings(want, cont);
+            try testing.expect(!chat.promptTailOpensThink(cont));
+        }
+    }
+}
+
+/// Streams the thought in `raw` one byte at a time the way each chat stream path
+/// does and returns (tools path, no-tools path) deltas joined.
+fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![2][]u8 {
+    const close_at = std.mem.indexOf(u8, raw, "</think>").?;
+    const through_close = raw[0 .. close_at + "</think>".len];
+
+    // Tools path: the open block's split, settled, then the closed split's rest.
+    var tools = std.ArrayList(u8).empty;
+    errdefer tools.deinit(allocator);
+    var streamed: usize = 0;
+    for (1..through_close.len + 1) |i| {
+        const buf = through_close[0..i];
+        const split = chat.splitThinkBlock(buf, true, opened);
+        const rc = split.reasoning_content orelse continue;
+        const closed = i == through_close.len;
+        const ready = if (closed) rc else chat.settledReasoning(rc);
+        if (chat.unstreamedReasoning(ready, streamed)) |fresh| {
+            try tools.appendSlice(allocator, fresh);
+            streamed = ready.len;
+        }
+    }
+
+    // No-tools path: raw thought bytes flushed from a buffer that keeps what may not ship yet.
+    var plain = std.ArrayList(u8).empty;
+    errdefer plain.deinit(allocator);
+    const body_from: usize = if (!opened and std.mem.startsWith(u8, raw, "<think>")) "<think>".len else 0;
+    var pending = std.ArrayList(u8).empty;
+    defer pending.deinit(allocator);
+    var shipped = false;
+    for (raw[body_from .. close_at + "</think>".len]) |byte| {
+        try pending.append(allocator, byte);
+        if (std.mem.indexOf(u8, pending.items, "</think>")) |pos| {
+            try plain.appendSlice(allocator, chat.closedThoughtDelta(pending.items[0..pos], shipped));
+            break;
+        }
+        const flush = chat.openThoughtFlush(pending.items, shipped);
+        const delta = pending.items[flush.skip..][0..flush.ship];
+        if (delta.len > 0) shipped = true;
+        try plain.appendSlice(allocator, delta);
+        const keep = pending.items[flush.skip + flush.ship ..];
+        std.mem.copyForwards(u8, pending.items[0..keep.len], keep);
+        pending.shrinkRetainingCapacity(keep.len);
+    }
+    return .{ try tools.toOwnedSlice(allocator), try plain.toOwnedSlice(allocator) };
+}
+
+test "format corpus: streamed reasoning adds up to the non-stream reasoning, on both stream paths" {
+    // A stream shipped an open thought's trailing newline, which the closed split
+    // trims: the thought Qwen3.8 closes with `\n</think>` streamed one byte longer.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, opened: bool };
+    var cases = std.ArrayList(Case).empty;
+    defer cases.deinit(allocator);
+    for (corpus) |e| {
+        if (std.mem.count(u8, e.raw, "</think>") != 1) continue;
+        // Tool markup inside a thought is cut as a leak, a class of its own.
+        if (chat.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
+        const opens = std.mem.startsWith(u8, e.raw, "<think>");
+        if (!opens and !e.opened_by_template) continue;
+        try cases.append(allocator, .{ .raw = e.raw, .opened = e.opened_by_template and !opens });
+    }
+    const edges = [_][]const u8{
+        "The answer is 4.\n</think>\n\n4",
+        "\n\nLeading blank lines.\n</think>A",
+        "First paragraph.\n\nSecond paragraph.\n\n</think>\n\n<tool_call>",
+        "Trailing spaces  \n </think>x",
+        "Multi-byte end: \u{00e9}\n</think>",
+    };
+    for (edges) |raw| try cases.append(allocator, .{ .raw = raw, .opened = true });
+    try testing.expect(cases.items.len > edges.len);
+    for (cases.items) |c| {
+        const want = chat.splitThinkBlock(c.raw[0 .. std.mem.indexOf(u8, c.raw, "</think>").? + "</think>".len], true, c.opened).reasoning_content orelse "";
+        const got = try streamThought(allocator, c.raw, c.opened);
+        defer for (got) |g| allocator.free(g);
+        errdefer std.debug.print("\nraw: {s}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, want, got[0], got[1] });
+        try testing.expectEqualStrings(want, got[0]);
+        try testing.expectEqualStrings(want, got[1]);
     }
 }

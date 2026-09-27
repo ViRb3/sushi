@@ -22,9 +22,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `ResponseStore`, WS via Upgrade. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl.
-  `stop_sequence` echo, full SSE block lifecycle; a `system`-role message past index 0 FOLDS into the leading system
-  message (`foldSystemMessages`, also run by `responses.parseInput`, since Codex sends a mid-input `developer` turn);
-  `developer` reads as `system` (`canonicalRole`).
+  `stop_sequence` echo, full SSE block lifecycle; a `system`-role message past index 0 (Claude Code's hook output,
+  Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only for a template that cannot
+  place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as `system` (`canonicalRole`).
+- **`preserve_thinking`** (templates that read it: Qwen3.8), resolved per request as `chat_template_kwargs.preserve_thinking`
+  (bool, all three surfaces) > `--preserve-thinking on|off` > `preserve_thinking` in model-settings.json > the template
+  default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
+- `tool_choice` reads every surface's wire shape; `required`/`any` and a named function are enforced at decode, a
+  named function the request does not declare is a 400 ([server-tool-calling](server-tool-calling.md#tool_choice)).
 - `/v1/models` rows carry `context_length` + `max_model_len` at TOP level. Context-overflow 400s name BOTH counts.
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);

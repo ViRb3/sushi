@@ -155,6 +155,9 @@ pub const ChatConfig = struct {
     eos_token: ?[]const u8,
     add_bos_token: bool,
     allocator: std.mem.Allocator,
+    /// The template's `preserve_thinking`, resolved per request; null leaves it
+    /// undefined, which Qwen3.8 reads as keeping every turn's thinking.
+    preserve_thinking: ?bool = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -490,6 +493,15 @@ pub fn renderChatTemplate(
             effective_tools_json = null; // already inlined as system content
         }
     }
+    // The fallback above inlines the instruction with the tools; a template that
+    // renders tools itself gets it on the last turn instead. A continuation keeps
+    // the client's own prefill.
+    if (tool_choice_instruction) |instr| {
+        if (tools_json != null and !needs_inject_tools and prefill == null) {
+            if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+            effective_messages = try appendTurnInstruction(fallback_arena.?.allocator(), effective_messages, std.mem.trim(u8, instr, "\n"));
+        }
+    }
 
     // Muse (harmony convention): reasoning belongs to the CURRENT turn only.
     // The app round-trips `reasoning_content` on assistant history, and this
@@ -529,6 +541,11 @@ pub fn renderChatTemplate(
     defer if (tools_z) |tz| allocator.free(tz);
     if (effective_tools_json) |tj| {
         tools_z = try allocator.dupeSentinel(u8, tj, 0);
+    }
+
+    if (prefill) |partial| {
+        const turn = messages[messages.len - 1];
+        if (try renderContinuation(allocator, tmpl_z, extra_z, tools_z, effective_messages, turn, partial, empty_content, chat_config)) |cont| return cont;
     }
 
     // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
@@ -576,6 +593,41 @@ pub fn renderChatTemplate(
         return std.mem.concat(allocator, u8, &.{ base, partial });
     }
     return base;
+}
+
+/// A continuation as the template writes the partial turn when it is history,
+/// cut right after its text (transformers' `continue_final_message` rule): the
+/// think block and separators match every earlier turn, thinking on or off.
+/// Null when the render fails or does not carry the text, and the caller falls
+/// back to the generation prompt plus the content-channel tail.
+fn renderContinuation(
+    allocator: std.mem.Allocator,
+    tmpl_z: [:0]const u8,
+    extra_z: [:0]const u8,
+    tools_z: ?[:0]const u8,
+    history: []const Message,
+    turn: Message,
+    partial: []const u8,
+    empty_content: EmptyContent,
+    chat_config: *const ChatConfig,
+) !?[]const u8 {
+    const turns = try allocator.alloc(Message, history.len + 1);
+    defer allocator.free(turns);
+    @memcpy(turns[0..history.len], history);
+    turns[history.len] = .{ .role = "assistant", .content = partial, .reasoning_content = turn.reasoning_content };
+    const json = try serializeMessagesJsonFor(allocator, turns, empty_content, chat_config);
+    defer allocator.free(json);
+    const json_z = try allocator.dupeSentinel(u8, json, 0);
+    defer allocator.free(json_z);
+    var len: usize = 0;
+    const ptr = jinja_c.jinja_render_chat(tmpl_z.ptr, json_z.ptr, if (tools_z) |tz| tz.ptr else null, extra_z.ptr, 0, &len) orelse return null;
+    defer jinja_c.jinja_str_free(ptr);
+    const rendered = try collapseDoubledThinkTags(allocator, ptr[0..len]);
+    defer allocator.free(rendered);
+    // A template may trim the text's leading whitespace, as transformers allows for.
+    const text = std.mem.trimStart(u8, partial, " \t\r\n");
+    const at = std.mem.lastIndexOf(u8, rendered, text) orelse return null;
+    return try allocator.dupe(u8, rendered[0 .. at + text.len]);
 }
 
 /// Null `reasoning_content` on assistant messages BEFORE the last user
@@ -694,6 +746,20 @@ fn templateProbeRendersMarker(
     probe_messages: []const Message,
     marker: []const u8,
 ) !bool {
+    const rendered = (try templateProbeRender(allocator, tpl, extra_json, probe_messages)) orelse return false;
+    defer allocator.free(rendered);
+    return std.mem.indexOf(u8, rendered, marker) != null;
+}
+
+/// The template's render of `probe_messages` without a generation prompt, or
+/// null when it fails. Probe failures are conservative: the real render clears
+/// the thread-local Jinja error and either renders or logs its own failure.
+fn templateProbeRender(
+    allocator: std.mem.Allocator,
+    tpl: []const u8,
+    extra_json: []const u8,
+    probe_messages: []const Message,
+) !?[]u8 {
     const messages_json = try serializeMessagesJson(allocator, probe_messages);
     defer allocator.free(messages_json);
 
@@ -712,15 +778,84 @@ fn templateProbeRendersMarker(
         extra_z.ptr,
         0,
         &rendered_len,
-    );
-    if (result_ptr) |ptr| {
-        defer jinja_c.jinja_str_free(ptr);
-        return std.mem.indexOf(u8, ptr[0..rendered_len], marker) != null;
-    }
+    ) orelse return null;
+    defer jinja_c.jinja_str_free(result_ptr);
+    return try allocator.dupe(u8, result_ptr[0..rendered_len]);
+}
 
-    // Probe failures are conservative: the real render below will clear the
-    // thread-local Jinja error and either render or log its own failure.
-    return false;
+/// What a forced tool_choice commits once the thought is closed, spelled the
+/// way the template renders a call after a closed think block.
+pub const ForcedCall = struct {
+    /// Whitespace between the think closer and the call.
+    sep: []u8,
+    /// The call up to the model's first free choice: through the function name
+    /// and its closing delimiter when one is named, else up to the name.
+    call: []u8,
+    /// What closes a name: its delimiter and the whitespace after it.
+    name_tail: []u8,
+
+    pub fn deinit(self: *ForcedCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.sep);
+        allocator.free(self.call);
+        allocator.free(self.name_tail);
+    }
+};
+
+/// Read the forced call from the template's own rendering of an assistant tool
+/// call. Null when the template renders no think closer before the call to
+/// anchor on, or no delimiter after the function name.
+pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConfig, name: ?[]const u8) !?ForcedCall {
+    const probe_name = "__sushi_forced_call_probe__";
+    const calls = [_]ToolCall{.{ .id = "call_probe", .name = probe_name, .arguments = "{\"a\": \"v\"}" }};
+    const probe = [_]Message{
+        .{ .role = "user", .content = "u" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "r" },
+    };
+    const extra_json = try serializeExtraContext(allocator, chat_config, true, null);
+    defer allocator.free(extra_json);
+    const rendered = (try templateProbeRender(allocator, chat_config.chat_template, extra_json, &probe)) orelse return null;
+    defer allocator.free(rendered);
+
+    const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
+    const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], BARE_THINK_CLOSER) orelse return null;
+    const between = rendered[closer_at + BARE_THINK_CLOSER.len .. name_at];
+    const head = std.mem.trimStart(u8, between, " \t\r\n");
+    if (head.len == 0) return null;
+    const sep = between[0 .. between.len - head.len];
+
+    const after = rendered[name_at + probe_name.len ..];
+    var delim: usize = 0;
+    while (delim < after.len and delim < 4 and !nameByte(after[delim]) and !std.ascii.isWhitespace(after[delim]) and after[delim] != '<') delim += 1;
+    if (delim == 0) return null;
+    var ws = delim;
+    while (ws < after.len and std.ascii.isWhitespace(after[ws])) ws += 1;
+    const tail = after[0..ws];
+
+    const owned_sep = try allocator.dupe(u8, sep);
+    errdefer allocator.free(owned_sep);
+    const owned_tail = try allocator.dupe(u8, tail);
+    errdefer allocator.free(owned_tail);
+    const call = try std.mem.concat(allocator, u8, &.{ head, name orelse "", if (name != null) tail else "" });
+    return .{ .sep = owned_sep, .call = call, .name_tail = owned_tail };
+}
+
+fn nameByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
+}
+
+/// `messages` with `text` closing the conversation: appended to a trailing user
+/// turn, else a user turn of its own. Every byte before the last message is
+/// unchanged, so the prefix cache still matches.
+fn appendTurnInstruction(arena: std.mem.Allocator, messages: []const Message, text: []const u8) ![]const Message {
+    const out = try arena.alloc(Message, messages.len + 1);
+    @memcpy(out[0..messages.len], messages);
+    if (messages.len > 0 and std.mem.eql(u8, messages[messages.len - 1].role, "user")) {
+        const last = &out[messages.len - 1];
+        last.content = if (last.content.len == 0) text else try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ last.content, text });
+        return out[0..messages.len];
+    }
+    out[messages.len] = .{ .role = "user", .content = text };
+    return out;
 }
 
 /// True if any message has `role: "tool"` or an assistant message with tool_calls.
@@ -1174,6 +1309,12 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
             ",\"thinking_mode\":\"thinking\""
         else
             ",\"thinking_mode\":\"chat\"");
+    }
+
+    if (chat_config.preserve_thinking) |keep| {
+        if (std.mem.indexOf(u8, chat_config.chat_template, "preserve_thinking") != null) {
+            try buf.appendSlice(allocator, if (keep) ",\"preserve_thinking\":true" else ",\"preserve_thinking\":false");
+        }
     }
 
     // Muse-Glimmer reads `reasoning_strength` (its template default is
@@ -3085,6 +3226,32 @@ pub fn streamContentLead(chunk: []const u8, content_started: bool) []const u8 {
 /// can SHRINK when a tool marker appears mid-thought and `trimLeakedToolMarkup`
 /// cuts the tail. An SSE delta cannot be retracted, so the honest behavior is to
 /// send nothing further — never to resend from the top.
+/// The part of a still-open thought's split a stream may ship. A closed thought
+/// is delivered as `trim(thought, "\n ")`, so a trailing run of those bytes, and
+/// a close tag still arriving, wait for what follows.
+pub fn settledReasoning(open: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, open[0 .. open.len - partialThinkCloseSuffixLen(open)], "\n ");
+}
+
+pub const OpenThoughtFlush = struct { skip: usize, ship: usize };
+
+/// How a stream flushes an open thought's raw bytes (everything since its last
+/// delta) so the deltas add up to the closed thought's `trim(thought, "\n ")`:
+/// `skip` leading bytes drop before the first delta, `ship` bytes go out, and the
+/// rest (a trailing "\n " run, a partial close tag, a split code point) waits.
+pub fn openThoughtFlush(buf: []const u8, shipped: bool) OpenThoughtFlush {
+    const skip = if (shipped) 0 else buf.len - std.mem.trimStart(u8, buf, "\n ").len;
+    const whole = @max(buf.len - partialThinkCloseSuffixLen(buf), skip);
+    var end = skip + std.mem.trimEnd(u8, buf[skip..whole], "\n ").len;
+    while (end > skip and end < buf.len and (buf[end] & 0xC0) == 0x80) end -= 1;
+    return .{ .skip = skip, .ship = end - skip };
+}
+
+/// The last delta of a thought whose remaining raw bytes are `body`.
+pub fn closedThoughtDelta(body: []const u8, shipped: bool) []const u8 {
+    return if (shipped) std.mem.trimEnd(u8, body, "\n ") else std.mem.trim(u8, body, "\n ");
+}
+
 pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
     if (already >= reasoning.len) return null;
     return reasoning[already..];
@@ -6502,6 +6669,9 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
         break :blk block.len - fn_body_start;
     };
     const fn_body = block[fn_body_start .. fn_body_start + fn_end];
+    // Qwen3.8 frames the body and every value with newlines; MiMo writes both bare,
+    // so there a value's edge newlines are its own bytes.
+    const framed = std.mem.startsWith(u8, fn_body, "\n") or std.mem.startsWith(u8, fn_body, "\r\n");
 
     // Track emitted parameter names so a repeated `<parameter=NAME>` can't
     // produce a duplicate JSON key (std.json rejects those with DuplicateField —
@@ -6531,7 +6701,8 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
 
         const p_val_start = p_name_start + p_name_end + 1;
         const p_val_end = (hermesValueEnd(fn_body, p_val_start) orelse break) - p_val_start;
-        const p_val = stripHermesValueFraming(fn_body[p_val_start .. p_val_start + p_val_end]);
+        const raw_val = fn_body[p_val_start .. p_val_start + p_val_end];
+        const p_val = if (framed) stripHermesValueFraming(raw_val) else raw_val;
 
         // Skip a duplicate name (first wins); still advance past its block.
         var dup = false;
@@ -6915,6 +7086,70 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
     try buf.append(allocator, '"');
 }
 
+/// A request's `tool_choice`, read from any surface's wire shape: chat nests the
+/// name under `function`, Responses and Anthropic carry it flat, Anthropic
+/// spells required `any`. Anything unrecognised is `auto`.
+pub const ToolChoice = union(enum) {
+    auto,
+    none,
+    required,
+    named: []const u8,
+
+    /// The prompt-side instruction of a forced choice; null for auto and none.
+    pub fn instruction(self: ToolChoice, allocator: std.mem.Allocator) !?[]u8 {
+        return switch (self) {
+            .auto, .none => null,
+            .required => try allocator.dupe(u8, "\nYou MUST call one of the available functions. Do not respond with text."),
+            .named => |name| try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name}),
+        };
+    }
+};
+
+pub fn parseToolChoice(value: ?std.json.Value) ToolChoice {
+    const v = value orelse return .auto;
+    switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "none")) return .none;
+            if (std.mem.eql(u8, s, "required") or std.mem.eql(u8, s, "any")) return .required;
+            return .auto;
+        },
+        .object => |obj| {
+            const kind = if (obj.get("type")) |t| (if (t == .string) t.string else "") else "";
+            if (std.mem.eql(u8, kind, "none")) return .none;
+            if (std.mem.eql(u8, kind, "any") or std.mem.eql(u8, kind, "required")) return .required;
+            const holder = if (obj.get("function")) |f| (if (f == .object) f.object else obj) else obj;
+            const name = holder.get("name") orelse return .auto;
+            if (name != .string or name.string.len == 0) return .auto;
+            return .{ .named = name.string };
+        },
+        else => return .auto,
+    }
+}
+
+/// Every function name the OpenAI-shaped tools array declares, in order; empty
+/// when it does not parse. Strings live in `arena`.
+pub fn declaredToolNames(arena: std.mem.Allocator, tools_json: []const u8) ![]const []const u8 {
+    const tools = std.json.parseFromSliceLeaky(std.json.Value, arena, tools_json, .{}) catch return &.{};
+    if (tools != .array) return &.{};
+    var names = std.ArrayList([]const u8).empty;
+    for (tools.array.items) |tool| {
+        if (tool != .object) continue;
+        const holder = if (tool.object.get("function")) |f| (if (f == .object) f.object else tool.object) else tool.object;
+        const name = holder.get("name") orelse continue;
+        if (name == .string and name.string.len > 0) try names.append(arena, name.string);
+    }
+    return names.toOwnedSlice(arena);
+}
+
+/// A named choice for a function the request never declared cannot be honoured.
+pub fn toolChoiceNamesUndeclared(allocator: std.mem.Allocator, choice: ToolChoice, tools_json: ?[]const u8) bool {
+    const name = switch (choice) {
+        .named => |n| n,
+        else => return false,
+    };
+    return !toolNameIsDeclared(allocator, tools_json orelse "[]", name);
+}
+
 /// Append tool definitions as a system prompt section.
 fn appendToolSystemPrompt(allocator: std.mem.Allocator, result_buf: *std.ArrayList(u8), tools_json: []const u8, tool_choice_instruction: ?[]const u8) !void {
     try result_buf.appendSlice(allocator,
@@ -6935,6 +7170,75 @@ fn appendToolSystemPrompt(allocator: std.mem.Allocator, result_buf: *std.ArrayLi
 // ── Tests ──
 
 const testing = std.testing;
+
+test "parseToolChoice reads every surface's wire shape" {
+    const Case = struct { json: []const u8, want: ToolChoice };
+    const cases = [_]Case{
+        // OpenAI chat completions
+        .{ .json = "\"auto\"", .want = .auto },
+        .{ .json = "\"none\"", .want = .none },
+        .{ .json = "\"required\"", .want = .required },
+        .{ .json = "{\"type\":\"function\",\"function\":{\"name\":\"get_time\"}}", .want = .{ .named = "get_time" } },
+        // OpenAI Responses
+        .{ .json = "{\"type\":\"function\",\"name\":\"get_time\"}", .want = .{ .named = "get_time" } },
+        .{ .json = "{\"type\":\"allowed_tools\",\"mode\":\"auto\"}", .want = .auto },
+        // Anthropic messages
+        .{ .json = "{\"type\":\"auto\"}", .want = .auto },
+        .{ .json = "{\"type\":\"none\"}", .want = .none },
+        .{ .json = "{\"type\":\"any\",\"disable_parallel_tool_use\":true}", .want = .required },
+        .{ .json = "{\"type\":\"tool\",\"name\":\"get_time\"}", .want = .{ .named = "get_time" } },
+        // A named choice with no usable name forces nothing.
+        .{ .json = "{\"type\":\"tool\"}", .want = .auto },
+        .{ .json = "{\"type\":\"function\",\"function\":{\"name\":\"\"}}", .want = .auto },
+        .{ .json = "7", .want = .auto },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.json, .{});
+        defer parsed.deinit();
+        try testing.expectEqualDeep(c.want, parseToolChoice(parsed.value));
+    }
+    try testing.expectEqualDeep(ToolChoice.auto, parseToolChoice(null));
+}
+
+test "a named tool_choice must name a declared tool" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_time","parameters":{}}}]
+    ;
+    try testing.expect(!toolChoiceNamesUndeclared(allocator, .{ .named = "get_time" }, tools));
+    try testing.expect(toolChoiceNamesUndeclared(allocator, .{ .named = "rm_rf" }, tools));
+    try testing.expect(toolChoiceNamesUndeclared(allocator, .{ .named = "get_time" }, null));
+    try testing.expect(!toolChoiceNamesUndeclared(allocator, .required, tools));
+    try testing.expect(!toolChoiceNamesUndeclared(allocator, .auto, null));
+}
+
+test "declaredToolNames lists every function a tools array declares, in order" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const names = try declaredToolNames(allocator,
+        \\[{"type":"function","function":{"name":"get_time"}},{"name":"flat_tool"},{"type":"function","function":{}},{"type":"function","function":{"name":"get_weather"}}]
+    );
+    try testing.expectEqual(@as(usize, 3), names.len);
+    try testing.expectEqualStrings("get_time", names[0]);
+    try testing.expectEqualStrings("flat_tool", names[1]);
+    try testing.expectEqualStrings("get_weather", names[2]);
+    try testing.expectEqual(@as(usize, 0), (try declaredToolNames(allocator, "not json")).len);
+}
+
+test "only a forced tool_choice carries a prompt instruction" {
+    const allocator = testing.allocator;
+    try testing.expect(try (ToolChoice{ .auto = {} }).instruction(allocator) == null);
+    try testing.expect(try (ToolChoice{ .none = {} }).instruction(allocator) == null);
+
+    const any = (try (ToolChoice{ .required = {} }).instruction(allocator)).?;
+    defer allocator.free(any);
+    try testing.expectEqualStrings("\nYou MUST call one of the available functions. Do not respond with text.", any);
+
+    const one = (try (ToolChoice{ .named = "get_time" }).instruction(allocator)).?;
+    defer allocator.free(one);
+    try testing.expectEqualStrings("\nYou MUST call the function \"get_time\". Do not respond with text.", one);
+}
 
 test "real mimo_v2 template preserves reasoning and XML tool history" {
     const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
@@ -9937,6 +10241,150 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
     }
 }
 
+const forced_choice_tools =
+    \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+;
+
+test "renderChatTemplate: a forced tool_choice reaches templates that render tools themselves" {
+    const allocator = testing.allocator;
+    const templates = [_][]const u8{
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+        @embedFile("fixtures/mimo_v26_chat_template.jinja"),
+    };
+    const instr = "\nYou MUST call the function \"get_time\". Do not respond with text.";
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const user_last = [_]Message{
+        .{ .role = "system", .content = "S" },
+        .{ .role = "user", .content = "What time is it?" },
+    };
+    const tool_last = [_]Message{
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+    const conversations = [_][]const Message{ &user_last, &tool_last };
+    for (templates) |tpl| {
+        var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        for (conversations) |msgs| {
+            for ([_]bool{ true, false }) |thinking| {
+                const plain = try renderChatTemplate(allocator, msgs, &config, forced_choice_tools, null, thinking, null, false);
+                defer allocator.free(plain);
+                const forced = try renderChatTemplate(allocator, msgs, &config, forced_choice_tools, instr, thinking, null, false);
+                defer allocator.free(forced);
+                try testing.expect(std.mem.indexOf(u8, plain, "You MUST call") == null);
+                try testing.expectEqual(@as(usize, 1), std.mem.count(u8, forced, "You MUST call the function \"get_time\". Do not respond with text."));
+                // Only the tail moves: every byte before the last message stays, so a
+                // prefix cached from an auto turn still serves a forced one.
+                const last = msgs[msgs.len - 1].content;
+                const cut = std.mem.lastIndexOf(u8, plain, last).?;
+                try testing.expect(std.mem.startsWith(u8, forced, plain[0..cut]));
+                try testing.expect(std.mem.lastIndexOf(u8, forced, "You MUST call").? > std.mem.lastIndexOf(u8, forced, last).?);
+                const generation_prompt = plain[std.mem.lastIndexOf(u8, plain, "<|im_start|>assistant").?..];
+                try testing.expect(std.mem.endsWith(u8, forced, generation_prompt));
+            }
+        }
+    }
+}
+
+test "forcedCallText reads each family's call markup from its own template" {
+    const allocator = testing.allocator;
+    const Case = struct { tpl: []const u8, sep: []const u8, required: []const u8, named: []const u8, name_tail: []const u8 };
+    const cases = [_]Case{
+        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
+        .{ .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
+        .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .sep = "", .required = "<tool_call><function=", .named = "<tool_call><function=get_time>", .name_tail = ">" },
+    };
+    for (cases) |c| {
+        var config = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        var any = (try forcedCallText(allocator, &config, null)).?;
+        defer any.deinit(allocator);
+        try testing.expectEqualStrings(c.sep, any.sep);
+        try testing.expectEqualStrings(c.required, any.call);
+        try testing.expectEqualStrings(c.name_tail, any.name_tail);
+        var one = (try forcedCallText(allocator, &config, "get_time")).?;
+        defer one.deinit(allocator);
+        try testing.expectEqualStrings(c.sep, one.sep);
+        try testing.expectEqualStrings(c.named, one.call);
+    }
+    // No think block to anchor on: nothing is forced.
+    var plain = ChatConfig{ .chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    try testing.expect(try forcedCallText(allocator, &plain, null) == null);
+}
+
+test "renderChatTemplate: a continuation keeps the client's own prefill, not a forced tool_choice" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{ .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "It is" },
+    };
+    const rendered = try renderChatTemplate(allocator, &msgs, &config, forced_choice_tools, "\nYou MUST call one of the available functions. Do not respond with text.", true, null, true);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "You MUST call") == null);
+    try testing.expect(std.mem.endsWith(u8, rendered, "It is"));
+}
+
+test "renderChatTemplate: preserve_thinking keeps or drops Qwen3.8's prior-turn thinking" {
+    const allocator = testing.allocator;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "q1" },
+        .{ .role = "assistant", .content = "a1", .reasoning_content = "PRIOR_THOUGHT" },
+        .{ .role = "user", .content = "q2" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "CURRENT_THOUGHT" },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+    const templates = [_][]const u8{
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+    };
+    for (templates) |tpl| {
+        var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        const absent = try renderChatTemplate(allocator, &messages, &config, forced_choice_tools, null, true, null, false);
+        defer allocator.free(absent);
+        try testing.expect(std.mem.indexOf(u8, absent, "<|im_start|>assistant\n<think>\nPRIOR_THOUGHT\n</think>\n\na1<|im_end|>") != null);
+        try testing.expect(std.mem.indexOf(u8, absent, "<think>\nCURRENT_THOUGHT\n</think>") != null);
+
+        config.preserve_thinking = true;
+        const on = try renderChatTemplate(allocator, &messages, &config, forced_choice_tools, null, true, null, false);
+        defer allocator.free(on);
+        try testing.expectEqualStrings(absent, on);
+
+        // Off renders only the latest user turn's thinking.
+        config.preserve_thinking = false;
+        const off = try renderChatTemplate(allocator, &messages, &config, forced_choice_tools, null, true, null, false);
+        defer allocator.free(off);
+        try testing.expect(std.mem.indexOf(u8, off, "PRIOR_THOUGHT") == null);
+        try testing.expect(std.mem.indexOf(u8, off, "<|im_start|>assistant\na1<|im_end|>") != null);
+        try testing.expect(std.mem.indexOf(u8, off, "<think>\nCURRENT_THOUGHT\n</think>") != null);
+    }
+}
+
+test "renderChatTemplate: a template that does not read preserve_thinking renders the same bytes" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "q1" },
+        .{ .role = "assistant", .content = "a1", .reasoning_content = "PRIOR_THOUGHT" },
+        .{ .role = "user", .content = "q2" },
+    };
+    const templates = [_][]const u8{
+        @embedFile("fixtures/mimo_v26_chat_template.jinja"),
+        "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>' }}{% endfor %}",
+    };
+    for (templates) |tpl| {
+        var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        const absent = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+        defer allocator.free(absent);
+        for ([_]bool{ true, false }) |p| {
+            config.preserve_thinking = p;
+            const got = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+            defer allocator.free(got);
+            try testing.expectEqualStrings(absent, got);
+        }
+    }
+}
+
 test "serializeExtraContext with thinking enabled" {
     const allocator = testing.allocator;
     var config = ChatConfig{
@@ -12649,8 +13097,9 @@ test "renderChatTemplate: continuation appends the partial reply into the OPEN a
 
     const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
     defer allocator.free(cont);
-    // Ends INSIDE the turn, on the partial text — no close tag after it.
-    try testing.expect(std.mem.endsWith(u8, cont, "<|im_start|>assistantone, two,"));
+    // Ends INSIDE the turn, on the partial text as the template writes the
+    // turn — no close tag after it.
+    try testing.expect(std.mem.endsWith(u8, cont, "<|im_start|>assistant\none, two,"));
     // Exactly one assistant turn was opened.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, cont, "<|im_start|>assistant"));
     // The partial appears once — as the prefill, not also as history.
@@ -12664,12 +13113,14 @@ test "renderChatTemplate: continuation appends the partial reply into the OPEN a
 }
 
 test "renderChatTemplate: continuation resumes in the CONTENT channel, not a think block" {
-    // A template that opens `<think>` unconditionally (LFM2.5 class) would
-    // otherwise put the partial reply — visible prose the user already read —
-    // inside a reasoning block, and the continuation would come back as
-    // reasoning. The same tail that thinking-off uses closes it first.
+    // A template that does not render the partial turn as history (this one
+    // drops assistant turns) falls back to the generation prompt. One that opens
+    // `<think>` unconditionally (LFM2.5 class) would then put the partial reply —
+    // visible prose the user already read — inside a reasoning block, and the
+    // continuation would come back as reasoning. The same tail that thinking-off
+    // uses closes it first.
     const allocator = testing.allocator;
-    const tpl = "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n<think>{%- endif -%}";
+    const tpl = "{%- for message in messages -%}{%- if message['role'] != 'assistant' -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n<think>{%- endif -%}";
     var config = ChatConfig{
         .chat_template = tpl,
         .bos_token = "",

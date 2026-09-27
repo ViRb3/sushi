@@ -80,6 +80,8 @@ sudo sysctl iogpu.wired_limit_mb=120000   # 128 GB Mac
 ```
 
 - `--mtp-head-kv-quant` stores the MTP head's own KV at 8 bits too.
+- `--preserve-thinking off` keeps only the latest turn's thinking in the prompt. Agents running long sessions may prefer
+  it for the shorter context; each new instruction then re-processes the prompt from the first dropped thought.
 - `--prefill-chunk 2048` caps the prompt tokens forwarded per step; 4096 prefills faster but needs more memory.
 - `--prefix-cache-mem 1GB` keeps seen prompt prefixes hot in RAM, faster than the SSD.
 - `--prefix-cache-disk 20GB` keeps seen prompt prefixes on the SSD, so a repeated prompt skips its prefill.

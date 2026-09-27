@@ -29,6 +29,10 @@ unmodified reference externally to generate independent numerical fixtures.
 The TP-aware FP8 QKV reconstruction in `src/mimo_source.zig` follows
 `conversion/mimo.py`, reimplemented in Zig.
 
+`src/fixtures/mimo_v26_chat_template.jinja` is the checkpoint's
+`chat_template` from tokenizer_config.json, unmodified, used as a test
+fixture; the model repository declares it under the MIT License.
+
 --------------------------------------------------------------------------------
 MTPLX
 https://github.com/youssofal/mtplx

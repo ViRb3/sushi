@@ -15,6 +15,7 @@
 //!     - tool_choice_instruction
 //!     - enable_thinking flag
 //!     - reasoning_effort string (dsv4 templates render it)
+//!     - preserve_thinking (Qwen3.8 drops prior-turn thinking when false)
 //! Image-bearing messages are intentionally excluded — the vision pipeline
 //! re-injects per-request token positions and any cache hit there would
 //! point at stale token IDs.
@@ -65,6 +66,7 @@ pub const TokenizeCache = struct {
         enable_thinking: bool,
         reasoning_effort: ?[]const u8,
         continue_final: bool,
+        preserve_thinking: ?bool,
     ) ?u64 {
         var h = std.hash.Wyhash.init(0xC0DEC0DE);
         for (messages) |m| {
@@ -108,6 +110,8 @@ pub const TokenizeCache = struct {
         // this the two collide in the cache and one of them is served the
         // other's tokens.
         h.update(if (continue_final) "continue=on" else "continue=off");
+        h.update("\x1e");
+        h.update(if (preserve_thinking) |p| (if (p) "preserve=on" else "preserve=off") else "(no-preserve)");
         return h.final();
     }
 
@@ -184,9 +188,9 @@ test "TokenizeCache key stability" {
     const m3 = [_]chat_mod.Message{
         .{ .role = "user", .content = "hello world!" }, // different content
     };
-    const k1 = TokenizeCache.keyFor(&m1, null, null, false, null, false).?;
-    const k2 = TokenizeCache.keyFor(&m2, null, null, false, null, false).?;
-    const k3 = TokenizeCache.keyFor(&m3, null, null, false, null, false).?;
+    const k1 = TokenizeCache.keyFor(&m1, null, null, false, null, false, null).?;
+    const k2 = TokenizeCache.keyFor(&m2, null, null, false, null, false, null).?;
+    const k3 = TokenizeCache.keyFor(&m3, null, null, false, null, false, null).?;
     try std.testing.expectEqual(k1, k2);
     try std.testing.expect(k1 != k3);
     _ = allocator;
@@ -202,8 +206,8 @@ test "TokenizeCache key distinguishes assistant reasoning_content" {
     const m2 = [_]chat_mod.Message{
         .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
     };
-    const k1 = TokenizeCache.keyFor(&m1, null, null, true, null, false).?;
-    const k2 = TokenizeCache.keyFor(&m2, null, null, true, null, false).?;
+    const k1 = TokenizeCache.keyFor(&m1, null, null, true, null, false, null).?;
+    const k2 = TokenizeCache.keyFor(&m2, null, null, true, null, false, null).?;
     try std.testing.expect(k1 != k2);
 }
 
@@ -214,9 +218,9 @@ test "TokenizeCache key distinguishes reasoning_effort" {
     const m = [_]chat_mod.Message{
         .{ .role = "user", .content = "prove it rigorously" },
     };
-    const k_default = TokenizeCache.keyFor(&m, null, null, true, null, false).?;
-    const k_high = TokenizeCache.keyFor(&m, null, null, true, "high", false).?;
-    const k_max = TokenizeCache.keyFor(&m, null, null, true, "max", false).?;
+    const k_default = TokenizeCache.keyFor(&m, null, null, true, null, false, null).?;
+    const k_high = TokenizeCache.keyFor(&m, null, null, true, "high", false, null).?;
+    const k_max = TokenizeCache.keyFor(&m, null, null, true, "max", false, null).?;
     try std.testing.expect(k_default != k_high);
     try std.testing.expect(k_high != k_max);
 }
@@ -229,9 +233,23 @@ test "keyFor: a continuation does not share a key with the same messages as hist
         .{ .role = "user", .content = "count to three" },
         .{ .role = "assistant", .content = "one, two," },
     };
-    const plain = TokenizeCache.keyFor(&m, null, null, true, null, false).?;
-    const cont = TokenizeCache.keyFor(&m, null, null, true, null, true).?;
+    const plain = TokenizeCache.keyFor(&m, null, null, true, null, false, null).?;
+    const cont = TokenizeCache.keyFor(&m, null, null, true, null, true, null).?;
     try std.testing.expect(plain != cont);
+}
+
+test "TokenizeCache.keyFor separates the preserve_thinking arms" {
+    // Off drops prior-turn thinking from the prompt: the same messages render
+    // three ways, and each must keep its own tokens.
+    const m = [_]chat_mod.Message{
+        .{ .role = "user", .content = "q1" },
+        .{ .role = "assistant", .content = "a1", .reasoning_content = "r1" },
+        .{ .role = "user", .content = "q2" },
+    };
+    const absent = TokenizeCache.keyFor(&m, null, null, true, null, false, null).?;
+    const on = TokenizeCache.keyFor(&m, null, null, true, null, false, true).?;
+    const off = TokenizeCache.keyFor(&m, null, null, true, null, false, false).?;
+    try std.testing.expect(absent != on and absent != off and on != off);
 }
 
 test "TokenizeCache get/put + LRU eviction" {
@@ -262,8 +280,8 @@ test "TokenizeCache get/put + LRU eviction" {
 test "TokenizeCache key keeps separator bytes inside their fields" {
     const a = [_]chat_mod.Message{.{ .role = "assistant", .content = "x\x1ey", .tool_call_id = "z" }};
     const b = [_]chat_mod.Message{.{ .role = "assistant", .content = "x", .tool_call_id = "y\x1ez" }};
-    try std.testing.expect(TokenizeCache.keyFor(&a, null, null, false, null, false).? !=
-        TokenizeCache.keyFor(&b, null, null, false, null, false).?);
+    try std.testing.expect(TokenizeCache.keyFor(&a, null, null, false, null, false, null).? !=
+        TokenizeCache.keyFor(&b, null, null, false, null, false, null).?);
 }
 
 test "TokenizeCache key includes tool call IDs" {
@@ -271,6 +289,6 @@ test "TokenizeCache key includes tool call IDs" {
     const calls_b = [_]chat_mod.ToolCall{.{ .id = "call_b", .name = "lookup", .arguments = "{}" }};
     const a = [_]chat_mod.Message{.{ .role = "assistant", .content = "", .tool_calls = &calls_a }};
     const b = [_]chat_mod.Message{.{ .role = "assistant", .content = "", .tool_calls = &calls_b }};
-    try std.testing.expect(TokenizeCache.keyFor(&a, null, null, false, null, false).? !=
-        TokenizeCache.keyFor(&b, null, null, false, null, false).?);
+    try std.testing.expect(TokenizeCache.keyFor(&a, null, null, false, null, false, null).? !=
+        TokenizeCache.keyFor(&b, null, null, false, null, false, null).?);
 }
