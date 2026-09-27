@@ -25,8 +25,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - The GDN chain is bf16-only: its prework and norm-gate decline other widths, and its recurrence cannot store an f32
   state into its bf16 output (a Metal compile error). A replacement declines what the chain cannot serve.
 - The qwen4 fused HC read groups verify rows (`HC_ROW_GROUP` 8 per D/U dispatch group), so each weight word is read
-  once per group; configs are cached per row count, since MTP alternates widths every round
-  ([perf-baselines](perf-baselines.md#hc-row-group)).
+  once per group. Configs are cached per (row count, inject, pending write): MTP alternates widths every round, and
+  the first read, reads after a flush and the mixer differ in the other two. The row count stays a template argument:
+  as a scalar input it cost 1-4% per verify forward ([perf-baselines](perf-baselines.md#hc-row-group)).
 - A GEMV that beats MLX's qmv in a chained in-graph ubench can still lose inside the forward: a vectorized affine-8
   reader 10-57% faster in-graph was 2-4% slower per decode forward on an M2 Max
   ([perf-baselines](perf-baselines.md#m2max-decode)). Judge a decode kernel by the decode meter.
