@@ -9,6 +9,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **sushi updates itself**: `sushi update` installs the newest release after checking its SHA-256, its signature and
   that it runs, keeping the old install for `sushi update --rollback`; a server checks for a release once a day
   (`--no-update-check` turns that off), and the chat page and `sushi run`'s `/update` install it and restart.
+- **SSD prompt-cache restores stay at one copy**: a restore no longer copies the whole restored cache at a chunk when
+  the GPU releases finished work late, which could hold up to three copies of it at once.
 
 ---
 

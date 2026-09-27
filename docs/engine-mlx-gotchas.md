@@ -45,6 +45,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   COPIES shape-worth of bytes.
 - **A refcount-shared snapshot makes every later write copy the whole buffer** (MLX donates only a sole owner's
   buffer): a spec rollback that can truncate by offset takes no `KVCache.snapshot`.
+- **`mlx_eval` returns before its command buffer lets go of the outputs**, so a write right after one can find its
+  buffer shared and copy it: a chain of in-place writes drains the stream (`mlx_synchronize`) between evals.
 - MLX releases an IMPORTED host buffer asynchronously ([engine-expert-streaming](engine-expert-streaming.md#io)).
 
 ## The allocator pool

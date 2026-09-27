@@ -49,7 +49,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **A disk restore fills its buffers chunk by chunk** (`restoreKvInto`): each chunk is evaluated into buffers
   allocated at the restored length before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
   eval (one eval at the end failed past the soft limit of 256 files), and a concatenation at the end held every chunk
-  beside the result, twice the restored KV before any bill saw it. The restore entry points drop the MLX latch they
+  beside the result, twice the restored KV before any bill saw it. Each chunk's eval is drained before the next chunk
+  writes: undrained, a write that beat the command buffer's release copied the whole buffers instead of donating, up
+  to three copies of the restored KV at once on CI's M1 VM. The restore entry points drop the MLX latch they
   raised, or the cold fallback's prefill fails on it. Measured on a 150k-token Sushi-3bpw entry (147 chunks; b9dbbf53
   plus this change, `--ctx-size 262144 --prefix-cache-disk 20GB --prefix-cache-entries 1`, arms O P M M P O, 4
   restores per boot, `taskpolicy -a`, fans max, a lock per boot, 2026-09-27): a warm restore takes 170-177 ms with the

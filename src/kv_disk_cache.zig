@@ -1077,6 +1077,9 @@ pub const DiskTier = struct {
             // A CHECKED eval: lazy Load reads the file here, so a corrupt chunk surfaces its MLX
             // error before install and the caller falls back to cold prefill.
             try mlx.check(mlx.mlx_eval(chunk_arrays));
+            // An eval returns before its command buffer lets go of the filled buffers; the next write
+            // into a still-held buffer copies all of it instead of donating, so drain the stream first.
+            _ = mlx.mlx_synchronize(s);
         }
 
         // Install the filled buffers as the cache's storage. Mirrors `KVCache.restore`: views stay
@@ -7946,12 +7949,12 @@ test "DiskTier: a restore fills its buffers chunk by chunk, never holding every 
 
     // Two layers of K and V, 4096 rows of 256 f32: 16 MiB restored.
     const restored_bytes: u64 = 2 * 2 * 4096 * 256 * 4;
-    // The peak is process-wide, so work another thread or an earlier test left in flight can land in one
-    // window; a concatenation lands in every one. The smaller of two restores is the restore's own.
-    var excess: usize = std.math.maxInt(usize);
+    // The stream is drained around each restore and the tier writes on this thread, so the process-wide
+    // peak is the restore's own: every restore must stay under the bound.
+    var excess: usize = 0;
     var cache2 = try KVCache.init(testing.allocator, 2);
     defer cache2.deinit();
-    for (0..2) |_| {
+    for (0..4) |_| {
         cache2.deinit();
         cache2 = try KVCache.init(testing.allocator, 2);
         _ = mlx.mlx_synchronize(s);
@@ -7963,7 +7966,7 @@ test "DiskTier: a restore fills its buffers chunk by chunk, never holding every 
         _ = mlx.mlx_synchronize(s);
         var peak: usize = 0;
         _ = mlx.mlx_get_peak_memory(&peak);
-        excess = @min(excess, peak -| before);
+        excess = @max(excess, peak -| before);
     }
     if (excess >= restored_bytes * 3 / 2) {
         std.debug.print("restore peak excess {d} B, restored {d} B\n", .{ excess, restored_bytes });
