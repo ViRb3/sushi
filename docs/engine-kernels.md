@@ -14,7 +14,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   DEFERS into the next read).
 - A kernel keyed on `batch*seq == 1` declines every verify row AND batched slot, so the grid carries the rows
   (`HC_FUSED_MAX_ROWS`/`GDN_FUSED_MAX_ROWS` 16).
-- GDN decode = three fused dispatches (`SUSHI_GDN_DECODE_FUSED=0`; S 1..9 bit-identity is SAMPLING).
+- GDN decode = three fused dispatches (`SUSHI_GDN_DECODE_FUSED=0`; S 1..9 bit-identity is SAMPLING). At B=1,
+  decode (S=1) and capturing verify (S 2..8) run two: `gdn_decode.step` (prework + recurrence, mlx-serve #517)
+  then the norm-gate, bit-identical to the chain, ~0.4 ms per forward
+  ([perf-baselines](perf-baselines.md#gdn-decode-recur)); either chain switch off keeps the chain. A/B seam:
+  `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
+- A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
+  `gated_delta_step_seq` carries the stored bf16 state to the next token, so serial decode and rollback agree; a
+  kernel that carries f32 (upstream's verbatim verify kernel) differs from verify row 1 on.
+- The GDN chain is bf16-only: its prework and norm-gate decline other widths, and its recurrence cannot store an f32
+  state into its bf16 output (a Metal compile error). A replacement declines what the chain cannot serve.
 - The qwen4 fused HC read groups verify rows (`HC_ROW_GROUP` 8 per D/U dispatch group), so each weight word is read
   once per group; configs are cached per row count, since MTP alternates widths every round
   ([perf-baselines](perf-baselines.md#hc-row-group)).

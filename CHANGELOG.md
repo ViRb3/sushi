@@ -14,6 +14,8 @@ earlier history is mlx-serve's, in that project's changelog.
   refused while the GPU is still finishing earlier work.
 - **Faster Flash-Next MTP decode**: speculative decoding reads the hyper-connection weights once for a group of
   draft tokens instead of once per token, on the M5 as on earlier Macs, with identical output.
+- **Faster Flash-Next decode**: each linear-attention layer now decodes and verifies MTP drafts in two GPU dispatches
+  instead of three, about 2% faster decode on an M5 Max with identical output (ported from mlx-serve #517).
 
 ---
 

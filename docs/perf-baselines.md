@@ -189,6 +189,40 @@ Sushi-3bpw, decode tok/s, median of 8 A runs (A B B A and A C C A) against 4 B a
   runs in prefill; one boot per arm), 4 streams 83.2 -> 81.2 aggregate.
 - Greedy output was identical to `--no-mtp` on every task, and `test_mtp_equivalence.sh` passed 18/18.
 
+<a id="gdn-decode-recur"></a>
+## Flash-Next: GDN prework and recurrence in one dispatch (caa02a4f vs the port)
+
+A = caa02a4f (sha256 0bec2879…), B = caa02a4f + the port with a kill-switch env the landed commit drops, same kernels
+(e73439e9, sha256 c45acaf6…), ReleaseFast. M5 Max 128 GB, 2026-09-27, Sushi-3bpw, `--ctx-size 65536 --kv-quant 8`,
+`SUSHI_ROUND_COST_PERSIST=0`, MTP prompt lookup on in both arms, `taskpolicy -a`, GPU lock `gdn-ab` per boot, fans at
+max with 10 s idle from 64 °C and restored to auto after. CONTENDED box: a system daemon at ~100% of one core
+throughout, other workers' builds and tests beside the first meter and live boots.
+
+Decode meter, the chain and the step alternated off / on / on / off per width in one process
+(`SUSHI_DECODE_FWD_UBENCH=40 _S=1,3,5,7,9 _GDN_ARMS=1`, `--prefix-cache-entries 0`), three boots per length, ms per
+forward, mean over boots:
+
+| rows | 4096 keys | 32768 keys |
+|---|---|---|
+| 1 | 18.50 -> 18.05 (-2.4%) | 18.70 -> 18.33 (-1.9%) |
+| 3 | 24.77 -> 24.35 (-1.7%) | 25.10 -> 24.68 (-1.7%) |
+| 5 | 32.99 -> 32.94 (-0.2%) | 34.02 -> 33.37 (-1.9%) |
+| 7 | 42.56 -> 42.23 (-0.8%) | 43.50 -> 43.08 (-1.0%) |
+| 9 (control: the step declines) | 51.02 -> 51.21 (+0.4%) | 52.25 -> 52.20 (-0.1%) |
+
+- 0.33-0.45 ms per forward at 1, 3 and 7 rows, faster in all 18 boot-width pairs: the 36 prework dispatches and their
+  gaps (4668 -> 4055 graph ops per one-row forward, 6903 -> 6255 at 7 rows; 7287 both at 9).
+- 5 rows at 4096 keys climbs 1.5-2.7 ms across its four passes in every boot whatever the arm (the meter's context
+  grows ~430 keys per pass there), a step the pass order cannot cancel; the same width reads -1.9% in 3/3 boots at
+  32768 keys.
+- llmprobe 0.6.12 `--bench-only`, A B B A, `--no-mtp`: decode 64.6 / 67.0 / 67.3 / 66.1 tok/s (+2.8%, both B boots above
+  both A boots); prefill, first token and the 0.5-16k rungs within noise.
+- Default MTP, A B B A: decode 93.5 / 90.4 / 91.0 / 90.4 at 4.92 / 4.92 / 6.40 / 5.82 tokens per step; each boot's
+  planner learns its own costs, so this cell is variance. Forced depth 3, one boot per arm, 6 prompts x 256 tokens:
+  588.4 -> 588.3 tok/s summed (serial 393.0 -> 396.3 in the same boots); a ~0.4 ms saving is ~1% of a round.
+- Identity: those 6 prompts serial and at forced depth 3, A == B 12/12 and MTP == serial 6/6 per arm;
+  `test_mtp_equivalence.sh` 18/18 on B, lookup rounds engaged on its copy task.
+
 <a id="m2max-64gb"></a>
 ## Flash-Next Sushi-3bpw on an M2 Max 64 GB
 

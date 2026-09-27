@@ -172,6 +172,13 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     capped at 8, the qwen4 head only, both rounds priced from sushi's own MTP
     cost source, an ordinary match must agree past the start of a line, and
     no lookup under a forced MTP depth.
+  * The fused GatedDeltaNet decode step (`src/gdn_decode.zig`): the GDN
+    prework and recurrence in one dispatch, David Dalcu's K1 kernel (mlx-serve
+    27407892 and 89eeb249), and its verify-width variant with the host plumbing
+    from mlx-serve #517 by Samuel Reed (@STRML). Modifications: the kernels emit
+    the bf16 output, state and capture buffers of sushi's own chain and carry
+    each stored capture state to the next token as sushi's capture kernel does;
+    the Hadamard norm-gate-rotate kernel is not ported.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)

@@ -3470,8 +3470,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // SUSHI_DECODE_FWD_UBENCH_ROW_ARMS=1: a MiMo verify width runs twice, the
             // prefill-shaped forward first, then the verify rows (decode arithmetic per row).
             const row_arms = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_ROW_ARMS") != null;
+            // SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1: every width runs the GDN chain and the fused
+            // decode step (`gdn_decode.step`) as off, on, on, off passes in this one process.
+            const gdn_arms = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_GDN_ARMS") != null;
+            defer transformer_mod.gdn_decode_recur_override = null;
             for (widths[0..n_widths]) |rows| {
             for (ubenchRowArms(rows, xfm_ptr.config.isMimo(), row_arms)) |verify_rows| {
+            for (@as([]const ?bool, if (gdn_arms) &.{ false, true, true, false } else &.{null})) |gdn_arm| {
+            transformer_mod.gdn_decode_recur_override = gdn_arm;
+            if (gdn_arm) |on| log.info("[fwd-ubench] gdn recur arm: {s}\n", .{if (on) "on" else "off"});
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
             defer sch.allocator.free(tok_slice);
             for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
@@ -3574,6 +3581,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     _ = mlx.mlx_array_free(lg);
                 }
                 transformer_mod.decodeProfileSession(0);
+            }
             }
             }
             }

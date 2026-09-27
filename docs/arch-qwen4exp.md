@@ -36,7 +36,8 @@ hidden 2560, expert intermediate 640.
 - **The deferred PLE leaf is filled before anything evaluates the build**: see [engine-mtp](engine-mtp.md#ple-defer).
   A host token read inside the graph build serialized the build with the GPU.
 - **Decode kernels**: the fused hc read is LATENCY-bound (`SUSHI_HC_FUSED=0`; `hcWrite` DEFERS into the next
-  read); HC + GDN prefill fusions take the chunk WIDTH as a scalar input. Details in
+  read); HC + GDN prefill fusions take the chunk WIDTH as a scalar input. Each of the 36 GDN layers decodes and
+  verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/gdn_decode.zig`), then the norm-gate. Details in
   [engine-kernels](engine-kernels.md).
 - **A GDN trunk's `KVCache.step` is 0 forever**: see [engine-kv-cache](engine-kv-cache.md#gdn).
 
