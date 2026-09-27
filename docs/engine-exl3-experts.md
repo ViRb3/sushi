@@ -22,11 +22,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 - Routed experts are stacked per layer as `[E, ...]` so gather kernels index expert e on axis 0; 16x16 tiles,
   `suh`/`svh` with the H128 Hadamard; `config.json` carries `expert_quant = {format: exl3, k, codebook: mul1|mcg}`
   (plus `window`); per-tensor rate read from the trellis shape. Every other module stays the affine pack's.
-- **A rate is K = n/16**, n the packed halfwords per 256-weight tile (40 = K2.5, 48 = K3, 64 = K4): weight t's
+- **A rate is K = n/16**, n the packed halfwords per 256-weight tile (36 = K2.25, 48 = K3, 64 = K4): weight t's
   codeword is the 16-bit window ending at `((t+1)*n)>>4`, so its fresh bits follow from n and the pattern is never
   stored. Even n in [32, 64] admits; `expert_quant.k` may be fractional JSON.
 - **Every reader keys on n, never on an integer K** (`exl3.Rate`, kernel template `NHW`, cache keys,
-  `exl3ExpertBytes`); a K printed anywhere reads 2.5, not 40. The K4 fast branch is `n == 64`; the n=40 and n=48
+  `exl3ExpertBytes`); a K printed anywhere reads 2.25, not 36. The K4 fast branch is `n == 64`; the n=40 and n=48
   readers use an eight-weight lane funnel (n=48 for every non-MUL1 codebook).
 - **The window is a pack field** (`expert_quant.window`, absent = 16, 8..16 admitted): the codeword is masked to the
   window in the one helper every weight kernel inlines, and kernel slots are keyed by codebook AND window. A w16
@@ -76,14 +76,13 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
   decodes each weight once and feeds both members in the single-slot order, so every row's bytes are its one-row
   decode tick's. Two members only: four spill their accumulators. Not on Flash-Next, whose rows share too few experts.
 - **A decode GEMV slot is bound by its own FMA and input path**, not the weight decode or DRAM, so deduplicating
-  shared experts recovers only 4-7% of the expert kernels at 3-4 rows
-  ([perf-baselines](perf-baselines.md#mimo-verify-attribution)).
+  shared experts recovers only 4-7% of the expert kernels at 3-4 rows.
 - Dead for the decode GEMVs (microbenched): 4 or 8 tiles per threadgroup, software prefetch, 2 simdgroups, a
   threadgroup LUT decode, a 24-bit multiply split, half2 input reads, bitfield extracts.
 - Dead for the prefill GEMM on the NAX body (MiMo and Flash-Next, outputs bit-identical, all slower): 64-row windows
   with one decode feeding 4 MMAs (+7-18%), a threadgroup-shared double-buffered decode (+30%), decoding tile k+1
   before tile k's MMA (+27%), 256- or 64-thread groups (+12% at 2048 rows). The kernel is register/occupancy bound:
-  added live state loses ([perf-baselines](perf-baselines.md#mimo-prefill-gemm)).
+  added live state loses.
 - **The SwiGLU chain is f32**: gate, up, sigmoid, SiLU and their product stay in f32 registers through the multiply
   by the down suh. In f16, MiMo's activations put gate and up near 400 each and the product past 65504, so a whole
   routed row became inf. The next ceiling is the f16 down inner plane (about 2x above the measured peak).

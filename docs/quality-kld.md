@@ -1,8 +1,9 @@
 # Quality: KLD against the teacher
 
-How a pack's quality is measured: the `kld` subcommand, the teacher fixtures on this box, the one reading the owner
-uses, the rule that the teacher path is lossless, and the recorded KLD of every served pack. Every new KLD lands here
-with its binary commit and fixture.
+How a pack's quality is measured: the `kld` subcommand, the teacher fixtures, the one reading the owner uses, the
+rule that the teacher path is lossless, and the recorded KLD of every served pack and of the comparison packs on the
+README chart. Every new KLD of a served pack lands here with its binary commit and fixture; readings of research
+packs live in the private repo.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-baselines.md),
 [pack-format](pack-format.md#quality-bar), [engine-exl3-experts](engine-exl3-experts.md#parity-bars),
@@ -24,8 +25,6 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 
 - **16 prompts x 512 tokens, scored to the first EOS, for every model** (Flash-Next's 16 wikitext prompts, raw text,
   no template). 60x64 is a short-context screen only, never a verdict.
-- Differences under ~3% of mean KLD are inside conversion noise (a quantizer's seed alone moves it that much); need
-  several seeds per arm or a larger margin before ranking.
 - Differences under ~1% on ONE pack are inside the ROUNDING-FLIP floor (measured 2026-09-24 on the MiMo MCG pack:
   flipping 0.07-0.13% of attention outputs by one bf16 ulp, no precision loss, moved 16x512 KLD -0.5% .. +0.55%). A
   kernel or storage change that flips bits reads as a KLD change of that size with no quality meaning; each flip
@@ -34,26 +33,21 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
   different order, so they score a slightly different KLD. The engine takes the faster arm knowingly: such a delta is
   recorded, never treated as a regression or a reason to hold a NAX kernel back, and never "fixed" toward SIMD.
   A NAX arm still has to pass its fp32 parity test; this policy covers only the model-level KLD difference.
-- No static weight metric (per-module error, weighted error, tail quantiles) predicts model-level KLD rank; only a real
-  pack and this reading decide.
 
-## Teacher fixtures on this box
-
-Under the models root, `${SUSHI_MODELS_DIR:-$HOME/.sushi/models}`:
+## Teacher fixtures
 
 | fixture | model | notes |
 |---|---|---|
-| `kld-teacher/mlx-serve-bf16-16x512-raw` | Flash-Next | bf16 stream, 16x512, raw; the standard |
-| `kld-teacher/mlx-serve-bf16-f32stream-16x512-raw` | Flash-Next | f32 residual stream variant |
-| `kld-teacher/mlx-serve-bf16-60x64` | Flash-Next | the 60x64 screen |
-| `kld-teacher/mimo-bf16trunk-16x512-raw` | MiMo | original checkpoint as stored (FP8 trunk: bf16 weights in prefill, FP8 code x f32 block scale in decode), dense KV; recaptured 2026-09-25 by 35a854c7 (its forward is unchanged at 2c4dd91e); mean strict NLL 0.2665; 623 s capture |
+| Flash-Next 16x512 raw | Flash-Next | the bf16 checkpoint, bf16 stream, raw text; the standard |
+| Flash-Next 16x512 raw, f32 stream | Flash-Next | the same with an f32 residual stream |
+| Flash-Next 60x64 | Flash-Next | the 60x64 screen |
+| MiMo 16x512 raw | MiMo | original checkpoint as stored (FP8 trunk: bf16 weights in prefill, FP8 code x f32 block scale in decode), dense KV; recaptured 2026-09-25 by 35a854c7 (its forward is unchanged at 2c4dd91e); mean strict NLL 0.2665; 623 s capture |
 
 Commands (MiMo; Flash-Next drops `--ssd-budget-gb` when the source fits):
 
 ```sh
-M=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}
-sushi kld capture --model $M/MiMo-V2.6-Flash-RL \
-  --prompts $M/kld-teacher/mlx-serve-bf16-16x512-raw --out <teacher dir> \
+sushi kld capture --model <original checkpoint> \
+  --prompts <the Flash-Next 16x512 raw fixture> --out <teacher dir> \
   --tokens 512 --top-k 10 --label <label> --no-template --kv-quant off --ctx-size 8192 --ssd-budget-gb 94
 sushi kld compare --model <pack> --fixture <teacher dir> --label <label> \
   --kv-quant 8 --tokens 512 --top-k 10 --ctx-size 8192 --json <out>.json
@@ -86,15 +80,14 @@ that shares no code with ours.
 
 | pack | KLD | top-1 | cosine loss | all positions |
 |---|---|---|---|---|
-| affine 4-bit gs64 / 8-bit (control) | 0.0818 | 91.39% | 2.63% | 0.0752 |
-| turboderp K3, MUL1 w16 | 0.0946 | 90.79% | 2.88% | 0.0866 |
-| MUL1 K3 w12 (in-house experts, turboderp dense) | 0.1031 | 90.44% | 3.15% | 0.0951 |
-| MCG K3 w12 (served; in-house experts, turboderp dense) | 0.1041 | 90.22% | 3.21% | 0.0958 |
-| MCG K3 w15 (in-house experts, turboderp dense; sashimi eebb3e9, pre-#17 skew rule; binary 7ed9795) | 0.1012 | 90.26% | 3.14% | 0.0931 |
-| MCG K4 w15 (in-house experts, turboderp K4 dense; sashimi 5561ccc; binary 30a27ba) | 0.0632 | 92.99% | 2.25% | 0.0588 |
+| mlx-serve mixed-4-8bit (affine 4-bit gs64 / 8-bit; the control) | 0.0818 | 91.39% | 2.63% | 0.0752 |
+| Sushi-3bpw (MCG K3 w15; binary 7ed9795) | 0.1012 | 90.26% | 3.14% | 0.0931 |
+| Sushi-4bpw (MCG K4 w15; binary 30a27ba) | 0.0632 | 92.99% | 2.25% | 0.0588 |
+
+The control row ran on binaries a05d15f / 28d7fab (the KLD tool is unchanged between them). Sushi-4bpw reads below it.
 
 Comparison packs, all on binary b64c5a0e (weights in GPU memory, n-gram table excluded; Sushi-3bpw 0.10123 and
-Sushi-4bpw 0.06319 reproduce on it): affine packs = routed experts N-bit g64, dense 8-bit, bf16 n-gram table; oQe =
+Sushi-4bpw 0.06319 reproduce on it): affine q3 = routed experts 3-bit g64, dense 8-bit, bf16 n-gram table; oQe =
 oMLX packs as published, restacked for sushi with their 4/5-bit n-gram table unchanged (oQ4e ships the table divided
 by a `weight_scale` tensor, folded into its scales by the restack); mlx-serve packs as published, both sharing one 4-bit
 n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi packs once shipped the vision tower twice,
@@ -102,7 +95,6 @@ n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi pack
 
 | pack | GiB | KLD | top-1 |
 |---|---|---|---|
-| affine q5 | 83.67 | 0.0433 | 93.86% |
 | oMLX oQ5e (GBP-DE) | 83.97 | 0.0625 | 92.40% |
 | mlx-serve mixed-4-8bit (ddalcu; the control above) | 70.13 | 0.0818 | 91.39% |
 | oMLX oQ4e (Jundot) | 69.21 | 0.1370 | 88.87% |
@@ -112,24 +104,13 @@ n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi pack
 | Sushi-4bpw with the same 4-bit g32 table | 63.68 | 0.0666 | 92.35% |
 | Sushi-2.6bpw (binary ad5e6be8, 2026-09-27; Sushi-3bpw's 0.10123 and 0.1047 reproduce on it bit for bit) | 43.95 | 0.1303 | 89.33% |
 | Sushi-2.6bpw with the 4-bit g32 table (the published Sushi-2.6bpw) | 43.95 | 0.1355 | 89.08% |
-| MCG K2 w15, pin pass 64 (Sushi-3bpw dense) | 36.0 active | 0.2244 | 85.42% |
 
 Release 1.0.4 check: `ad4a3ce0` plus the context-bill change, ReleaseFast binary SHA-256
 `2aeee2e678521727e66994d75260c25cd4cffd0d05ecb797c73210a2b0ea9704` (mtime 2026-09-26 15:26:43 +0700),
-Sushi-3bpw, `mlx-serve-bf16-16x512-raw`, kv8, `--tokens 512 --top-k 10 --ctx-size 8192`, no MTP:
+Sushi-3bpw, the Flash-Next 16x512 raw teacher, kv8, `--tokens 512 --top-k 10 --ctx-size 8192`, no MTP:
 first-EOS KLD **0.10469852**, top-1 **90.3423%** (7186 positions); all-position KLD 0.09614411, top-1 91.1743%.
 This reproduces the published 0.1047 baseline (-0.0014% relative, inside the 1% floor), without an old-binary rerun.
 M5 Max 128 GB, `taskpolicy -a`, GPU lock `release-v1.0.4-kld-sushi3bpw`; conversion suspended, no timing claim.
-
-w12 -> w15 bought 2.8% of KLD on MCG; the remaining gap to turboderp's MUL1 w16 (0.0946) is not mostly the window.
-Pack `Qwen3.8-Flash-Next-Sushi-3bpw` (MCG K3 w15, plugged). Pack `Qwen3.8-Flash-Next-Sushi-4bpw` (MCG K4 w15, plugged) reads below the
-affine 4/8 control.
-
-Binaries a05d15f / 28d7fab (the KLD tool is unchanged
-between them).
-
-EXL3 K4 (turboderp), 60x64 screen: the f32 SwiGLU widening moved mean KLD 0.01872 → 0.01816 and top-1 96.20% →
-96.07% (a wash; the widening stands on MiMo's magnitudes).
 
 <a id="kv-width"></a>
 ### KV cache width (the one setting that is not the pack)
@@ -142,12 +123,11 @@ The tables above rank packs at kv8. The cache width is a separate dial, and the 
 | `--kv-quant 4` | 0.114179 | 89.65% | 0.437941 |
 | delta | **+0.009480 (+9.05%)** | **-0.70 pp** | +1.50% |
 
-kv4 is 9% of KLD, three times the noise bar and nine times the ROUNDING-FLIP floor, so it is a real cost and not an
-accumulation artefact. For scale it gives back about three times what the w12 -> w15 window change bought (2.8%), and
+kv4 is 9% of KLD, nine times the ROUNDING-FLIP floor, so it is a real cost and not an accumulation artefact. It
 spends 49% of the gap between this pack and the affine 4/8 control. It nearly halves the cache's bytes per token,
 which is the only reason to take it.
 
-Binary `db249826` (Zig sources identical to `e8e2a3cb`), M5 Max 128 GB, teacher `mlx-serve-bf16-16x512-raw`,
+Binary `db249826` (Zig sources identical to `e8e2a3cb`), M5 Max 128 GB, the Flash-Next 16x512 raw teacher,
 `--tokens 512 --top-k 10 --ctx-size 8192`, no `--mtp`, 7186 positions to first EOS. Both arms ran on the same binary,
 so the delta stands on that; the absolute kv8 figure reads 0.1047 where the table above records 0.1012, a +3.5% gap
 against a different binary and flag set, which is why the delta is quoted rather than either absolute.
@@ -155,27 +135,8 @@ against a different binary and flag set, which is why the delta is quoted rather
 <a id="mimo"></a>
 ## MiMo (16x512, first EOS, student kv8)
 
-| pack | expert bpw | KLD | top-1 | cosine loss | all positions | binary |
-|---|---|---|---|---|---|---|
-| MCG K2.5 w12 (served) | 2.5 | 0.0776 | 92.0% | 1.95% | 0.0792 | a916af3 |
-| MCG K2.5 w12, FP8-native trunk (branch) | 2.5 | 0.0776 | | | | f72f989 |
-| MCG K2.5 w12, fused sliding prefill (branch) | 2.5 | 0.0775 | | | | |
-| MCG K2.5 w12, stored imatrix affine-8 o_proj + lm_head + embed | 2.5 | 0.07793 | 92.14% | 1.97% | 0.07944 | 28d8a4b |
-| MCG K2.5 w12, stored round-to-nearest affine-8 o_proj + lm_head + embed (served) | 2.5 | 0.07783 | 91.92% | 1.97% | 0.07937 | 8341222 |
-| the served pack, prefill attention with f16 P (`sushi_attn_pd_nax`) | 2.5 | 0.07768 | 92.12% | 1.96% | 0.07935 | 79a4cb4 + f16 P |
-| the served pack, against the 2026-09-25 teacher (8099 positions) | 2.5 | 0.0851 | 91.54% | 2.05% | 0.0863 | 35a854c7 |
-
-An imatrix-weighted search of the three affine-8 tensors lowers their weighted weight error ~45% against MLX's
-round-to-nearest packer (most of it from the error-minimizing search with scale/bias rounded to bf16 before the codes,
-which the same search unweighted also gets; the imatrix weighting adds 4-7%), yet scores 0.07793 against
-round-to-nearest's 0.07783, inside the rounding-flip floor: at 8 bits these tensors sit below the pack's noise floor,
-which the K2.5 experts set. The served pack stores them round-to-nearest (exactly `mx.quantize`'s bytes).
-
-The rows above the last one scored against the 2026-09-23 teacher (8037 positions), which the 2026-09-25 capture
-replaced. The two teachers generate different continuations (mean strict NLL 0.278 against 0.2665), so the sets are
-not comparable: a new MiMo row compares against 0.0851.
-
-f16 P in the NAX prefill attention: 0.07768 / top-1 92.12% / NLL 0.3471 against the served row's 0.07783 / 91.92% /
-0.3492 on the same binary (-0.19%, inside the rounding-flip floor).
+MiMo-V2.6-Flash-Sushi-2.25bpw lands here once measured against the 2026-09-25 teacher (8099 positions). That capture
+replaced the 2026-09-23 teacher (8037 positions); the two generate different continuations (mean strict NLL 0.278
+against 0.2665), so readings against the two are not comparable.
 
 The FP8-native teacher against the bf16-rounded teacher: 0.0034 nats.

@@ -54,9 +54,10 @@ quote them from a committed file.
 |---|---|
 | `docs/private/sashimi-workflow.md` | how to convert with sashimi: venv, subcommands, served-pack recipes, imatrix files and hashes, stamps, window speeds, wall times, speed work, lessons |
 | `docs/private/sashimi-codebooks.md` | MCG decision, decoder dead ends, fractional-rate trellis |
+| `docs/private/quality-kld-research.md` | KLD of every intermediate and experimental pack, sweeps, how packs were made |
 | `docs/private/measurement-raw.md` | the raw-file path behind every committed measurement, keyed by doc and section |
 | `docs/private/future.md` | strictly work still to continue or explore; an entry leaves when it starts or lands |
-| `docs/private/fail/` | one file per failed experiment (TINY, beam Viterbi, ...): the numbers that killed it, where its code lives |
+| `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
 
 Skills: `/release` (SemVer, CHANGELOG), `/bench` (llmprobe methodology, comparison traps).
 

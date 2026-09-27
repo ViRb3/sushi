@@ -36,7 +36,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - A matmul2d decode tile of 16 query rows is latency-bound: its barriers and small matmuls cost more than its
   reads. `sushi_qkv_mpp` runs 4 simdgroups, not 8, and holds packed words in registers one phase ahead.
   Tried with no gain: more splits, 64-key pages, split K/V tiles, vector tile stores, transposed QK, a fused merge.
-  Numbers: [perf-baselines](perf-baselines.md#mimo-long-decode).
+  Numbers: [perf-baselines](perf-baselines.md#mimo-attn-kernels).
 - Decode on this box is dispatch-gap bound: ~860 kernels per Flash-Next token, kernel time ~9.8 of ~18 ms, ~7 us
   per boundary. `MLX_MAX_OPS_PER_BUFFER` and `MLX_METAL_FAST_SYNCH` gave nothing; decode wins come from fewer,
   denser kernels ([perf-baselines](perf-baselines.md#exl3)).
@@ -66,13 +66,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   - A chunked chain is bit-identical to one dispatch on either arm.
   - Gate `attnPdNaxServes`: NAX + macOS 26.3 + a one-tile probe of both instantiations (causal, band + sinks)
     against an f32 reference; a failed probe declines by name. `SUSHI_ATTN_PD_NAX=0` = SIMD.
-- Its PV feeds P as ONE f16 term (P is in [0, 1]; f16 keeps 11 bits). Served-pack 16x512 KLD 0.07768, inside the
-  rounding floor ([quality-kld](quality-kld.md#mimo)). Parity bar: per element vs fp64 no
+- Its PV feeds P as ONE f16 term (P is in [0, 1]; f16 keeps 11 bits): 16x512 KLD -0.19%, inside the rounding-flip
+  floor ([quality-kld](quality-kld.md#the-standard-reading)). Parity bar: per element vs fp64 no
   worse than the SIMD kernel beyond a store rounding flip plus 2^-11 of max|V|. A float P operand into the relaxed
   matmul is truncated (~1e-3).
 - Its ceiling is the matrix units' issue rate for 16x32x16 ops (~55 TFLOPS issued on the M5 Max, the rate MLX's hd-128
   NAX sdpa also reaches), so a P that costs a second PV pass costs ~20% of the kernel. The f16 P pays only
-  together with the lockstep walk and the branch-free loads ([perf-baselines](perf-baselines.md#mimo-decode)).
+  together with the lockstep walk and the branch-free loads ([perf-baselines](perf-baselines.md#mimo-attn-kernels)).
 - The SIMD kernel stages K^T with consecutive lanes on consecutive KEY rows: lanes spread over head-dim chunks
   stride 8*LDK halves, one bank. Bit-identical output.
 - hd 256 stays off the NAX attn_pd arm: the same kernel at 256/256 (O in 128 registers per lane) ran 3.2x slower

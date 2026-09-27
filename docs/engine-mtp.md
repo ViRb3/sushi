@@ -59,20 +59,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   serial router rows, the EXL3 decode chain). A partial accept truncates the cache (attention-only trunk).
 - Oracle: `tests/dump_mimo_v2_mtp_fixtures.py` renders the heads from the HF reference's own modules on the tiny
   fixture model; `mimo mtp heads track the torch rendering…` replays history, rounds, wrong drafts and rollbacks.
-- **A MiMo verify row is ~45% of a forward** (~10-12 ms of 24; its own 8 routed experts), so depth pays only on
-  predictable text: forced depth 3 is +27-52% on code/lists/JSON and -10 to -18% on prose; per-index acceptance on
-  code 1.00/0.91/0.81 confirms the non-chained semantics. Greedy MTP is byte-identical to serial (18/18 pairs at 256
-  tokens, forced and auto). Numbers: [perf-baselines](perf-baselines.md#mimo-verify-rows).
-- **A MiMo verify row costs ~8-12 ms of a ~20.6 ms forward, ~75% of it its own experts** streaming at 96% of the
-  read peak; attention per row, the o_proj row kernel and ~550 extra dispatches make most of the rest. Real-text rows
-  share ~30% of their expert slots; grouping them (the grouped decode GEMVs) saves ~1.9 ms at 4 rows and ~1 ms at 3.
-  What is left is small: one sdpa for all rows of a sliding layer (~0.7 ms at 4 rows; the global layers' split-K
-  follows each row's own key count, so batching them is not bit-identical), the o_proj row kernel and the per-row
-  router GEMV ([perf-baselines](perf-baselines.md#mimo-verify-attribution)).
-- **MTP costs MiMo's prefill nothing measurable**: each chunk's head catch-up (three heads x the 128-row window) is
-  ~6 ms per 4096-row chunk, and same-boot TTFT on vs off stays within noise from 2k to 71k
-  ([perf-baselines](perf-baselines.md#mimo-mtp-prefill)). Compare prefill arms interleaved in one boot, never one
-  reading per arm.
+- **A MiMo verify row reads its own 8 routed experts**, so it costs a large share of a forward and depth pays only
+  on predictable text (code, lists, JSON; prose loses). Greedy MTP is byte-identical to serial (18/18 pairs at 256
+  tokens, forced and auto).
+- **Real-text verify rows share ~30% of their expert slots**, which the grouped decode GEMVs exploit (one weight
+  decode per pair of slots, [engine-exl3-experts](engine-exl3-experts.md#kernels)). One sdpa for all rows of a sliding layer is open; the
+  global layers' split-K follows each row's own key count, so batching them is not bit-identical.
+- **MTP adds to each prefill chunk only the heads' catch-up** (three heads x the 128-row window). Compare prefill arms
+  interleaved in one boot, never one reading per arm.
 - The EV planner prices a MiMo EXL3 round with its own surface (`.mimo_exl3`, `MTP_EV_MIMO_EXL3_COSTS`: draft
   .04, verify row .44 of a forward, flat to depth 3); the generic surface prices a row at .20 and over-drafts prose.
 
@@ -173,7 +167,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - **Sampled auto-mode output follows the round times**: the plan reads measured round costs, and the draft counts
   decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
   SUSHI_MTP_COST_TABLE=0`, or `SUSHI_MTP_FORCE_DEPTH`).
-- Forced-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on MCG and MUL1 K3).
+- Forced-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
 - `SUSHI_MTP_DENSE_ROWS=1` stays off by default: one `test_mtp_equivalence.sh` run with it on failed (top-2 gap
   1.125 nats, a slow loaded run) and seven reruns passed ([perf-baselines](perf-baselines.md#m2max-decode)).
 

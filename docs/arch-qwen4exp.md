@@ -93,11 +93,9 @@ hidden 2560, expert intermediate 640.
 
 | pack | directory under the models root | notes |
 |---|---|---|
-| MCG K3 w15 (served target) | `Qwen3.8-Flash-Next-Sushi-3bpw` | our MCG experts (window 15) plugged into turboderp's K3 dense |
-| MCG K3 w15, our dense | `Qwen3.8-Flash-Next-EXL3-K3-w15-mcg-ours` | the same experts with our own dense |
-| turboderp K3 / K4 | `Qwen3.8-Flash-Next-EXL3-K3`, `...-K4` | restacked from exllamav3, MUL1 w16 |
+| MCG K3 w15 (served target) | `Qwen3.8-Flash-Next-Sushi-3bpw` | our MCG experts (window 15) |
 | affine 4/8 control | `Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit` | the control column in every table |
-| bf16 source | `Qwen/Qwen3.8-Flash-Next` | teacher + imatrix source; streams (335 GB) |
+| bf16 source | `Qwen/Qwen3.8-Flash-Next` | the KLD teacher; streams (335 GB) |
 
 Bytes read per decoded token on the MCG K3 pack: trunk 4.01 GB (affine-8), lm_head 0.66, routed 0.91 = 5.58 GB,
 a 107 tok/s ceiling at 600 GB/s against 61.8 measured (58%). Numbers and their sources: [perf-baselines](perf-baselines.md).

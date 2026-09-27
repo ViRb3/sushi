@@ -15,7 +15,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   healthy inputs = MEMORY symptom.
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
-- The box: M5 Max 128 GB; the default wired limit admits about 120 GB; a resident MiMo EXL3 pack is ~97 GB, so two
+- The box: M5 Max 128 GB; the default wired limit admits about 120 GB; a resident MiMo EXL3 pack is over 90 GB, so two
   heavy GPU jobs at once risk an OOM for both (and concurrent conversions have died together in a GPU reset).
 
 ## Load-time preflight

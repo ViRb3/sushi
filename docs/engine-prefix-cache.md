@@ -38,8 +38,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   does); the slot's own are its restore point and its prompt end (`SlotRingCps`). A reply longer than the
   ring's slack compacts it past where the next turn diverges (the previous reply re-renders); the checkpoint's rows
   go under the ringed layers (`restoreRing`) and the usual clamp follows.
-  A checkpoint restore of fewer than `RING_RESTORE_MIN_TOKENS` (64) cold-prefills: on MiMo kv8 one costs +6 to
-  +41 ms over the cold prefill at 16-32 tokens, breaks even at 64, and saves ~180 ms at 256.
+  A checkpoint restore of fewer than `RING_RESTORE_MIN_TOKENS` (64) cold-prefills: below it a restore cost more than
+  the cold prefill it replaced.
   Below both, `SlidingRingRewindPastWindow` → cold prefill.
 - **The SSD tier restores a ringed entry only at a ring file** (`bestRingMatch`, `restoreIntoRinged`): chunks hold the
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,

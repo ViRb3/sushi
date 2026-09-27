@@ -12,8 +12,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Product policy
 
-- **MCG EXL3 only.** The served MiMo target is the K2.5 MCG EXL3 pack
-  (`MiMo-V2.6-Flash-Sushi-2.5bpw`).
+- **MCG EXL3 only.** The served MiMo target is the K2.25 MCG EXL3 pack
+  (`MiMo-V2.6-Flash-Sushi-2.25bpw`).
 - **Thinking defaults ON** (the vendor template's default; `generation_config.json` declares none); effort words
   only set the thinking budget (see [server-http-apis](server-http-apis.md)).
 
@@ -55,13 +55,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   binds the raw FP8 fused QKV and its logits stop following the routed experts (two packs sharing a hard-linked
   trunk produced bit-identical logits until `kld` took the served loader).
 - **Stored-affine trunk**: a SERVED pack stores o_proj, lm_head and embed_tokens as affine triples (8-bit g64,
-  round-to-nearest, exactly `mx.quantize`'s bytes, written by the private converter); the loader serves and bills them as
-  stored (lm_head via quantized matmul, embed via the quantized row gather), with no load-time step. The source
-  checkpoint stores them bf16, so the teacher keeps bf16. Contract: [pack-format](pack-format.md). An
-  imatrix-weighted search of the same tensors scored 0.07793 against round-to-nearest's 0.07783, inside the
-  rounding-flip floor, so the pack ships round-to-nearest ([quality-kld](quality-kld.md#mimo)).
-- The FP8 linears stay FP8: affine-8 for them measured no faster (43.3 vs 43.5 tok/s) and lossy (KLD 0.07774 vs
-  0.07745). Details: [perf-baselines](perf-baselines.md#mimo-decode).
+  written by the private converter); the loader serves and bills them as stored (lm_head via quantized matmul, embed
+  via the quantized row gather), with no load-time step. The source checkpoint stores them bf16, so the teacher keeps
+  bf16. Contract: [pack-format](pack-format.md); how the triples are packed lives in the private converter repo.
+- The FP8 linears stay FP8: affine-8 for them measured no faster and is lossy.
 
 ## Geometry and math
 
@@ -110,9 +107,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's two copies
   beside the ring (at its restore and its prompt end; 158 rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`);
   each entry bills its own in `kv_bytes`, up to four with those it inherits from the entry it forked off
-  (`bestRingDonor`). Live (2026-09-24, kv8, default cache, `taskpolicy -a`, main 298165c vs the landing commit):
-  a 2000-word essay, a 600-word follow-up, then a question: turn 3 TTFT 3.38 -> 1.34 s (cold -> restored 2525 of
-  3430).
+  (`bestRingDonor`).
 - **A hot entry holds a ringed layer's RETAINED ROWS, never the ring's capacity** (`KVCache.snapshotRetained`): the
   buffer is allocated at `ringCap` from token one, so a plain share billed and pinned rows no restore can read.
 - Per token: bf16 288 KiB → 22.5 KiB, kv8 153 KiB → 12.0 KiB; ring per slot 122 MiB bf16, 65 MiB kv8.
@@ -126,11 +121,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   DISPATCH at a time (`fusedSdpaPrefillKv`; `kr` = {begin, end, koff, kL_abs} puts every causal comparison in CACHE
   coordinates), never rebuilt whole; the sliding ring view is window + chunk rows, dequantized per view.
   Landed 2026-09-23 (668278c): 39-layer band attention 39.5 -> 20.3 ms at chunk 512, 603 -> 95.5 at 2048, 2439 -> 181
-  at 4096; live prefill (back-to-back pair) 886 -> 1059 tok/s at 4k and 526 -> 603 at 64k, chunk 2048; a 500k prompt
-  admits at chunk 2048 (`needed=10262 MB available=17538 MB`); 16x512 KLD 0.07747 vs 0.07761.
+  at 4096; 16x512 KLD -0.2%, inside the rounding-flip floor.
 - **On M5 both layer kinds prefill on the matrix units** (`sushi_attn_pd_nax`, same carries, bill and slices;
-  `SUSHI_ATTN_PD_NAX=0` = the SIMD kernel): global attention ~3x faster per layer, live 64k 597 -> 786 tok/s
-  ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](perf-baselines.md#mimo-decode)).
+  `SUSHI_ATTN_PD_NAX=0` = the SIMD kernel): global attention ~3x faster per layer
+  ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](perf-baselines.md#mimo-attn-kernels)).
 - **A packed-cache global-layer DECODE reads in place** (`mimoGlobalDecodeArm`): with matrix units (M5) the matmul2d
   `sushi_qkv_mpp` (`qkvMppDecodeServes`, from `QKV_MPP_DECODE_MIN_TK` = 4096 keys); without them (M4) the QSA split-K
   body over the whole causal range (`qkvAttnSplitKKernel`, from `QKV_SPLITK_DECODE_MIN_TK` = 4096 keys; 512 keys per
@@ -146,10 +140,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   matmul2d is ~1.2-1.4x faster than split-K at 16k-512k (cross-run). Live 64k split-K decode not yet measured.
 - **`sushi_qkv_mpp` is latency-bound, not bandwidth-bound**: 4 simdgroups with register-prefetched words
   (bit-identical to the 8-simdgroup kernel) cut global-layer attention ~30% at 256k keys. Split-K never beats it on M5
-  at 8k keys or more ([perf-baselines](perf-baselines.md#mimo-long-decode)).
+  at 8k keys or more ([perf-baselines](perf-baselines.md#mimo-attn-kernels)).
 - Before the sliding fusion landed, the composed band+sink sheet was the biggest chunk-dependent bill term (0.17 GB
-  at chunk 512, 2.28 GB at 2048), so 500k at chunk 2048 billed ~14.3 GB against ~12.4 GB of headroom. That term is
-  now zero wherever the fused arm serves. Global-layer decode no longer rebuilds on M4-class GPUs (split-K, above).
+  at chunk 512, 2.28 GB at 2048). That term is now zero wherever the fused arm serves. Global-layer decode no longer
+  rebuilds on M4-class GPUs (split-K, above).
 
 ## Decode dispatches
 
@@ -165,7 +159,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - Count one decode forward's primitives with `SUSHI_DECODE_FWD_GRAPH=<path>` beside `SUSHI_DECODE_FWD_UBENCH`.
   What is left, per token: the kv8 append (2 quantize + 6 slice updates per layer, 384), the sliding ring's
   dequant (78) and the partial rotary's input copy (96) are ~650 dispatches, but they overlap the heavy kernels:
-  removing all three families outright saved ~0.4 of ~21.8 ms per forward (79a4cb4, 4096 keys, one boot, arms
+  removing all three families outright saved under 2% of a decode forward (79a4cb4, 4096 keys, one boot, arms
   interleaved), so fusing them is worth under 1%. The decode idle time is the dependent chain of heavy kernels.
 - An MLX custom kernel writes fresh outputs, never the cache in place; writing through an input buffer would bypass
   MLX's hazard tracking and the copy-on-write the prefix-cache snapshots rely on. A fused rope + kv8 quantize was
@@ -179,19 +173,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   row reads the packed cache as its own decode tick would, a partial accept truncates, and no `KVCache.snapshot` is
   taken, so greedy PLD is serial byte for byte. The prefill-shaped verify it replaced declined the fused kernel below
   16 rows, rebuilt every global layer's whole cache dense, copied the cache on every write under the snapshot and
-  re-forwarded partial accepts: 375-410 ms per verify at 244k keys, and live decode of 10.3 tok/s against a 37.7 ms
-  forward.
-- On vs off (9c9eb92, kv8, `--no-mtp`, hot-cache arms off/on/on/off in one boot, 192 greedy tokens, tok/s):
-
-  | prompt | 4k | 64k | 244k |
-  |---|---|---|---|
-  | code edit (echoes the context) | 45.0-45.5 → 59.3-60.9 | 38.0-38.2 → 51.5-52.4 | 25.9-26.0 → 27.1-27.2 |
-  | novel prose after the code | 44.6-45.6 → 44.1-44.7 | 37.9-38.8 → 37.8-38.0 | 26.0-26.9 → 26.4-26.5 |
-
-  Plain code continuation at 17k / 72k / 126k: 43.6-44.4 → 43.3, 38.0-38.7 → 37.4, 33.3-34.1 → 32.8.
+  re-forwarded partial accepts.
 - MTP outranks PLD (`server.requestSpecModes`), so PLD runs only on requests without MTP.
-- PLD stays on by default: it pays on echo workloads. The prompt n-gram gate passes all of these prompts (score
-  0.16-0.32 against 0.01), so the runtime yield and per-draft gates are what cap the losers at 1-2%.
+- PLD stays on by default: it pays on echo workloads (a code edit that echoes the context). The prompt n-gram gate
+  passes ordinary prompts too (score 0.16-0.32 against 0.01), so the runtime yield and per-draft gates are what bound
+  the loss on text that does not echo.
 
 <a id="vision"></a>
 ## Vision (MiMo-ViT)
@@ -248,13 +234,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **A ringed arch RESERVES its cache capacity up front** (`ModelConfig.reservesKvCapacity`, narrower than
   `longCtxGated`) and bills the reservation headroom and the ring: growing +25% at a time duplicated a global layer
   mid-prefill.
-- Admission at kv8 against the ~12.4 GB the weights leave: 64k 2.75 GiB, 128k 3.69, 512k 9.29 at chunk 512
-  (10.34 at 1024), 1M 16.76. 1M at kv8 needs 12.83 GB of KV alone and is out on this box; kv4 fits. Auto-context
-  advertises about 480k; `--ctx-size 524288` outranks it.
+- Admission bills at kv8: 64k 2.75 GiB, 128k 3.69, 512k 9.29 at chunk 512 (10.34 at 1024), 1M 16.76; 1M at kv8
+  needs 12.83 GB of KV alone. An explicit `--ctx-size` outranks auto-context.
 
 ## Evidence
 
 - `tests/dump_mimo_v2_fixtures.py` supplies the independent HF oracle; `MIMO_V2_SOURCE` tests the downloaded Flash
   config/template. Native-byte preservation, forward parity, and live serving are separate gates; a header audit
   proves neither numerical parity nor generation. Test commands: [tests/CLAUDE.md](../tests/CLAUDE.md).
-- Quality: MCG K2.5 w12 KLD 0.0776 through EOS on the 16x512 teacher; tables in [quality-kld](quality-kld.md#mimo).
+- Quality: KLD through EOS on the 16x512 teacher, recorded in [quality-kld](quality-kld.md#mimo).
