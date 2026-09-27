@@ -36,6 +36,7 @@ const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 const ane_mod = @import("ane.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
+const update_mod = @import("update.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -84,6 +85,12 @@ pub var g_api_key_strict: bool = false;
 /// schema-type coercion, the opinionated layer). Off means a weak model's
 /// mistyped value reaches the client verbatim, which strict clients reject.
 pub var g_tool_autocorrect: bool = true;
+
+/// `--parent-pid`: a host runs this engine, so the host (not `/v1/update`) updates it.
+pub var host_managed: bool = false;
+/// The bind `serve` listens on; `/v1/update` checks the page's Origin against it.
+var listen_host: []const u8 = default_host;
+var listen_port: u16 = default_port;
 
 pub const default_host: []const u8 = "127.0.0.1";
 pub const default_port: u16 = 12345;
@@ -818,6 +825,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/unload-model",
+    "/v1/update",
 };
 
 /// The browser chat page: one self-contained file that talks to this server's own API.
@@ -1870,6 +1878,8 @@ pub fn serve(
     std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
 
+    listen_host = host;
+    listen_port = port;
     // Parse host address
     var server = startListener(host, port) catch |err| {
         var msg_buf: [512]u8 = undefined;
@@ -2225,6 +2235,14 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "OPTIONS")) {
         log.debug("OPTIONS {s} -> 204\n", .{path});
         try sendResponse(stream, "204 No Content", "text/plain", "");
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/update")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "/v1/update answers POST only", 405);
+            return;
+        }
+        try handleUpdate(allocator, stream, request[0..header_end_pos], raw_path);
         return;
     }
     // Every method is answered here: past this point a request resolves (and may cold-load) a model.
@@ -7285,7 +7303,9 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
+    const update_json = try update_mod.propsJson(allocator);
+    defer allocator.free(update_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, update_json });
     defer allocator.free(extra_json);
 
     const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extra_json);
@@ -7303,11 +7323,61 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
+    const update_json = try update_mod.propsJson(allocator);
+    defer allocator.free(update_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
-    , .{ active_mem, peak_mem, available_mem, scheduler_mod.MAX_BATCH_GROUP });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
+    , .{ active_mem, peak_mem, available_mem, scheduler_mod.MAX_BATCH_GROUP, update_json });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// A request decoding or queued, or a model loading or evicting: an update now would cut it off.
+fn busyForUpdate(io: std.Io) bool {
+    if (global_scheduler) |sch| {
+        sch.queue_mu.lockUncancelable(sch.io);
+        const in_flight = sch.in_flight;
+        sch.queue_mu.unlock(sch.io);
+        if (in_flight > 0) return true;
+    }
+    const reg = global_registry orelse return false;
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var it = reg.entries.valueIterator();
+    while (it.next()) |e| if (e.*.state == .loading or e.*.state == .evicting) return true;
+    return false;
+}
+
+/// `POST /v1/update`: `update.guard` decides. On accept the answer is 202 and the server shuts down through its
+/// SIGTERM path; main then replaces the process with the updater (`update.relaunchIfRequested`).
+fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, raw_path: []const u8) !void {
+    var ebuf: [std.fs.max_path_bytes]u8 = undefined;
+    var rbuf: [512]u8 = undefined;
+    var vbuf: [64]u8 = undefined;
+    const latest = update_mod.availableVersion(&vbuf);
+    const ask: update_mod.Ask = .{
+        .bind_host = listen_host,
+        .port = listen_port,
+        .peer_loopback = peerIsLoopback(stream),
+        .origin = findHeaderValueCI(headers, "origin"),
+        .key_set = g_api_key != null,
+        .key_ok = apiKeyAuthorized(headers, raw_path),
+        .host_managed = host_managed,
+        .busy = busyForUpdate(stream.io),
+        .install = update_mod.selfInstallRefusal(stream.io, &ebuf, &rbuf),
+        .available = latest != null,
+    };
+    if (update_mod.guard(ask)) |r| {
+        log.info("[update] POST /v1/update -> {d}: {s}\n", .{ r.code, r.message });
+        if (r.code == 401) return sendUnauthorized(stream);
+        return sendErrorResponse(allocator, stream, r.status, r.kind, r.message, r.code);
+    }
+    const body = try std.fmt.allocPrint(allocator, "{{\"status\":\"updating\",\"from\":\"{s}\",\"to\":\"{s}\"}}", .{ update_mod.version, latest.? });
+    defer allocator.free(body);
+    try sendResponse(stream, "202 Accepted", "application/json", body);
+    log.info("[update] updating {s} -> {s} from the chat page; the server restarts\n", .{ update_mod.version, latest.? });
+    update_mod.relaunch_requested.store(true, .release);
+    shutdown_requested.store(true, .release);
 }
 
 /// `<bos> ids <eos>` for bidirectional embedding models. Either special is
@@ -11762,6 +11832,32 @@ test "chat page: --api-key leaves the page open and keeps the API behind the key
         defer t.allocator.free(response);
         try t.expect(std.mem.startsWith(u8, response, c.status));
     }
+}
+
+test "self-update: /v1/update refuses by name over the wire and never shuts the server down" {
+    const t = std.testing;
+    const prev_key = g_api_key;
+    defer g_api_key = prev_key;
+    const Case = struct { request: []const u8, status: []const u8, says: []const u8 };
+    for ([_]Case{
+        .{ .request = "GET /v1/update HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 405 ", .says = "POST only" },
+        .{ .request = "POST /v1/update HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 403 ", .says = "no Origin" },
+        .{ .request = "POST /v1/update HTTP/1.1\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 ", .says = "Origin" },
+        // This test binary sits in a checkout: refused as a source build, before asking whether a release is newer.
+        .{ .request = "POST /v1/update HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n", .status = "HTTP/1.1 409 ", .says = "built from source" },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, c.status));
+        try t.expect(std.mem.indexOf(u8, responseBody(response), c.says) != null);
+    }
+    // The key binds this route from loopback too: loopback is otherwise exempt.
+    g_api_key = "s3cret";
+    const keyless = try serveOneForTest("POST /v1/update HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n");
+    defer t.allocator.free(keyless);
+    try t.expect(std.mem.startsWith(u8, keyless, "HTTP/1.1 401 "));
+    try t.expect(!update_mod.relaunch_requested.load(.acquire));
+    try t.expect(!shutdown_requested.load(.acquire));
 }
 
 test "chat page URL: a wildcard bind is opened through loopback" {

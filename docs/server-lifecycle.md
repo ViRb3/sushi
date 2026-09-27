@@ -10,7 +10,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 ## Entry points
 
-- `src/main.zig`: entry, CLI flags + subcommands (`run/pull/list/serve/launch/kld`).
+- `src/main.zig`: entry, CLI flags + subcommands (`run/pull/list/serve/launch/kld/update`).
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
@@ -23,6 +23,35 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   version, commit, `guest_api`, the mlx/mlx-c pins, `min_macos` from the binary's own target, `model_types`
   (`version.guest_model_types`, a subset of the served types) and the EXL3 codebooks and window range the decoder
   accepts. The release tarball ships it as `guest.json`, next to a `.sha256` of the tarball.
+
+<a id="self-update"></a>
+## Self-update
+
+- **`sushi update`** (`src/update.zig`) reads `/repos/beamivalice/sushi/releases?per_page=100` and takes the highest
+  SemVer carrying both assets (drafts never, prereleases by flag or by version only with `--pre`; `/releases/latest`
+  is newest by date, so a 1.0.x hotfix published after 1.1.0 would be offered to 1.0.4). Never an equal or lower one.
+- **Refused by name**: a source build (under `zig-out/bin`, or in a checkout holding `build.zig`), an app bundle, a
+  folder without `lib/`, an unwritable install or parent, another process running from the install (`proc_pidpath`;
+  `--force` skips it), and an install folder holding anything the release does not ship (the swap would carry it off).
+- **Steps**: curl into `<parent>/.<install>.update` (same volume; the tarball resumes), SHA-256 against the `.sha256`
+  asset, `tar -x`, `codesign --verify --strict` (a Developer ID install takes only its own TeamIdentifier; an ad-hoc
+  one takes either), `renamex_np(RENAME_SWAP)` (three self-undoing renames where the volume lacks it), then
+  `<install>/sushi --version` and `--guest-manifest` must name the tag or the swap is undone; the old install becomes
+  the one `<install>.previous`, which `--rollback` swaps back. One line per step to stderr and
+  `~/.sushi/logs/update.log`.
+- **Every tool runs through `posix_spawn`**, never `std.process.spawn`: Zig 0.17's forks on macOS, and a fork of a
+  server copies its whole MLX mapping.
+- **Daily check**: a serving process (`serve`, `--serve`, `run`) asks GitHub at most once a day on a detached thread,
+  with the in-process HTTPS client and the cached ETag (`~/.sushi/update-check.json`); a failure is one debug line and
+  a retry an hour later. A newer release logs `sushi X is available: run \`sushi update\`` and shows in `/props` and the
+  `run` banner. Boot logs `[update] daily check on|off (source)`: `--no-update-check` > `SUSHI_NO_UPDATE_CHECK`
+  (`diagEnvOn`) > off for a source build > on. `SUSHI_UPDATE_API` is a test-only hook (tests/test_self_update.sh).
+- **Update and restart** (`/v1/update`, the REPL's `/update`): the server shuts down through its SIGTERM path, then
+  main's last defer REPLACES the process (`posix_spawn` with `SETEXEC | CLOEXEC_DEFAULT`, fds 0-2 kept) with
+  `sushi update --relaunch -- <argv>`, which in turn replaces itself with `<install>/sushi <argv>`, new or restored.
+  Same pid, same argv, same terminal and parent: host, launchd and `nohup` supervision carry through, and no socket
+  outlives the server. An exec that cannot happen logs `[update] cannot run …` and exits 1; the outcome lands in the
+  cache so `/props.update.error` names a failure after the relaunch.
 
 ## What loads
 

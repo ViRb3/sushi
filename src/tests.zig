@@ -59,6 +59,7 @@ test {
     _ = @import("status.zig");
     _ = @import("sleep_inhibit.zig");
     _ = @import("parent_watch.zig");
+    _ = @import("update.zig");
     _ = @import("kv_disk_cache.zig");
     _ = @import("kv_disk_writer.zig");
     _ = @import("model_discovery.zig");

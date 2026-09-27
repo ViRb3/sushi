@@ -4,6 +4,14 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **sushi updates itself**: `sushi update` installs the newest release after checking its SHA-256, its signature and
+  that it runs, keeping the old install for `sushi update --rollback`; a server checks for a release once a day
+  (`--no-update-check` turns that off), and the chat page and `sushi run`'s `/update` install it and restart.
+
+---
+
 ## v1.0.5 — Sushi-2.6bpw at full speed
 
 - **Sushi-2.6bpw for 64 GB Macs, as fast as Sushi-3bpw**: the new Qwen3.8-Flash-Next pack carries 43.95 GiB of

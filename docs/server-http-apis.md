@@ -109,8 +109,24 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   own login dialog.
 - Conversations live in the browser's `localStorage` (every access guarded); attached images stay in memory only, as a
   few photos would fill the storage quota.
+- `/props` gives the version and the update banner: shown while `update.available`, its button POSTs `/v1/update`,
+  polls `/health` until the server has gone down and come back, reloads, and reports the new version or `update.error`.
 - Startup prints `chat in your browser: <url>` once (`chatPageUrl`: a `0.0.0.0` bind shows as `127.0.0.1`); `sushi run`
   prints it under its banner, since its log is quieted to warn.
+
+## Self-update (`POST /v1/update`, `/props.update`)
+
+- `/props` carries `update: {current, latest, available, checked_at, url, error}` with or without a model
+  (`update.propsJson`): `latest`/`checked_at`/`url` stay null until a daily check has answered; `error` is why the
+  last update failed, cleared by the next success.
+- `update.guard`, first refusal wins: a non-loopback bind 403 (update on the server with `sushi update`), a
+  non-loopback peer 403, `--api-key` set and not presented 401 FROM LOOPBACK TOO, no Origin or one other than the bind's
+  own `http://<host>:<port>` (127.0.0.1 and localhost interchangeable; DNS rebinding carries its own name) 403,
+  `--parent-pid` 403 (the host updates its engine), a request decoding or queued or a model loading 409 `update_busy`
+  (refused, never queued), an install that cannot replace itself (source build, app bundle, unwritable) 409 by name,
+  no newer release known 409.
+- Accepted: 202 `{"status":"updating","from","to"}`, then the SIGTERM shutdown path and the in-place updater
+  ([server-lifecycle](server-lifecycle.md#self-update)).
 
 ## Agent launcher (`sushi launch <agent>`)
 

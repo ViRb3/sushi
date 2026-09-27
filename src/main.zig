@@ -25,6 +25,7 @@ const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const ane_mod = @import("ane.zig");
 const parent_watch = @import("parent_watch.zig");
+const update_mod = @import("update.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -72,7 +73,8 @@ fn printUsage(io: std.Io) void {
         \\                      model an image (a relative path is read from
         \\                      that folder). The prompt shows the folder and
         \\                      whether tools are on. The same chat opens in a
-        \\                      browser at the URL it prints.
+        \\                      browser at the URL it prints. /update installs
+        \\                      a newer release and restarts the chat.
         \\  pull <model>        Download a model into ~/.sushi/models
         \\  list                Show downloaded models
         \\  serve               Start the server over ~/.sushi/models
@@ -85,6 +87,12 @@ fn printUsage(io: std.Io) void {
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
+        \\  update              Replace this install with the newest release,
+        \\                      after checking its SHA-256, its signature and
+        \\                      that it runs; the old one stays as
+        \\                      <install>.previous. --check only reports,
+        \\                      --rollback swaps the previous one back.
+        \\                      `sushi update --help` for options
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -309,6 +317,9 @@ fn printUsage(io: std.Io) void {
         \\                      Default: ~/.sushi/logs/sushi-<port>.log
         \\  --parent-pid <pid>  Shut down when process <pid> exits (for a host
         \\                        that runs sushi as its engine).
+        \\  --no-update-check   Never ask GitHub for a newer release (a server
+        \\                        otherwise checks at most once a day; also
+        \\                        SUSHI_NO_UPDATE_CHECK=1)
         \\  --version           Print version and exit
         \\  --guest-manifest    Print the JSON a host checks before running this
         \\                        build as its engine (guest.json), and exit
@@ -347,6 +358,9 @@ pub fn main(init: std.process.Init) !void {
         try args_list.append(allocator, try allocator.dupe(u8, arg));
     }
     const args = args_list.items;
+    // Runs after every other defer: an update asked for by /v1/update or the REPL replaces this process only once
+    // the server has shut down the way a SIGTERM exit does.
+    defer update_mod.relaunchIfRequested(allocator, io, args);
 
     if (args.len == 1) {
         printUsage(io);
@@ -404,8 +418,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "kld")) {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "update")) {
+            try update_mod.cmdUpdate(allocator, io, args[2..]);
+            return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -422,6 +439,7 @@ pub fn main(init: std.process.Init) !void {
     // `--log-file <path|off>`. null = default (`~/.sushi/logs/sushi-<port>.log`).
     var log_file_arg: ?[]const u8 = null;
     var parent_pid: ?std.posix.pid_t = null;
+    var no_update_check = false;
     var serve_mode = false;
     var stream_mode = false;
     var prompt: ?[]const u8 = null;
@@ -706,6 +724,9 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--parent-pid: expected a process id above 1; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            server_mod.host_managed = true;
+        } else if (std.mem.eql(u8, args[i], "--no-update-check")) {
+            no_update_check = true;
         } else if (std.mem.eql(u8, args[i], "--warmup-eager")) {
             warmup_eager = true;
         } else if (std.mem.eql(u8, args[i], "--no-warmup-eager")) {
@@ -936,6 +957,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
+    if (serve_mode) update_mod.startDailyCheck(io, no_update_check, transformer_mod.diagEnvOn("SUSHI_NO_UPDATE_CHECK"));
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {

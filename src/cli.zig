@@ -21,6 +21,7 @@ const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 const status = @import("status.zig");
 const repl_tools = @import("repl_tools.zig");
+const update = @import("update.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -1214,6 +1215,8 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     defer allocator.free(driver.tools.root);
     var state_buf: [512]u8 = undefined;
     try writeReadyBanner(w, vision, port, formatPromptStatus(&state_buf, driver.tools.root, homeDir(), opts.tools));
+    var version_buf: [64]u8 = undefined;
+    try writeUpdateNotice(w, update.availableVersion(&version_buf));
     try w.flush();
 
     var history = std.ArrayList(Turn).empty;
@@ -1267,6 +1270,10 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
             try attachImage(allocator, w, driver.tools, arg, &pending_images);
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/update")) {
+            if (try replUpdate(allocator, io, w)) break;
+            continue;
+        }
 
         const mark = history.items.len;
         const images = try pending_images.toOwnedSlice(allocator);
@@ -1289,6 +1296,41 @@ pub fn writeReadyBanner(w: *std.Io.Writer, vision: bool, port: u16, state: []con
     try w.writeAll(if (vision) ", /image <path> to show an image\n" else "\n");
     try w.print(">>> {s} (shown before each prompt); /cd <folder> moves the folder the file tools{s} read\n", .{ state, if (vision) " and relative /image paths" else "" });
     try w.print(">>> chat in your browser: http://127.0.0.1:{d}/\n", .{port});
+}
+
+/// The REPL's line for a newer release found by the daily check; nothing without one.
+pub fn writeUpdateNotice(w: *std.Io.Writer, latest: ?[]const u8) !void {
+    const v = latest orelse return;
+    try w.print(">>> sushi {s} is available: /update installs it and restarts this chat on the same model\n", .{v});
+}
+
+/// `/update`: a fresh check; with a newer release the REPL ends, and main replaces the process with the updater,
+/// which restarts `sushi run` on the same model. True when the REPL should end.
+fn replUpdate(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer) !bool {
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var why_buf: [512]u8 = undefined;
+    if (update.selfInstallRefusal(io, &path_buf, &why_buf)) |why| {
+        try w.print("update: {s}\n", .{why});
+        return false;
+    }
+    const found = update.checkNow(arena_state.allocator(), io, false) catch {
+        try w.print("update: could not read the release list\n", .{});
+        return false;
+    };
+    const r = found orelse {
+        try w.print("update: no release carries {s}\n", .{update.asset});
+        return false;
+    };
+    if (!update.isNewer(r.version, update.version)) {
+        try w.print("sushi {s} is up to date\n", .{update.version});
+        return false;
+    }
+    try w.print("updating to sushi {s}; this chat restarts on the same model\n", .{r.version});
+    try w.flush();
+    update.relaunch_requested.store(true, .release);
+    return true;
 }
 
 const max_status_path = 32;
@@ -1798,6 +1840,15 @@ test "cli: the ready banner shows the folder, the tools state, /cd and the brows
         try testing.expect(std.mem.indexOf(u8, text, "/cd <folder>") != null);
         try testing.expectEqual(vision, std.mem.indexOf(u8, text, "/image") != null);
     }
+}
+
+test "cli: the REPL names a newer release and /update, and says nothing without one" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeUpdateNotice(&w, null);
+    try testing.expectEqualStrings("", w.buffered());
+    try writeUpdateNotice(&w, "1.1.0");
+    try testing.expectEqualStrings(">>> sushi 1.1.0 is available: /update installs it and restarts this chat on the same model\n", w.buffered());
 }
 
 test "cli: the prompt status shows the tools' folder (~ for home, the tail when long) and the tools state" {

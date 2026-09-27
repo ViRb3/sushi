@@ -224,6 +224,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
 .topbar-actions { display: flex; align-items: center; gap: 6px; }
 #serverDot { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2); padding: 5px 10px; border-radius: 999px; }
 #appMain { flex: 1; min-height: 0; position: relative; }
+#updateBanner { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 7px 18px; flex: none; font-size: 13px; background: var(--accent-soft); border-bottom: 1px solid var(--border); }
+#updateBanner[hidden] { display: none; }
+#updateBanner a { color: var(--accent-2); }
 
 /* ============================================================
    Chat
@@ -729,6 +732,12 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
     <button class="icon-btn" id="themeToggle" title="Theme" aria-label="Toggle theme"><svg id="themeToggleIcon"><use href="#i-auto"/></svg></button>
   </div>
 </header>
+<div id="updateBanner" role="status" hidden>
+  <span id="updateText"></span>
+  <a id="updateNotes" target="_blank" rel="noopener noreferrer">Release notes</a>
+  <span class="spacer"></span>
+  <button class="btn small primary" id="updateButton">Update and restart</button>
+</div>
 
 <main id="appMain">
 <section id="chatPanel">
@@ -1274,11 +1283,69 @@ async function refreshServerDot() {
 function loadVersion() {
   apiJson("/props")
     .then((props) => {
-      const version = props?.settings?.version;
+      const version = props?.update?.current ?? props?.settings?.version;
       if (version) $("brandVersion").textContent = `v${String(version).replace(/^v/, "")}`;
+      showUpdate(props?.update);
+      reportUpdateResult(props?.update);
     })
     .catch(() => {});
 }
+
+/* ------------------------------------------------------------
+   Self-update: the server offers a newer release and restarts into it
+   ------------------------------------------------------------ */
+const UPDATE_KEY = "sushi-update-pending";
+let updateFrom = "";
+function showUpdate(update) {
+  if (!update || $("updateButton").disabled) return;
+  updateFrom = update.current;
+  $("updateBanner").hidden = !update.available;
+  $("updateText").textContent = `sushi ${update.latest} is available (this is ${update.current}).`;
+  $("updateNotes").hidden = !update.url;
+  if (update.url) $("updateNotes").href = update.url;
+}
+function reportUpdateResult(update) {
+  const from = readStore(UPDATE_KEY);
+  if (!from || !update) return;
+  dropStore(UPDATE_KEY);
+  if (update.current !== from) toast(`Updated to sushi ${update.current}`, "ok");
+  else toast(`Update failed: ${update.error || "sushi restarted on the version it had"}`, "err");
+}
+/* The server goes down while the updater runs; back up (or on another version) means the restart is over. */
+async function waitForRestart(from) {
+  let down = false;
+  for (let i = 0; i < 1200; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    let ok = false;
+    try {
+      ok = (await fetch("/health", { credentials: "omit", cache: "no-store" })).ok;
+    } catch {}
+    if (!ok) {
+      down = true;
+      continue;
+    }
+    if (down) return;
+    const props = await apiJson("/props").catch(() => null);
+    if (props?.update?.current && props.update.current !== from) return;
+  }
+}
+$("updateButton").onclick = async () => {
+  const button = $("updateButton");
+  button.disabled = true;
+  const response = await api("/v1/update", { method: "POST" }).catch(() => null);
+  if (response?.status !== 202) {
+    const detail = await response?.json().catch(() => null);
+    toast(detail?.error?.message || "The server did not accept the update", "err");
+    button.disabled = false;
+    return;
+  }
+  writeStore(UPDATE_KEY, updateFrom, true);
+  $("updateText").textContent = "Updating: sushi restarts once the new version is in place…";
+  $("updateNotes").hidden = true;
+  button.hidden = true;
+  await waitForRestart(updateFrom);
+  window.location.reload();
+};
 
 /* ------------------------------------------------------------
    Chat options
@@ -2092,6 +2159,7 @@ async function init() {
   setInterval(refreshServerDot, 10_000);
   await refreshModels().catch(() => {});
   loadVersion();
+  setInterval(loadVersion, 300_000);
   setInterval(() => {
     if (!document.hidden && !chatAbort) refreshModels().catch(() => {});
   }, 30_000);

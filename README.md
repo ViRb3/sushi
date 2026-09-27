@@ -17,6 +17,8 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 ./sushi-macos-arm64/sushi --version
 ```
 
+Update with `sushi update` (or the button in the chat page).
+
 Or build from source (needs Xcode 26.2+ with its Metal toolchain; `brew bundle` installs cmake and webp):
 
 ```bash
