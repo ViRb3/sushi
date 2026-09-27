@@ -1026,7 +1026,7 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     if (prompts.items.len == 0) return error.NoPromptsFound;
     try std.Io.Dir.cwd().createDirPath(io, opts.out_dir);
     const hidden = if (opts.hidden_out.len > 0)
-        try hidden_capture.Writer.open(allocator, io, opts.hidden_out, l.config.num_hidden_layers, l.config.hidden_size)
+        try hidden_capture.Writer.open(allocator, io, opts.hidden_out, l.config.num_hidden_layers, hiddenCaptureWidth(&l.config))
     else
         null;
     defer if (hidden) |w| w.close();
@@ -1961,6 +1961,22 @@ test "kld records the budget that shaped the load, never the raw flag" {
     try testing.expectEqual(@as(u64, 60), capturedSsdBudgetGb(&q4, 0));
     q4.expert_ssd_budget_bytes = 0;
     try testing.expectEqual(@as(u64, 48), capturedSsdBudgetGb(&q4, 48 * GiB));
+}
+
+fn hiddenCaptureWidth(config: *const model_mod.ModelConfig) usize {
+    // Block boundaries precede the final mixer and retain all HC streams.
+    const streams: usize = if (std.mem.eql(u8, config.model_type, "qwen4_exp"))
+        @max(config.hc_count, 1)
+    else
+        1;
+    return @as(usize, config.hidden_size) * streams;
+}
+
+test "kld hidden capture keeps the complete Qwen4 residual stream" {
+    const q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .hidden_size = 2560, .hc_count = 4 };
+    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2", .hidden_size = 4096 };
+    try testing.expectEqual(@as(usize, 10240), hiddenCaptureWidth(&q4));
+    try testing.expectEqual(@as(usize, 4096), hiddenCaptureWidth(&mimo));
 }
 
 const TinyMimo = struct {

@@ -1,7 +1,8 @@
 //! The residual stream at every block boundary of a prompt forward, appended to
 //! one directory while `sushi kld capture` runs the teacher:
-//!   boundary-XX.bin   XX = 00..num_layers, raw bf16 row-major [tokens, hidden], no header;
+//!   boundary-XX.bin   XX = 00..num_layers, raw bf16 row-major [tokens, width], no header;
 //!                     boundary 0 is the input to layer 0, boundary b the output of layer b-1
+//!                     width is hidden_size (Qwen4: hc_count * hidden_size)
 //!   tokens.bin        u32 token ids [tokens]
 //! Every file is opened for append, so prompts (and runs) concatenate in token
 //! order. A prompt's ids land after all of its rows: `tokens.bin` counts only

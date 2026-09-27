@@ -24366,6 +24366,10 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(h);
             h = h32;
         }
+        // Boundary zero includes all HC streams, matching the layer outputs.
+        if (ctx.capture_layers) |cl| if (cl.input) |slot| {
+            _ = mlx.mlx_array_set(slot, h);
+        };
         // M-RoPE chunk tables: read by every full-attn layer AND the QSA
         // indexer's queries (its pooled block keys take a strided build).
         try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), mlx.mlx_array_dtype(h));
