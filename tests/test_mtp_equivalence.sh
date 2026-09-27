@@ -19,6 +19,10 @@
 #      chained per_draft_pct legitimately dilutes to ~25%.
 #   2. EQUIVALENCE — full output bytes must match at temp=0.
 #      Every divergence fails, with the serial top-two gap reported.
+#   3. PROMPT LOOKUP — a copy task (return a file with one rename) runs
+#      lookup rounds (`lookup=R/..` with R > 0) and still matches the
+#      --no-mtp bytes, stream and non-stream; `SUSHI_MTP_LOOKUP=0` runs none
+#      and matches too; a seeded sampled copy is the same bytes streamed.
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
 # Default model: ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw. A standalone
@@ -187,11 +191,96 @@ messages_nonstream() {
         python3 -c "import json,sys; print(''.join(b.get('text','') for b in json.load(sys.stdin)['content']), end='')"
 }
 
+# A copy task: return a file with one rename. Built as JSON by python (the
+# prompt is multi-line code); thinking off so the answer is the copy.
+COPY_MAX_TOKENS=480
+COPY_PROMPT_FILE="$ARTIFACTS/copy_prompt.txt"
+cat >"$COPY_PROMPT_FILE" <<'COPYEOF'
+Rename the function `load_rows` to `read_rows` everywhere in the file below (its definition and every call). Output the complete updated file only, with no commentary.
+
+```python
+import csv
+from collections import defaultdict
+
+
+def load_rows(path):
+    with open(path, newline="") as fh:
+        return [row for row in csv.DictReader(fh)]
+
+
+def total_by_sku(rows):
+    totals = defaultdict(int)
+    for row in rows:
+        totals[row["sku"]] += int(row["qty"])
+    return dict(totals)
+
+
+def low_stock(rows, threshold=5):
+    return sorted(sku for sku, qty in total_by_sku(rows).items() if qty < threshold)
+
+
+def summarize(path, threshold=5):
+    rows = load_rows(path)
+    totals = total_by_sku(rows)
+    lines = [f"{sku}: {qty}" for sku, qty in sorted(totals.items())]
+    lines.append(f"low stock: {', '.join(low_stock(rows, threshold)) or 'none'}")
+    return "\n".join(lines)
+
+
+def merge(paths):
+    rows = []
+    for path in paths:
+        rows.extend(load_rows(path))
+    return total_by_sku(rows)
+
+
+if __name__ == "__main__":
+    import sys
+    print(summarize(sys.argv[1]))
+```
+COPYEOF
+COPY_PROMPT="$(cat "$COPY_PROMPT_FILE")"
+
+copy_request() { # $1 stream true|false, $2 sampling JSON fields (empty = greedy)
+    python3 - "$PORT" "$1" "$COPY_MAX_TOKENS" "$COPY_PROMPT_FILE" "${2:-}" <<'PYCOPY'
+import json, sys, urllib.request
+port, stream, max_tokens, prompt_file, sampling = sys.argv[1], sys.argv[2] == "true", int(sys.argv[3]), sys.argv[4], sys.argv[5]
+body = {"model": "default", "stream": stream, "max_tokens": max_tokens, "enable_thinking": False,
+        "messages": [{"role": "user", "content": open(prompt_file).read()}]}
+body.update(json.loads(sampling) if sampling else {"temperature": 0})
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=900) as resp:
+    if not stream:
+        print(json.load(resp)["choices"][0]["message"]["content"], end="")
+        sys.exit(0)
+    out = []
+    for raw in resp:
+        line = raw.decode().strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            d = json.loads(line[6:])
+        except ValueError:
+            continue
+        for c in d.get("choices", []):
+            out.append(c.get("delta", {}).get("content") or "")
+    print("".join(out), end="")
+PYCOPY
+}
+
+SEEDED='{"temperature":0.6,"top_p":0.95,"top_k":20,"seed":1234}'
+
+lookup_rounds_max() { # largest lookup round count on any [spec-stats] line of this boot
+    grep -o 'lookup=[0-9]*/' "$LOG" | tr -dc '0-9\n' | sort -n | tail -1
+}
+
 # Every mismatch fails and reports its serial top-two gap.
 tie_gap_at_divergence() { # $1 expected-file, $2 actual-file → prints gap or "none"
-    python3 - "$1" "$2" "$PORT" "$MAX_TOKENS" "$PROMPT" <<'PYEOF'
+    python3 - "$1" "$2" "$PORT" "$MAX_TOKENS" "$PROMPT" "${GAP_EXTRA:-}" <<'PYEOF'
 import json, sys, urllib.request
 expf, actf, port, max_tokens, prompt = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+extra = json.loads(sys.argv[6]) if sys.argv[6] else {}
 exp = open(expf).read()
 act = open(actf).read()
 n = min(len(exp), len(act))
@@ -199,6 +288,7 @@ i = next((k for k in range(n) if exp[k] != act[k]), n)
 body = {"model": "default", "stream": False, "temperature": 0, "max_tokens": max_tokens,
         "enable_mtp": False, "logprobs": True, "top_logprobs": 2,
         "messages": [{"role": "user", "content": prompt}]}
+body.update(extra)
 req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                              data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
 resp = json.load(urllib.request.urlopen(req, timeout=600))
@@ -250,6 +340,7 @@ echo "── baseline server (--no-mtp) ──"
 start_server "--no-mtp"
 chat_nonstream > "$ARTIFACTS/mtp_base_chat.txt"
 messages_nonstream > "$ARTIFACTS/mtp_base_msg.txt"
+copy_request false > "$ARTIFACTS/mtp_base_copy.txt"
 if grep -q "mode=mtp" "$LOG"; then
     echo "FAIL: --no-mtp server ran MTP rounds"; FAIL=$((FAIL+1))
 else
@@ -282,6 +373,18 @@ chat_stream > "$ARTIFACTS/mtp_on_chat_stream.txt"
 check "chat stream" "$ARTIFACTS/mtp_base_chat.txt" "$ARTIFACTS/mtp_on_chat_stream.txt" yes
 messages_nonstream > "$ARTIFACTS/mtp_on_msg.txt"
 check "messages non-stream" "$ARTIFACTS/mtp_base_msg.txt" "$ARTIFACTS/mtp_on_msg.txt" yes
+copy_request false > "$ARTIFACTS/mtp_on_copy.txt"
+PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
+    check "copy non-stream (lookup on)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_on_copy.txt" yes
+copy_request true > "$ARTIFACTS/mtp_on_copy_stream.txt"
+PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
+    check "copy stream (lookup on)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_on_copy_stream.txt" yes
+LOOKUP_ROUNDS=$(lookup_rounds_max)
+if [ "${LOOKUP_ROUNDS:-0}" -gt 0 ] && grep -q "\[mtp\] prompt-lookup drafts engaged" "$LOG"; then
+    echo "PASS [prompt lookup engages on the copy task] (lookup rounds=$LOOKUP_ROUNDS)"; PASS=$((PASS+1))
+else
+    echo "FAIL [prompt lookup engagement]: lookup rounds=${LOOKUP_ROUNDS:-none} on a copy task"; FAIL=$((FAIL+1))
+fi
 # Acceptance floor: a broken head engages but accepts ~0 tokens per round.
 # avg_per_round is depth-independent (per_draft_pct divides by depth and
 # legitimately dilutes on chained creative drafts at the depth-3 default).
@@ -315,6 +418,14 @@ else
     echo "FAIL [enable_mtp:false opt-out]: MTP ran despite per-request disable"; FAIL=$((FAIL+1))
 fi
 
+stop_server
+
+echo "── MTP server, prompt lookup off (SUSHI_MTP_LOOKUP=0) ──"
+# The EV checks need MTP rounds on an echo; with lookup on, an echo is served
+# by lookup rounds instead. The echo runs first: a copy before it would seed the
+# EV surface at the depth cap, where a round has no chunk B to extend into.
+SUSHI_MTP_LOOKUP=0 start_server ""
+ENGAGE_BASE=0
 # EV-controller engagement (dispatch-hole lesson: output equality can't see a
 # silent fallback). An ECHO workload is the max-confidence case: past the
 # ~10-round warmup the chain confidence clears any tau, so chunk-B extension
@@ -340,13 +451,24 @@ if [ -n "$EXPECT_AUTO_DEPTH" ]; then
         FAIL=$((FAIL+1))
     fi
 fi
+ENGAGE_BASE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
+copy_request false > "$ARTIFACTS/mtp_nolookup_copy.txt"
+PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
+    check "copy non-stream (lookup off)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_nolookup_copy.txt" yes
+if [ "$(lookup_rounds_max)" = "0" ] && ! grep -q "prompt-lookup drafts engaged" "$LOG"; then
+    echo "PASS [SUSHI_MTP_LOOKUP=0 runs no lookup round]"; PASS=$((PASS+1))
+else
+    echo "FAIL [SUSHI_MTP_LOOKUP=0]: lookup rounds ran"; FAIL=$((FAIL+1))
+fi
 stop_server
 
 echo "── fixed-depth server (SUSHI_MTP_ADAPTIVE=0) ──"
 # The env kill switch must fully revert: legacy cap 3 (not the adaptive auto
 # cap) and zero chunk-B extensions on the same echo workload.
 BOOT=$((BOOT+1))
-SUSHI_MTP_ADAPTIVE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS >"$LOG" 2>&1 &
+# SUSHI_MTP_COST_TABLE=0: the lookup gate and the plan read no measured round
+# times, so a seeded sampled request takes the same rounds streamed or not.
+SUSHI_MTP_ADAPTIVE=0 SUSHI_MTP_COST_TABLE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS >"$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 120); do
     curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
@@ -371,6 +493,18 @@ if [ "${FIXED_EXT:-1}" = "0" ] && [ "${FIXED_DEPTH:-0}" = "3" ]; then
 else
     echo "FAIL [adaptive kill switch]: depth=${FIXED_DEPTH:-none} ext_rounds=${FIXED_EXT:-none} (want depth=3 ext_rounds=0)"
     FAIL=$((FAIL+1))
+fi
+copy_request false "$SEEDED" > "$ARTIFACTS/mtp_seeded_copy.txt"
+copy_request true "$SEEDED" > "$ARTIFACTS/mtp_seeded_copy_stream.txt"
+if [ -s "$ARTIFACTS/mtp_seeded_copy.txt" ] && cmp -s "$ARTIFACTS/mtp_seeded_copy.txt" "$ARTIFACTS/mtp_seeded_copy_stream.txt"; then
+    echo "PASS [seeded sampled copy: stream == non-stream]"; PASS=$((PASS+1))
+else
+    echo "FAIL [seeded sampled copy]: stream and non-stream bytes differ"; FAIL=$((FAIL+1))
+fi
+if [ "$(lookup_rounds_max)" -gt 0 ] 2>/dev/null; then
+    echo "PASS [prompt lookup engages on the seeded copy]"; PASS=$((PASS+1))
+else
+    echo "FAIL [prompt lookup on the seeded copy]: no lookup round"; FAIL=$((FAIL+1))
 fi
 stop_server
 

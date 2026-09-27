@@ -19,6 +19,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 | `src/mtp_qmv.zig` | M=1-exact qmv rows |
 | `src/mimo_mtp.zig` | MiMo's three trained heads (`model.mtp.layers.{0,1,2}`), per-request row state |
 | `src/round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`) |
+| `src/mtp_lookup.zig` | Prompt lookup inside the MTP round: the committed-context index and its gate |
 | `src/generate.zig` | MTP orchestration, `commitForcedTokens` |
 
 ## The head
@@ -97,13 +98,47 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
   `scheduler.mtpDefaultOffUnderStreaming`) and an explicit `--mtp` there still refuses. The load-time bill prices the head's
   KV whenever it runs by default (`server.mtpHeadDefaultOn`).
-- Rounds stay solo; two interleave, three or more go plain (`mtpRoundsStaySolo`; `SUSHI_MTP_BATCHED_QWEN4` opts
-  in; `mergedVerifyDeclineReason` names the decline). Four MTP streams on MCG K3 aggregate ~85 tok/s today; a linear
-  model of the measured verify-row cost predicts ~95-125 with merged verify at depth 2-3. Measure before any code.
+- **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default, `SUSHI_MTP_GROUP_PLANNER`;
+  a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis
+  verify) when it prices one cheaper, and `mtpRoundsStaySolo` does not gate it. Only when the planner declines the
+  tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`;
+  `SUSHI_MTP_BATCHED_QWEN4` opts in; `mergedVerifyDeclineReason` names the decline). Four MTP streams on MCG K3
+  aggregate ~85 tok/s; a linear model of the measured verify-row cost predicts ~95-125 with merged verify at depth
+  2-3. Measure before any code.
 - **Drafts shortlist on a coarse lm_head copy and re-score exactly** from the MIXER output
   (`buildRerankCoarse`/`rerankShortlist`/`fullReadoutArgmax`, `StepWant.mixed`; `SUSHI_MTP_DRAFT_RERANK=0`
   restores the full readout). A greedy target drafts the argmax (byte-identity contract); a sampled target draws
   from the re-scored top-32 (`mtpDraftStepPath`); draft temperature is per family.
+
+<a id="lookup"></a>
+## Prompt lookup inside the round
+
+- **A lookup stands in for the chain when the output copies its context** (`mtpLookupChain`, ported from mlx-serve
+  #523/#533): the last 3 committed tokens plus t1 matched earlier in the prompt or output, agreeing back 8+ tokens,
+  make the drafts with no head forward. On by default for the qwen4 head; `SUSHI_MTP_LOOKUP=0` turns it off.
+- **An ordinary match (suffix under 32) must agree past the start of a line**: a unified diff echoes the file's
+  lines behind a `-`/`+`/space prefix, so its matches agree to the end of one line and fail at the next (-4.8% on
+  the diff before the rule, -1.6% after). A line's own last token (`):\n`) agrees whatever the next line starts
+  with, so a break counts only with agreement after it ([perf-baselines](perf-baselines.md#mtp-lookup)).
+- **At most 8 drafts (9 verify rows)**: `MtpHistStash.host_ids` holds `MAX_DEPTH + 1` committed ids, and 9 rows is
+  the widest verify whose rows match the decode tick (`sdpaTickIdenticalGroups`). Upstream drafts 14.
+- **The gate prices both rounds from the planner's own `MtpCostSource`** (measured width row, else the EV surface):
+  a lookup of k drafts reads the table's runtime lookup row, else the MTP round at k without its k head steps. The
+  lookup row is never stored, and the first round at each draft count is dropped as its compile.
+- **A lookup round feeds no EV, depth, planner, round-cost, regime or adaptive-serial price state**, and the MTP
+  round after one stays untimed; an untimed round ends the regime interval (`mtpRoundUntimed`), or the next MTP
+  round is billed for it.
+- **A lookup round applies the pending history stash** (`mtpApplyStash`): left pending, it grows across lookup
+  rounds into one oversized head forward.
+- **Declined on MiMo** (three drafts per round), under `SUSHI_MTP_FORCE_DEPTH` (the byte bar's measurement mode),
+  for a batched head and in planner-owned rounds; a serial block (adaptive serial past 32k) runs none either.
+- **Output**: greedy is serial byte for byte (every row is a decode tick's); sampled under `exact` keeps the target
+  distribution, but seeded text differs from lookup-off because the draws land differently; `typical`/`tokenv3`
+  accept a lookup draft as leniently as a head draft.
+- **Measured on Sushi-3bpw**: copies and edits of a file +16-21%, a write_file tool call +9-11%, long-context edits
+  +18-24%; diff, new code and prose inside noise ([perf-baselines](perf-baselines.md#mtp-lookup)).
+- Engagement: `[mtp] prompt-lookup drafts engaged: k=… suffix=…` once, `[spec-stats] … lookup=rounds/drafted/landed`
+  and `lookup_table=`. A/B driver: `tests/bench_mtp_lookup.sh`.
 
 ## Round cost table
 
@@ -130,10 +165,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 
 ## Reproducibility
 
-- **Auto-mode MTP output is NOT byte-reproducible** (round times pick depths → widths → kernels → greedy near-tie
-  flips); byte bar = `SUSHI_MTP_FORCE_DEPTH`.
-- `test_mtp_equivalence.sh` acquits divergences at serial top-2 gap ≤ 0.15 nats and boots
-  `--prefix-cache-entries 0`.
+- **Greedy MTP output is serial's byte for byte, auto mode included**: every verify row computes its position with
+  the decode tick's arithmetic at any width the plan can pick (`mtpVerifyDraftsMax`: `MAX_DEPTH` drafts on qwen4,
+  `MIMO_VERIFY_ROWS_MAX` rows on MiMo), so the width a round takes cannot flip a greedy token.
+- `test_mtp_equivalence.sh` compares full output bytes with `--no-mtp` and acquits nothing
+  (`test_mtp_equivalence_strict.py`); its servers boot `--prefix-cache-entries 0`.
+- **Sampled auto-mode output follows the round times**: the plan reads measured round costs, and the draft counts
+  decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
+  SUSHI_MTP_COST_TABLE=0`, or `SUSHI_MTP_FORCE_DEPTH`).
 - Forced-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on MCG and MUL1 K3).
 - `SUSHI_MTP_DENSE_ROWS=1` stays off by default: one `test_mtp_equivalence.sh` run with it on failed (top-2 gap
   1.125 nats, a slow loaded run) and seven reruns passed ([perf-baselines](perf-baselines.md#m2max-decode)).

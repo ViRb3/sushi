@@ -154,6 +154,41 @@ NOT a quiet box (a system daemon at ~100% of one core). Greedy, 4 prompts x 256 
 - `[spec-warmup]` over 16 boots per arm: 1.20-1.34 s on B and 1.23-1.73 s on A, apart from one ~2.2 s boot in each
   (B's first, 2290 ms; A 2171 ms). The per-width D/U kernel variants add no measurable load time.
 
+<a id="mtp-lookup"></a>
+## Flash-Next: prompt lookup inside the MTP round (2f1e4bf2 + the port)
+
+Arms of one binary per step: A = `SUSHI_MTP_LOOKUP=0`, B = lookup (c68b4cf7, ReleaseFast, sha256 848bd456…),
+C = lookup with the line rule (6ea00e3f, sha256 ea4f6fd0…). M5 Max 128 GB, 2026-09-27, `tests/bench_mtp_lookup.sh`
+(a file of ~600 tokens in the prompt; thinking off; greedy, and sampled 0.6 / 0.95 / 20 seed 7; 2 reps per boot),
+`--ctx-size 131072 --kv-quant 8 --prefix-cache-entries 0`, `SUSHI_ROUND_COST_PERSIST=0`, MTP and exact acceptance at
+their defaults, `taskpolicy -a`, GPU lock `lookup-ab` per boot, fans at max with 3 min idle from 98 °C and restored to
+auto after. CONTENDED box: other workers' builds and tests ran throughout, so compare the interleaved arms only.
+Sushi-3bpw, decode tok/s, median of 8 A runs (A B B A and A C C A) against 4 B and 4 C runs:
+
+| task | greedy A / B / C | sampled A / B / C | C lookup rounds / drafted / landed |
+|---|---|---|---|
+| copy the file | 125.6 / 152.7 / 152.1 (+21%) | 125.2 / 140.7 / 149.1 (+19%) | 52 / 409 / 389 |
+| rename in the file | 124.3 / 142.9 / 150.1 (+21%) | 123.8 / 141.2 / 145.1 (+17%) | 58 / 449 / 430 |
+| fix a bug in the file | 129.4 / 138.0 / 149.5 (+16%) | 125.7 / 141.8 / 146.8 (+17%) | 39 / 301 / 279 |
+| unified diff | 122.1 / 116.2 / 120.1 (-1.6%) | 122.4 / 108.4 / 119.3 (-2.5%) | 2 / 14 / 7 |
+| write_file tool call | 124.0 / 137.4 / 135.4 (+9%) | 122.2 / 134.9 / 135.3 (+11%) | 44 / 337 / 303 |
+| new code | 108.4 / 106.9 / 107.5 (-0.9%) | 103.9 / 103.2 / 102.4 (-1.4%) | 1 / 7 / 6 |
+| prose about the file | 86.3 / 87.1 / 84.8 (-1.7%) | 82.2 / 82.2 / 82.3 (0%) | 0 / 0 / 0 |
+
+- MTP alone already takes ~5.5 tokens per round on a copy; a lookup round lands ~7.5 of 8 drafts.
+- B lost 4.8% (greedy) and 11.5% (sampled) on the diff: its lines echo the file's behind a `-`/`+`/space prefix, so a
+  match agrees to the end of one line and its draft fails at the next (2-7 rounds per request landing 0-60%). The line
+  rule (C) keeps 1-3 such rounds; its -1.6% / -2.5% is inside this box's noise: C's prose, with no lookup round at all,
+  read -8.0% against the adjacent A boots.
+- Long context (B, one pair A B then B A, median of 2, greedy): the file renamed behind ~32k tokens of repo text
+  110.0 -> 136.1 (+24%), behind ~64k 108.7 -> 127.9 (+18%).
+- Sushi-4bpw (B, one A B pair, median of 2): copy 112.8 -> 125.8, rename 110.7 -> 116.8, fix 102.7 -> 120.4, write_file
+  104.6 -> 114.9 greedy; diff 97.0 -> 94.6 (-2.5%) and 96.9 -> 91.4 (-5.7%) before the line rule.
+- llmprobe 0.6.12 `--bench-only` (`tests/bench.sh --only sushi-4bpw`, B): decode 77.7 -> 77.9, predictable 78.7 ->
+  113.7 tok/s at 2.04 -> 5.33 tokens per step, novel 65.5 -> 65.6, prefill 1524 -> 1479 at 2039 tokens (lookup never
+  runs in prefill; one boot per arm), 4 streams 83.2 -> 81.2 aggregate.
+- Greedy output was identical to `--no-mtp` on every task, and `test_mtp_equivalence.sh` passed 18/18.
+
 <a id="m2max-64gb"></a>
 ## Flash-Next Sushi-3bpw on an M2 Max 64 GB
 

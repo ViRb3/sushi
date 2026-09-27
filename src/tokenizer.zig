@@ -298,6 +298,16 @@ pub const Tokenizer = struct {
         };
     }
 
+    /// Does token `id` carry a line break? Byte-level vocabularies spell byte 0x0A as U+010A.
+    pub fn tokenHasNewline(self: *const Tokenizer, id: u32) bool {
+        const token = self.id_to_token.get(id) orelse return false;
+        return switch (self.tok_type) {
+            .byte_level_bpe => std.mem.indexOf(u8, token, "\u{010A}") != null,
+            .sentencepiece_bpe => std.mem.indexOfScalar(u8, token, '\n') != null or std.mem.eql(u8, token, "<0x0A>"),
+            .wordpiece => false,
+        };
+    }
+
     /// Look up a special token ID by its string representation.
     pub fn specialTokenId(self: *const Tokenizer, name: []const u8) ?u32 {
         return self.special_tokens.get(name);
@@ -1512,6 +1522,23 @@ fn hasByteLevel(pt: std.json.Value) bool {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "tokenHasNewline: byte-level spells the line break as U+010A, sentencepiece as itself or <0x0A>" {
+    const a = std.testing.allocator;
+    var bl = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer bl.deinit();
+    try bl.id_to_token.put(1, "\u{010A}\u{0120}\u{0120}return");
+    try bl.id_to_token.put(2, "\u{0120}return");
+    try std.testing.expect(bl.tokenHasNewline(1));
+    try std.testing.expect(!bl.tokenHasNewline(2));
+    try std.testing.expect(!bl.tokenHasNewline(3));
+    var sp = Tokenizer.initEmptyForTests(a, .sentencepiece_bpe);
+    defer sp.deinit();
+    try sp.id_to_token.put(1, "<0x0A>");
+    try sp.id_to_token.put(2, "\u{2581}x");
+    try std.testing.expect(sp.tokenHasNewline(1));
+    try std.testing.expect(!sp.tokenHasNewline(2));
+}
 
 test "isPunct identifies punctuation" {
     try testing.expect(Tokenizer.isPunct('.'));

@@ -159,6 +159,21 @@ MIT License
 ================================================================================
 
 --------------------------------------------------------------------------------
+mlx-serve, after sushi detached
+https://github.com/ddalcu/mlx-serve
+Copyright (c) 2026 David Dalcu and mlx-serve contributors
+Licensed under the MIT License, the license and copyright of this project's LICENSE.
+
+Ported after the 2026-09-17 detach; each site names its upstream pull request:
+
+  * MTP prompt lookup (`src/mtp_lookup.zig`, the lookup row in
+    `src/round_cost.zig`, the lookup round in `src/generate.zig`), from
+    mlx-serve #523 and #533 by Samuel Reed (@STRML). Modifications: drafts
+    capped at 8, the qwen4 head only, both rounds priced from sushi's own MTP
+    cost source, an ordinary match must agree past the start of a line, and
+    no lookup under a forced MTP depth.
+
+--------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)
 https://github.com/maderix/h3.c-ane
 https://github.com/maderix/ANE

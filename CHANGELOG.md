@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Faster file rewrites and edits on Qwen3.8-Flash-Next**: when a reply copies text already in the conversation (a
+  file returned with an edit, a tool call carrying a file), speculative decoding drafts from that text instead of the
+  MTP head: 16-21% faster file edits and 9-11% faster file-writing tool calls on an M5 Max, 18-24% on edits deep in a
+  long context, with greedy output unchanged; `SUSHI_MTP_LOOKUP=0` turns it off. Ported from mlx-serve, thanks @STRML.
 - **Long prompts after a busy moment**: a long prompt that fits once the RAM prompt cache is emptied is no longer
   refused while the GPU is still finishing earlier work.
 - **Faster Flash-Next MTP decode**: speculative decoding reads the hyper-connection weights once for a group of
