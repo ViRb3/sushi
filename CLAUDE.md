@@ -58,6 +58,7 @@ quote them from a committed file.
 | `docs/private/measurement-raw.md` | the raw-file path behind every committed measurement, keyed by doc and section |
 | `docs/private/future.md` | strictly work still to continue or explore; an entry leaves when it starts or lands |
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
+| `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging script, card, upload, verification, past hiccups |
 
 Skills: `/release` (SemVer, CHANGELOG), `/bench` (llmprobe methodology, comparison traps).
 
@@ -147,6 +148,9 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 variance (sample across boots), an A/B arm is proven by ENGAGEMENT lines in its log. Interleave A/B kernels in ONE
 process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box. Recorded baselines to
 inherit: [docs/perf-baselines.md](docs/perf-baselines.md), [docs/quality-kld.md](docs/quality-kld.md).
+
+A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
+owner-approved card; the README pack line follows once the repo is live.
 
 ## Conventions
 
