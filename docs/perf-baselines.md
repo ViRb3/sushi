@@ -290,6 +290,13 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
   f22a383 + the gate, A B B A twice: 33.9 / 36.6 / 31.4 / 34.8 and 30.7 / 37.0 / 37.4 / 35.1 tok/s, paired 1.08,
   0.90, 1.21, 1.07 (mean 1.06, inside the prompt-to-prompt spread).
 
+### v1.0.5 release gate
+
+`tests/bench.sh --tag v1.0.5` (Sushi-4bpw, llmprobe 0.6.12 `--bench-only`, MTP) on the release tree (1ea9492a plus the
+version bump), M5 Max, `taskpolicy -a`, lock `release-105`, fans max, no build or test running (load1 1.74):
+decode 82.6 tok/s (82.1-89.9), prefill 1796 tok/s, 5.33 tokens per step, 37/37 requests `mode=mtp`. The v1.0.4 column
+has no Sushi-4bpw cell.
+
 ### v1.0.4 (27ca1c86), user-reported
 
 A user ran the release on their own M2 Max 64 GB: llmprobe 0.6.12 against port 1234, default ladder,
