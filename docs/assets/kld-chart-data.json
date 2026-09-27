@@ -1,0 +1,107 @@
+{
+  "fixture": "mlx-serve-bf16-16x512-raw",
+  "metric": "mean_kld_to_eos",
+  "legacy_source": "docs/quality-kld.md: Flash-Next comparison packs, binary b64c5a0e",
+  "legacy_kv8": [
+    {
+      "name": "Sushi-3bpw",
+      "gib": 49.33,
+      "kld": 0.10123,
+      "series": "sushi"
+    },
+    {
+      "name": "Sushi-4bpw",
+      "gib": 63.68,
+      "kld": 0.06319,
+      "series": "sushi"
+    },
+    {
+      "name": "3bpw \u00b7 4-bit n-gram",
+      "gib": 49.33,
+      "kld": 0.1047,
+      "series": "ngram"
+    },
+    {
+      "name": "4bpw \u00b7 4-bit n-gram",
+      "gib": 63.68,
+      "kld": 0.0666,
+      "series": "ngram"
+    },
+    {
+      "name": "iQ-MLX 3.3bpw",
+      "gib": 50.6,
+      "kld": 0.1987,
+      "series": "mlx"
+    },
+    {
+      "name": "mixed-4-8bit",
+      "gib": 70.13,
+      "kld": 0.0818,
+      "series": "mlx"
+    },
+    {
+      "name": "oQ4e",
+      "gib": 69.21,
+      "kld": 0.137,
+      "series": "oqe"
+    },
+    {
+      "name": "oQ5e",
+      "gib": 83.97,
+      "kld": 0.0625,
+      "series": "oqe"
+    },
+    {
+      "name": "affine q3",
+      "gib": 54.94,
+      "kld": 0.1444,
+      "series": "affine"
+    }
+  ],
+  "bf16_kv": [
+    {
+      "name": "Sushi-2.6bpw",
+      "result_file": "qwen38-k2625-packed-original.json",
+      "mean_kld": 0.1297814656779365,
+      "mean_kld_to_eos": 0.1434075920398332,
+      "mean_top1": 0.897705078125,
+      "mean_nll": 0.4232538538835539,
+      "positions": 8192,
+      "positions_to_eos": 7186,
+      "kv_cache_format": "bf16"
+    },
+    {
+      "name": "Sushi-2.6bpw T2",
+      "result_file": "qwen38-k2625-960x512-tuned.json",
+      "mean_kld": 0.12150052558304572,
+      "mean_kld_to_eos": 0.1337572524974727,
+      "mean_top1": 0.900634765625,
+      "mean_nll": 0.407888530453903,
+      "positions": 8192,
+      "positions_to_eos": 7186,
+      "kv_cache_format": "bf16"
+    },
+    {
+      "name": "Sushi-3bpw",
+      "result_file": "qwen38-k3-vs-bf16.json",
+      "mean_kld": 0.09566898244554325,
+      "mean_kld_to_eos": 0.10442910002295931,
+      "mean_top1": 0.9105224609375,
+      "mean_nll": 0.3886826315594133,
+      "positions": 8192,
+      "positions_to_eos": 7186,
+      "kv_cache_format": "bf16"
+    },
+    {
+      "name": "Sushi-4bpw",
+      "result_file": "qwen38-k4-vs-bf16.json",
+      "mean_kld": 0.057755728105549624,
+      "mean_kld_to_eos": 0.06174567572211586,
+      "mean_top1": 0.9339599609375,
+      "mean_nll": 0.3464870710762823,
+      "positions": 8192,
+      "positions_to_eos": 7186,
+      "kv_cache_format": "bf16"
+    }
+  ]
+}
