@@ -67,6 +67,11 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
 unshipped and any new bullets get merged into it. Unshipped work lives under `## Unreleased`; the version heading is
 written in the release step. A model that is not public yet (MiMo-V2.6-Flash until v1.1) stays out of the entry.
 
+**Contributor credit (every release):** list outside contributors' PRs since the last tag (`gh pr list --state merged
+--search "merged:>=<last tag date>"`, plus PRs landed as a squash or cherry-pick whose commit subject carries `(#N)`).
+The entry thanks each by @handle, naming what they shipped in user terms, in the bullet for that change or in one
+closing "Thanks" bullet. A credit a shipped release missed goes into the next entry, marked as belated.
+
 Tone: high-level executive bullets, marketing-style. The audience is users/integrators, not contributors reading the diff.
 
 - Lead each bullet with **what changed for the user** (capability, speed, model support), not the implementation.

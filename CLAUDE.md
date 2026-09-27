@@ -147,8 +147,10 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 `/release` for process, SemVer, CHANGELOG. Perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in
 `benchmarks.md` (ONE new column per release). `/bench` for methodology: same-methodology cells only, spec cells are
 variance (sample across boots), an A/B arm is proven by ENGAGEMENT lines in its log. Interleave A/B kernels in ONE
-process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box. Recorded baselines to
-inherit: [docs/perf-baselines.md](docs/perf-baselines.md), [docs/quality-kld.md](docs/quality-kld.md).
+process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box.
+
+Release notes thank every outside contributor by @handle for each merged PR the release ships (`gh pr list --state
+merged` since the last tag); a credit missed in a shipped release goes into the next one, marked as belated.
 
 A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
 owner-approved card; the README pack line follows once the repo is live.
