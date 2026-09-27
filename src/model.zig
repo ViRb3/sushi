@@ -468,6 +468,7 @@ pub const ModelConfig = struct {
     kv_quant_override: ?kv_quant_mod.KVQuantConfig = null,
     mtp_override: ?bool = null,
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
+    mtp_greedy_tail_override: ?bool = null,
     /// Per-model `ssd_budget_gb` (GiB, the `--ssd-budget-gb` unit) from model-settings.json; 0 = none.
     ssd_budget_gb_override: u32 = 0,
     preserve_thinking_override: ?bool = null,

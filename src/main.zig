@@ -186,6 +186,11 @@ fn printUsage(io: std.Io) void {
         \\                        Alias: --mtp-cascade. Use 0.95 for the
         \\                        Qwen3.8 matched comparison. Exclusive with
         \\                        --mtp-typical; exact is the default.
+        \\  --mtp-greedy-tail   Sampled requests draft only the first MTP token
+        \\                        from the draft sampler, every later one by
+        \\                        argmax. Pays beside --mtp-typical (faster,
+        \\                        slightly more predictable text); greedy
+        \\                        requests are unchanged. Default off.
         \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
         \\                        context tokens (default: 0 = no ceiling).
         \\                        A verify row is BYTES, so on a long-context
@@ -697,6 +702,8 @@ pub fn main(init: std.process.Init) !void {
         } else if ((std.mem.eql(u8, args[i], "--mtp-tokenv3") or std.mem.eql(u8, args[i], "--mtp-cascade")) and i + 1 < args.len) {
             i += 1;
             mtp_tokenv3_raw = args[i];
+        } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
+            generate_mod.mtp_greedy_tail_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);

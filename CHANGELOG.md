@@ -11,6 +11,9 @@ earlier history is mlx-serve's, in that project's changelog.
   (`--no-update-check` turns that off), and the chat page and `sushi run`'s `/update` install it and restart.
 - **SSD prompt-cache restores stay at one copy**: a restore no longer copies the whole restored cache at a chunk when
   the GPU releases finished work late, which could hold up to three copies of it at once.
+- **`--mtp-greedy-tail`**: beside `--mtp-typical`, sampled decoding drafts its later speculative tokens by argmax
+  for faster output at slightly more predictable text; off by default, or per model with `"mtp_greedy_tail": true`
+  in model-settings.json.
 
 ---
 

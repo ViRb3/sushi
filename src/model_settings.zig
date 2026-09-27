@@ -89,12 +89,13 @@ pub const Override = struct {
     kv_quant: ?kv_quant.KVQuantConfig = null,
     mtp: ?bool = null,
     mtp_acceptance: ?mtp_acceptance.Mode = null,
+    mtp_greedy_tail: ?bool = null,
     ssd_budget_gb: ?u32 = null,
     preserve_thinking: ?bool = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
-            o.mtp_acceptance == null and o.ssd_budget_gb == null and o.preserve_thinking == null;
+            o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.preserve_thinking == null;
     }
 };
 
@@ -149,6 +150,10 @@ fn fromValue(v: std.json.Value) Override {
         .string => |name| o.mtp_acceptance = mtp_acceptance.fromName(name),
         else => {},
     };
+    if (obj.get("mtp_greedy_tail")) |g| switch (g) {
+        .bool => |b| o.mtp_greedy_tail = b,
+        else => {},
+    };
     if (obj.get("ssd_budget_gb")) |g| switch (g) {
         .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) {
             o.ssd_budget_gb = @intCast(i);
@@ -190,12 +195,13 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} ssd_budget_gb={d} preserve_thinking={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} preserve_thinking={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
         if (o.mtp) |m| (if (m) "on" else "off") else "default",
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
+        if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         o.ssd_budget_gb orelse 0,
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
     });
@@ -227,6 +233,17 @@ test "model_settings: mtp_acceptance names a mode at its default threshold" {
     try std.testing.expectEqual(@as(f32, 0.95), s.lookup("/m/b").mtp_acceptance.?.tokenv3);
     try std.testing.expect(s.lookup("/m/c").mtp_acceptance.? == .exact);
     try std.testing.expect(s.lookup("/m/d").isEmpty());
+}
+
+test "model_settings: the greedy tail (mtp_greedy_tail) is a bool, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"mtp_greedy_tail": true}, "/m/b": {"mtp_greedy_tail": false}, "/m/c": {"mtp_greedy_tail": "on"}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?bool, true), s.lookup("/m/a").mtp_greedy_tail);
+    try std.testing.expectEqual(@as(?bool, false), s.lookup("/m/b").mtp_greedy_tail);
+    try std.testing.expect(!s.lookup("/m/b").isEmpty());
+    try std.testing.expect(s.lookup("/m/c").isEmpty());
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {

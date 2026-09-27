@@ -2406,6 +2406,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
+    config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
     config.preserve_thinking_override = o.preserve_thinking;
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.streamsExperts()).setting_ignored)
@@ -3393,9 +3394,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
     const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming);
     const acceptance = generate_mod.mtpAcceptanceFor(params.config.mtp_acceptance_override);
-    log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s})\n", .{
+    const greedy_tail = generate_mod.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
+    log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
         if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
         mtp_acceptance_mod.name(acceptance.value),     model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
+        if (greedy_tail.value) "on" else "off",        model_settings.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
     const mtp_enabled = mtp.on and !mtp_streaming_off;
     if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
@@ -5933,6 +5936,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             ),
             .mtp_enabled = use_mtp,
             .mtp_acceptance = generate_mod.mtpAcceptanceFor(slot.model.config.?.mtp_acceptance_override).value,
+            .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override).value,
             .mtp = if (use_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,

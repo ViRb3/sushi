@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Per-model settings (`~/.sushi/model-settings.json`, issue #269): a model's
-# `ctx_size` / `kv_quant` / `mtp` / `mtp_acceptance` follow the MODEL, apply on its
+# `ctx_size` / `kv_quant` / `mtp` / `mtp_acceptance` / `mtp_greedy_tail` follow the MODEL, apply on its
 # load (boot AND cold load), and a second model cold-loaded in the same process
 # keeps the globals and the launch flags. An explicit launch flag outranks the file.
 # The served packs cannot sit side by side under the resident cap, so the second
@@ -47,7 +47,7 @@ sleep 0.5
 
 write_settings() { # write_settings <ctx> <kv>  — override for MODEL_A only
     cat >"$SETTINGS" <<JSON
-{ "$MODEL_A/": { "ctx_size": $1, "kv_quant": "$2", "mtp": true, "mtp_acceptance": "typical" }, "not-a-model": 1 }
+{ "$MODEL_A/": { "ctx_size": $1, "kv_quant": "$2", "mtp": true, "mtp_acceptance": "typical", "mtp_greedy_tail": true }, "not-a-model": 1 }
 JSON
 }
 write_settings 4096 8
@@ -112,6 +112,8 @@ check "[1] load log: --no-mtp outranks mtp:true, acceptance from the file" \
 check "[1] /props settings.mtp.source --no-mtp (got $(props_mtp_source "$MODEL_A"))" "$([ "$(props_mtp_source "$MODEL_A")" = "--no-mtp" ] && echo 1 || echo 0)"
 check "[1] log names the override" "$(grep -q "\[model-settings\] .*ctx=4096 kv=8 mtp=on" "$LOG" && echo 1 || echo 0)"
 check "[1] log names the MTP acceptance mode" "$(grep -q "\[model-settings\] .*accept=typical" "$LOG" && echo 1 || echo 0)"
+check "[1] load log: greedy tail from the file" \
+    "$(grep -q "acceptance typical (model-settings.json); greedy tail on (model-settings.json)" "$LOG" && echo 1 || echo 0)"
 
 # [2] a second model keeps the globals, and its cold load carries the explicit --no-mtp
 CODE="$(post unload-model "{\"model\":\"$MODEL_A\"}")"
@@ -122,6 +124,7 @@ check "[2] model B keeps the kv8 default (got $(row "$MODEL_B" kv))" "$([ "$(row
 check "[2] model B kv_cache source default (got $(row "$MODEL_B" src))" "$([ "$(row "$MODEL_B" src)" = "default" ] && echo 1 || echo 0)"
 check "[2] cold-load log names the KV and ctx choices" "$(grep -q "\[kv-cache\] kv8 (default); ctx auto (default)" "$LOG" && echo 1 || echo 0)"
 check "[2] cold-load log: --no-mtp, exact acceptance" "$(grep -q "\[mtp\] off (--no-mtp); acceptance exact (default)" "$LOG" && echo 1 || echo 0)"
+check "[2] cold-load log: greedy tail off by default" "$(grep -q "acceptance exact (default); greedy tail off (default)" "$LOG" && echo 1 || echo 0)"
 check "[2] /props settings.mtp.source --no-mtp for B (got $(props_mtp_source "$MODEL_B"))" "$([ "$(props_mtp_source "$MODEL_B")" = "--no-mtp" ] && echo 1 || echo 0)"
 
 # [3] edit + unload + load applies the new values, no restart
@@ -156,9 +159,9 @@ check "[5] one line says it is ignored" \
 # [6] explicit launch flags outrank every competing key in the file
 kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
 cat >"$SETTINGS" <<JSON
-{ "$MODEL_A/": { "ctx_size": 4096, "kv_quant": "8", "mtp": false, "mtp_acceptance": "typical" } }
+{ "$MODEL_A/": { "ctx_size": 4096, "kv_quant": "8", "mtp": false, "mtp_acceptance": "typical", "mtp_greedy_tail": false } }
 JSON
-boot --ctx-size 16384 --kv-quant 4 --mtp --mtp-tokenv3 0.9
+boot --ctx-size 16384 --kv-quant 4 --mtp --mtp-tokenv3 0.9 --mtp-greedy-tail
 check "[6] --ctx-size 16384 outranks ctx_size 4096 (got $(row "$MODEL_A" ctx))" "$([ "$(row "$MODEL_A" ctx)" = "16384" ] && echo 1 || echo 0)"
 check "[6] --kv-quant 4 outranks kv_quant 8 (got $(row "$MODEL_A" kv), source $(row "$MODEL_A" src))" \
     "$([ "$(row "$MODEL_A" kv)" = "4" ] && [ "$(row "$MODEL_A" src)" = "--kv-quant" ] && echo 1 || echo 0)"
@@ -166,6 +169,8 @@ check "[6] load log names the flags" "$(grep -q "\[kv-cache\] kv4 (--kv-quant); 
 check "[6] --mtp outranks mtp:false, --mtp-tokenv3 outranks typical" \
     "$(grep -q "\[mtp\] on (--mtp); acceptance tokenv3 (--mtp-tokenv3)" "$LOG" && echo 1 || echo 0)"
 check "[6] /props settings.mtp.source --mtp (got $(props_mtp_source "$MODEL_A"))" "$([ "$(props_mtp_source "$MODEL_A")" = "--mtp" ] && echo 1 || echo 0)"
+check "[6] --mtp-greedy-tail outranks mtp_greedy_tail:false" \
+    "$(grep -q "acceptance tokenv3 (--mtp-tokenv3); greedy tail on (--mtp-greedy-tail)" "$LOG" && echo 1 || echo 0)"
 
 # [7] no flag, no file: a served pack runs MTP by default; the file's mtp:false turns it off
 kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
