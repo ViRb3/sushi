@@ -103,16 +103,16 @@ through environment variables. `--print` writes the config and prints the launch
 
 GPU memory in GiB (what `sushi run` reports); the n-gram table stays on the SSD.
 
-| | Sushi-3bpw | Sushi-4bpw |
-|---|---|---|
-| model weights | 47.51 | 61.58 |
-| MTP head | 0.98 | 1.27 |
-| vision tower | 0.84 | 0.84 |
-| **weights loaded** | **49.33** | **63.68** |
-| KV cache, 256k tokens | 4.06 | 4.06 |
-| KV cache, 512k tokens | 8.12 | 8.12 |
-| KV cache, 1M tokens | 16.25 | 16.25 |
-| **total at 256k / 512k / 1M** | **53.4 / 57.5 / 65.6** | **67.7 / 71.8 / 79.9** |
+| | Sushi-2.6bpw | Sushi-3bpw | Sushi-4bpw |
+|---|---|---|---|
+| model weights | 42.24 | 47.51 | 61.58 |
+| MTP head | 0.87 | 0.98 | 1.27 |
+| vision tower | 0.84 | 0.84 | 0.84 |
+| **weights loaded** | **43.95** | **49.33** | **63.68** |
+| KV cache, 256k tokens | 4.06 | 4.06 | 4.06 |
+| KV cache, 512k tokens | 8.12 | 8.12 | 8.12 |
+| KV cache, 1M tokens | 16.25 | 16.25 | 16.25 |
+| **total at 256k / 512k / 1M** | **48.0 / 52.1 / 60.2** | **53.4 / 57.5 / 65.6** | **67.7 / 71.8 / 79.9** |
 
 The KV cache is for one request at 8 bits with MTP on and `--mtp-head-kv-quant`: 16,640 bytes per token of context.
 Leave room for the hot prefix cache (`--prefix-cache-mem`) and the prefill buffers.
