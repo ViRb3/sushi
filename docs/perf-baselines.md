@@ -401,6 +401,8 @@ and 4-8% of a depth-3 verify; a matmul2d QSA prototype (branch `qsa-mpp-proto`) 
 ## MiMo
 
 MiMo speed for the shipped MiMo-V2.6-Flash-Sushi-2.25bpw pack will be recorded here after its v1.1 measurement.
+Its n36 experts reached the fast decode arms only with the rate-generic readers:
+[exl3-rate-generic](#exl3-rate-generic) (live decode 35 -> 61 tok/s with MTP).
 
 <a id="mimo-attn-kernels"></a>
 ### MiMo attention kernels (attention only: no expert pack in these timings)
@@ -482,3 +484,55 @@ Live, llmprobe `--bench-only`, no MTP, one boot per arm, `taskpolicy -a`, lock `
 | pack, flags | base | new | decode | prefill 2k |
 |---|---|---|---|---|
 | Flash-Next MCG K3, kv off, ctx 65536 | 61.8 recorded (28d7fab, `--full`) | this change on c4f3f7a (aff4f85) | 61.8 → 66.2 | 1763 → 1845 |
+
+<a id="exl3-rate-generic"></a>
+## EXL3 readers for every rate (Sushi-2.6bpw n42, MiMo Sushi-2.25bpw n36)
+
+Before this change, only n40 and n48 read through the lane funnel. Every other rate decoded through the generic window
+reader at one tile per threadgroup, including Sushi-2.6bpw (n42) and the shipped MiMo pack (n36). MiMo's prepared mid,
+grouped verify rows and GPU window metadata were also gated on n40. Every rate below K4 now takes the funnel
+([engine-exl3-experts](engine-exl3-experts.md#format-as-the-engine-sees-it)), and outputs are bit-identical.
+
+Setup: M5 Max 128 GB, 2026-09-27. Base 7ad2f407; new = this change (branch commit 49aad597); both ReleaseFast.
+`taskpolicy -a`, GPU lock `exl3-n42`, fans at max, box otherwise idle.
+
+Kernel microbench, us per step:
+- 47 chained steps; a copy kernel makes each step wait on the last, and every step draws fresh routing.
+- Arms interleaved in one process, median of 11, net of the copy-only chain.
+
+| geometry, kernel | rows 1 | rows 2 | rows 4 | rows 8 |
+|---|---|---|---|---|
+| Flash-Next n42 pair GEMV (E=512) | 55.8 → 34.6 | 103.5 → 58.3 | 198.9 → 110.7 | 389.1 → 213.1 |
+| Flash-Next n42 fused-mid down | 32.0 → 20.3 | 59.2 → 36.9 | 112.1 → 68.9 | 218.7 → 133.1 |
+| Flash-Next n42 MoE layer | 94.1 → 59.5 | 172.3 → 100.4 | 329.2 → 188.3 | 628.0 → 354.8 |
+| Flash-Next n48 pair GEMV, generic → funnel (reference) | 56.4 → 30.1 | 104.6 → 49.0 | 200.5 → 92.6 | 390.8 → 175.8 |
+| MiMo n36 MoE layer (E=256): base → funnel → + prepared mid, grouped | 342 → 157 → 146 | 662 → 295 → 276 | 1271 → 562 → 498 | 2437 → 1104 → 912 |
+
+- n42's lane reads a third word, so its funnel pair GEMV costs ~15% more per step than n48's, and its down ~12% more.
+- Prefill GEMM on NAX, per projection, one 2048-token chunk:
+  - Flash-Next n42 (20480 slots): 3336 → 2323 us.
+  - MiMo n36 (16384 slots): 10350 → 7611 us.
+  - The simdgroup-matrix body (NAX forced off) at n42: 7302 → 6858 us.
+
+Live runs:
+- Sushi-2.6bpw forward meter: `tests/fwd_ubench.sh`, A B B A, no MTP.
+- Sushi-2.6bpw llmprobe: one boot of the new binary against today's recorded 7ad2f407 cells.
+- MiMo: A B B A, forward meter at load, then a greedy 1024-token chat twice per boot.
+- All runs kv8.
+
+| pack, run | meter | 7ad2f407 | this change |
+|---|---|---|---|
+| Sushi-2.6bpw, no MTP | ms/forward, 1 row | 19.74 / 19.87 | 17.87 / 17.88 |
+| Sushi-2.6bpw, no MTP | ms/forward, verify 4 rows | 33.87 / 33.89 | 27.41 / 27.59 |
+| Sushi-2.6bpw, `--mtp`, ctx 131072, llmprobe `--bench-only --rungs 4k,16k,64k` | decode / prefill 2k, tok/s | 79.5 / 1492 | 93.9 / 1680 |
+| same | decode at 4k / 16k / 64k | 76.7 / 77.9 / 66.5 | 102.1 / 88.2 / 72.3 |
+| same, the 192-token decodes in the server log | round ms at tokens per round | 35.9 at 2.83 | 28.8 at 2.74 |
+| MiMo Sushi-2.25bpw, `--mtp`, ctx 131072 | ms/forward, 1 row / verify 4 rows | 28.93 / 74.33, 29.08 / 74.36 | 19.56 / 39.06, 19.59 / 39.13 |
+| same, greedy 1024-token chat | decode tok/s | 36.6 / 34.9, 35.1 / 34.4 | 62.8 / 60.7, 62.4 / 60.6 |
+| same | round ms at tokens per round | 49-83 at 2.05-2.55 | 39.2-39.8 at 2.30-2.48 |
+
+- Sushi-3bpw at the same llmprobe settings read 94.1 / 100.3 decode and 1660 / 1674 prefill today, so Sushi-2.6bpw
+  now matches it.
+- Residual n42 cost, same session, new binary, forward meter: 2.6bpw vs 3bpw read 17.93 vs 17.80 ms at 1 row, and
+  28.72 vs 27.04 ms at 4 verify rows.
+- Greedy 1024-token outputs are byte-identical across arms: MiMo 8/8, Sushi-2.6bpw 4/4.

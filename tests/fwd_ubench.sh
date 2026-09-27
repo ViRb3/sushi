@@ -22,7 +22,7 @@ SUSHI_DECODE_FWD_UBENCH="$ITERS" "$BIN" --model "$MODEL" --serve --port "$PORT" 
 SRV=$!
 
 for _ in $(seq 1 600); do
-  grep -qE "\[fwd-ubench\]" "$LOG" && break
+  grep -qE "\[fwd-ubench\] done" "$LOG" && break
   kill -0 "$SRV" 2>/dev/null || break
   sleep 1
 done

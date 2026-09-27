@@ -26,8 +26,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
   codeword is the 16-bit window ending at `((t+1)*n)>>4`, so its fresh bits follow from n and the pattern is never
   stored. Even n in [32, 64] admits; `expert_quant.k` may be fractional JSON.
 - **Every reader keys on n, never on an integer K** (`exl3.Rate`, kernel template `NHW`, cache keys,
-  `exl3ExpertBytes`); a K printed anywhere reads 2.25, not 36. The K4 fast branch is `n == 64`; the n=40 and n=48
-  readers use an eight-weight lane funnel (n=48 for every non-MUL1 codebook).
+  `exl3ExpertBytes`); a K printed anywhere reads 2.25, not 36.
+- **Every fast path serves every admitted n; a guard test enumerates them** (`every admitted rate takes the fast
+  arms`). The funnel readers take their word indices and shifts from n at compile time: eight weights span n/2 whole
+  bits, and 16 weights span n. Below n64 every codebook reads through them. n64 keeps its packed K4 branch, which does
+  the same reads at a word-aligned rate, one output tile per threadgroup:
+  - decode GEMV lane: 64 bits ending at the lane's last bit. A third word is read only when the first codeword can
+    start before the two words (every n from 42 to 62 but 48).
+  - simdgroup-matrix group: one or two 32-bit funnels, split at the widest weight whose first codeword still fits.
+  - NAX fragment: one funnel per quad of weights; above n50 a quad's codewords pass 32 bits, and the funnel reads 64
+    bits from three words.
 - **The window is a pack field** (`expert_quant.window`, absent = 16, 8..16 admitted): the codeword is masked to the
   window in the one helper every weight kernel inlines, and kernel slots are keyed by codebook AND window. A w16
   bitstream decodes to different weights at every other window, so a window can never come from a flag.
@@ -56,21 +64,24 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
 - **Prefill off NAX** (M1–M4, or NAX declined): the 8x8 `simdgroup_matrix` body computes D = W^T X^T so each lane's
   eight-weight slot group lands straight in its A fragments (the tile layout is the MMA fragment layout). f16 x and
   128-multiple widths only; anything else takes the scalar body. Not byte-identical to the scalar body (sum order).
-- K2.25 (`n36`, including MiMo MCG w12) reads each eight-weight group through one 32-bit funnel; codewords and
-  decoded weights equal the generic reader's, with no change to the GEMM accumulation order.
+- The funnel readers' codewords and decoded weights equal the host tile decode's at every n, so the GEMM
+  accumulation order and output bytes are unchanged (n32..36 read a group through one funnel, wider rates two).
 - **Its block count is compile-time** (`(WIN+7)/8`), never the run's: a data-dependent bound over the
   `simdgroup_matrix` arrays spilled them, 2.6x slower. Short runs pay the padding and still win
   ([perf-baselines](perf-baselines.md#m2max-64gb)).
 - **Decode**: four dispatches per MoE layer — pair prepare, split-K pair GEMV with f32 inner planes, fused mid+down
   GEMV, f32 finish reduce (`moeSwigluFused`; top-k ≤ 32, named refusal above). On MiMo geometry the pair prepare is
   fused into the pair GEMV and the SwiGLU mid is prepared once per (row, expert) (`preparedMidOn`, disabled for
-  Qwen). Rows ≤ `DECODE_ROWS_MAX` or verify rows take this chain; wider takes `moePrefill`. The MTP head's MoE rows
-  ride the decode chain and refuse wider (`Exl3MtpRowsExceedDecode`).
+  Qwen; like `mimoPrefillOn` it keys on geometry, never on the rate). Rows ≤ `DECODE_ROWS_MAX` or verify rows take
+  this chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider
+  (`Exl3MtpRowsExceedDecode`).
 - **The decode GEMVs are bound by fixed per-tile work, not DRAM** (64-bit index math, two word loads and a 64-bit
-  shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: n40, n48 off MUL1) carry two output
+  shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: every n below 64) carry two output
   tiles per threadgroup, load both k-tiles of an iteration before decoding, and bump pointers; the per-tile
   accumulation order is unchanged, so the bytes equal the one-tile generic reader's (`FUNNEL=0`, the test's
   reference). A layout that changes which simdgroup sums which k-tile (8 simdgroups) is NOT bit-identical.
+- A rate on the generic reader decodes ~40% slower per GEMV than on the funnel, with no other symptom. The engagement
+  line `[exl3] n<n> funnel engaged arm=<arm>` names the rate and arm in a live log.
 - **MiMo verify rows share an expert's weight reads** (`PAIR_GEMV_GROUPED_SOURCE`, `DOWN_PREPARED_GROUPED_SOURCE`;
   prepared-mid geometry, 2+ rows): among an expert's slots, each even-ranked slot leads itself and the next one,
   decodes each weight once and feeds both members in the single-slot order, so every row's bytes are its one-row
