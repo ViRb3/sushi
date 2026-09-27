@@ -179,6 +179,12 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     the bf16 output, state and capture buffers of sushi's own chain and carry
     each stored capture state to the next token as sushi's capture kernel does;
     the Hadamard norm-gate-rotate kernel is not ported.
+  * The fused QSA pooled-key kernel (`sushi_qsa_pool_rope`,
+    `qsaPoolNormRopeFused` in `src/transformer.zig`): the indexer's block mean,
+    key RMSNorm and partial RoPE in one dispatch, bit-identical to the MLX op
+    chain it replaces, from mlx-serve #556 by Samuel Reed (@STRML).
+    Modifications: no environment switch; a microbenchmark arm compares it
+    with the chain.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)

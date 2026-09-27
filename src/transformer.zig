@@ -22521,6 +22521,56 @@ pub const Transformer = struct {
         return cs;
     }
 
+    /// Pooled block keys `[B, nb, D]` from raw index keys `kb4 [B, nb, ratio, D]`: f32 block mean,
+    /// bf16, idx_k_norm, then partial RoPE at the block starts `base + i*ratio`. Text turns take
+    /// one fused kernel, bit-identical to the chain; M-RoPE and other shapes keep the chain.
+    fn qsaPooledKeys(self: *Transformer, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
+        const sh = mlx.getShape(kb4);
+        if (ctx.mrope_pos == null and qsaPoolRopeFusedEnabled() and mlx.mlx_array_dtype(norm_w) == .bfloat16) {
+            const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], .bfloat16);
+            if (try qsaPoolNormRopeFused(self.s, kb4, norm_w, self.config.rms_norm_eps, cs.cos, cs.sin, rope_dims)) |out| return out;
+        }
+        const pn = try self.qsaPoolNorm(kb4, norm_w);
+        defer _ = mlx.mlx_array_free(pn);
+        const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], mlx.mlx_array_dtype(pn));
+        if (ctx.mrope_pos == null) return self.qsaPooledRopeComposed(pn, rope_dims, cs.cos, cs.sin);
+        var pn4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pn4);
+        try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
+        const roped = try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims);
+        defer _ = mlx.mlx_array_free(roped);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&out, roped, &[_]c_int{ sh[0], sh[1], sh[3] }, 3, self.s));
+        return out;
+    }
+
+    /// `rms_norm(bf16(mean_f32(kb4, axis 2)), w)` → `[B, nb, D]`.
+    fn qsaPoolNorm(self: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array) !mlx.mlx_array {
+        var kb_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kb_f32);
+        try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
+        var pooled_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled_f32);
+        try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
+        var pooled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled);
+        try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
+        return self.rmsNorm(pooled, norm_w);
+    }
+
+    /// Scalar partial RoPE of the normed pooled keys `pn [B, nb, D]`, row i at cos/sin row i.
+    fn qsaPooledRopeComposed(self: *Transformer, pn: mlx.mlx_array, rope_dims: c_int, cosv: mlx.mlx_array, sinv: mlx.mlx_array) !mlx.mlx_array {
+        const sh = mlx.getShape(pn);
+        var pn4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pn4);
+        try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
+        const roped = try self.ropeApplyCosSin(pn4, rope_dims, cosv, sinv);
+        defer _ = mlx.mlx_array_free(roped);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&out, roped, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, self.s));
+        return out;
+    }
+
     /// QSA: append this chunk's raw index keys to the layer's history and,
     /// past the token budget, build the block-selection mask. Returns the
     /// bool `[B,1,S,kv]` mask or null-ctx for dense attention.
@@ -22685,29 +22735,8 @@ pub const Transformer = struct {
             var kb4 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(kb4);
             try mlx.check(mlx.mlx_reshape(&kb4, kb_flat, &kb_shape, 4, self.s));
-            var kb_f32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(kb_f32);
-            try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
-            var pooled_f32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pooled_f32);
-            try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
-            var pooled = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pooled);
-            try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
-            const pn = try self.rmsNorm(pooled, fa.idx_k_norm);
-            defer _ = mlx.mlx_array_free(pn);
-            var pn4 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pn4);
-            try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
-            const cs = try self.qsaPooledCosSin(ctx, rope_dims, pos_base + nb_cached * ratio, ratio, n_new, mlx.mlx_array_dtype(pn4));
-            const new_rope = if (ctx.mrope_pos != null)
-                try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims)
-            else
-                try self.ropeApplyCosSin(pn4, rope_dims, cs.cos, cs.sin);
-            defer _ = mlx.mlx_array_free(new_rope);
-            var new3 = mlx.mlx_array_new();
+            const new3 = try self.qsaPooledKeys(ctx, kb4, fa.idx_k_norm, rope_dims, pos_base + nb_cached * ratio);
             defer _ = mlx.mlx_array_free(new3);
-            try mlx.check(mlx.mlx_reshape(&new3, new_rope, &[_]c_int{ batch, n_new, idx_hd }, 3, self.s));
             try self.qsaAppendPooled(entry, new3, nb_cached);
         }
 
@@ -35903,6 +35932,149 @@ pub fn gdnNormGateFused(
     if (!gdn_normgate_engaged) {
         gdn_normgate_engaged = true;
         log.info("[gdn] fused norm-gate engaged: Hv={d} S={d} gate={s}\n", .{ hv, seq, if (swish) "swish" else "sigmoid" });
+    }
+    return out;
+}
+
+// ── Fused QSA pooled-key upkeep ──
+
+/// Arm seam for the parity tests and the fwd-ubench A/B: false runs the composed chain.
+pub var qsa_pool_rope_fused_override: ?bool = null;
+/// Fused launches since the fwd-ubench last zeroed it: an A/B arm's proof of engagement.
+pub var qsa_pool_rope_dispatches: usize = 0;
+/// Config builds whose template args changed; each new tuple is a pipeline compile.
+var qsa_pool_rope_tpl_switches: usize = 0;
+
+fn qsaPoolRopeFusedEnabled() bool {
+    return qsa_pool_rope_fused_override orelse true;
+}
+
+// Ported from upstream mlx-serve #556 (Samuel Reed). Mirrors each rounding of the composed chain:
+//   mean = f32 sum in row order r = 0..R-1 times f32(1/R), then bf16 (MLX's order only while
+//          R <= QSA_POOL_SERIAL_MAX_R);
+//   norm = `rms_single_row` at D = 128: 32 lanes x 4 reads, simd_sum, precise rsqrt, w * T(x * inv);
+//   rope = the bf16 cos/sin table, bf16(bf16(x*cos) + bf16(rot*sin)) as MLX's binary kernels round.
+// One simdgroup per pooled row; lane l owns dims 4l..4l+3, so rotate_half's partner (d +- HALF) is
+// HALF/4 lanes away. The block count `nblk` varies per call and rides an INPUT.
+const QSA_POOL_ROPE_SOURCE =
+    \\uint lane = thread_position_in_threadgroup.x;
+    \\uint row = threadgroup_position_in_grid.y;
+    \\uint blk = row % uint(nblk);
+    \\uint kbase = row * uint(R * 128) + lane * 4;
+    \\float xs[4];
+    \\float sumsq = 0.0f;
+    \\for (uint j = 0; j < 4; ++j) {
+    \\    float acc = 0.0f;
+    \\    for (uint r = 0; r < uint(R); ++r) acc = float(kb[kbase + r * 128 + j]) + acc;
+    \\    const T pooled = T(acc * inv_r);
+    \\    xs[j] = float(pooled);
+    \\    sumsq += xs[j] * xs[j];
+    \\}
+    \\sumsq = simd_sum(sumsq);
+    \\float inv = metal::precise::rsqrt(sumsq / 128.0f + eps);
+    \\for (uint j = 0; j < 4; ++j) {
+    \\    const T nv = norm_w[lane * 4 + j] * T(xs[j] * inv);
+    \\    const float nf = float(nv);
+    \\    const float up = simd_shuffle_down(nf, ushort(HALF / 4));
+    \\    const float dn = simd_shuffle_up(nf, ushort(HALF / 4));
+    \\    uint d = lane * 4 + j;
+    \\    T o = nv;
+    \\    if (d < uint(RD)) {
+    \\        const T rot = d < uint(HALF) ? T(-up) : T(dn);
+    \\        const T a = T(nf * float(cosv[blk * RD + d]));
+    \\        const T b = T(float(rot) * float(sinv[blk * RD + d]));
+    \\        o = T(float(a) + float(b));
+    \\    }
+    \\    out[row * 128 + d] = o;
+    \\}
+;
+
+/// Largest block ratio whose f32 block sum MLX folds in row order 0..R-1. The mean over axis 2 of
+/// `[B, nb, R, 128]` is `col_reduce_small` with threadgroup_y = min(8, R): up to 8 rows each y-thread
+/// owns one row and lid.y 0 folds them in order; past 8 threads pre-sum rows y, y+8, ... or trees.
+const QSA_POOL_SERIAL_MAX_R: c_int = 8;
+
+var qsa_pool_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var qsa_pool_rope_engaged: bool = false;
+const QsaPoolRopeCfgKey = struct { tpl: [3]c_int, b: c_int, nb: c_int };
+var qsa_pool_rope_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var qsa_pool_rope_cfg_key: QsaPoolRopeCfgKey = std.mem.zeroes(QsaPoolRopeCfgKey);
+
+fn getQsaPoolRopeKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_pool_rope_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "kb", "norm_w", "cosv", "sinv", "eps", "inv_r", "nblk" };
+    const output_names = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("sushi_qsa_pool_rope", in_vec, out_vec, QSA_POOL_ROPE_SOURCE, "", true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_pool_rope_kernel = kernel;
+    return kernel;
+}
+
+/// Pooled block keys in one launch: f32 block mean, bf16, rms_norm(w), then partial RoPE with the
+/// bf16 cos/sin table `[nb, rope_dims]`. Null → the caller runs `qsaPoolNorm` + `qsaPooledRopeComposed`.
+pub fn qsaPoolNormRopeFused(
+    s: mlx.mlx_stream,
+    kb4: mlx.mlx_array, // [B, nb, R, D] bf16
+    norm_w: mlx.mlx_array, // [D] bf16
+    eps: f32,
+    cosv: mlx.mlx_array, // [nb, rope_dims] bf16
+    sinv: mlx.mlx_array,
+    rope_dims: c_int,
+) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const ksh = mlx.getShape(kb4);
+    const wsh = mlx.getShape(norm_w);
+    const csh = mlx.getShape(cosv);
+    if (ksh.len != 4 or ksh[3] != 128 or ksh[1] < 1 or ksh[2] < 1 or ksh[2] > QSA_POOL_SERIAL_MAX_R) return null;
+    if (wsh.len != 1 or wsh[0] != 128) return null;
+    // rotate_half's partner must sit whole lanes away: HALF a multiple of 4.
+    if (rope_dims <= 0 or rope_dims > 128 or @mod(rope_dims, 8) != 0) return null;
+    if (csh.len != 2 or csh[0] != ksh[1] or csh[1] != rope_dims) return null;
+    if (!std.mem.eql(c_int, csh, mlx.getShape(sinv))) return null;
+    inline for (.{ kb4, norm_w, cosv, sinv }) |arr| {
+        if (mlx.mlx_array_dtype(arr) != .bfloat16) return null;
+    }
+    const key = QsaPoolRopeCfgKey{ .tpl = .{ ksh[2], rope_dims, @divExact(rope_dims, 2) }, .b = ksh[0], .nb = ksh[1] };
+    if (qsa_pool_rope_cfg == null or !std.meta.eql(qsa_pool_rope_cfg_key, key)) {
+        if (qsa_pool_rope_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qsa_pool_rope_cfg = null;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const out_shape = [_]c_int{ ksh[0], ksh[1], 128 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, ksh[0] * ksh[1], 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+        for ([_][*:0]const u8{ "R", "RD", "HALF" }, key.tpl) |n, v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, n, v));
+        if (!std.meta.eql(qsa_pool_rope_cfg_key.tpl, key.tpl)) qsa_pool_rope_tpl_switches += 1;
+        qsa_pool_rope_cfg = config;
+        qsa_pool_rope_cfg_key = key;
+    }
+    const kernel = try getQsaPoolRopeKernel();
+    const eps_a = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_a);
+    // MLX's mean multiplies by NumberOfElements: f32(1.0 / n) computed in f64.
+    const inv_r = mlx.mlx_array_new_float(@floatCast(1.0 / @as(f64, @floatFromInt(ksh[2]))));
+    defer _ = mlx.mlx_array_free(inv_r);
+    const nblk = mlx.mlx_array_new_int(ksh[1]);
+    defer _ = mlx.mlx_array_free(nblk);
+    const inputs_arr = [_]mlx.mlx_array{ kb4, norm_w, cosv, sinv, eps_a, inv_r, nblk };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_pool_rope_cfg.?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    qsa_pool_rope_dispatches += 1;
+    if (!qsa_pool_rope_engaged) {
+        qsa_pool_rope_engaged = true;
+        log.info("[qsa] fused pooled-key upkeep engaged (blocks={d} ratio={d} rope={d})\n", .{ ksh[1], ksh[2], rope_dims });
     }
     return out;
 }
@@ -64584,6 +64756,339 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     try testing.expect(t.qsa_pooled_rope.stale.load(.acquire));
     _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+}
+
+// ── The fused QSA pooled-key kernel against the composed chain ──
+
+/// Elements whose bits differ; bf16 and f16 widen to f32 exactly, so ±0 and NaN payloads count.
+fn qsaPoolBitMismatches(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !usize {
+    try testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    try testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    var ac = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ac);
+    var bc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bc);
+    try mlx.check(mlx.mlx_contiguous(&ac, a, false, s));
+    try mlx.check(mlx.mlx_contiguous(&bc, b, false, s));
+    const ah = try qwen4ReadF32(testing.allocator, ac, s);
+    defer testing.allocator.free(ah);
+    const bh = try qwen4ReadF32(testing.allocator, bc, s);
+    defer testing.allocator.free(bh);
+    var bad: usize = 0;
+    for (ah, bh) |x, y| bad += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(y)));
+    return bad;
+}
+
+/// Raw index keys `[B, nb, ratio, 128]` with magnitudes spread over 10^lo..10^hi and random signs.
+fn qsaPoolTestKeys(rnd: std.Random, b: c_int, nb: c_int, ratio: c_int, lo_exp: f32, hi_exp: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = [_]c_int{ b, nb, ratio, 128 };
+    const data = try testing.allocator.alloc(f32, @intCast(b * nb * ratio * 128));
+    defer testing.allocator.free(data);
+    for (data) |*x| {
+        const mag = std.math.pow(f32, 10.0, lo_exp + (hi_exp - lo_exp) * rnd.float(f32));
+        x.* = if (rnd.boolean()) mag else -mag;
+    }
+    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f, dt, s));
+    return out;
+}
+
+/// Keys `[1, nb, ratio, 128]` whose f32 block sums depend on the add order: even columns hold
+/// 2^24, -2^24 half a block later and 1s, rotated per column and block; odd columns are noise.
+fn qsaPoolCancelKeys(rnd: std.Random, nb: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const r: usize = @intCast(ratio);
+    const data = try testing.allocator.alloc(f32, @as(usize, @intCast(nb)) * r * 128);
+    defer testing.allocator.free(data);
+    for (0..@intCast(nb)) |b| for (0..128) |c| for (0..r) |row| {
+        const at = (b * r + row) * 128 + c;
+        const p = (row + c / 2 + b) % r;
+        data[at] = if (c % 2 == 1) rnd.float(f32) - 0.5 else if (r > 1 and p == 0) 16777216.0 else if (r > 1 and p == r / 2) -16777216.0 else 1.0;
+    };
+    const shape = [_]c_int{ 1, nb, ratio, 128 };
+    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
+    return out;
+}
+
+/// The served Flash-Next indexer: 4 x 128 index heads, ratio 4, rope theta 1e7 on 64 of 256 dims,
+/// and (`yarn`) the packs' YaRN x4 over 262144 with its bf16 mscale on the cos/sin table.
+const QsaPoolTestTrunk = struct {
+    t: Transformer,
+    inv: [32]f64,
+    freqs: mlx.mlx_array,
+
+    fn init(self: *QsaPoolTestTrunk, s: mlx.mlx_stream, yarn: bool) void {
+        const t = &self.t;
+        t.s = s;
+        t.allocator = testing.allocator;
+        t.config = .{};
+        t.config.head_dim = 256;
+        t.config.partial_rotary_factor = 0.25;
+        t.config.rope_theta = 10_000_000.0;
+        t.config.rms_norm_eps = 1e-6;
+        t.config.indexer_n_heads = 4;
+        t.config.indexer_head_dim = 128;
+        t.config.indexer_compress_ratio = 4;
+        t.config.indexer_budget = 1 << 30; // pool only: never reach the selection
+        t.rope_freqs_yarn = null;
+        t.yarn_inv_freq = null;
+        t.fwd_gen = 0;
+        t.qsa_pooled_rope = .{};
+        self.freqs = .{ .ctx = null };
+        if (!yarn) return;
+        t.config.rope_yarn = true;
+        t.config.yarn_factor = 4.0;
+        t.config.yarn_orig_max_pos = 262_144;
+        t.config.yarn_attention_factor = 0.1 * @log(@as(f32, 4.0)) + 1.0;
+        yarnSpec(&t.config).invFreq(&self.inv);
+        var den: [32]f32 = undefined;
+        for (self.inv, 0..) |v, i| den[i] = @floatCast(1.0 / v);
+        self.freqs = mlx.mlx_array_new_data(&den, &[_]c_int{32}, 1, .float32);
+        t.rope_freqs_yarn = self.freqs;
+        t.yarn_inv_freq = &self.inv;
+    }
+
+    fn deinit(self: *QsaPoolTestTrunk) void {
+        self.t.qsa_pooled_rope.deinit();
+        if (self.freqs.ctx != null) _ = mlx.mlx_array_free(self.freqs);
+    }
+
+    /// The indexer's table for `nb` blocks from `base`, as `qsaPooledCosSin` builds it on a text turn.
+    fn cosSin(self: *QsaPoolTestTrunk, base: c_int, ratio: c_int, nb: c_int) !Transformer.MropeCosSin {
+        const t = &self.t;
+        return t.ropeCosSinFromFreqs(64, try t.ropeInvFreq(64, t.config.rope_theta), @floatFromInt(base), @floatFromInt(ratio), nb, .bfloat16);
+    }
+
+    /// Fused vs composed pooled keys for one block batch at `base`: the bit-mismatch count.
+    fn case(self: *QsaPoolTestTrunk, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, base: c_int) !usize {
+        const t = &self.t;
+        const sh = mlx.getShape(kb4);
+        const cs = try self.cosSin(base, sh[2], sh[1]);
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        const pn = try t.qsaPoolNorm(kb4, norm_w);
+        defer _ = mlx.mlx_array_free(pn);
+        const want = try t.qsaPooledRopeComposed(pn, 64, cs.cos, cs.sin);
+        defer _ = mlx.mlx_array_free(want);
+        const got = (try qsaPoolNormRopeFused(t.s, kb4, norm_w, t.config.rms_norm_eps, cs.cos, cs.sin, 64)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expect(qsaProbeAllFinite(t.s, want));
+        return qsaPoolBitMismatches(want, got, t.s);
+    }
+};
+
+// Bar: bit-identical at every block count, rope position, table and key range the indexer hands it.
+test "qsa pooled keys: the fused kernel is bit-identical to the composed chain at the served geometry" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x1D8_0BE5);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    // { batch, blocks, base position, lo exp, hi exp }
+    const cases = [_][5]f32{
+        .{ 1, 1, 0, -1, 0.5 }, // first block: cos 1, sin 0
+        .{ 1, 1, 2052, -1, 0.5 }, // decode just past the budget
+        .{ 1, 2, 16000, -1, 0.5 }, // a 5-row verify completing two blocks
+        .{ 1, 1, 262_148, -1, 0.5 }, // past YaRN's original window
+        .{ 1, 1, 1_000_000, -1, 0.5 }, // 1M context
+        .{ 1, 512, 0, -1, 0.5 }, // a 2048-token prefill chunk
+        .{ 1, 37, 8196, -3, 4 }, // wide range: the f32 block sums round
+        .{ 2, 5, 4096, -1, 0.5 }, // two rows
+    };
+    for ([_]bool{ true, false }) |yarn| {
+        var tr: QsaPoolTestTrunk = undefined;
+        tr.init(s, yarn);
+        defer tr.deinit();
+        for (cases) |c| {
+            const kb4 = try qsaPoolTestKeys(rnd, @intFromFloat(c[0]), @intFromFloat(c[1]), 4, c[3], c[4], .bfloat16, s);
+            defer _ = mlx.mlx_array_free(kb4);
+            try testing.expectEqual(@as(usize, 0), try tr.case(kb4, norm_w, @intFromFloat(c[2])));
+        }
+    }
+}
+
+// Bar: a strided view of the indexer projection (the live k_raw slice) reads the same bits as a packed array.
+test "qsa pooled keys: the fused kernel reads a strided raw-key view bit-identically" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tr: QsaPoolTestTrunk = undefined;
+    tr.init(s, true);
+    defer tr.deinit();
+    var prng = std.Random.DefaultPrng.init(0x5171_DE);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const qk = try attn256RandBf16(rnd, &[_]c_int{ 1, 12, 5 * 128 }, s);
+    defer _ = mlx.mlx_array_free(qk);
+    var k_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_raw);
+    try mlx.check(mlx.mlx_slice(&k_raw, qk, &[_]c_int{ 0, 0, 4 * 128 }, 3, &[_]c_int{ 1, 12, 5 * 128 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    var kb4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kb4);
+    try mlx.check(mlx.mlx_reshape(&kb4, k_raw, &[_]c_int{ 1, 3, 4, 128 }, 4, s));
+    try testing.expectEqual(@as(usize, 0), try tr.case(kb4, norm_w, 2048));
+}
+
+// Bar: the kernel sums rows 0..R-1 in order, MLX's order while R <= 8; past 8 it declines.
+test "qsa pooled keys: order-sensitive block sums match at ratios 1..8, and larger ratios decline" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tr: QsaPoolTestTrunk = undefined;
+    tr.init(s, true);
+    defer tr.deinit();
+    var prng = std.Random.DefaultPrng.init(0xCA2CE1);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    for ([_]c_int{ 1, 2, 3, 4, 8 }) |ratio| {
+        const kb4 = try qsaPoolCancelKeys(rnd, 9, ratio, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        try testing.expectEqual(@as(usize, 0), try tr.case(kb4, norm_w, 4096));
+        const wide = try qsaPoolTestKeys(rnd, 1, 5, ratio, -3, 4, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(wide);
+        try testing.expectEqual(@as(usize, 0), try tr.case(wide, norm_w, 8192));
+    }
+    for ([_]c_int{ 9, 16, 32 }) |ratio| {
+        const kb4 = try qsaPoolCancelKeys(rnd, 3, ratio, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        const cs = try tr.cosSin(4096, ratio, 3);
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        try testing.expect((try qsaPoolNormRopeFused(s, kb4, norm_w, 1e-6, cs.cos, cs.sin, 64)) == null);
+    }
+}
+
+// Bar: only the shapes and dtypes the kernel mirrors engage; everything else keeps the chain.
+test "qsa pooled keys: f16 and f32 operands, other head and rope widths, and a CPU stream decline" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tr: QsaPoolTestTrunk = undefined;
+    tr.init(s, true);
+    defer tr.deinit();
+    var prng = std.Random.DefaultPrng.init(0xDEC1);
+    const rnd = prng.random();
+    const cs = try tr.cosSin(0, 4, 1);
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    const kb4 = try qsaPoolTestKeys(rnd, 1, 1, 4, -1, 0.5, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(kb4);
+    const w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(w);
+    const got = (try qsaPoolNormRopeFused(s, kb4, w, 1e-6, cs.cos, cs.sin, 64)) orelse return error.FusedDeclined;
+    _ = mlx.mlx_array_free(got);
+
+    inline for (.{ .float16, .float32 }) |dt| {
+        const kb_dt = try qsaPoolTestKeys(rnd, 1, 1, 4, -1, 0.5, dt, s);
+        defer _ = mlx.mlx_array_free(kb_dt);
+        var w_dt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w_dt);
+        try mlx.check(mlx.mlx_astype(&w_dt, w, dt, s));
+        var cos_dt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cos_dt);
+        try mlx.check(mlx.mlx_astype(&cos_dt, cs.cos, dt, s));
+        var sin_dt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sin_dt);
+        try mlx.check(mlx.mlx_astype(&sin_dt, cs.sin, dt, s));
+        try testing.expect((try qsaPoolNormRopeFused(s, kb_dt, w, 1e-6, cs.cos, cs.sin, 64)) == null);
+        try testing.expect((try qsaPoolNormRopeFused(s, kb4, w_dt, 1e-6, cs.cos, cs.sin, 64)) == null);
+        try testing.expect((try qsaPoolNormRopeFused(s, kb4, w, 1e-6, cos_dt, sin_dt, 64)) == null);
+        try testing.expect((try qsaPoolNormRopeFused(s, kb_dt, w_dt, 1e-6, cos_dt, sin_dt, 64)) == null);
+    }
+
+    const kb64 = try attn256RandBf16(rnd, &[_]c_int{ 1, 1, 4, 64 }, s);
+    defer _ = mlx.mlx_array_free(kb64);
+    const w64 = try testRandUniformBf16(rnd, &[_]c_int{64}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(w64);
+    try testing.expect((try qsaPoolNormRopeFused(s, kb64, w64, 1e-6, cs.cos, cs.sin, 64)) == null);
+    var cos60 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cos60);
+    try mlx.check(mlx.mlx_slice(&cos60, cs.cos, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 1, 60 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    try testing.expect((try qsaPoolNormRopeFused(s, kb4, w, 1e-6, cos60, cos60, 60)) == null);
+
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const switches = qsa_pool_rope_tpl_switches;
+    try testing.expect((try qsaPoolNormRopeFused(cpu, kb4, w, 1e-6, cs.cos, cs.sin, 64)) == null);
+    try testing.expectEqual(switches, qsa_pool_rope_tpl_switches);
+}
+
+// Bar: the block count is a runtime input, so decode (1), verify (2) and prefill (512) share ONE pipeline.
+test "qsa pooled keys: block counts 1, 2, 7 and 512 share one fused pipeline" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tr: QsaPoolTestTrunk = undefined;
+    tr.init(s, true);
+    defer tr.deinit();
+    var prng = std.Random.DefaultPrng.init(0x919E);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    var after_first: ?usize = null;
+    for ([_]c_int{ 1, 2, 7, 512, 1 }) |nb| {
+        const kb4 = try qsaPoolTestKeys(rnd, 1, nb, 4, -1, 0.5, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        try testing.expectEqual(@as(usize, 0), try tr.case(kb4, norm_w, 4096));
+        if (after_first == null) after_first = qsa_pool_rope_tpl_switches;
+        try testing.expectEqual(after_first.?, qsa_pool_rope_tpl_switches);
+    }
+}
+
+// Bar: the indexer's own upkeep (ring tails joined to the new rows, block-aligned strided views,
+// rope bases at `pos_base + nb_cached*ratio`) leaves the same pooled bank with the kernel on or off.
+test "qsa pooled keys: the pooled bank after prefill, decode and verify is bit-identical with the kernel on and off" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    defer qsa_pool_rope_fused_override = null;
+    var tr: QsaPoolTestTrunk = undefined;
+    tr.init(s, true);
+    defer tr.deinit();
+    var prng = std.Random.DefaultPrng.init(0xB4_2CE);
+    const rnd = prng.random();
+    const none: mlx.mlx_array = .{ .ctx = null };
+    var fa: FullAttnWeights = .{ .q_w = none, .q_s = none, .q_b = none, .k_w = none, .k_s = none, .k_b = none, .v_w = none, .v_s = none, .v_b = none, .o_w = none, .o_s = none, .o_b = none, .q_norm = none, .k_norm = none };
+    fa.idx_k_norm = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(fa.idx_k_norm);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    // A 37-row prefill leaves a 1-row tail; 36 is block-aligned, so its later 4-row verifies read strided views.
+    const widths = [_][]const c_int{ &.{ 37, 1, 1, 1, 3, 3, 3, 5, 5, 5, 5, 1, 2 }, &.{ 36, 4, 4, 1, 1, 1, 1, 5, 3, 3, 5, 4 } };
+    for ([_]c_int{ 0, 262_101, 999_937 }) |pos_base| for (widths) |seq| {
+        var arms: [2]SSMCacheEntry = @splat(.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true });
+        defer for (&arms) |*e| ssmFreeQsaState(e);
+        const launched = qsa_pool_rope_dispatches;
+        var offset: c_int = 0;
+        for (seq) |w| {
+            const qk = try qsaPoolTestKeys(rnd, 1, 1, w, -1, 0.5, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(qk);
+            var qk3 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(qk3);
+            const wide = try attn256RandBf16(rnd, &[_]c_int{ 1, w, 4 * 128 }, s);
+            defer _ = mlx.mlx_array_free(wide);
+            var raw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(raw);
+            try mlx.check(mlx.mlx_reshape(&raw, qk, &[_]c_int{ 1, w, 128 }, 3, s));
+            const parts = [_]mlx.mlx_array{ wide, raw };
+            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&qk3, vec, 2, s));
+            for (&arms, [_]bool{ true, false }) |*e, fused| {
+                qsa_pool_rope_fused_override = fused;
+                const m = try tr.t.qsaMaskFromQk(&ctx, qk3, &fa, e, offset, pos_base, 1, w, 0);
+                if (m.ctx != null) _ = mlx.mlx_array_free(m);
+            }
+            offset += w;
+        }
+        try testing.expect(qsa_pool_rope_dispatches > launched);
+        try testing.expectEqual(@as(c_int, @divTrunc(offset, 4)), mlx.getShape(arms[0].qsa_pooled)[1]);
+        try testing.expectEqual(@as(usize, 0), try qsaPoolBitMismatches(arms[0].qsa_pooled, arms[1].qsa_pooled, s));
+    };
 }
 
 // ── The QSA all-visible identity skip at the engagement boundary ──

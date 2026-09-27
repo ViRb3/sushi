@@ -41,6 +41,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   hd 256 + gqa 12 + q_len ≥ 16; bar = per-element error vs float64 no worse than stock,
   `tests/qsa_nax_precision.py`, never bytes). The packed NAX variant joins the NAX probe.
 - One effective YaRN mscale on every indexer arm; the indexer ropes with the SAME M-RoPE table as attention.
+- The pooled block keys are ONE kernel (`sushi_qsa_pool_rope`, from mlx-serve #556): block mean, key norm and
+  partial RoPE, bit-identical to the MLX chain. It serves text turns, bf16, 128-wide keys and ratios up to 8; M-RoPE
+  turns and other shapes keep the chain. No env lever; `SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS=1` is its A/B
+  ([perf-baselines](perf-baselines.md#qsa-pool-rope)).
 
 ## Indexer history
 

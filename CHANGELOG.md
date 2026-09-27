@@ -16,6 +16,8 @@ earlier history is mlx-serve's, in that project's changelog.
   draft tokens instead of once per token, on the M5 as on earlier Macs, with identical output.
 - **Faster Flash-Next decode**: each linear-attention layer now decodes and verifies MTP drafts in two GPU dispatches
   instead of three, about 2% faster decode on an M5 Max with identical output (ported from mlx-serve #517).
+- **Leaner Flash-Next decoding**: the sparse-attention indexer updates its block keys in one GPU kernel instead of a
+  chain of about ten, and the output is token-for-token the same.
 
 ---
 

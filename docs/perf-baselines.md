@@ -223,6 +223,37 @@ forward, mean over boots:
 - Identity: those 6 prompts serial and at forced depth 3, A == B 12/12 and MTP == serial 6/6 per arm;
   `test_mtp_equivalence.sh` 18/18 on B, lookup rounds engaged on its copy task.
 
+<a id="qsa-pool-rope"></a>
+## Flash-Next: QSA pooled-key upkeep in one kernel (ad5e6be8 vs the port)
+
+A = ad5e6be8 (sha256 bb649a00…), B = ad5e6be8 + the port (8785d33b before the squash, sha256 15ffa4be…), ReleaseFast.
+M5 Max 128 GB, 2026-09-27, Sushi-3bpw, kv8, `--mtp`, `SUSHI_ROUND_COST_PERSIST=0`, MTP prompt lookup on in both arms,
+`taskpolicy -a`, GPU lock `qsa-pool-ab` per boot, fans at max per boot with 10 s idle (3 min before greedy B, which
+followed a KLD run at 90.6 °C) and restored to auto after; load 1.9-3.5 with other workers' builds beside.
+
+Decode meter on B, the composed chain and the kernel alternated A B B A per width in one process
+(`SUSHI_DECODE_FWD_UBENCH=48 _S=1,3,5,1,3,5 _QSA_POOL_ARMS=1`, ctx 131072), one boot per length, two rounds per
+width; the context grows ~7.3k keys over a boot. ms per forward:
+
+| keys prefilled | rows | chain | kernel | delta | per round | graph ops |
+|---|---|---|---|---|---|---|
+| 16384 | 1 | 18.21 | 18.03 | -1.0% | -0.2, -1.8 | 4055 -> 4013 |
+| 16384 | 3 | 26.65 | 26.72 | +0.3% | +2.1, -1.5 | 4490 -> 4364 |
+| 16384 | 5 | 37.04 | 36.88 | -0.4% | +0.2, -1.0 | 4938 -> 4774 |
+| 65536 | 1 | 18.88 | 18.55 | -1.7% | -1.4, -2.1 | 4055 -> 4013 |
+| 65536 | 3 | 27.27 | 27.17 | -0.4% | +0.4, -1.1 | 4490 -> 4364 |
+| 65536 | 5 | 37.90 | 37.25 | -1.7% | -1.0, -2.4 | 4939 -> 4774 |
+
+- 9 of 12 rounds favour the kernel. The 65536-key 1- and 5-row cells agree in both rounds (-0.33 and -0.65 ms, all
+  GPU eval); the 16384-key cells sit inside the chain arm's own block-to-block spread (0.6-1.9 ms). CPU graph build
+  moves under 0.04 ms. The kernel launched 300-1224 times per fused block, 0 per chain block.
+- Identity: 6 prompts of 3.1-21k tokens x 256 tokens, serial and at forced depth 3, A == B 12/12, MTP == serial 6/6
+  per arm, identical per-request acceptance (prompt lookup stays off under a forced depth).
+- Not attributed: forced depth 3 summed 525.6 -> 593.4 tok/s (serial 353.6 -> 355.4) and llmprobe 0.6.12
+  `--bench-only` (ctx 1048576) decode 92.3 -> 95.2, prefill 1475 -> 1674, one boot each. Both A boots started hotter
+  (72.8 / 73.6 °C die vs 90.6-then-3-min / 53.2 °C); the kernel is ~1% of a round and cannot reach prefill by 13%
+  (the recorded v1.0.4 cell reads 1671).
+
 <a id="m2max-64gb"></a>
 ## Flash-Next Sushi-3bpw on an M2 Max 64 GB
 

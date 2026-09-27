@@ -125,6 +125,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   DEPENDENCY CHAIN.
 - A lever that pays in another harness may pay for a constraint we don't have — a DEFAULT belongs to the engine that
   MEASURED it.
+- MLX's mean over a NON-last axis sums a column in row order only while that axis is <= 8 (`col_reduce_small`,
+  threadgroup_y = min(8, R)); longer columns pre-sum at stride 8 or in trees, so a serial mirror declines past 8.
+- `mlx_fast_rope` is not the composed rope: it keeps cos/sin in f32 and rounds once; the chain rounds the bf16 table,
+  each product and the sum.
 
 ## Timing a kernel
 
