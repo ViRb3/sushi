@@ -7946,16 +7946,29 @@ test "DiskTier: a restore fills its buffers chunk by chunk, never holding every 
 
     // Two layers of K and V, 4096 rows of 256 f32: 16 MiB restored.
     const restored_bytes: u64 = 2 * 2 * 4096 * 256 * 4;
+    // The peak is process-wide, so work another thread or an earlier test left in flight can land in one
+    // window; a concatenation lands in every one. The smaller of two restores is the restore's own.
+    var excess: usize = std.math.maxInt(usize);
     var cache2 = try KVCache.init(testing.allocator, 2);
     defer cache2.deinit();
-    _ = mlx.mlx_synchronize(s);
-    var before: usize = 0;
-    _ = mlx.mlx_get_active_memory(&before);
-    _ = mlx.mlx_reset_peak_memory();
-    try testing.expectEqual(@as(u32, 4096), try tier.restoreInto(&cache2, m.idx, s));
-    var peak: usize = 0;
-    _ = mlx.mlx_get_peak_memory(&peak);
-    try testing.expect(peak -| before < restored_bytes * 3 / 2);
+    for (0..2) |_| {
+        cache2.deinit();
+        cache2 = try KVCache.init(testing.allocator, 2);
+        _ = mlx.mlx_synchronize(s);
+        _ = mlx.mlx_clear_cache();
+        var before: usize = 0;
+        _ = mlx.mlx_get_active_memory(&before);
+        _ = mlx.mlx_reset_peak_memory();
+        try testing.expectEqual(@as(u32, 4096), try tier.restoreInto(&cache2, m.idx, s));
+        _ = mlx.mlx_synchronize(s);
+        var peak: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&peak);
+        excess = @min(excess, peak -| before);
+    }
+    if (excess >= restored_bytes * 3 / 2) {
+        std.debug.print("restore peak excess {d} B, restored {d} B\n", .{ excess, restored_bytes });
+        return error.TestUnexpectedResult;
+    }
     for ([_]u32{ 0, 127, 128, 2049, 4095 }) |pos| {
         try testing.expectEqual(try cacheValueAt(&cache, 1, pos, 5, s), try cacheValueAt(&cache2, 1, pos, 5, s));
         try testing.expectEqual(try cacheBufValueAt(&cache, 1, pos, 5, s, true), try cacheBufValueAt(&cache2, 1, pos, 5, s, true));
