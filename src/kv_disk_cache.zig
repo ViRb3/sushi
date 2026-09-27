@@ -755,6 +755,9 @@ pub const DiskTier = struct {
     /// ring file `pos` (>= len) under the ringed layers (`KVCache.restoreRing`), clamped to
     /// `len`. On error the cache may be half-rebuilt; the caller resets it.
     pub fn restoreIntoRinged(self: *DiskTier, cache: *KVCache, idx: usize, pos: u32, len: u32, s: mlx.mlx_stream) !void {
+        // Callers swallow a restore failure and prefill cold; the latch it raised must not fail that prefill.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         self.drainEntry(self.entries.items[idx].id);
         const e = &self.entries.items[idx];
         if (len == 0 or len > pos) return error.DiskCacheNoCheckpoint;
@@ -848,6 +851,9 @@ pub const DiskTier = struct {
     /// diverged-prefix "hit" that would otherwise read every stored chunk to
     /// serve a few hundred tokens — slower than a cold prefill).
     pub fn restorePrefixInto(self: *DiskTier, cache: *KVCache, idx: usize, limit: u32, s: mlx.mlx_stream) !void {
+        // Callers swallow a restore failure and prefill cold; the latch it raised must not fail that prefill.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         // This entry's staged chunks must be on disk before the readback.
         self.drainEntry(self.entries.items[idx].id);
         const e = &self.entries.items[idx];
@@ -872,6 +878,9 @@ pub const DiskTier = struct {
         cp_pos: u32,
         s: mlx.mlx_stream,
     ) !u32 {
+        // Callers swallow a restore failure and prefill cold; the latch it raised must not fail that prefill.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         self.drainEntry(self.entries.items[idx].id);
         const e = &self.entries.items[idx];
         if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
@@ -968,16 +977,16 @@ pub const DiskTier = struct {
         else
             &.{ "k", "v", "ks", "kb", "vs", "vb" };
 
-        // Per-layer per-kind accumulation vectors. Layers absent from chunk 0
-        // stay uninitialized — the GatedDeltaNet layers of a hybrid arch have
-        // no KV (their state rides the SSM checkpoints), so only the
-        // full-attention layers appear in the chunks.
+        // Per-layer per-kind buffers at `limit` rows, filled chunk by chunk: the restore runs before
+        // any admission bill sees it, and a concatenation at the end held every chunk beside the
+        // result (twice the restored KV). Layers absent from chunk 0 stay uninitialized: the
+        // GatedDeltaNet layers of a hybrid arch have no KV (their state rides the SSM checkpoints).
         const n_layers = cache.entries.len;
-        const vecs = try self.allocator.alloc(mlx.mlx_vector_array, n_layers * kinds.len);
-        for (vecs) |*v| v.* = mlx.mlx_vector_array_new();
+        const dsts = try self.allocator.alloc(mlx.mlx_array, n_layers * kinds.len);
+        for (dsts) |*d| d.* = mlx.mlx_array_new();
         defer {
-            for (vecs) |v| _ = mlx.mlx_vector_array_free(v);
-            self.allocator.free(vecs);
+            for (dsts) |d| _ = mlx.mlx_array_free(d);
+            self.allocator.free(dsts);
         }
         const present = try self.allocator.alloc(bool, n_layers);
         defer self.allocator.free(present);
@@ -995,6 +1004,10 @@ pub const DiskTier = struct {
             var meta_map = mlx.mlx_map_string_to_string_new();
             defer _ = mlx.mlx_map_string_to_string_free(meta_map);
             try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+            // A lazy load holds its file open until eval, so each chunk is evaluated before the
+            // next opens: one eval at the end held a descriptor per chunk (256 = ~256k tokens).
+            const chunk_arrays = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(chunk_arrays);
 
             for (0..n_layers) |li| {
                 for (kinds, 0..) |kind, ki| {
@@ -1003,10 +1016,17 @@ pub const DiskTier = struct {
                     var arr = mlx.mlx_array_new();
                     if (mlx.mlx_map_string_to_array_get(&arr, tensor_map, @ptrCast(key.ptr)) != 0) {
                         _ = mlx.mlx_array_free(arr);
-                        if (ki == 0) break; // layer absent from this chunk
+                        // A layer holds KV in every chunk or in none.
+                        if (ki == 0 and !present[li]) break;
                         return error.DiskCacheCorruptChunk;
                     }
-                    if (ki == 0) present[li] = true;
+                    if (ki == 0) {
+                        if (chunk_i == 0) present[li] = true;
+                        if (!present[li]) {
+                            _ = mlx.mlx_array_free(arr);
+                            return error.DiskCacheCorruptChunk;
+                        }
+                    }
                     // Crash-tolerance: a chunk file may hold MORE positions
                     // than meta.json committed to (rewrite raced a crash).
                     // Slice down to the committed range; never trust the file.
@@ -1030,51 +1050,50 @@ pub const DiskTier = struct {
                         try mlx.check(rc);
                         arr = sliced;
                     }
-                    _ = mlx.mlx_vector_array_append_value(vecs[li * kinds.len + ki], arr);
-                    _ = mlx.mlx_array_free(arr);
+                    defer _ = mlx.mlx_array_free(arr);
+                    const dst = &dsts[li * kinds.len + ki];
+                    const rows = mlx.getShape(arr);
+                    if (chunk_i == 0) {
+                        const full = [_]c_int{ rows[0], rows[1], @intCast(limit), rows[3] };
+                        try mlx.check(mlx.mlx_zeros(dst, &full, 4, mlx.mlx_array_dtype(arr), s));
+                    }
+                    const dshape = mlx.getShape(dst.*);
+                    if (dshape.len != 4 or dshape[0] != rows[0] or dshape[1] != rows[1] or dshape[3] != rows[3])
+                        return error.DiskCacheCorruptChunk;
+                    var updated = mlx.mlx_array_new();
+                    const st = [_]c_int{ 0, 0, @intCast(c0), 0 };
+                    const sp = [_]c_int{ rows[0], rows[1], @intCast(c0 + need), rows[3] };
+                    const sd = [_]c_int{ 1, 1, 1, 1 };
+                    const rc = mlx.mlx_slice_update(&updated, dst.*, arr, &st, 4, &sp, 4, &sd, 4, s);
+                    if (rc != 0) {
+                        _ = mlx.mlx_array_free(updated);
+                        try mlx.check(rc);
+                    }
+                    _ = mlx.mlx_array_free(dst.*);
+                    dst.* = updated;
+                    _ = mlx.mlx_vector_array_append_value(chunk_arrays, updated);
                 }
             }
+            // A CHECKED eval: lazy Load reads the file here, so a corrupt chunk surfaces its MLX
+            // error before install and the caller falls back to cold prefill.
+            try mlx.check(mlx.mlx_eval(chunk_arrays));
         }
 
-        // Install per-layer concatenations as the cache's storage buffers.
-        // Mirrors `KVCache.restore`: views stay empty, offset/initialized set,
-        // step = kv_len.
+        // Install the filled buffers as the cache's storage. Mirrors `KVCache.restore`: views stay
+        // empty, offset/initialized set, step = kv_len.
         for (cache.entries, 0..) |*dst, li| {
             transformer_mod.resetKVEntry(dst);
             if (!present[li]) continue;
-            const base = li * kinds.len;
-            try concatInto(&dst.keys, vecs[base + 0], s);
-            try concatInto(&dst.values, vecs[base + 1], s);
-            if (quant.scheme != .off) {
-                try concatInto(&dst.keys_scales, vecs[base + 2], s);
-                try concatInto(&dst.keys_biases, vecs[base + 3], s);
-                try concatInto(&dst.values_scales, vecs[base + 4], s);
-                try concatInto(&dst.values_biases, vecs[base + 5], s);
+            const slots = [_]*mlx.mlx_array{ &dst.keys, &dst.values, &dst.keys_scales, &dst.keys_biases, &dst.values_scales, &dst.values_biases };
+            for (slots[0..kinds.len], dsts[li * kinds.len ..][0..kinds.len]) |slot, *filled| {
+                _ = mlx.mlx_array_free(slot.*);
+                slot.* = filled.*;
+                filled.* = mlx.mlx_array_new();
             }
             dst.offset = limit;
             dst.initialized = true;
         }
         cache.step = limit;
-        // Materialize with a CHECKED eval: a corrupt chunk surfaces its MLX
-        // error HERE (lazy Load reads data at eval), so the caller's catch
-        // resets the cache and falls back to cold prefill instead of running
-        // a forward over poisoned buffers.
-        {
-            const vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(vec);
-            for (cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-                if (quant.scheme != .off) {
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.keys_scales);
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.keys_biases);
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.values_scales);
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.values_biases);
-                }
-            }
-            try mlx.check(mlx.mlx_eval(vec));
-        }
     }
 
     /// Load a persisted SSM checkpoint file into a transient `SSMCheckpoint`
@@ -1203,13 +1222,6 @@ pub const DiskTier = struct {
             if (count > 0) try mlx.check(mlx.mlx_eval(vec));
         }
         return cp;
-    }
-
-    fn concatInto(dst: *mlx.mlx_array, vec: mlx.mlx_vector_array, s: mlx.mlx_stream) !void {
-        var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
-        _ = mlx.mlx_array_free(dst.*);
-        dst.* = out;
     }
 
     // ── Commit ──
@@ -7832,4 +7844,120 @@ test "fingerprint single shard and ngram size" {
 
 test "fingerprint single shard and ngram mtime" {
     try testFingerprintPayloadChange(false, true);
+}
+
+test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" {
+    // Restoring more chunk files than the soft RLIMIT_NOFILE allows open at once succeeds.
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    // 600 tokens at 8 per chunk = 75 chunk files.
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-fdlimit", 0, 8);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    tier.drainEntry(tier.entries.items[m.idx].id);
+
+    const saved = try std.posix.getrlimit(.NOFILE);
+    defer std.posix.setrlimit(.NOFILE, saved) catch {};
+    var top: usize = 0;
+    for (0..@min(saved.cur, 4096)) |fd| {
+        if (std.c.fcntl(@intCast(fd), std.c.F.GETFD) != -1) top = fd;
+    }
+    try std.posix.setrlimit(.NOFILE, .{ .cur = top + 1 + 16, .max = saved.max });
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    const restored = tier.restoreInto(&cache2, m.idx, s);
+    std.posix.setrlimit(.NOFILE, saved) catch {};
+    try testing.expectEqual(@as(u32, 600), try restored);
+    for ([_]u32{ 0, 7, 8, 333, 599 }) |pos| {
+        try testing.expectEqual(try cacheValueAt(&cache, 2, pos, 5, s), try cacheValueAt(&cache2, 2, pos, 5, s));
+    }
+}
+
+test "DiskTier: a failed restore drops the latch it raised and keeps a foreign one" {
+    // The caller's cold-prefill fallback must not inherit this restore's MLX error.
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-restore-latch", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 13);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    const id = tier.entries.items[m.idx].id;
+    tier.drainEntry(id);
+    var path_buf: [1024]u8 = undefined;
+    const chunk = try std.fmt.bufPrint(&path_buf, "{s}/e{d}/c000002.safetensors", .{ tier.root, id });
+    try std.Io.Dir.deleteFileAbsolute(io, chunk);
+
+    var target = try KVCache.init(testing.allocator, 2);
+    defer target.deinit();
+    try testing.expectError(error.MlxError, tier.restoreInto(&target, m.idx, s));
+    try testing.expect(!mlx.errorPending());
+
+    mlx.latchErrorForTest("foreign pre-existing error");
+    _ = tier.restoreInto(&target, m.idx, s) catch {};
+    var msg: [512]u8 = undefined;
+    try testing.expectEqualStrings("foreign pre-existing error", mlx.takeError(&msg).?);
+}
+
+test "DiskTier: a restore fills its buffers chunk by chunk, never holding every chunk beside the result" {
+    // The restore runs before the inference thread's admission bill sees it; a concatenation at
+    // the end held every loaded chunk beside the result, twice the restored KV.
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-restore-peak", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 4096, 256, 0.0, .float32);
+    var tokens: [4096]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 17);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    tier.drainEntry(tier.entries.items[m.idx].id);
+
+    // Two layers of K and V, 4096 rows of 256 f32: 16 MiB restored.
+    const restored_bytes: u64 = 2 * 2 * 4096 * 256 * 4;
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    _ = mlx.mlx_synchronize(s);
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    _ = mlx.mlx_reset_peak_memory();
+    try testing.expectEqual(@as(u32, 4096), try tier.restoreInto(&cache2, m.idx, s));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    try testing.expect(peak -| before < restored_bytes * 3 / 2);
+    for ([_]u32{ 0, 127, 128, 2049, 4095 }) |pos| {
+        try testing.expectEqual(try cacheValueAt(&cache, 1, pos, 5, s), try cacheValueAt(&cache2, 1, pos, 5, s));
+        try testing.expectEqual(try cacheBufValueAt(&cache, 1, pos, 5, s, true), try cacheBufValueAt(&cache2, 1, pos, 5, s, true));
+    }
 }

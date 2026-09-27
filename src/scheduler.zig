@@ -5807,7 +5807,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .enable_mtp = slot.enable_mtp,
                 .fits = fits_fn,
             };
-            if (!Probe.call(&probe)) {
+            var fits = Probe.call(&probe);
+            // A shared restore is billed a whole second copy; taking the entry over moves it instead.
+            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
+                if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
+                    hot_checked_out = true;
+                    probe.warm_will_donate = true;
+                    fits = Probe.call(&probe);
+                }
+            };
+            if (!fits) {
                 // The width admission was billed at, read before anything is evicted.
                 if (prefill_request_chunk) |pick_pre| {
                     admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
@@ -5886,6 +5895,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
+    if (hot_checked_out) slot.cache.adoptRestored();
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,

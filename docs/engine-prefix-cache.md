@@ -22,7 +22,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - KV reuse via prompt-prefix matching; invalidated after tool calls + pad-only gens (`commitDeclinesPadOnly`: only an
   ALL-pad generation declines); hot cache spills to SSD; RAM invalidation propagates to disk.
 - Restore ALWAYS clamps (`truncate(final_len)`); a failed restore hands back an EMPTY cache; every eviction loop has
-  a no-progress exit (checked-out entries are unevictable).
+  a no-progress exit (checked-out entries are unevictable). A restore leaves a token to forward: a one-token prompt
+  prefills cold (its full hit restored everything and the empty prefill crashed upstream).
 - **Media keys are a CHAIN** (`MediaSpan`: per block, a hash of its pixels, its position and every block before it;
   the entry key is the last). An entry keyed by a request's block k restores up to block k+1, so a turn that appends
   a screenshot reuses everything before it; any other key mismatch shares only the text before the first media row
@@ -45,6 +46,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
   the highest `RING_DISK_MAX_PER_ENTRY` = 8 kept, salvaged per file at scan; manifest v9, which an older reader
   drops) ([arch-mimo-v2](arch-mimo-v2.md#sliding-layers-the-ring)).
+- **A disk restore fills its buffers chunk by chunk** (`restoreKvInto`): each chunk is evaluated into buffers
+  allocated at the restored length before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
+  eval (one eval at the end failed past the soft limit of 256 files), and a concatenation at the end held every chunk
+  beside the result, twice the restored KV before any bill saw it. The restore entry points drop the MLX latch they
+  raised, or the cold fallback's prefill fails on it. Measured on a 150k-token Sushi-3bpw entry (147 chunks; b9dbbf53
+  plus this change, `--ctx-size 262144 --prefix-cache-disk 20GB --prefix-cache-entries 1`, arms O P M M P O, 4
+  restores per boot, `taskpolicy -a`, fans max, a lock per boot, 2026-09-27): a warm restore takes 170-177 ms with the
+  fill, 185-188 ms with a per-chunk eval and the final concatenation, 183-187 ms on b9dbbf53; the first restore of a
+  process takes 611-618 ms with the fill, 642-917 ms without it, 307-326 ms on b9dbbf53 (one eval per chunk).
 - **A commit that forked off another entry inherits that entry's ring checkpoints below the fork** (`bestRingDonor`,
   refcount-shared and billed per entry like SSM checkpoints): a request appending to the conversation (a client's
   side request: the chat + a reminder) otherwise holds only its own prompt end, and once the count cap evicts the
@@ -59,15 +69,29 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Checkpoint retention thins the INTERIOR with a dense newest quarter (`spanPreservingDropIndex`, `ThinPolicy`).
 - An oversized candidate is TRIMMED to the longest restorable prefix that fits (`trimLenForBudget`,
   `KVCacheSnapshot.trimmedCopy` is a REAL copy); a QSA trim bills the bank on the final retained checkpoint.
+- **A ringed candidate trims only where it restores** (`ringTrimLen`): its end, dropping the reservation's spare
+  capacity, or a ring checkpoint whose rows become its ring (`trimmedCopy`'s `ring_cp`). Its ringed layers are a
+  constant, not a per-token price: priced per token, every MiMo target fell below the ring and every entry declined.
 - A decline carries its `TrimDecline` reason; a RAM-budget decline spills to SSD (`spillDeclinedToDisk`).
 
 ## Budget
 
 - A commit declines and frees its incoming snapshot when checked-out residents prevent satisfying either the entry-count or byte cap; the request continues and one `[hot-cache]` line names the limiting cap.
+  The byte cap is judged AFTER the new entry sheds checkpoints (`retainNewEntry`): a qwen4_exp trim is priced against
+  its shed survivors, and judging it unshed declined every session past the budget, so each turn cold-prefilled.
 
 - **The hot-cache budget is CLAMPED at load** to what the weights leave under the GPU ceiling and is a HARD cap; it
   FOLLOWS residency (`reviseHotCacheBudgets` after every load/unload, repeated for 10 s because the OS returns pages
   lazily).
+- **An unnamed `--prefix-cache-mem` holds one session at the working context** (`oneSessionFor`, >= 2 GB, both arms)
+  where the ceiling holds it beside the weights, the n-gram page cache (`page_cache_claim`) and a cold full-context
+  prompt's bill (MiMo refuses rather than evicts); else that room, at most half the bill, so an outgrown session's
+  trim copy fits beside it. A flag stands, `2GB` too; context sizing and the chunk pin still read the raw ask.
+- A replacement over the budget sheds its lowest ring checkpoints before the entry goes (`shedRingCheckpoints`).
+- Measured (b9dbbf53 plus this change, Sushi-3bpw, auto context 1M, kv8, MTP on; a ~200k-token three-turn session; `taskpolicy -a`,
+  fans max, GPU lock per boot; 2026-09-27): unset, the budget is 11516 MB and turns 2-3 prefill in 0.35 s (199.7k
+  reused); `--prefix-cache-mem 2GB` keeps a 139k-147k prefix and prefills in 36.0 / 31.3 s (turn 1: 114-115 s cold). The
+  n-gram table stayed 100% resident (mincore) in both arms.
 - Eviction is WORKLOAD-fair (`cache_key`: `prompt_cache_key` > `metadata.user_id` > system-prompt hash;
   `lruIndexExcluding`).
 
@@ -82,7 +106,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   per-chunk write-through; a diverging turn hard-links the donor's LANDED chunks; a full-prefix hit CHECKS the entry
   OUT so the first append donates.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
-  below every refusal; `releaseCheckout` hands an undonated entry back intact). Disk checkpoints come off the TOP of
+  below every refusal; `releaseCheckout` hands an undonated entry back intact).
+- **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's
+  admission pass): a full-entry hit is checked out on demand and billed as donated. The tradeoff: a request that
+  fails after donating loses the entry. Disk checkpoints come off the TOP of
   the flush budget; the disk tier serves the pre-media text prefix only.
 - **"Free disk" is what the OS will GRANT** (`sushi_volume_free_for_use`, statfs fallback): purgeable space is released
   on demand. The `volumeSpace` test must not race the OS's purgeable answer.

@@ -12,6 +12,24 @@ earlier history is mlx-serve's, in that project's changelog.
   file returned with an edit, a tool call carrying a file), speculative decoding drafts from that text instead of the
   MTP head: 16-21% faster file edits and 9-11% faster file-writing tool calls on an M5 Max, 18-24% on edits deep in a
   long context, with greedy output unchanged; `SUSHI_MTP_LOOKUP=0` turns it off. Ported from mlx-serve, thanks @STRML.
+- **Long conversations stay in the prompt cache**: without `--prefix-cache-mem`, the RAM prompt cache holds a whole
+  conversation at the working context where memory allows (never less than 2 GB, and never at the expense of
+  Flash-Next's n-gram table), so later turns of a long Flash-Next or MiMo chat reuse it instead of re-reading it.
+  Ported from mlx-serve #575, thanks @STRML.
+- **Very long sessions restore from the SSD cache**: a session of about 250k tokens or more no longer fails its SSD
+  restore, and a restore that does fail falls back to reading the prompt instead of failing the request. Ported from
+  mlx-serve #527, thanks @brandondyal.
+- **A short chat no longer copies a long one's cache**: a chat that starts like a longer cached one copies only
+  what it needs, so it no longer holds the long session's memory or pushes it out of the cache. Ported from
+  mlx-serve #492, thanks @celestial-rose for the report.
+- **Long Flash-Next sessions keep their cache when memory is tight**: a warm turn that cannot fit a second copy of
+  its cached conversation takes the cache over instead of being refused. Ported from mlx-serve #518.
+- **Repeated one-token prompts**: a one-token prompt that matches its own cached entry is read again instead of
+  restored with nothing left to process. Ported from mlx-serve #518.
+- **SSD restores need half the memory**: restoring a long session from the SSD cache no longer holds two copies of
+  it for a moment.
+- **Sessions past `--prefix-cache-mem` keep a cached prefix**: a Flash-Next conversation longer than the RAM prompt
+  cache keeps the longest prefix that fits instead of being re-read in full every turn (a regression since v1.0.3).
 - **Long prompts after a busy moment**: a long prompt that fits once the RAM prompt cache is emptied is no longer
   refused while the GPU is still finishing earlier work.
 - **Faster Flash-Next MTP decode**: speculative decoding reads the hyper-connection weights once for a group of

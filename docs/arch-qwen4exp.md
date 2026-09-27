@@ -75,6 +75,8 @@ hidden 2560, expert intermediate 640.
   takes the pool only when it wins by 20%; SSD and page-cache state determine the choice on each load.
 - `SUSHI_NGRAM_WARM` preads the whole table, and the residency cap (`ngramCacheLimit` = half of RAM) already declines
   one that cannot be held. Calibration and residency measurements: [perf-baselines](perf-baselines.md#ngram-arm).
+- A table under the cap is a page-cache claim from `startWarm` to `close` (`page_cache_claim`), billed as GPU memory
+  by the hot cache's unnamed budget ([engine-prefix-cache](engine-prefix-cache.md#budget)): wired KV evicts it.
 - The n-gram hash's eos is the TEXT config's (`ngram_eos`).
 - `SUSHI_NGRAM_BF16_DIR=<hf checkpoint>` serves any pack with the ORIGINAL bf16 n-gram table, so `kld compare`
   isolates the PLE table's cost.

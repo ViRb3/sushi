@@ -40,6 +40,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 
 - KV growth is PROPORTIONAL (`nextCapacity` +25%, capped 8192). Past 32k a request reserves its capacity up front
   (`KVCache.reservedTokens`); a ringed arch reserves always (`ModelConfig.reservesKvCapacity`).
+- **A shared restore whose buffer is longer than the request reserves copies its rows into a request-sized buffer**
+  on the first append (`KVCache.copiesSharedRestore`), because the admission bills the copy at the reservation: a 4k
+  chat restored from an 80k entry held the 80k buffer (mlx-serve #492), and a donor that decoded past its own
+  reservation was copied past the bill. A donated checkout owns its buffers (`adoptRestored`) and appends in place.
 - **A fallible re-init BEHIND a `deinit` leaves a freed object on the error path** — build first, then swap
   (`KVCache.reinit`). A handle freed before a fallible op is reset AT the free (`updateDense`).
 - A lazily copied side-channel state is not in the residual's graph: name the owned copy in the cadence eval vector

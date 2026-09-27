@@ -172,6 +172,10 @@ fn ngramCacheLimit() usize {
 /// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
 pub var live_warm_bytes = std.atomic.Value(u64).init(0);
 pub var live_warm_total = std.atomic.Value(u64).init(0);
+
+/// Page cache the open tables keep resident (`startWarm` to `close`), which the hot cache's
+/// unnamed budget must leave standing: the decode gathers rows from it every token.
+pub var page_cache_claim = std.atomic.Value(u64).init(0);
 const empty_ngram_map: [0]u8 align(std.heap.page_size_min) = .{};
 
 /// A progress line at each 8 GB step or after 10 s of silence, never twice per step. Pure.
@@ -222,6 +226,8 @@ pub const NgramTable = struct {
     prefer_pool: bool = false,
     /// What the calibration read, for the one line that reports it.
     calib: Calibration = .{},
+    /// This table's share of `page_cache_claim`.
+    claimed: u64 = 0,
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -408,6 +414,8 @@ pub const NgramTable = struct {
         }
         live_warm_bytes.store(0, .release);
         live_warm_total.store(0, .release);
+        _ = page_cache_claim.fetchSub(self.claimed, .release);
+        self.claimed = 0;
         if (self.pool) |p| p.destroy();
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
@@ -486,17 +494,27 @@ pub const NgramTable = struct {
 
     const WARM_CHUNK: usize = 8 << 20;
 
+    /// A raw bf16 table this box cannot hold: read by row, never warmed or claimed.
+    fn pastResidencyCap(self: *const NgramTable) bool {
+        return self.bits == 16 and self.map.len > ngramCacheLimit();
+    }
+
     /// Call only at the table's final address; the warm thread retains `self`
     /// until close joins it.
     pub fn startWarm(self: *NgramTable) void {
         if (self.bf16 != null) return;
         if (self.fd < 0 or self.warm_thread != null) return;
+        // Warm or not, a table under its residency cap ends up in page cache through the gathers.
+        if (self.claimed == 0 and !self.pastResidencyCap()) {
+            self.claimed = self.map.len;
+            _ = page_cache_claim.fetchAdd(self.claimed, .release);
+        }
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
             log.info("[qwen4] ngram table warm: disabled (SUSHI_NGRAM_WARM=0) - the first long prompt faults the table in from SSD\n", .{});
             return;
         }
-        if (self.bits == 16 and self.map.len > ngramCacheLimit()) {
+        if (self.pastResidencyCap()) {
             log.info("[qwen4] ngram table warm: skipped, {d:.1} GB exceeds the {d:.1} GB residency cap; prefill reads requested rows\n", .{ asGb(self.map.len), asGb(ngramCacheLimit()) });
             return;
         }
@@ -598,7 +616,7 @@ pub const NgramTable = struct {
         }
         const need: usize = self.rowBytes();
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
-        const oversized_bf16 = self.bits == 16 and self.map.len > ngramCacheLimit();
+        const oversized_bf16 = self.pastResidencyCap();
         const prefer_pool = oversized_bf16 or self.prefer_pool;
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
@@ -1073,6 +1091,24 @@ test "ngram oversized bf16: warming stops at the residency cap" {
     test_ngram_cache_limit = f.bytes.len;
     f.table.startWarm();
     try testing.expect(f.table.warm_thread != null);
+}
+
+test "ngram table: the page cache it keeps is claimed until close, unless its residency cap declined it" {
+    const before = page_cache_claim.load(.acquire);
+    var f = try Bf16GatherFixture.init();
+    test_ngram_cache_limit = f.bytes.len - 1;
+    defer test_ngram_cache_limit = null;
+    warm_override = false;
+    defer warm_override = null;
+    f.table.startWarm();
+    try testing.expectEqual(before, page_cache_claim.load(.acquire));
+    // Under the cap it is claimed with the warm off too: the gathers fault it in.
+    test_ngram_cache_limit = f.bytes.len;
+    f.table.startWarm();
+    f.table.startWarm();
+    try testing.expectEqual(before + f.bytes.len, page_cache_claim.load(.acquire));
+    f.deinit();
+    try testing.expectEqual(before, page_cache_claim.load(.acquire));
 }
 
 test "ngram oversized bf16: each unique row is read once and duplicates keep their positions" {

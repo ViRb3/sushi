@@ -8446,16 +8446,15 @@ pub const KVCache = struct {
         const sc_last = sc_shape[3];
         const vsc_last = vsc_shape[3];
 
-        const will_grow = !entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys);
-        if (entry.shared_view) {
-            if (entry.initialized and !will_grow) try cowAffineBuffers(s, entry);
-            entry.shared_view = false;
-        }
+        const shared = self.copiesSharedRestore(entry, entry.offset + new_len);
+        const will_grow = !entry.initialized or shared or entry.offset + new_len > bufferCapacity(entry.keys);
+        if (entry.initialized and entry.shared_view and !will_grow) try cowAffineBuffers(s, entry);
+        entry.shared_view = false;
 
         // 4. Grow buffers if needed (6 of them, in lockstep on the seq axis).
         if (will_grow) {
             const needed = entry.offset + new_len;
-            const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
+            const cur_cap = if (entry.initialized and !shared) bufferCapacity(entry.keys) else 0;
             const new_cap: c_int = @intCast(self.growCapacityFor(entry, cur_cap, needed));
             kv_cap_buf_grows += 1;
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
@@ -8500,6 +8499,20 @@ pub const KVCache = struct {
         try self.ringCompact(entry, s);
     }
 
+    /// Does a shared restore's first append copy its rows into a buffer sized for THIS request? Yes
+    /// when the donor's buffer is longer than the request reserves (or its rows, unreserved): the
+    /// admission bills the copy at that, never at the donor's capacity. A ringed layer keeps its
+    /// ring; a donated checkout owns its buffers (`adoptRestored`) and appends in place.
+    fn copiesSharedRestore(self: *const KVCache, entry: *const KVCacheEntry, needed: usize) bool {
+        if (!entry.initialized or !entry.shared_view or entry.ringed) return false;
+        return bufferCapacity(entry.keys) > @max(self.reserve_tokens, needed);
+    }
+
+    /// The restored buffers are this cache's alone now (a donated checkout): append in place.
+    pub fn adoptRestored(self: *KVCache) void {
+        for (self.entries) |*e| e.shared_view = false;
+    }
+
     fn cowAffineBuffers(s: mlx.mlx_stream, entry: *KVCacheEntry) !void {
         const bufs = [_]*mlx.mlx_array{
             &entry.keys,
@@ -8540,18 +8553,17 @@ pub const KVCache = struct {
         const new_len: usize = @intCast(new_shape[2]);
         const v_head_dim = mlx.getShape(new_v)[3];
 
-        const will_grow = !entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys);
-        if (entry.shared_view) {
-            if (entry.initialized and !will_grow) {
-                const k_owned = try materializedOwnedCopy(s, entry.keys);
-                _ = mlx.mlx_array_free(entry.keys);
-                entry.keys = k_owned;
-                const v_owned = try materializedOwnedCopy(s, entry.values);
-                _ = mlx.mlx_array_free(entry.values);
-                entry.values = v_owned;
-            }
-            entry.shared_view = false;
+        const shared = self.copiesSharedRestore(entry, entry.offset + new_len);
+        const will_grow = !entry.initialized or shared or entry.offset + new_len > bufferCapacity(entry.keys);
+        if (entry.initialized and entry.shared_view and !will_grow) {
+            const k_owned = try materializedOwnedCopy(s, entry.keys);
+            _ = mlx.mlx_array_free(entry.keys);
+            entry.keys = k_owned;
+            const v_owned = try materializedOwnedCopy(s, entry.values);
+            _ = mlx.mlx_array_free(entry.values);
+            entry.values = v_owned;
         }
+        entry.shared_view = false;
 
         // 3. Grow buffer if needed
         if (will_grow) {
@@ -8560,7 +8572,7 @@ pub const KVCache = struct {
             const head_dim = new_shape[3];
             const dtype = mlx.mlx_array_dtype(new_k);
             const needed = entry.offset + new_len;
-            const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
+            const cur_cap = if (entry.initialized and !shared) bufferCapacity(entry.keys) else 0;
             const new_cap: c_int = @intCast(self.growCapacityFor(entry, cur_cap, needed));
             kv_cap_buf_grows += 1;
             const initialized = entry.initialized;
@@ -8990,14 +9002,20 @@ pub const KVCacheSnapshot = struct {
     /// must be a real slice + copy into fresh buffers. Each array is sliced
     /// against its OWN shape (affine scales/biases are [B,H,T,D/gs]; the
     /// packed codes [B,H,T,D*bits/32] — all carry T at axis 2).
-    pub fn trimmedCopy(self: *const KVCacheSnapshot, len: usize, s: mlx.mlx_stream) !KVCacheSnapshot {
+    /// `ring_cp` (`KVCache.ringCheckpoint`) supplies the ringed layers' rows below the ring.
+    pub fn trimmedCopy(self: *const KVCacheSnapshot, len: usize, ring_cp: ?*const KVCacheSnapshot, s: mlx.mlx_stream) !KVCacheSnapshot {
+        if (ring_cp) |cp| {
+            std.debug.assert(cp.entries.len == self.entries.len);
+            if (cp.step < len) return error.SlidingRingRewindPastWindow;
+        }
         const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
         var built: usize = 0;
         errdefer {
             for (out[0..built]) |*e| freeKVEntry(e);
             self.allocator.free(out);
         }
-        for (self.entries, 0..) |src, i| {
+        for (self.entries, 0..) |own, i| {
+            const src = if (ring_cp != null and own.ringed and ring_cp.?.entries[i].initialized) ring_cp.?.entries[i] else own;
             out[i] = newEmptyKVEntry();
             built = i + 1;
             out[i].initialized = src.initialized;
@@ -44479,6 +44497,103 @@ test "KVCache snapshot then more updates does not corrupt the snapshot" {
     try testing.expectEqual(@as(usize, 2), cache.step);
 }
 
+/// A donor that reserved `reserve` rows and wrote `rows`, and a cache restored from its snapshot.
+fn sharedRestoreFixture(s: mlx.mlx_stream, cfg: KVQuantConfig, reserve: usize, rows: c_int, donor: *KVCache, snap: *KVCacheSnapshot, warm: *KVCache) !mlx.mlx_array {
+    donor.* = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+    donor.reserve(reserve);
+    const k = try qkvIdentityArray(s, 2, rows, 64, 0.5, .bfloat16);
+    var dv = try donor.update(0, k, k, s, 0);
+    dv.deinit();
+    snap.* = try donor.snapshot();
+    warm.* = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+    try warm.restore(snap);
+    return k;
+}
+
+test "KVCache: an append after a short restore sizes its copy from the prefix, not the donor (#492)" {
+    // A 4k "hi" session restored from an 80k agent session's entry kept an 80k-capacity copy,
+    // and its commit evicted the agent session to fit the budget.
+    const s = mlx.gpuStream();
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |cfg| {
+        var donor: KVCache = undefined;
+        var snap: KVCacheSnapshot = undefined;
+        var cache: KVCache = undefined;
+        const k = try sharedRestoreFixture(s, cfg, 0, 8192, &donor, &snap, &cache);
+        defer _ = mlx.mlx_array_free(k);
+        defer donor.deinit();
+        defer snap.deinit();
+        defer cache.deinit();
+        try cache.truncate(100, s);
+        const one = try sliceAttentionSeq(s, k, 100, 101);
+        defer _ = mlx.mlx_array_free(one);
+        var cv = try cache.update(0, one, one, s, 0);
+        cv.deinit();
+        try testing.expectEqual(@as(usize, 101), cache.entries[0].offset);
+        try testing.expect(KVCache.bufferCapacity(cache.entries[0].keys) <= 512);
+        try testing.expect(KVCache.bufferCapacity(snap.entries[0].keys) >= 8192);
+    }
+}
+
+test "KVCache: a shared restore's first append allocates what the request reserves, not the donor's capacity" {
+    // The admission bills a shared restore's copy at THIS request's reservation; the donor's buffer
+    // is longer when it reserved for its own reply or decoded past its reservation.
+    const s = mlx.gpuStream();
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |cfg| {
+        var donor: KVCache = undefined;
+        var snap: KVCacheSnapshot = undefined;
+        var warm: KVCache = undefined;
+        const k = try sharedRestoreFixture(s, cfg, 16384, 1024, &donor, &snap, &warm);
+        defer _ = mlx.mlx_array_free(k);
+        defer donor.deinit();
+        defer snap.deinit();
+        defer warm.deinit();
+        try testing.expectEqual(@as(usize, 16384), KVCache.bufferCapacity(donor.entries[0].keys));
+        warm.reserve(2048);
+        const tail = try sliceAttentionSeq(s, k, 0, 8);
+        defer _ = mlx.mlx_array_free(tail);
+        var wv = try warm.update(0, tail, tail, s, 0);
+        defer wv.deinit();
+        const want = warm.nextCapacityReserved(0, 1024 + 8);
+        try testing.expect(want < 16384);
+        try testing.expectEqual(want, KVCache.bufferCapacity(warm.entries[0].keys));
+        try testing.expectEqual(want, KVCache.bufferCapacity(warm.entries[0].values));
+        try testing.expectEqual(@as(usize, 1024 + 8), warm.entries[0].offset);
+        if (cfg.scheme == .off) {
+            const head = try sliceAttentionSeq(s, wv.k, 0, 1024);
+            defer _ = mlx.mlx_array_free(head);
+            try testing.expectEqual(@as(f32, 0), try maxAbsDiffF32(head, k, s));
+        }
+        // The donor's rows and buffer are untouched.
+        try testing.expectEqual(@as(usize, 1024), donor.entries[0].offset);
+        try testing.expectEqual(@as(usize, 16384), KVCache.bufferCapacity(donor.entries[0].keys));
+    }
+}
+
+test "KVCache: a donated restore appends in place, at the entry's own capacity" {
+    const s = mlx.gpuStream();
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |cfg| {
+        var donor: KVCache = undefined;
+        var snap: KVCacheSnapshot = undefined;
+        var warm: KVCache = undefined;
+        const k = try sharedRestoreFixture(s, cfg, 16384, 1024, &donor, &snap, &warm);
+        defer _ = mlx.mlx_array_free(k);
+        defer donor.deinit();
+        defer snap.deinit();
+        defer warm.deinit();
+        donor.deinit();
+        donor = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+        snap.releaseHandles();
+        warm.adoptRestored();
+        warm.reserve(2048);
+        const tail = try sliceAttentionSeq(s, k, 0, 8);
+        defer _ = mlx.mlx_array_free(tail);
+        var wv = try warm.update(0, tail, tail, s, 0);
+        defer wv.deinit();
+        try testing.expectEqual(@as(usize, 16384), KVCache.bufferCapacity(warm.entries[0].keys));
+        try testing.expectEqual(@as(usize, 1024 + 8), warm.entries[0].offset);
+    }
+}
+
 test "KVCache snapshot/restore in a tight loop does not leak" {
     // testing.allocator is a TrackingAllocator — any unfreed allocation here
     // surfaces as a test failure at the leak-detection step.
@@ -50676,9 +50791,9 @@ test "a ring rewinds inside its retained window and declines below it" {
     // a window it cannot reproduce.
     var snap = try c.snapshot();
     defer snap.deinit();
-    var kept = try snap.trimmedCopy(c.absSeqLen(0), s);
+    var kept = try snap.trimmedCopy(c.absSeqLen(0), null, s);
     kept.deinit();
-    try std.testing.expectError(error.SlidingRingRewindPastWindow, snap.trimmedCopy(window, s));
+    try std.testing.expectError(error.SlidingRingRewindPastWindow, snap.trimmedCopy(window, null, s));
     // Zero is a reset, not a rewind.
     try c.truncate(0, s);
     try std.testing.expectEqual(@as(usize, 0), c.absSeqLen(0));
@@ -50743,6 +50858,42 @@ fn ringCheckpointRestore(kv_cfg: KVQuantConfig) !void {
     try std.testing.expectEqual(prompt - 1, restored.absSeqLen(0));
     try std.testing.expectEqual(prompt - 1, restored.absSeqLen(1));
     // Every view after the restore is the full-length cache's, across a compaction.
+    try ringCheckpointFeed(&restored, &plain, window, prompt - 1, prompt + 700, 100);
+}
+
+test "a trim below the ring takes the ringed rows from a checkpoint at the trim point" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const prompt: usize = 700;
+
+    var live = try KVCache.init(alloc, 2);
+    defer live.deinit();
+    live.setSwaRing(window);
+    var plain = try KVCache.init(alloc, 2);
+    defer plain.deinit();
+    try ringCheckpointFeed(&live, &plain, window, 0, prompt, 250);
+    var cp = (try live.ringCheckpoint(prompt, s)) orelse return error.TestExpectedRingCheckpoint;
+    defer cp.deinit();
+    try ringCheckpointFeed(&live, &plain, window, prompt, prompt + 600, 50);
+    var end = try live.snapshotRetained(s);
+    defer end.deinit();
+
+    try std.testing.expectError(error.SlidingRingRewindPastWindow, end.trimmedCopy(prompt, null, s));
+    // A checkpoint short of the trim point has no rows for it either.
+    try std.testing.expectError(error.SlidingRingRewindPastWindow, end.trimmedCopy(prompt + 1, &cp, s));
+    var kept = try end.trimmedCopy(prompt, &cp, s);
+    defer kept.deinit();
+    try std.testing.expectEqual(prompt, kept.step);
+
+    var restored = try KVCache.init(alloc, 2);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    try restored.restore(&kept);
+    try restored.truncate(prompt - 1, s);
+    try plain.truncate(prompt - 1, s);
+    // Every view after the trim is the full-length cache's, across a compaction.
     try ringCheckpointFeed(&restored, &plain, window, prompt - 1, prompt + 700, 100);
 }
 

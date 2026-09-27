@@ -216,7 +216,9 @@ fn printUsage(io: std.Io) void {
         \\                        turns off SSM checkpoint capture, since
         \\                        checkpoints exist only to feed it.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
-        \\                      Hot prefix cache KV-bytes budget (default: 2GB).
+        \\                      Hot prefix cache KV-bytes budget (default: one
+        \\                        session at the working context where memory
+        \\                        holds it, never under 2GB).
         \\                      Evicts LRU entries until the budget fits.
         \\                      Pass 0/off to disable the byte budget.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
@@ -730,6 +732,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            server_mod.prefix_cache_mem_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts

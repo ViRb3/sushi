@@ -303,7 +303,8 @@ var restore_move_env_cached: ?bool = null;
 pub var restore_move_override: ?bool = null;
 
 /// Restore by move. `SUSHI_RESTORE_MOVE=0` restores the refcount share whose first append
-/// copies the whole prefix. Armed only where `HotPrefixCache.ssd_first` is.
+/// copies the whole prefix. Armed where `HotPrefixCache.ssd_first` is, or on demand when a share
+/// does not fit (`checkoutRestored`).
 pub fn restoreMoveEnabled() bool {
     if (restore_move_override) |v| return v;
     if (restore_move_env_cached) |v| return v;
@@ -433,6 +434,8 @@ pub const HotPrefixCache = struct {
     disk_dirty: bool = false,
     /// `last_used` of the entry the current request restored from; `evictLruToAdmit` refuses to evict it.
     last_restored_used: ?u64 = null,
+    /// The raw prefix that restore matched, before a hybrid clamp (`checkoutRestored`).
+    last_restored_shared: usize = 0,
     last_restored_disk_id: ?u64 = null,
     /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
     /// A restore that leaves the live entries without it cannot prefill —
@@ -736,11 +739,12 @@ pub const HotPrefixCache = struct {
     /// Issue #330: per-token bytes of a snapshot — what one retained token
     /// costs after a `trimmedCopy` materializes exactly `len` rows. Derived
     /// from each array's own shape (bytes / capacity rows), so it prices
-    /// quantized triples correctly too.
+    /// quantized triples correctly too. A ringed layer holds a window at any
+    /// length (`ringedBytes`), so it has no per-token price.
     fn snapshotRowBytes(snap: *const KVCacheSnapshot) u64 {
         var total: u64 = 0;
         for (snap.entries) |e| {
-            if (!e.initialized) continue;
+            if (!e.initialized or e.ringed) continue;
             inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
                 // A dense snapshot leaves the quant handles as empty 0-dim arrays; the ndim check makes axis 2 a fact.
                 if (arr.ctx != null and mlx.mlx_array_ndim(arr) > 2) {
@@ -752,6 +756,42 @@ pub const HotPrefixCache = struct {
             }
         }
         return total;
+    }
+
+    /// Bytes of a snapshot's ringed layers: the window they keep whatever the length.
+    fn ringedBytes(snap: *const KVCacheSnapshot) u64 {
+        var total: u64 = 0;
+        for (snap.entries) |e| {
+            if (!e.initialized or !e.ringed) continue;
+            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+                if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+            }
+        }
+        return total;
+    }
+
+    /// Where a ringed candidate trims to: its end, or ring checkpoint `cp`, whose rows become its ring.
+    const RingTrim = struct { len: usize, cp: ?usize = null };
+
+    /// A ringed candidate restores only where its sliding layers hold the window: at its `end`, or
+    /// at one of its ring checkpoints (ascending). The longest that fits `budget`: the rows below it
+    /// at `row_bytes`, the ring it keeps and the checkpoints below it. Null = none above the floor.
+    fn ringTrimLen(budget: u64, limit: usize, row_bytes: u64, end: usize, ring_bytes: u64, cps: []const KVCacheSnapshot) ?RingTrim {
+        var below: u64 = 0;
+        for (cps) |*c| below += snapshotBytes(c);
+        if (end <= limit and end >= MIN_CANCELLED_COMMIT_TOKENS and
+            @as(u64, end) * row_bytes + ring_bytes + below <= budget) return .{ .len = end };
+        var k = cps.len;
+        while (k > 0) {
+            k -= 1;
+            const cp_bytes = snapshotBytes(&cps[k]);
+            below -= cp_bytes;
+            const p = cps[k].step;
+            if (p > limit or p >= end) continue;
+            if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
+            if (@as(u64, p) * row_bytes + cp_bytes + below <= budget) return .{ .len = p, .cp = k };
+        }
+        return null;
     }
 
     /// Positions printed by the trim-inputs line before it elides; the count is always exact.
@@ -1348,6 +1388,13 @@ pub const HotPrefixCache = struct {
             });
             return .{ .matched = 0, .full_match = false };
         }
+        // A full reuse re-forwards the last token; a one-token prompt has nothing before it.
+        if (prompt_ids.len == 1) {
+            try target_cache.truncate(0, s);
+            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            target_moe_seq_offset.* = 0;
+            return .{ .matched = 0, .full_match = false };
+        }
         const would_full = m.shared == prompt_ids.len and m.shared > 1;
         const restore_cap: usize = blk: {
             if (target_ssm_entries == null or !would_full) break :blk m.shared;
@@ -1365,6 +1412,7 @@ pub const HotPrefixCache = struct {
         e.last_used = self.bumpCounter();
         // Identity of the entry this request runs on: evicting it frees nothing (shared buffers).
         self.last_restored_used = e.last_used;
+        self.last_restored_shared = m.shared;
 
         // The sole caller reads an error as "no match" and cold-prefills the whole prompt, so a
         // failed restore must hand back an EMPTY cache, never a half-bound one.
@@ -1539,6 +1587,22 @@ pub const HotPrefixCache = struct {
         e.checked_out_by = slot_id;
         log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
         return true;
+    }
+
+    /// Restore by move on demand: the admission pass found this slot's share does not fit (its first
+    /// append copies the prefix). Takes, on the entry the slot just restored, the checkout
+    /// `checkoutIfEligible` takes up front in SSD-first mode.
+    pub fn checkoutRestored(self: *HotPrefixCache, slot_id: usize, prompt_len: usize) bool {
+        const used = self.last_restored_used orelse return false;
+        for (self.entries.items) |*e| {
+            if (e.last_used != used) continue;
+            if (e.checked_out_by != null) return false;
+            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, self.last_restored_shared, prompt_len, true)) return false;
+            e.checked_out_by = slot_id;
+            log.info("  [hot-cache] checked out {d}-token entry to the slot (the share does not fit; the append donates in place)\n", .{e.tokens.len});
+            return true;
+        }
+        return false;
     }
 
     /// Restore by move, the transfer: give up the entry's own handles so the slot is the sole
@@ -1763,7 +1827,13 @@ pub const HotPrefixCache = struct {
             var inputs_logged = false;
             trim_blk: while (true) {
                 const row_bytes = snapshotRowBytes(&new_snap);
-                const tl_opt = self.trimLenForBudget(self.max_kv_bytes, limit, row_bytes, eff_cps);
+                const ring_bytes = ringedBytes(&new_snap);
+                var ring_cp: ?*const KVCacheSnapshot = null;
+                const tl_opt = if (ring_bytes > 0) blk: {
+                    const rt = ringTrimLen(self.max_kv_bytes, limit, row_bytes, tokens.len, ring_bytes, new_rings orelse &.{}) orelse break :blk null;
+                    if (rt.cp) |k| ring_cp = &new_rings.?[k];
+                    break :blk rt.len;
+                } else self.trimLenForBudget(self.max_kv_bytes, limit, row_bytes, eff_cps);
                 if (!inputs_logged) {
                     inputs_logged = true;
                     logTrimInputs(tokens.len, row_bytes, self.max_kv_bytes, eff_cps, tl_opt, self.cp_thin != .min_span);
@@ -1798,7 +1868,7 @@ pub const HotPrefixCache = struct {
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
-                const trimmed = new_snap.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
+                const trimmed = new_snap.trimmedCopy(tl, ring_cp, mlx.gpuStream()) catch |err| {
                     // A copy that failed at this width is not a verdict on the entry: retry at the next-lower checkpoint.
                     decline = .snapshot_copy_failed;
                     decline_err = err;
@@ -1867,9 +1937,10 @@ pub const HotPrefixCache = struct {
                 if (eff_cps) |cps| {
                     for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
                 }
-                // Only this slot's own checkpoints so far; inheritance runs below.
+                // Only this slot's own checkpoints so far; inheritance runs below. A checkpoint
+                // the trim landed on is the entry's ring now.
                 if (new_rings) |r| {
-                    new_rings = ringCpsUpTo(self.allocator, r, tl);
+                    new_rings = ringCpsUpTo(self.allocator, r, if (ring_cp != null) tl - 1 else tl);
                     new_ring_bytes = ringCpsBytes(new_rings);
                 }
                 new_bytes = new_kv_bytes + new_ssm_bytes + new_ring_bytes;
@@ -2174,13 +2245,7 @@ pub const HotPrefixCache = struct {
                 if (!self.evictOneLruProgress("byte budget", incoming.cache_key)) break;
             }
         }
-        const count_full = self.entries.items.len >= self.max_entries;
-        const bytes_full = self.max_kv_bytes > 0 and incoming.kv_bytes > self.max_kv_bytes -| self.current_kv_bytes;
-        if (count_full or bytes_full) {
-            freeEntryOwnedState(self.allocator, &incoming);
-            log.info("  [hot-cache] skipped incoming snapshot: {s} full; checked-out entries prevent eviction\n", .{if (count_full) @as([]const u8, "count cap") else "byte budget"});
-            return false;
-        }
+        if (self.entries.items.len >= self.max_entries) return self.declineIncoming(&incoming, "count cap");
         if (incoming.ssm_checkpoints) |cps| {
             if (self.takeCpsIfQsaBank(cps)) |kept| {
                 incoming.ssm_checkpoints = kept;
@@ -2192,7 +2257,22 @@ pub const HotPrefixCache = struct {
         }
         try self.entries.append(self.allocator, incoming);
         self.current_kv_bytes += incoming.kv_bytes;
+        // A trim is priced against the checkpoints that survive the shed, so shed before judging.
+        if (self.max_kv_bytes > 0 and self.current_kv_bytes > self.max_kv_bytes) {
+            self.shedCheckpointsToFit();
+            if (self.current_kv_bytes > self.max_kv_bytes) {
+                var last = self.entries.pop().?;
+                self.current_kv_bytes -|= last.kv_bytes;
+                return self.declineIncoming(&last, "byte budget");
+            }
+        }
         return true;
+    }
+
+    fn declineIncoming(self: *HotPrefixCache, incoming: *Entry, cap: []const u8) bool {
+        freeEntryOwnedState(self.allocator, incoming);
+        log.info("  [hot-cache] skipped incoming snapshot: {s} full; checked-out entries prevent eviction\n", .{cap});
+        return false;
     }
 
     /// Offer a budget-declined candidate to the SSD tier before discarding
@@ -2895,6 +2975,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items[1..]) |*e| {
             if (e.last_used > newest.last_used) newest = e;
         }
+        self.shedRingCheckpoints(newest);
         const cps = newest.ssm_checkpoints orelse return;
         var n = cps.len;
         var shed: usize = 0;
@@ -2939,6 +3020,25 @@ pub const HotPrefixCache = struct {
             n = 0;
         }
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
+    }
+
+    /// Lowest first, while the cache is over its budget: a later request forks near the end.
+    fn shedRingCheckpoints(self: *HotPrefixCache, e: *Entry) void {
+        const cps = e.ring_cps orelse return;
+        var drop: usize = 0;
+        var freed: u64 = 0;
+        while (drop < cps.len and self.current_kv_bytes -| freed > self.max_kv_bytes) : (drop += 1) {
+            freed += snapshotBytes(&cps[drop]);
+        }
+        if (drop == 0) return;
+        // A fresh list, never a shrunk one: a deinit'd snapshot left in the slice would be freed twice.
+        const kept: ?[]KVCacheSnapshot = if (drop == cps.len) null else self.allocator.dupe(KVCacheSnapshot, cps[drop..]) catch return;
+        for (cps[0..drop]) |*c| c.deinit();
+        self.allocator.free(cps);
+        e.ring_cps = kept;
+        e.kv_bytes -|= freed;
+        self.current_kv_bytes -|= freed;
+        log.info("  [hot-cache] shed {d} ring checkpoints to fit the byte budget ({d} kept)\n", .{ drop, cps.len - drop });
     }
 
     /// Re-clamp the byte budget after the machine's residency changed (a model loaded
@@ -3949,6 +4049,170 @@ test "an entry extended in place keeps its older ring checkpoints" {
     restored.setSwaRing(window);
     const again = try hc.lookupAndRestore(&restored, &moe_off, null, s, &next, false, 0, null, null);
     try testing.expectEqual(@as(usize, prompt), again.matched);
+}
+
+/// Bytes one row of `e`'s K and V bill, from their own shapes.
+fn ringEntryRowBytes(e: *const transformer_mod.KVCacheEntry) u64 {
+    return ringRowBytes(e.keys) + ringRowBytes(e.values);
+}
+
+/// The next turn's first write through both caches: identical views prove the restore.
+fn ringExpectSameNext(ref: *KVCache, restored: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, at: u32) !void {
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var rv = try ringWriteLayer(ref, s, li, at, 1, window);
+        defer rv.deinit();
+        var sv = try ringWriteLayer(restored, s, li, at, 1, window);
+        defer sv.deinit();
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
+    }
+}
+
+test "an oversized ringed entry trims to its end: the ring is a constant, not a per-token price" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
+    const prompt: u32 = 2000;
+
+    var toks: [prompt]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    try ringFill(&live, s, n_layers, window, 0, prompt, 64);
+
+    // The global layer's buffer holds spare capacity past its rows, as a reservation does.
+    var probe = try live.snapshotRetained(s);
+    const cap: u64 = @intCast(mlx.getShape(probe.entries[0].keys)[2]);
+    const rows_bytes = HotPrefixCache.snapshotBytes(&probe) - (cap - prompt) * ringEntryRowBytes(&probe.entries[0]);
+    probe.deinit();
+    try testing.expect(cap > prompt);
+
+    // Room for the rows, not the capacity they sit in.
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, rows_bytes);
+    defer hc.deinit();
+    const status = try hc.commitWithState(&live, &toks, false, 0, null, null, null);
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, prompt), hc.entries.items[0].tokens.len);
+    try testing.expectEqual(rows_bytes, hc.current_kv_bytes);
+
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&restored, &moe_off, null, s, &toks, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt - 1), hit.matched);
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt + 64, 64);
+    try ringFill(&restored, s, n_layers, window, @intCast(hit.matched), prompt + 64, prompt + 64);
+    try ringExpectSameNext(&ref, &restored, s, n_layers, window, prompt + 64);
+}
+
+test "an oversized ringed entry trims to the highest ring checkpoint that fits, and declines below every one" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 2000;
+    const reply: u32 = 600;
+
+    var toks: [prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+    const cp_bytes = HotPrefixCache.snapshotBytes(&cp.?);
+    var probe = try live.snapshotRetained(s);
+    const global_row = ringEntryRowBytes(&probe.entries[0]);
+    probe.deinit();
+
+    // The prompt's global rows plus the checkpoint's window: the entry ends where the checkpoint is.
+    const budget = prompt * global_row + cp_bytes;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    defer hc.deinit();
+    const status = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, prompt), hc.entries.items[0].tokens.len);
+    try testing.expect(hc.entries.items[0].ring_cps == null);
+    try testing.expectEqual(budget, hc.current_kv_bytes);
+
+    // The next turn keeps the prompt and diverges after it.
+    var next: [prompt + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + 1], toks[0 .. prompt + 1]);
+    for (next[prompt + 1 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), hit.matched);
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt + 40, 64);
+    try ringFill(&restored, s, n_layers, window, prompt, prompt + 40, 40);
+    try ringExpectSameNext(&ref, &restored, s, n_layers, window, prompt + 40);
+
+    // No room for the checkpoint's window: nothing restorable fits.
+    var live2 = try KVCache.init(testing.allocator, n_layers);
+    defer live2.deinit();
+    const cp2 = try ringTurn(&live2, s, n_layers, window, prompt, reply);
+    var tight = HotPrefixCache.initWithMem(testing.allocator, 4, prompt * global_row);
+    defer tight.deinit();
+    const declined = try tight.commitWithRing(&live2, &toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp2 });
+    try testing.expectEqual(std.meta.Tag(CommitStatus).declined, std.meta.activeTag(declined));
+    try testing.expectEqual(@as(usize, 0), tight.entries.items.len);
+}
+
+test "a replacement over the budget sheds its lowest ring checkpoints before the entry" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const turn2 = prompt + reply + 100;
+
+    var toks: [turn2 + 300]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // Turn 2's cache first, to price a budget that holds it and its own checkpoint.
+    var ext = try KVCache.init(testing.allocator, n_layers);
+    defer ext.deinit();
+    ext.setSwaRing(window);
+    try ringFill(&ext, s, n_layers, window, 0, turn2, 64);
+    var cp2 = try ext.ringCheckpoint(turn2, s);
+    errdefer if (cp2) |*c| c.deinit();
+    try ringFill(&ext, s, n_layers, window, turn2, toks.len, 16);
+    var probe = try ext.snapshotRetained(s);
+    const alone = HotPrefixCache.snapshotBytes(&probe) + HotPrefixCache.snapshotBytes(&cp2.?);
+    probe.deinit();
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, alone);
+    defer hc.deinit();
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+    _ = try hc.commitWithRing(&live, toks[0 .. prompt + reply], false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+
+    // Turn 2 extends the entry, and the merge brings turn 1's checkpoint along: one too many.
+    const moved = cp2;
+    cp2 = null;
+    const status = try hc.commitWithRing(&ext, &toks, false, 0, 0, null, null, null, null, turn2, .{ .prompt_end = moved });
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(usize, toks.len), hc.entries.items[0].tokens.len);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items[0].ring_cps.?.len);
+    try testing.expectEqual(@as(usize, turn2), hc.entries.items[0].ring_cps.?[0].step);
+    try testing.expectEqual(alone, hc.current_kv_bytes);
 }
 
 test "a ring checkpoint taken at the restore keeps the fork when the donor is evicted before the commit" {
@@ -5771,6 +6035,48 @@ test "HotPrefixCache: oversized hybrid entry trims to the highest checkpoint tha
     const kept = e.ssm_checkpoints.?;
     try testing.expectEqual(@as(usize, 5), kept.len);
     try testing.expectEqual(@as(usize, 500), kept[kept.len - 1].pos);
+}
+
+test "HotPrefixCache: a trim priced after its checkpoint shed is retained, then shed" {
+    // qwen4_exp prices a trim against the checkpoints that survive the shed; retaining the new
+    // entry declined it on its unshed size, so a session past the budget was never cached.
+    const s = mlx.gpuStream();
+    var toks: [900]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 3);
+    var srcs: [8][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer {
+        for (&srcs) |*e| pcFreeHybrid(e);
+    }
+    var c1 = try KVCache.init(testing.allocator, 3);
+    defer c1.deinit();
+    try testFillCache(&c1, s, 3, 900);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 8);
+    for (cps, 0..) |*c, i| {
+        c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+    }
+    var probe = try c1.snapshot();
+    defer probe.deinit();
+    const cp_bytes = transformer_mod.ssmCheckpointBytes(&cps[0]);
+    // Room for a 500-token prefix and three of its five checkpoints.
+    const budget = pcRowBytes(&probe) * 500 + 3 * cp_bytes;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+    hc.ssm_checkpoint_max = 8;
+    hc.cp_thin = .min_span_recency;
+    defer hc.deinit();
+    const status = try hc.commitWithSsm(&c1, &toks, false, cps, null, null);
+    try testing.expectEqual(std.meta.Tag(CommitStatus).ok, std.meta.activeTag(status));
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    const e = &hc.entries.items[0];
+    try testing.expect(e.tokens.len >= 500);
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+    const kept = e.ssm_checkpoints.?;
+    try testing.expect(kept.len < 5);
+    try testing.expectEqual(e.tokens.len, kept[kept.len - 1].pos);
 }
 
 /// A two-layer QSA hybrid: the layer counts differ from `pcBuildQsaHybrid`'s, which is how a
@@ -9326,8 +9632,11 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
         try testing.expectEqual(@as(usize, 600), res.matched);
         // The transfer is the scheduler's second step, taken at the last point
-        // before the first write (see `donateCheckout`).
+        // before the first write (see `donateCheckout`), and the slot adopts the buffers.
         hc.donateCheckout(0xA11CE);
+        slot.adoptRestored();
+        // A share would size its copy by this reservation; the move ignores it.
+        slot.reserve(reserve / 4);
 
         // The entry gave the buffers up: its handles are empty and it names the slot.
         const e = &hc.entries.items[0];
@@ -9364,6 +9673,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
 
         slot.evalState();
         try testing.expectEqual(buf_bytes, testKeyBufferBytes(&slot, 0));
+        slot.reserve(reserve / 4);
         const before = testLiveBytes(s);
         try testWriteCacheLayer(&slot, s, 0, 600, 8);
         slot.evalState();
@@ -9371,8 +9681,8 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         try testReadKeyRows(&slot, 0, 596, &copied_bytes);
     }
 
-    // The share arm had to copy a second capacity-shaped buffer.
-    try testing.expect(copied_delta > buf_bytes);
+    // The share arm copied into a buffer the request's reservation sizes, not the donor's capacity.
+    try testing.expect(copied_delta * 4 > buf_bytes and copied_delta < buf_bytes);
     // The move arm allocated nothing beyond the tail; a quarter of one buffer is a loose ceiling.
     try testing.expect(moved_delta * 4 < buf_bytes);
     try testing.expectEqualSlices(f32, &copied_bytes, &moved_bytes);
@@ -9382,6 +9692,60 @@ fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void 
     cache.evalState();
     const p = mlx.mlx_array_data_float32(cache.entries[layer].keys) orelse return error.NotEvaluated;
     for (out, 0..) |*v, i| v.* = p[row * 8 + i];
+}
+
+test "a one-token prompt that hits its own entry prefills cold: a restore leaves a token to forward" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{42};
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 64);
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &tokens, false, 0, null, null, null, 7);
+    try testing.expectEqual(@as(usize, 0), res.matched);
+    try testing.expectEqual(@as(usize, 0), moe_off);
+    try testing.expectEqual(@as(usize, 0), slot.step);
+    try testing.expect(hc.last_restored_used == null);
+}
+
+test "restore by move ON DEMAND: a share that does not fit is taken over, off SSD-first" {
+    // The admission pass converts a full-entry hit into a checkout; a partial hit and a second call decline.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    var diverged = prompt;
+    diverged[500] = 999_999;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const partial = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &diverged, false, 0, null, null, null, 7);
+    try testing.expectEqual(@as(usize, 500), partial.matched);
+    try testing.expect(!hc.checkoutRestored(7, diverged.len));
+
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
+    try testing.expectEqual(@as(usize, 600), res.matched);
+    try testing.expect(!res.checked_out);
+    try testing.expect(hc.checkoutRestored(7, prompt.len));
+    try testing.expectEqual(@as(?usize, 7), hc.entries.items[0].checked_out_by);
+    try testing.expect(!hc.checkoutRestored(7, prompt.len));
+
+    hc.releaseCheckout(7, "prefill refused");
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
 }
 
 test "restore by move: a partial-prefix hit keeps the refcount-share" {

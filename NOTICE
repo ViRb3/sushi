@@ -185,6 +185,27 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     chain it replaces, from mlx-serve #556 by Samuel Reed (@STRML).
     Modifications: no environment switch; a microbenchmark arm compares it
     with the chain.
+  * The one-session hot prefix cache default (`defaultPrefixCacheAsk`,
+    `oneSessionEntryBytes` and `prefix_cache_mem_explicit` in `src/server.zig`,
+    the flag in `src/main.zig`), from mlx-serve #575 by Samuel Reed (@STRML).
+    Modifications: both served architectures take it, the session counts the
+    capacity a request reserves and the sliding-window ring, and the grown ask
+    leaves room for the n-gram table's page cache and a cold full-context
+    prompt. The app-side settings changes are not ported.
+  * The SSD restore that evaluates each chunk before opening the next and
+    drops the MLX error its failure latched (`src/kv_disk_cache.zig`, section 7
+    of `tests/test_prefix_cache_disk.sh`), from mlx-serve #527 by @brandondyal.
+    Modifications: the ring-restore entry point drops its latch too.
+  * The first append after a short shared restore sizes its copy from the
+    request rather than the donor's buffer (`src/transformer.zig`), from
+    mlx-serve 0405fd10 (#492, reported by @celestial-rose) by David Dalcu.
+    Modifications: the copy is taken whenever the donor's buffer is longer
+    than the request reserves, and a donated checkout adopts its buffers.
+  * Restore by move on demand when a warm share does not fit
+    (`checkoutRestored` in `src/prefix_cache.zig`, its admission-pass call in
+    `src/scheduler.zig`) and the one-token full-hit guard, from mlx-serve
+    a456fd01 (#518) by David Dalcu. Modifications: only qwen4_exp's
+    inference-thread admission pass takes the checkout.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)

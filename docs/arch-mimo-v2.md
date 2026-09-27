@@ -94,8 +94,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   never the context.
   A non-zero `max_seq` into `KVCache.update` IS the ring predicate, so `slidingViewFor` may never decline the trim
   on a ringed arch.
-- **A ringed entry's `offset` is LOCAL**; absolute = `base + offset` (`absSeqLen`). A clamp or trim below the
-  retained window declines by NAME (`SlidingRingRewindPastWindow`) and the hot-cache restore cold-prefills.
+- **A ringed entry's `offset` is LOCAL**; absolute = `base + offset` (`absSeqLen`). A clamp below the retained
+  window declines by NAME (`SlidingRingRewindPastWindow`) and the hot-cache restore cold-prefills; a byte-budget trim
+  lands only at the entry's end or a ring checkpoint ([engine-prefix-cache](engine-prefix-cache.md#candidate-ranking-and-trimming)).
 - **The SSD tier persists a ringed entry as chunks of the global layers plus one ring file per restore point**
   (`r{pos}.safetensors`: the prompt end, inherited forks, the entry's end) and restores only at one of them
   (`restoreIntoRinged`, manifest v9); a ringed slot never takes an entry without them (its sliding layers are billed

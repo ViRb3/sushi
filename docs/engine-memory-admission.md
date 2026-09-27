@@ -93,7 +93,11 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 
 - One `[admission] needed=… available=… reclaimable=… width=… verdict=…` line per decision.
 - A long prefill evicts the hot cache on the INFERENCE thread to be admitted (`evictLruToAdmit`), crediting only
-  provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name.
+  provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
+  over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
+- qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill and its first
+  grow is billed whole beside it (nothing credited). The restore itself runs unbilled, so it holds the restored KV
+  plus one chunk ([engine-prefix-cache](engine-prefix-cache.md#basics)).
 - The eviction pass drains the GPU stream before it reads live memory: a command buffer in flight holds its inputs'
   buffers, so an eviction read early frees nothing and trips the shared-entry stop.
 - **Concurrent arrivals are each billed against the SAME free memory** on their connection threads. The gated arch

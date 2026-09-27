@@ -883,8 +883,12 @@ pub var prefix_cache_capacity: u32 = 32;
 /// default (2 GB) is generous for one or two long conversations on a Gemma 4
 /// E4B-sized model and tiny relative to total wired-limit budget; tune via
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
-/// from `--prefix-cache-entries` still applies).
-pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
+/// from `--prefix-cache-entries` still applies). An unset budget grows to one
+/// session at the working context where the machine holds it (`defaultPrefixCacheAsk`).
+pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
+pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+/// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
+pub var prefix_cache_mem_explicit = false;
 
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
 /// Every post-load reserve reads it through `resolvedPrefixCacheMem()`. Atomic: written on the
@@ -3451,6 +3455,61 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
     );
 }
 
+/// The hot-cache ask when nobody named one: `session` (`OneSession.ask`), never under 2 GB. Below
+/// one session the cache keeps only a prefix of the longest conversations, the ones whose reuse
+/// saves the most prefill. Any other ask (an operator's, even one equal to the default) stands.
+pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session: u64) u64 {
+    if (explicit or requested != PREFIX_CACHE_MEM_DEFAULT) return requested;
+    return @max(requested, session);
+}
+
+/// Bytes one cached session at `ctx_tokens` holds: the capacity a request there reserves (one
+/// widest rung past it, `reservedCacheTokens`), the rings, every ring checkpoint an entry keeps,
+/// and the SSM checkpoints a cold prefill of that length retains.
+pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
+    const ring = config.swaRingBytes() +| @as(u64, prefix_cache_mod.RING_CHECKPOINT_MAX) *| config.swaRingCheckpointBytes();
+    return sessionBytesPerToken(config, kv_bits) *| (ctx_tokens +| @as(u64, PREFILL_CHUNK_LADDER[0])) +|
+        config.qsaRingBytes() +| kvBytesPerTokenAtBits(ring, kv_bits) +| retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
+}
+
+/// What an unnamed hot-cache budget grows toward, and the room the machine leaves it.
+pub const OneSession = struct {
+    /// One cached session at the working context (`oneSessionEntryBytes`).
+    session: u64,
+    /// The ceiling less the weights, `claim` and `bill`.
+    room: u64,
+    /// Admission's bill for a cold prompt that fills the working context.
+    bill: u64,
+    /// Page cache that must stay resident beside the weights.
+    claim: u64,
+
+    /// The session when the room holds it. Else the room, at most half the bill: a session that
+    /// outgrows the cache is trimmed by a real copy beside the entry it replaces and its live KV.
+    pub fn ask(self: OneSession) u64 {
+        if (self.session <= self.room) return self.session;
+        return @min(self.room, self.bill / 2);
+    }
+};
+
+/// `claim` (the qwen4_exp n-gram table, `qwen4_exp.page_cache_claim`) is billed as GPU memory: the
+/// wired KV would otherwise evict the rows every decode step gathers. `chunk` is the width the
+/// clamp reserves, so a full cache still admits a cold full-context prompt there.
+pub fn oneSessionFor(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, claim: u64, ctx_tokens: u64, chunk: u64) OneSession {
+    const bill = prefillNeededAtChunk(config, ctx_tokens, 0, kv_bits, chunk, .{ .mtp_on = mtpHeadDefaultOn(config) });
+    return .{
+        .session = oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk),
+        .room = ceiling -| (active_mem +| claim +| bill),
+        .bill = bill,
+        .claim = claim,
+    };
+}
+
+fn logOneSessionAsk(ask: u64, ctx_tokens: u64, one: OneSession) void {
+    log.info("[hot-cache] budget {d} MB for one session at the working context ({d} tokens, {d} MB; room {d} MB beside the weights, {d} MB of n-gram page cache and a full-context prompt's {d} MB) — --prefix-cache-mem overrides\n", .{
+        ask >> 20, ctx_tokens, one.session >> 20, one.room >> 20, one.claim >> 20, one.bill >> 20,
+    });
+}
+
 /// `revise` marks a post-load re-clamp (#364): the cache's own resident bytes come off the
 /// machine read so it never bills itself, and the budget lines stay quiet.
 pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle_out: *u64) u64 {
@@ -3465,12 +3524,17 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     // Ungated is the previous `prefixCacheMemForLoad`.
     if (!config.longCtxGated()) {
         const chunk: u64 = pinPrefillChunk(config);
+        const ctx_tokens: u64 = getEffectiveContextLength(config);
+        const ceiling = currentGpuMemoryCeiling(config, active_mem);
         // `statePerTokenBilled` is 0 off qwen4_exp.
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
-            getEffectiveContextLength(config) +| slotRingBytes(config, kv_bits);
+            ctx_tokens +| slotRingBytes(config, kv_bits);
+        // Context sizing and the chunk pin read the raw ask, so neither moves with this one.
+        const one = oneSessionFor(config, kv_bits, ceiling, active_mem, qwen4_mod.page_cache_claim.load(.acquire), ctx_tokens, chunk);
+        const ask = defaultPrefixCacheAsk(requested, prefix_cache_mem_explicit, one.ask());
         const clamped = clampedPrefixCacheMem(
-            requested,
-            currentGpuMemoryCeiling(config, active_mem),
+            ask,
+            ceiling,
             active_mem,
             ctx_kv,
             prefillTransientReserve(config, kv_bits, chunk),
@@ -3478,8 +3542,9 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
         publishResolvedPrefixCacheMem(clamped);
         if (revise.quiet) return clamped;
-        if (requested > 0 and clamped < requested) {
-            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+        if (ask != requested) logOneSessionAsk(ask, ctx_tokens, one);
+        if (ask > 0 and clamped < ask) {
+            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ ask >> 20, clamped >> 20 });
         } else if (requested == 0) {
             log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
         }
@@ -3496,16 +3561,19 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out, revise.quiet)) |b| return b;
     // Pin first, then hand the pinned width in as the override.
     const pinned: u32 = pinPrefillChunk(config);
+    // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
+    const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, pinned);
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
+    const one = oneSessionFor(config, kv_bits, staticGpuMemoryCeiling(), active_mem, qwen4_mod.page_cache_claim.load(.acquire), ctx_tokens, clampReserveWidth(config, pinned));
+    const ask = defaultPrefixCacheAsk(requested, prefix_cache_mem_explicit, one.ask());
     const plan = planHotCache(
         config,
         kv_bits,
         staticGpuMemoryCeiling(),
         active_mem,
-        // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
-        ramFirstContextForLoad(config, kv_bits, active_mem, pinned),
+        ctx_tokens,
         sizerCtxKvBytes(config, kv_bits),
-        requested,
+        ask,
         pinned,
     );
     publishResolvedPrefixCacheMem(plan.budget);
@@ -3516,12 +3584,155 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
         log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
     }
-    if (requested > 0 and plan.budget < requested) {
-        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+    if (ask != requested) logOneSessionAsk(ask, ctx_tokens, one);
+    if (ask > 0 and plan.budget < ask) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ ask >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     } else if (requested == 0) {
         log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
     return plan.budget;
+}
+
+test "defaultPrefixCacheAsk: an unnamed budget holds one session at the working context, never under 2 GB" {
+    const t = std.testing;
+    const gb: u64 = 1024 * 1024 * 1024;
+    const session: u64 = 262144 * 24576; // 262k-token qwen4_exp session, ~6 GB
+    try t.expectEqual(session, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, session));
+    // A short working context keeps the old floor.
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, gb));
+    // An operator's number stands, even one equal to the default.
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, true, session));
+    try t.expectEqual(32 * gb, defaultPrefixCacheAsk(32 * gb, true, session));
+    try t.expectEqual(@as(u64, 0), defaultPrefixCacheAsk(0, true, session));
+    // Any other ask is someone's choice and stands.
+    try t.expectEqual(256 * 1024 * 1024, defaultPrefixCacheAsk(256 * 1024 * 1024, false, session));
+}
+
+test "defaultPrefixCacheAsk: the machine's headroom still caps the defaulted ask" {
+    const t = std.testing;
+    const gb: u64 = 1024 * 1024 * 1024;
+    const session: u64 = 262144 * 24576;
+    const ask = defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, session);
+    // 16 GB ceiling, 11 GB weights, 1 GB live context, 1.5 GB prefill reserve: 2.5 GB left.
+    try t.expectEqual(gb * 5 / 2, clampedPrefixCacheMem(ask, 16 * gb, 11 * gb, gb, gb * 3 / 2));
+    // A big machine gets the whole session.
+    try t.expectEqual(session, clampedPrefixCacheMem(ask, 200 * gb, 80 * gb, gb, 2 * gb));
+}
+
+test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints and the capacity it reserved" {
+    const t = std.testing;
+    const guard = qsaScoreFusedOffGuard();
+    defer guard.deinit();
+    var cfg = qwen4DeployedTestConfig();
+    const ctx: u64 = 262_144;
+    const chunk: u64 = 8192;
+    cfg.pinned_context = @intCast(ctx);
+    const entry = oneSessionEntryBytes(&cfg, 16, ctx, chunk);
+    try t.expect(cfg.ssmCheckpointBytes() > 0);
+    const fixed = cfg.qsaRingBytes() + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk);
+    // A request at the working context reserves past it (`reservedCacheTokens`), and the entry
+    // shares that capacity: no session the context admits outgrows the default.
+    for ([_]u64{ ctx - 4000, ctx }) |seq| {
+        const reserved = reservedCacheTokens(seq, 8192, PREFILL_CHUNK_LADDER[0], ctx);
+        try t.expect(reserved > ctx);
+        try t.expect(sessionBytesPerToken(&cfg, 16) * reserved + fixed <= entry);
+    }
+    try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+test "oneSessionEntryBytes: a ringed session is billed with its ring and every checkpoint an entry keeps" {
+    const t = std.testing;
+    var cfg = mimoV2FlashBillConfig();
+    const ctx: u64 = 454_656;
+    cfg.pinned_context = @intCast(ctx);
+    const ring = cfg.swaRingBytes() + prefix_cache_mod.RING_CHECKPOINT_MAX * cfg.swaRingCheckpointBytes();
+    try t.expect(ring > 0);
+    const entry = oneSessionEntryBytes(&cfg, 8, ctx, 2048);
+    try t.expectEqual(sessionBytesPerToken(&cfg, 8) * (ctx + PREFILL_CHUNK_LADDER[0]) + kvBytesPerTokenAtBits(ring, 8), entry);
+    // Past the 2 GB default at kv8: the sessions that cold-prefilled every turn.
+    try t.expect(entry > PREFIX_CACHE_MEM_DEFAULT);
+}
+
+test "oneSessionFor: an unnamed budget grows only into room the n-gram table and a full-context prompt leave" {
+    const t = std.testing;
+    const guard = qsaScoreFusedOffGuard();
+    defer guard.deinit();
+    const GiB: u64 = 1 << 30;
+    var cfg = qwen4DeployedTestConfig();
+    const ctx: u64 = 1_048_576;
+    cfg.pinned_context = @intCast(ctx);
+    const chunk: u64 = 512;
+    const weights: u64 = 51 * GiB;
+    const table: u64 = 30 * GiB;
+
+    const roomy = oneSessionFor(&cfg, 8, 400 * GiB, weights, table, ctx, chunk);
+    try t.expectEqual(roomy.session, roomy.ask());
+
+    // This box: the session fits beside the weights, not beside the table as well.
+    const ceiling: u64 = 111_808 * (1 << 20);
+    const bare = oneSessionFor(&cfg, 8, ceiling, weights, 0, ctx, chunk);
+    try t.expectEqual(bare.session, bare.ask());
+    const with_table = oneSessionFor(&cfg, 8, ceiling, weights, table, ctx, chunk);
+    const ask = with_table.ask();
+    try t.expect(ask > PREFIX_CACHE_MEM_DEFAULT and ask < with_table.session);
+    try t.expect(weights + table + ask + with_table.bill <= ceiling);
+
+    // A room past half the prompt's bill stops at the half: the trim a session makes when it
+    // outgrows the cache copies up to the budget beside the entry it replaces and the live KV.
+    const wide = oneSessionFor(&cfg, 8, weights + roomy.bill + roomy.session - 1, weights, 0, ctx, chunk);
+    try t.expect(wide.bill / 2 < wide.room);
+    try t.expectEqual(wide.bill / 2, wide.ask());
+
+    // No room: nothing grows and the 2 GB default stands.
+    const none = oneSessionFor(&cfg, 8, weights + table, weights, table, ctx, chunk);
+    try t.expectEqual(@as(u64, 0), none.ask());
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, none.ask()));
+}
+
+test "oneSessionFor: a full MiMo cache leaves a cold full-context prompt its bill at the pinned width" {
+    const t = std.testing;
+    transformer_mod.fused256_override = true;
+    defer transformer_mod.fused256_override = null;
+    const GiB: u64 = 1 << 30;
+    var cfg = mimoV2FlashBillConfig();
+    const ctx: u64 = 454_656;
+    cfg.pinned_context = @intCast(ctx);
+    const chunk: u64 = 2048;
+    const weights: u64 = 97 * GiB;
+    const ceiling: u64 = weights + 14 * GiB;
+    const saved = server_config.default_force_mtp;
+    defer server_config.default_force_mtp = saved;
+    server_config.default_force_mtp = false;
+    // Off, then the served default: the heads on for every request that leaves MTP out.
+    for ([_]?bool{ false, null }) |mtp| {
+        cfg.mtp_override = mtp;
+        const ask = defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, oneSessionFor(&cfg, 8, ceiling, weights, 0, ctx, chunk).ask());
+        try t.expect(ask > PREFIX_CACHE_MEM_DEFAULT);
+        // The ungated arch refuses rather than evicts to admit, so the cache must not take that bill.
+        try t.expect(prefillNeededAtChunk(&cfg, ctx, 0, 8, chunk, .{ .mtp_on = mtp == null }) <= ceiling - weights - ask);
+    }
+    try t.expect(oneSessionFor(&cfg, 8, ceiling, weights, 0, ctx, chunk).bill > prefillNeededAtChunk(&cfg, ctx, 0, 8, chunk, .{}));
+}
+
+test "a qwen4_exp SSD restore's first grow is billed: rows it did not check out are never credited" {
+    // The inference thread bills a warm request after its restore, so the restored buffer is live
+    // memory; with nothing credited the grown copy is billed whole beside it, more than a donated
+    // restore that models the same grow's coexistence.
+    const t = std.testing;
+    const guard = qsaScoreFusedOffGuard();
+    defer guard.deinit();
+    var cfg = qwen4DeployedTestConfig();
+    cfg.pinned_context = 1 << 20;
+    const seq: u64 = 400_000;
+    const restored: u64 = seq - 2000;
+    const disk = WarmPrefix{ .matched_tokens = restored, .capacity_tokens = restored };
+    const donated = WarmPrefix{ .matched_tokens = restored, .capacity_tokens = restored, .will_donate = true };
+    try t.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, seq, 2048, 8, 1024, disk).shared_resident_bytes);
+    // Over the donated bill by at least the restored KV less the old buffers the grow keeps alive.
+    const d = prefillRequestTerms(&cfg, seq, 2048, 8, 1024, donated);
+    try t.expect(d.grow_coexist_bytes > 0 and d.shared_resident_bytes > d.grow_coexist_bytes);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, 8, 1024, disk) - prefillNeededAtChunk(&cfg, seq, 2048, 8, 1024, donated) >=
+        d.shared_resident_bytes - d.grow_coexist_bytes);
 }
 
 test "clampedPrefixCacheMem: the budget never exceeds what the weights leave under the ceiling" {
