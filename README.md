@@ -122,8 +122,8 @@ Leave room for the hot prefix cache (`--prefix-cache-mem`) and the prefill buffe
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
 KLD against the bf16 model: 16 prompts x 512 tokens scored to the first EOS, kv8, every pack run by the same sushi
-build. The light rings are the sushi packs with a 4-bit n-gram table (Sushi-3bpw ships that table; either table works
-with either pack). Numbers: [docs/quality-kld.md](docs/quality-kld.md).
+build. The light rings are the sushi packs with a 4-bit n-gram table (Sushi-2.6bpw and Sushi-3bpw ship that table;
+either table works with either pack). Numbers: [docs/quality-kld.md](docs/quality-kld.md).
 
 ## Speed
 

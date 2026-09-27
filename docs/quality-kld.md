@@ -110,6 +110,8 @@ n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi pack
 | mlx-serve iQ-MLX 3.3bpw (ddalcu; imatrix-weighted affine) | 50.60 | 0.1987 | 86.28% |
 | Sushi-3bpw with mixed-4-8bit's 4-bit g32 n-gram table (the published Sushi-3bpw) | 49.33 | 0.1047 | 90.34% |
 | Sushi-4bpw with the same 4-bit g32 table | 63.68 | 0.0666 | 92.35% |
+| Sushi-2.6bpw (binary ad5e6be8, 2026-09-27; Sushi-3bpw's 0.10123 and 0.1047 reproduce on it bit for bit) | 43.95 | 0.1303 | 89.33% |
+| Sushi-2.6bpw with the 4-bit g32 table (the published Sushi-2.6bpw) | 43.95 | 0.1355 | 89.08% |
 | MCG K2 w15, pin pass 64 (Sushi-3bpw dense) | 36.0 active | 0.2244 | 85.42% |
 
 Release 1.0.4 check: `ad4a3ce0` plus the context-bill change, ReleaseFast binary SHA-256
