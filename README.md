@@ -110,7 +110,7 @@ Sushi-3bpw on an M5 Max 128 GB, sushi v1.0.0 release candidate (build 725b76ca):
 <p align="center"><img src="docs/assets/perf-sushi3bpw-1m.png" alt="decode and prefill vs context" width="100%"></p>
 
 Smaller Macs have less memory bandwidth, so expect lower numbers. Chips before M5 also lack the neural accelerators:
-an M2 Max 64 GB measured 124-141 tok/s prefill at 3-4k tokens and 33 tok/s decode
+a user reported about 400 tok/s prefill at 2-16k tokens and 38.6 tok/s decode on an M2 Max 64 GB running v1.0.4
 ([numbers](docs/perf-baselines.md#m2max-64gb)).
 
 ## License

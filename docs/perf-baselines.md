@@ -169,6 +169,24 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
   f22a383 + the gate, A B B A twice: 33.9 / 36.6 / 31.4 / 34.8 and 30.7 / 37.0 / 37.4 / 35.1 tok/s, paired 1.08,
   0.90, 1.21, 1.07 (mean 1.06, inside the prompt-to-prompt spread).
 
+### v1.0.4 (27ca1c86), user-reported
+
+A user ran the release on their own M2 Max 64 GB: llmprobe 0.6.12 against port 1234, default ladder,
+warmup + median of 3, greedy, thinking on (reasoning medium), MTP engaged. Launch flags, QoS, lock and box state were not
+reported, so this is a reference point, not a controlled cell.
+
+| prompt | decode tok/s | first token | prefill tok/s | tokens per step |
+|---|---:|---:|---:|---:|
+| 2041 (headline) | 38.6 (38.5–38.8) | 866 ms | 399 (398.9–401.2) | 2.91 |
+| ~512 | 31.4 | 2.0 s | 258 | 2.67 |
+| ~4.2k | 34.2 | 10.4 s | 410 | 3.15 |
+| ~8.2k | 36.9 | 20.0 s | 413 | 2.95 |
+| ~16.3k | 37.8 | 39.8 s | 409 | 2.74 |
+
+- Speculation 1.38x (predictable 46.4, novel 33.5 tok/s); prefix cache 6.8x (4.1 s cold, 607 ms warm, 1509 of 1540
+  tokens cached); 4 streams 39.9 tok/s aggregate vs 26.6 alone (0.38 efficiency); sustained 38.6 -> 36 tok/s over 4 m 5 s
+  (-6.7%).
+
 <a id="ngram-arm"></a>
 ## The n-gram gather arm is measured per load (feb9ed7d)
 
