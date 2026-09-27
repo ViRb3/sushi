@@ -82,24 +82,6 @@ teacher: the original checkpoint scores 0.0077 nats / 95.8% top-1 (the engine-to
 teacher top-2 gap ≤ 0.5 nats, flat across the context). The teacher and the tool are validated by an implementation
 that shares no code with ours.
 
-## Flash-Next K2.6 T2 (16x512, bf16 KV)
-
-The chart's lower panel uses the `mlx-serve-bf16-16x512-raw` teacher fixture with bf16 KV, 8,192 total positions
-and 7,186 positions through the first EOS. These results are separate from the published kv8 comparison below.
-
-| pack | KLD to first EOS | all-position KLD |
-|---|---:|---:|
-| Sushi-2.6bpw, untuned | 0.14340759 | 0.12978147 |
-| Sushi-2.6bpw T2 (960 × 512 calibration tokens) | 0.13375725 | 0.12150053 |
-| Sushi-3bpw | 0.10442910 | 0.09566898 |
-| Sushi-4bpw | 0.06174568 | 0.05775573 |
-
-T2 lowers first-EOS KLD by 6.73% and all-position KLD by 6.38% versus untuned K2.6. Sushi-3bpw still has lower
-KLD: T2 is 28.08% higher through first EOS and 27.00% higher over all positions.
-
-Chart data, including evaluation result filenames, is in [assets/kld-chart-data.json](assets/kld-chart-data.json).
-Regenerate with `python scripts/plot_kld_chart.py` from the repository root (requires matplotlib).
-
 ## Flash-Next (16x512, first EOS, 7186 positions, kv8)
 
 | pack | KLD | top-1 | cosine loss | all positions |
