@@ -1,13 +1,12 @@
 //! CLI subcommands — `sushi run|pull|list <model>` — Ollama-grade
 //! ergonomics for the terminal.
 //!
-//!   sushi run gemma4        # download if missing, serve, drop into a REPL
-//!   sushi pull qwen3.6      # download only
-//!   sushi list              # what's on disk
+//!   sushi run qwen3.8-flash-next          # download if missing, serve, drop into a REPL
+//!   sushi pull qwen3.8-flash-next:2.6bpw  # download only
+//!   sushi list                            # what's on disk
 //!
-//! Short names resolve through a curated alias table (mirroring the MLX
-//! Core app catalog in ChatModels.swift); anything containing '/' is
-//! treated as a HuggingFace repo id directly ("org/repo", with optional
+//! Short names resolve through the published Sushi packs (`aliases`);
+//! anything containing '/' is treated as a HuggingFace repo id directly ("org/repo", with optional
 //! "hf.co/" prefix and ":tag" suffix). Downloads land in
 //! `~/.sushi/models/<org>/<repo>` — the single source of truth shared
 //! with the app's DownloadManager and the server's media-dep resolution.
@@ -65,7 +64,7 @@ pub fn classifyUnparsedArg(arg: []const u8, is_last: bool) ArgReject {
 // ── Alias table ─────────────────────────────────────────────────────────
 
 pub const Alias = struct {
-    /// Short name before the ':', e.g. "gemma4".
+    /// Short name before the ':', e.g. "qwen3.8-flash-next".
     name: []const u8,
     /// Tag after the ':'; empty = selectable only by full name:tag.
     tag: []const u8,
@@ -76,40 +75,12 @@ pub const Alias = struct {
     gguf_file: []const u8 = "",
 };
 
-/// Mirrors the app catalog (`gemmaModelOptions` in ChatModels.swift).
-/// Bare-name defaults pick the 4-bit build that fits the widest range of
-/// Macs for that family.
+/// The published Sushi packs. The bare name picks 3bpw: 2.6bpw needs the same
+/// 64 GB and scores worse on KLD; 4bpw needs 96 GB.
 pub const aliases = [_]Alias{
-    .{ .name = "gemma4", .tag = "e2b", .repo = "mlx-community/gemma-4-e2b-it-4bit" },
-    .{ .name = "gemma4", .tag = "e2b-8bit", .repo = "mlx-community/gemma-4-e2b-it-8bit" },
-    .{ .name = "gemma4", .tag = "e4b", .repo = "mlx-community/gemma-4-e4b-it-4bit", .is_default = true },
-    .{ .name = "gemma4", .tag = "e4b-8bit", .repo = "mlx-community/gemma-4-e4b-it-8bit" },
-    .{ .name = "gemma4", .tag = "12b", .repo = "mlx-community/gemma-4-12b-it-4bit" },
-    .{ .name = "gemma4", .tag = "12b-8bit", .repo = "mlx-community/gemma-4-12b-it-8bit" },
-    .{ .name = "gemma4", .tag = "26b", .repo = "mlx-community/gemma-4-26b-a4b-it-4bit" },
-    .{ .name = "gemma4", .tag = "26b-8bit", .repo = "mlx-community/gemma-4-26b-a4b-it-8bit" },
-    .{ .name = "gemma4", .tag = "31b", .repo = "mlx-community/gemma-4-31b-it-4bit" },
-    .{ .name = "gemma4", .tag = "31b-8bit", .repo = "mlx-community/gemma-4-31b-it-8bit" },
-    .{ .name = "gemma3", .tag = "12b", .repo = "mlx-community/gemma-3-12b-it-4bit", .is_default = true },
-    // Qwen 3.6 27B ships an MTP sidecar the server auto-loads for
-    // multi-token speculative decode — the best default experience.
-    .{ .name = "qwen3.6", .tag = "27b", .repo = "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", .is_default = true },
-    .{ .name = "qwen3.5", .tag = "0.8b", .repo = "mlx-community/Qwen3.5-0.8B-MLX-4bit", .is_default = true },
-    .{ .name = "deepseek-v4", .tag = "flash", .repo = "antirez/deepseek-v4-gguf", .is_default = true, .gguf_file = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf" },
-    // Tencent Hunyuan 3 (hy_v3, 295B-A21B MoE) — mixed 2/3-bit experts +
-    // 8-bit attention/router/shared, MTP layer included. ~110 GB on disk;
-    // needs a 128 GB Mac.
-    .{ .name = "hy3", .tag = "295b", .repo = "mlx-community/Hy3-oQ2e", .is_default = true },
-    // OpenAI gpt-oss. The MXFP4-Q8 conversions keep the native mxfp4 expert
-    // banks (what the model was released in) and put attention/embeddings at
-    // affine 8-bit: ~12 GB for the 20B, ~63 GB for the 120B.
-    .{ .name = "gpt-oss", .tag = "20b", .repo = "mlx-community/gpt-oss-20b-MXFP4-Q8", .is_default = true },
-    .{ .name = "gpt-oss", .tag = "120b", .repo = "mlx-community/gpt-oss-120b-MXFP4-Q8" },
-    .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
-    .{ .name = "spark", .tag = "4b", .repo = "abenzerps/Spark-X2.5-4B-MLX-4bit", .is_default = true },
-    .{ .name = "spark", .tag = "4b-8bit", .repo = "abenzerps/Spark-X2.5-4B-MLX-8bit" },
-    // IFM K2-Horizon dense. oMLX's 6-bit pack with 8-bit edge layers.
-    .{ .name = "k2", .tag = "7b", .repo = "mlx-community/K2-Horizon-7B-oQ6e", .is_default = true },
+    .{ .name = "qwen3.8-flash-next", .tag = "2.6bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw" },
+    .{ .name = "qwen3.8-flash-next", .tag = "3bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-3bpw", .is_default = true },
+    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw" },
 };
 
 pub const Resolved = struct {
@@ -126,7 +97,7 @@ fn stripTag(name: []const u8) []const u8 {
 }
 
 /// Short name / repo ref → HF repo id. Accepts:
-///   "gemma4" / "gemma4:12b"           (alias table)
+///   "qwen3.8-flash-next" / "qwen3.8-flash-next:2.6bpw"  (alias table)
 ///   "org/repo" / "org/repo:tag"       (direct, tag stripped)
 ///   "hf.co/org/repo", "huggingface.co/org/repo"
 /// Returns null for unknown alias-shaped names (no '/').
@@ -545,7 +516,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     defer w.flush() catch {};
 
     var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch {
-        try w.print("no models yet (looked in {s})\ntry: sushi pull gemma4\n", .{root});
+        try w.print("no models yet (looked in {s})\ntry: sushi pull qwen3.8-flash-next\n", .{root});
         return;
     };
     defer dir.close(io);
@@ -577,7 +548,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         }
     }
     if (count == 0) {
-        try w.print("(none) — try: sushi pull gemma4\n", .{});
+        try w.print("(none) — try: sushi pull qwen3.8-flash-next\n", .{});
     }
 }
 
@@ -1515,24 +1486,25 @@ const testing = std.testing;
 
 test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Bare alias picks the family default.
-    try testing.expectEqualStrings("mlx-community/gemma-4-e4b-it-4bit", resolveShortName("gemma4").?.repo);
-    try testing.expectEqualStrings("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", resolveShortName("qwen3.6").?.repo);
-    // Tagged alias.
-    try testing.expectEqualStrings("mlx-community/gemma-4-12b-it-4bit", resolveShortName("gemma4:12b").?.repo);
-    try testing.expectEqualStrings("mlx-community/gemma-4-26b-a4b-it-8bit", resolveShortName("GEMMA4:26B-8BIT").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-3bpw", resolveShortName("qwen3.8-flash-next").?.repo);
+    // Tagged alias, case-insensitive.
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", resolveShortName("qwen3.8-flash-next:2.6bpw").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-4bpw", resolveShortName("QWEN3.8-FLASH-NEXT:4BPW").?.repo);
     // :latest behaves like bare.
-    try testing.expectEqualStrings("mlx-community/gemma-4-e4b-it-4bit", resolveShortName("gemma4:latest").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-3bpw", resolveShortName("qwen3.8-flash-next:latest").?.repo);
     // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo:latest").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("hf.co/org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("https://huggingface.co/org/repo").?.repo);
-    // GGUF single-artifact alias carries its file restriction.
-    const ds = resolveShortName("deepseek-v4").?;
-    try testing.expect(ds.gguf_file.len > 0);
-    // Unknown alias-shaped name → null.
+    // Unknown alias-shaped name → null; upstream families are not served.
     try testing.expect(resolveShortName("doesnotexist") == null);
-    try testing.expect(resolveShortName("gemma4:nosuchtag") == null);
+    try testing.expect(resolveShortName("qwen3.8-flash-next:nosuchtag") == null);
+    try testing.expect(resolveShortName("gemma4") == null);
+}
+
+test "cli: every short name is a published Sushi pack" {
+    for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-"));
 }
 
 test "cli: modelDestPath layout" {

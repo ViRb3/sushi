@@ -51,6 +51,8 @@ earlier history is mlx-serve's, in that project's changelog.
   `tools` is a 400.
 - **Streamed thinking matches the non-streamed reply**: a thought's trailing line break no longer rides out on the
   stream, so streamed and non-streamed reasoning are the same text on every API.
+- **`sushi run` and `sushi pull` name the Sushi packs**: `qwen3.8-flash-next` fetches Sushi-3bpw, with tags `:2.6bpw`
+  and `:4bpw`; the short names for models sushi does not serve are gone.
 
 ---
 

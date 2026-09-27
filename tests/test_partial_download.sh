@@ -1,5 +1,5 @@
 #!/bin/bash
-# Interrupted-pull recovery (issue: Ctrl-C during `sushi run gemma4`'s
+# Interrupted-pull recovery (issue: Ctrl-C during `sushi run qwen3.8-flash-next`'s
 # download, rerun → SIGSEGV instead of resuming). Two bugs, two checks:
 #
 #   A. `modelPresent` used to return true on config.json alone, so a dir left
@@ -31,9 +31,10 @@ check() {
     if [ "$2" -eq 0 ]; then echo "PASS: $1"; PASS=$((PASS + 1)); else echo "FAIL: $1"; FAIL=$((FAIL + 1)); fi
 }
 
-# The exact state an interrupted `pull gemma4` leaves behind (live capture
-# 2026-07-03): small files complete, weights only .partial, no tokenizer.
-MODEL_DIR="$SCRATCH/home/.sushi/models/mlx-community/gemma-4-e4b-it-4bit"
+# The state an interrupted pull leaves behind (live capture 2026-07-03): small
+# files complete, weights only .partial, no tokenizer. The config only has to
+# parse: B fails at tokenizer load, before any architecture code runs.
+MODEL_DIR="$SCRATCH/home/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-3bpw"
 mkdir -p "$MODEL_DIR"
 printf '{"model_type": "gemma4"}\n' > "$MODEL_DIR/config.json"
 printf '{{ messages }}\n' > "$MODEL_DIR/chat_template.jinja"
@@ -42,11 +43,11 @@ dd if=/dev/zero of="$MODEL_DIR/model.safetensors.partial" bs=1024 count=64 2>/de
 
 # ── A. rerun resumes the pull instead of fast-pathing ──
 OUT="$SCRATCH/pull.txt"
-HOME="$SCRATCH/home" "$BIN" pull gemma4 > "$OUT" 2>&1 &
+HOME="$SCRATCH/home" "$BIN" pull qwen3.8-flash-next > "$OUT" 2>&1 &
 PID=$!
 SEEN=1
 for _ in $(seq 1 40); do
-    if grep -q "pulling manifest for mlx-community/gemma-4-e4b-it-4bit" "$OUT"; then SEEN=0; break; fi
+    if grep -q "pulling manifest for beamster/Qwen3.8-Flash-Next-Sushi-3bpw" "$OUT"; then SEEN=0; break; fi
     kill -0 "$PID" 2>/dev/null || break
     sleep 0.5
 done
