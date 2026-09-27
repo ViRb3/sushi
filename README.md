@@ -9,10 +9,6 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 
-## Streaming
-
-SSD expert streaming serves the bf16 Qwen3.8-Flash-Next checkpoint.
-
 ## Install
 
 ```bash
