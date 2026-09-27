@@ -70,6 +70,25 @@ architectures need their own measured envelope. These runs do not simulate a 64 
 - Disconnect cancellation takes effect at the next prefill chunk boundary; a wall-time cancellation test must bound
   its chunk size rather than assume the auto-sized chunk fits a fixed deadline.
 
+<a id="recipe-64gb"></a>
+### The 64 GB recipe contexts
+
+The README's 64 GB `--ctx-size` values are checked with the engine's own full-context admission bill
+(`prefillNeededAtChunk` through the per-request ladder) at a 59,000 MB ceiling: a prompt that fills the context, MTP
+on, `--mtp-head-kv-quant`, the 1 GiB hot cache pinned (not evictable). No live boot: the wired limit has only test
+seams (`wired_limit_mb_override`, `static_ceiling_override`), so the bill was computed in a scratch test at `ad5e6be8`.
+
+| pack, KV | `--ctx-size` | bill (MiB) | width | available (MiB) | weights + bill (GiB) | largest admitted |
+|---|---:|---:|---:|---:|---:|---:|
+| Sushi-2.6bpw, kv8 | 250000 | 11866 | 4096 | 12975 | 55.5 | 470000 |
+| Sushi-2.6bpw, kv4 | 450000 | 12719 | 4096 | 12975 | 56.4 | 786000 |
+| Sushi-3bpw, kv8 | 128000 | 7329 | 2048 | 7463 | 56.5 | 200000 |
+| Sushi-3bpw, kv4 | 248000 | 6987 | 1024 | 7463 | 56.2 | 322000 |
+
+The ladder widens the chunk until the bill nearly fills what is available, so the spare in a row is small by
+construction; "largest admitted" (2000-token steps) is where even the 512 rung stops fitting. The ceiling assumes
+the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lower (`currentGpuMemoryCeiling`).
+
 ## Admission
 
 - One `[admission] needed=… available=… reclaimable=… width=… verdict=…` line per decision.

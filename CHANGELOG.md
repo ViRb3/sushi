@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Sushi-2.6bpw for 64 GB Macs**: a new Qwen3.8-Flash-Next pack with 43.95 GiB of weights, 5.4 GiB less than
+  Sushi-3bpw, so a 64 GB Mac serves 250k tokens of context at 8-bit KV.
 - **Faster file rewrites and edits on Qwen3.8-Flash-Next**: when a reply copies text already in the conversation (a
   file returned with an edit, a tool call carrying a file), speculative decoding drafts from that text instead of the
   MTP head: 16-21% faster file edits and 9-11% faster file-writing tool calls on an M5 Max, 18-24% on edits deep in a

@@ -112,6 +112,14 @@ first-EOS KLD **0.10469852**, top-1 **90.3423%** (7186 positions); all-position 
 This reproduces the published 0.1047 baseline (-0.0014% relative, inside the 1% floor), without an old-binary rerun.
 M5 Max 128 GB, `taskpolicy -a`, GPU lock `release-v1.0.4-kld-sushi3bpw`; conversion suspended, no timing claim.
 
+Sushi-2.6bpw rows: `ad5e6be8`, ReleaseFast binary SHA-256
+`e85c49f28330474a581954e9eb439294097e83838d42f71c65ab5338113bda4a` (mtime 2026-09-27 14:19:09 +0700),
+`mlx-serve-bf16-16x512-raw`, kv8, `--tokens 512 --top-k 10 --ctx-size 8192`, no MTP, 7186 positions to first EOS;
+all-position KLD 0.1183 (bf16 table) and 0.1229 (4-bit table). Same-binary controls: Sushi-3bpw scores 0.101234497
+with the bf16 table and 0.104698517 with the 4-bit table, the b64c5a0e figures to nine digits. M5 Max 128 GB,
+`taskpolicy -a`, GPU lock `k26-kld` per run, 2026-09-27.
+
+
 <a id="kv-width"></a>
 ### KV cache width (the one setting that is not the pack)
 
@@ -131,6 +139,9 @@ Binary `db249826` (Zig sources identical to `e8e2a3cb`), M5 Max 128 GB, the Flas
 `--tokens 512 --top-k 10 --ctx-size 8192`, no `--mtp`, 7186 positions to first EOS. Both arms ran on the same binary,
 so the delta stands on that; the absolute kv8 figure reads 0.1047 where the table above records 0.1012, a +3.5% gap
 against a different binary and flag set, which is why the delta is quoted rather than either absolute.
+
+Sushi-2.6bpw (4-bit n-gram table, binary `ad5e6be8`, same settings): `--kv-quant 4` scores 0.145841 / top-1 88.84% /
+NLL 0.465802 against kv8's 0.135508 / 89.08% / 0.454090, +7.63% KLD and -0.24 pp.
 
 <a id="mimo"></a>
 ## MiMo (16x512, first EOS, student kv8)

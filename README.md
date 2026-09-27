@@ -6,6 +6,7 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 
 ## Model support list
 
+* [Qwen3.8-Flash-Next-Sushi-2.6bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 
@@ -32,7 +33,7 @@ The server listens on `127.0.0.1:12345` by default.
 
 The model's own MTP draft head and the 8-bit KV cache are on by default.
 
-**64 GB Mac, Sushi-3bpw**
+**64 GB Mac, Sushi-2.6bpw**
 
 Set the GPU memory limit first (it resets at reboot). 59,000 MB is the ceiling for this box: above it macOS runs out
 of memory before the model does, and the kernel panics rather than the server refusing.
@@ -44,21 +45,23 @@ Then pick one of the two. They differ only in KV width; the context is set expli
 memory, so its answer is not the same on two 64 GB machines.
 
 ```bash
-hf download beamster/Qwen3.8-Flash-Next-Sushi-3bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw
+hf download beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw
 
 # 1. images, 8-bit KV — the default quality
-./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 128000 \
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 250000 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --prefix-cache-mem 1GB --temp 1
 
-# 2. images, 4-bit KV — twice the context, at 9% KLD and 0.7 points of next-token agreement
-./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
-  --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 248000 \
+# 2. images, 4-bit KV — 1.8 times the context, at 8% KLD and 0.2 points of next-token agreement
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
+  --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 450000 \
   --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --prefix-cache-mem 1GB --temp 1
 ```
 
-At 4-bit KV the quality cost: mean KLD 0.1047 to 8-bit KV's 0.1142 and next-token agreement 90.34% to
-89.65%.
+At 4-bit KV the quality cost: mean KLD 0.1355 at 8-bit KV to 0.1458, and next-token agreement 89.08% to 88.84%.
+
+Sushi-3bpw also fits a 64 GB Mac, for lower KLD (0.1047 against 0.1355) at about half the context: the same commands
+with its model path and `--ctx-size 128000` at 8-bit KV or `--ctx-size 248000` at 4-bit.
 
 **96 GB+ Mac, Sushi-4bpw**
 
