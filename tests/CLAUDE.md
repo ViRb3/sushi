@@ -132,3 +132,5 @@ Existing tools:
 - Legacy-completions logprob checks branch on the model returning immediate EOS: zero-token usage, empty text and a normal stop permit no entries; nonempty replies still require token logprobs.
 
 - `gdn verify fold:` covers bit-identical output and every rollback state at widths 2–8, lazy-input preservation during the independent pipeline probe, clean thread-limit fallback, and the measured two-row default.
+
+- `qwen4 decode ladder:` uses a synthetic host PLE table to compare serial/off, eager-ID/on, lazy-ID/skipped and N=2/off-on forwards bit for bit, including per-slot PLE history and convolution state.

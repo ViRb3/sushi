@@ -46,6 +46,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   per boundary. `MLX_MAX_OPS_PER_BUFFER` and `MLX_METAL_FAST_SYNCH` gave nothing; decode wins come from fewer,
   denser kernels ([perf-baselines](perf-baselines.md#exl3)).
 
+## Batched Qwen4 decode overlap
+
+- Qwen4 batched S=1 forwards submit the live residual and pending MLP output every fourth layer. An explicit
+  `SUSHI_DECODE_ASYNC_LADDER` setting overrides the stride; serial decode remains off when it is unset.
+- A deferred host PLE leaf is filled before early evaluation only when its token IDs are already available;
+  otherwise that forward skips the ladder and retains its normal terminal evaluation.
+- The `[qwen4] batched decode ladder engaged` line distinguishes the batched path from a serial opt-in ladder.
+  Model-free parity tests cover eager/lazy IDs, N=2 logits, per-slot PLE history and an unfilled-leaf negative control.
+
 ## MoE kernels (affine)
 
 - Fused gate+up made `gatherQmv` the decode default (eligibility = the kernel's OWN conditions,

@@ -199,6 +199,10 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     (@STRML). Modifications: bf16-only with sushi's per-token state rounding;
     the pipeline probe uses independent dummy inputs to preserve deferred PLE,
     and the default dispatch serves two rows only.
+  * Batched Qwen4 decode's async evaluation ladder and its deferred-PLE guard
+    (`src/transformer.zig`), from mlx-serve #584 by @cowboycoderhq.
+    Modifications: host-only PLE, synthetic bf16 table fixtures and a separate
+    batched engagement line; serial decode keeps its existing default.
   * The fused QSA pooled-key kernel (`sushi_qsa_pool_rope`,
     `qsaPoolNormRopeFused` in `src/transformer.zig`): the indexer's block mean,
     key RMSNorm and partial RoPE in one dispatch, bit-identical to the MLX op
