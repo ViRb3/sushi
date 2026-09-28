@@ -92,6 +92,8 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
   streaming grammar → per-token mask), `src/reasoning_protocol.zig`.
 
+- `/props.settings.prefill_decode_share` reports the effective process-wide share, including zero under the interleave kill switch.
+
 ## Security and observability
 
 - `--api-key`: loopback exempt, `/health` + OPTIONS + `GET` of the chat page open, `constTimeEql`.

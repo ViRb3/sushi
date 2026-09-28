@@ -115,6 +115,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   batched group is capped by PADDING WASTE (`batchedKvKeepCount`, `MAX_PAD_WASTE` 1.5 < 2.0), not slot count.
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
+- `--prefill-decode-share S` (flag > `SUSHI_PREFILL_DECODE_SHARE` > 0) targets the fraction of wall time given
+  to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
+  Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
+  decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables both the share and its width cap.
+- While decoders are live, the share caps the base prefill width at 1024 after explicit/environment chunk settings;
+  normal tail merging still applies. Admission bills the original width, and adaptive widening retains its memory
+  confirmation. An adaptive slot can lift the cap after the other decoders finish; a pinned slot keeps its cap.
+  Hosted decode time is excluded from prefill compute time but remains part of request latency.
 - **Serial ≠ exclusive**: only a slot driving a module-owned decode state is exclusive (`slotExclusiveDecode`);
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:

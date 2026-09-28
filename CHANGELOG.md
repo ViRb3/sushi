@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- `--prefill-decode-share` reserves a target share of prefill wall time for active decoders and narrows prefill chunks while they run (mlx-serve #568, thanks @STRML).
+
 - Batched Qwen4 decode overlaps GPU execution with graph construction through a PLE-safe async ladder; serial decode stays off by default (mlx-serve #584, thanks @cowboycoderhq).
 
 - Two-row Qwen4 MTP verification folds GDN normalization, gating and rollback history into the recurrence without changing output (mlx-serve #558, thanks @STRML).

@@ -134,3 +134,5 @@ Existing tools:
 - `gdn verify fold:` covers bit-identical output and every rollback state at widths 2–8, lazy-input preservation during the independent pipeline probe, clean thread-limit fallback, and the measured two-row default.
 
 - `qwen4 decode ladder:` uses a synthetic host PLE table to compare serial/off, eager-ID/on, lazy-ID/skipped and N=2/off-on forwards bit for bit, including per-slot PLE history and convolution state.
+
+- `INTERLEAVE_SHARE_ONLY=1 INTERLEAVE_PREFILL_CHUNK=8192 tests/test_prefill_interleave.sh` checks #568 in two boots: share zero versus 0.5, two probes each, effective `/props`, increased hosted-decode fraction and identical decoder output. Set `INTERLEAVE_TEST_OUTPUT_DIR` to retain logs; the default run also retains the original interleave on/off checks.

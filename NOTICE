@@ -203,6 +203,11 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     (`src/transformer.zig`), from mlx-serve #584 by @cowboycoderhq.
     Modifications: host-only PLE, synthetic bf16 table fixtures and a separate
     batched engagement line; serial decode keeps its existing default.
+  * Prefill/decode wall-time sharing (`src/scheduler.zig`, `src/generate.zig`,
+    `src/main.zig`, `src/server.zig`, `tests/test_prefill_interleave.sh`), from
+    mlx-serve #568 by Samuel Reed (@STRML). Modifications: share zero retains
+    sushi's single boundary tick; its admission and adaptive-widening checks
+    remain in place, and decode-time budget arithmetic saturates on overflow.
   * The fused QSA pooled-key kernel (`sushi_qsa_pool_rope`,
     `qsaPoolNormRopeFused` in `src/transformer.zig`): the indexer's block mean,
     key RMSNorm and partial RoPE in one dispatch, bit-identical to the MLX op

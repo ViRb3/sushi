@@ -229,6 +229,10 @@ fn printUsage(io: std.Io) void {
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
         \\                        Lower it if a long prompt spikes memory.
+        \\  --prefill-decode-share <s>
+        \\                      Target decode wall-time share during another
+        \\                        request's prefill (0..0.9); narrows chunks too.
+        \\                        Default 0; env SUSHI_PREFILL_DECODE_SHARE.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables the cache — which also
@@ -500,6 +504,7 @@ pub fn main(init: std.process.Init) !void {
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
     var log_level_explicit = false;
+    var decode_share_flag: ?[]const u8 = null;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -807,6 +812,9 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
+            i += 1;
+            decode_share_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -907,6 +915,17 @@ pub fn main(init: std.process.Init) !void {
     const bind = server_mod.resolveBind(host_flag, port_flag);
     const host = bind.host;
     const port = bind.port;
+
+    const decode_share_env: ?[]const u8 = if (std.c.getenv("SUSHI_PREFILL_DECODE_SHARE")) |r| std.mem.span(r) else null;
+    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
+        log.err("--prefill-decode-share / SUSHI_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
+        std.process.exit(1);
+    };
+    const effective_decode_share = scheduler_mod.prefillDecodeShare();
+    log.info("[prefill] decode share: configured={d}, effective={d} ({s})\n", .{
+        scheduler_mod.prefill_decode_share, effective_decode_share,
+        if (decode_share_flag != null) "--prefill-decode-share" else if (decode_share_env != null) "SUSHI_PREFILL_DECODE_SHARE" else "default",
+    });
 
     transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
