@@ -6,6 +6,7 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 
 ## Model support list
 
+* [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+)
 * [Qwen3.8-Flash-Next-Sushi-2.6bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
@@ -38,9 +39,48 @@ mkdir -p ~/.local/bin && ln -s "$PWD/zig-out/bin/sushi" ~/.local/bin/sushi   # o
 
 The server listens on `127.0.0.1:12345` by default.
 
+## Memory
+
+GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on, `--mtp-head-kv-quant`,
+`--prefix-cache-mem 1GB`). The n-gram table stays on the SSD and is not counted.
+
+| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-3bpw | Sushi-4bpw |
+|---|---:|---:|---:|---:|
+| weights only | 35.0 | 44.0 | 49.3 | 63.7 |
+| 128k | 41.7 | 50.7 | 56.1 | 70.4 |
+| 256k | 44.6 | 53.6 | 58.9 | 73.3 |
+| 512k | 49.7 | 58.6 | 64.0 | 78.4 |
+| 1M | 59.8 | 68.8 | 74.2 | 88.5 |
+
+A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
+the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M:
+
+| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-3bpw | Sushi-4bpw |
+|---|---|---|---|---|---|
+| 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — |
+| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | 184k / 288k | — |
+| 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 880k / 1M |
+| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M |
+
 ## Recommended launch
 
 The model's own MTP draft head and the 8-bit KV cache are on by default.
+
+**48 GB Mac, Sushi-2bpw**
+
+Set the GPU memory limit first (it resets at reboot):
+```bash
+sudo sysctl iogpu.wired_limit_mb=43000
+```
+
+```bash
+hf download beamster/Qwen3.8-Flash-Next-Sushi-2bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw
+
+# images, 8-bit KV, 128k context
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 131072 \
+  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --prefix-cache-mem 1GB --temp 1
+```
 
 **64 GB Mac, Sushi-2.6bpw or 3bpw**
 
@@ -109,31 +149,14 @@ pi, omp, codex and hermes run from their own home under `~/.sushi/<agent>/`, so 
 the session does not see your other providers, settings or history; claude, opencode and aider reach the server
 through environment variables. `--print` writes the config and prints the launch script instead of running it.
 
-## Memory
-
-GPU memory in GiB (what `sushi run` reports); the n-gram table stays on the SSD.
-
-| | Sushi-2.6bpw | Sushi-3bpw | Sushi-4bpw |
-|---|---|---|---|
-| model weights | 42.24 | 47.51 | 61.58 |
-| MTP head | 0.87 | 0.98 | 1.27 |
-| vision tower | 0.84 | 0.84 | 0.84 |
-| **weights loaded** | **43.95** | **49.33** | **63.68** |
-| KV cache, 256k tokens | 4.06 | 4.06 | 4.06 |
-| KV cache, 512k tokens | 8.12 | 8.12 | 8.12 |
-| KV cache, 1M tokens | 16.25 | 16.25 | 16.25 |
-| **total at 256k / 512k / 1M** | **48.0 / 52.1 / 60.2** | **53.4 / 57.5 / 65.6** | **67.7 / 71.8 / 79.9** |
-
-The KV cache is for one request at 8 bits with MTP on and `--mtp-head-kv-quant`: 16,640 bytes per token of context.
-Leave room for the hot prefix cache (`--prefix-cache-mem`) and the prefill buffers.
-
 ## Quality
 
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
 KLD against the bf16 model: 16 prompts x 512 tokens scored to the first EOS, kv8, every pack run by the same sushi
-build. The light rings are the sushi packs with a 4-bit n-gram table (Sushi-2.6bpw and Sushi-3bpw ship that table;
-either table works with either pack). Numbers: [docs/quality-kld.md](docs/quality-kld.md).
+build except Sushi-2bpw (sushi v1.0.4, bf16 KV cache). The light rings are the sushi packs with a 4-bit n-gram table
+(Sushi-2bpw, Sushi-2.6bpw and Sushi-3bpw ship that table, and Sushi-2bpw is plotted with it; either table works with
+any pack). Numbers: [docs/quality-kld.md](docs/quality-kld.md).
 
 ## Speed
 

@@ -71,7 +71,7 @@ architectures need their own measured envelope. These runs do not simulate a 64 
   its chunk size rather than assume the auto-sized chunk fits a fixed deadline.
 
 <a id="recipe-64gb"></a>
-### The 64 GB recipe contexts
+### The 48 GB and 64 GB recipe contexts
 
 The README's 64 GB `--ctx-size` values are checked with the engine's own full-context admission bill
 (`prefillNeededAtChunk` through the per-request ladder) at a 59,000 MB ceiling: a prompt that fills the context, MTP
@@ -84,6 +84,18 @@ seams (`wired_limit_mb_override`, `static_ceiling_override`), so the bill was co
 | Sushi-2.6bpw, kv4 | 450000 | 12719 | 4096 | 12975 | 56.4 | 786000 |
 | Sushi-3bpw, kv8 | 128000 | 7329 | 2048 | 7463 | 56.5 | 200000 |
 | Sushi-3bpw, kv4 | 248000 | 6987 | 1024 | 7463 | 56.2 | 322000 |
+
+The 48 GB recipe is the same check at a 43,000 MB ceiling (probe at `eab60060`, weights 37,552,413,730 bytes):
+
+| pack, KV | `--ctx-size` | bill (MiB) | width | available (MiB) | weights + bill (GiB) | largest admitted |
+|---|---:|---:|---:|---:|---:|---:|
+| Sushi-2bpw, kv8 | 131072 | 5905 | 512 | 6163 | 40.7 | 141072 |
+
+The README memory table's "needed" row is the weights plus this full-context bill at the 512 rung plus a 1 GiB hot
+cache. At `eab60060` the bill is the same for every Flash-Next pack and for `--max-tokens` 32000 or 64000: 5905 /
+8825 / 14025 / 24425 MiB at 128k / 256k / 512k / 1M tokens (KV 2080 / 4160 / 8320 / 16640 of it).
+Its max-context column is the largest multiple of 8192 tokens whose weights + 512-rung bill + 1 GiB hot cache + 256
+MiB spare fits each wired limit, capped at 1M (same probe, kv8 and kv4).
 
 The ladder widens the chunk until the bill nearly fills what is available, so the spare in a row is small by
 construction; "largest admitted" (2000-token steps) is where even the 512 rung stops fitting. The ceiling assumes

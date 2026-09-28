@@ -104,6 +104,7 @@ n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi pack
 | Sushi-4bpw with the same 4-bit g32 table | 63.68 | 0.0666 | 92.35% |
 | Sushi-2.6bpw (binary ad5e6be8, 2026-09-27; Sushi-3bpw's 0.10123 and 0.1047 reproduce on it bit for bit) | 43.95 | 0.1303 | 89.33% |
 | Sushi-2.6bpw with the 4-bit g32 table (the published Sushi-2.6bpw) | 43.95 | 0.1355 | 89.08% |
+| Sushi-2bpw with the 4-bit g32 table (the published Sushi-2bpw; bf16 KV, see below) | 34.97 | 0.2080 | 85.94% |
 
 Release 1.0.4 check: `ad4a3ce0` plus the context-bill change, ReleaseFast binary SHA-256
 `2aeee2e678521727e66994d75260c25cd4cffd0d05ecb797c73210a2b0ea9704` (mtime 2026-09-26 15:26:43 +0700),
@@ -118,6 +119,11 @@ Sushi-2.6bpw rows: `ad5e6be8`, ReleaseFast binary SHA-256
 all-position KLD 0.1183 (bf16 table) and 0.1229 (4-bit table). Same-binary controls: Sushi-3bpw scores 0.101234497
 with the bf16 table and 0.104698517 with the 4-bit table, the b64c5a0e figures to nine digits. M5 Max 128 GB,
 `taskpolicy -a`, GPU lock `k26-kld` per run, 2026-09-27.
+
+Sushi-2bpw row: sushi v1.0.4 ReleaseFast, binary SHA-256
+`1c2c952090f2642c5119061fc94a552a131b30ca698779bd9593d1c60f9db934` (mtime 2026-09-26 19:51:49 +0700),
+`mlx-serve-bf16-16x512-raw`, `--kv-quant off` (bf16 KV, unlike every other row), no MTP, 7186 positions to first EOS:
+KLD 0.208021, top-1 85.94%, NLL 0.539001; all positions 0.189374 / 87.30% / 0.484980. M5 Max 128 GB, 2026-09-28.
 
 
 <a id="kv-width"></a>
