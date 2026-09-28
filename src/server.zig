@@ -634,7 +634,7 @@ var configured_mtp: ?bool = null;
 pub fn mtpChoiceFor(config: *const model_mod.ModelConfig) model_settings.MtpChoice {
     if (global_scheduler) |sch| return scheduler_mod.mtpChoiceFor(sch.mtp_enabled, sch.mtp_explicit, config);
     const flag: ?bool = configured_mtp orelse (if (server_config.default_force_mtp) @as(?bool, true) else null);
-    return model_settings.MtpChoice.resolve(flag, config.mtp_override, true);
+    return scheduler_mod.mtpChoiceFor(flag orelse true, flag != null, config);
 }
 
 ///
@@ -7147,13 +7147,13 @@ fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u
 const PropsSettings = struct {
     engine: []const u8,
     kv_quant: []const u8,
-    kv_cache: transformer_mod.KvCacheChoice = transformer_mod.KvCacheChoice.resolve(null, transformer_mod.KVQuantConfig.engine_default, false),
+    kv_cache: transformer_mod.KvCacheChoice = .{ .config = transformer_mod.KVQuantConfig.engine_default, .source = .default },
     kv_attn_mode: KvAttnMode,
     decode_attn_quant: bool,
     prefill_chunk: usize,
     mtp_loaded: bool,
     mtp_default_on: bool,
-    mtp_choice: model_settings.MtpChoice = model_settings.MtpChoice.resolve(null, null, true),
+    mtp_choice: model_settings.MtpChoice = .{ .on = true, .source = .default },
     mtp_acceptance: mtp_acceptance_mod.Mode,
     mtp_acceptance_source: []const u8 = "default",
     mtp_greedy_tail: model_settings.Pick(bool) = .{ .value = false, .source = .default },
@@ -20051,7 +20051,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
 }
 
 test "settingsPropsJson: /props names the greedy tail and where it came from" {
-    for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
+    for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag }, .{ .value = true, .source = .fast } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail", "--fast" }) |tail, source| {
         const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
         defer testing.allocator.free(frag);
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});

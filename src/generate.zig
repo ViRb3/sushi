@@ -56,17 +56,17 @@ pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
 /// `--mtp-typical` / `--mtp-tokenv3` (or their env twins) chose the default above.
 pub var mtp_acceptance_explicit: bool = false;
 
-/// THIS model's acceptance mode: the launch flag > its `mtp_acceptance` > exact.
+/// THIS model's acceptance mode: the launch flag > `--fast` > its `mtp_acceptance` > exact.
 pub fn mtpAcceptanceFor(setting: ?mtp_acceptance.Mode) model_settings.Pick(mtp_acceptance.Mode) {
-    return model_settings.pick(mtp_acceptance.Mode, model_settings.launchFlag(mtp_acceptance.Mode, mtp_acceptance_default, mtp_acceptance_explicit), setting, mtp_acceptance_default);
+    return model_settings.pickLaunch(mtp_acceptance.Mode, .mtp_acceptance, model_settings.launchFlag(mtp_acceptance.Mode, mtp_acceptance_default, mtp_acceptance_explicit), setting, mtp_acceptance_default);
 }
 
 /// `--mtp-greedy-tail` was given.
 pub var mtp_greedy_tail_explicit: bool = false;
 
-/// THIS model's greedy tail: the launch flag > its `mtp_greedy_tail` > off.
+/// THIS model's greedy tail: the launch flag > `--fast` > its `mtp_greedy_tail` > off.
 pub fn mtpGreedyTailFor(setting: ?bool) model_settings.Pick(bool) {
-    return model_settings.pick(bool, model_settings.launchFlag(bool, true, mtp_greedy_tail_explicit), setting, false);
+    return model_settings.pickLaunch(bool, .mtp_greedy_tail, model_settings.launchFlag(bool, true, mtp_greedy_tail_explicit), setting, false);
 }
 
 /// The width `SUSHI_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.

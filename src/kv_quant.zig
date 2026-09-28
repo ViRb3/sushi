@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const model_settings = @import("model_settings.zig");
 
 /// KV-cache storage scheme.
 ///   * `off`      — dense bf16.
@@ -76,19 +77,16 @@ pub const KVQuantConfig = struct {
     }
 };
 
-/// Where a load's KV scheme came from. A request's own `kv_quant` outranks all three.
-pub const KvCacheSource = enum { model_settings, flag, default };
-
-/// The KV scheme a load stores at, with its provenance: `--kv-quant` > per-model setting >
+/// The KV scheme a load stores at, with its provenance: `--kv-quant` > `--fast` > per-model setting >
 /// `KVQuantConfig.engine_default`. `launch` is the flag's value, or the default when unflagged.
+/// A request's own `kv_quant` outranks all of them.
 pub const KvCacheChoice = struct {
     config: KVQuantConfig,
-    source: KvCacheSource,
+    source: model_settings.Source,
 
     pub fn resolve(setting: ?KVQuantConfig, launch: KVQuantConfig, launch_explicit: bool) KvCacheChoice {
-        if (launch_explicit) return .{ .config = launch, .source = .flag };
-        if (setting) |s| return .{ .config = s, .source = .model_settings };
-        return .{ .config = launch, .source = .default };
+        const p = model_settings.pickLaunch(KVQuantConfig, .kv_quant, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, launch);
+        return .{ .config = p.value, .source = p.source };
     }
 
     pub fn label(self: KvCacheChoice) []const u8 {
@@ -99,11 +97,7 @@ pub const KvCacheChoice = struct {
     }
 
     pub fn sourceName(self: KvCacheChoice) []const u8 {
-        return switch (self.source) {
-            .model_settings => "model-settings.json",
-            .flag => "--kv-quant",
-            .default => "default",
-        };
+        return model_settings.sourceLabel(self.source, "--kv-quant");
     }
 };
 

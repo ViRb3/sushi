@@ -16,6 +16,9 @@ earlier history is mlx-serve's, in that project's changelog.
   in model-settings.json.
 - **Install with Homebrew**: `brew install beamivalice/tap/sushi`; a Homebrew install updates with
   `brew upgrade sushi`, which `sushi update`, the chat page and `/update` name instead of replacing its files.
+- **`--fast`** turns on the fastest settings in one flag: MTP with typical acceptance and the greedy tail, and 8-bit
+  KV. It trades a little sampling fidelity for speed (greedy requests are unchanged), and any of those flags given
+  beside it wins.
 
 ---
 

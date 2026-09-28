@@ -152,6 +152,8 @@ fn printUsage(io: std.Io) void {
         \\  --no-pld            Force-disable Prompt Lookup Decoding.
         \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
         \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
+        \\  --fast              MTP with typical acceptance and greedy tail, plus kv8: lossy
+        \\                        for sampled requests, greedy requests unchanged.
         \\  --no-mtp            Disable the native MTP head. Both served models
         \\                        load it and run it by default.
         \\  --mtp               Force the MTP head ON, also for an SSD-streamed
@@ -704,6 +706,8 @@ pub fn main(init: std.process.Init) !void {
             mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
             generate_mod.mtp_greedy_tail_explicit = true;
+        } else if (std.mem.eql(u8, args[i], "--fast")) {
+            model_settings_mod.fast = true;
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
@@ -1099,6 +1103,19 @@ pub fn main(init: std.process.Init) !void {
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
     log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
+    if (model_settings_mod.fast) {
+        // The launch layer only: a model's own settings resolve at its load.
+        const mtp = model_settings_mod.MtpChoice.resolve(model_settings_mod.launchFlag(bool, enable_mtp, mtp_explicit), null, true);
+        const acceptance = generate_mod.mtpAcceptanceFor(null);
+        const tail = generate_mod.mtpGreedyTailFor(null);
+        const kv = transformer_mod.KvCacheChoice.resolve(null, kv_quant_config, kv_quant_explicit);
+        log.info("[args] fast: mtp {s} ({s}); acceptance {s} ({s}); greedy tail {s} ({s}); {s} ({s})\n", .{
+            mtp.label(),                           mtp.sourceName(),
+            mtp_acceptance.name(acceptance.value), model_settings_mod.sourceLabel(acceptance.source, model_settings_mod.acceptanceFlagName(acceptance.value)),
+            if (tail.value) "on" else "off",       model_settings_mod.sourceLabel(tail.source, "--mtp-greedy-tail"),
+            kv.label(),                            kv.sourceName(),
+        });
+    }
 
     // Set GPU as default
     var metal_avail: bool = false;

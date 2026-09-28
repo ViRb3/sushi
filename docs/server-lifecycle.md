@@ -83,6 +83,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
   `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
+- **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >
+  `model-settings.json` > the default, per key (`model_settings.pickLaunch`; the one table is
+  `model_settings.fast_preset`: MTP, typical acceptance, greedy tail, kv8). Its values report source `--fast` in the
+  load lines, `/props` and the boot line `[args] fast: ...`. It asks only for what applies: an SSD-streamed load drops
+  its MTP (`[mtp] off: unsupported under streaming (--fast)`, `MtpChoice.streamed`), where an explicit `--mtp` refuses.
 - A flag that shapes a LOAD is retained on the Scheduler with its `*_explicit` bit (`ensureLoaded`'s cold-load
   `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
   resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props

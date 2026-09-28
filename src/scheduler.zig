@@ -1729,7 +1729,7 @@ pub const Scheduler = struct {
                 return error.ExpertStreamingUnsupportedLayout;
             const split = try model_mod.streamingResidentSplit(self.io, self.allocator, entry.path, layout);
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
-            switch (expert_stream_mod.mtpUnderStreaming(mtp.on, mtp.source == .model_settings, mtp.source == .default)) {
+            switch (mtpStreamingVerdict(mtp)) {
                 .refuse => return error.ExpertStreamingMtpUnsupported,
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
@@ -2466,9 +2466,17 @@ fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelCon
     return ptr;
 }
 
-/// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
+/// A load's MTP decision: `--mtp`/`--no-mtp` > `--fast` > the per-model `mtp` > on.
 pub fn mtpChoiceFor(mtp_enabled: bool, mtp_explicit: bool, config: *const ModelConfig) model_settings.MtpChoice {
-    return model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, true);
+    const choice = model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, true);
+    return if (config.expert_streaming) choice.streamed() else choice;
+}
+
+/// The streaming gate's verdict on a load's MTP choice (`expert_stream.mtpUnderStreaming`). The gate
+/// runs before the load marks its config streamed.
+fn mtpStreamingVerdict(choice: model_settings.MtpChoice) expert_stream_mod.MtpUnderStreaming {
+    const c = choice.streamed();
+    return expert_stream_mod.mtpUnderStreaming(c.on, c.source == .model_settings, c.source == .default);
 }
 
 /// An engine-default MTP under expert streaming resolves off (`expert_stream.mtpUnderStreaming`):
@@ -2482,6 +2490,107 @@ test "a streamed load drops only the engine-default MTP, never an asked-for one"
     try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, false));
     try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .flag }, true));
     try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true));
+}
+
+/// What a load line and `/props` read for the four keys `--fast` sets, under the launch globals.
+const LaunchPicks = struct {
+    mtp: model_settings.MtpChoice,
+    acceptance: model_settings.Pick(mtp_acceptance_mod.Mode),
+    greedy_tail: model_settings.Pick(bool),
+    kv: transformer_mod.KvCacheChoice,
+
+    fn of(mtp_flag: ?bool, kv_flag: ?transformer_mod.KVQuantConfig, config: *const ModelConfig) LaunchPicks {
+        return .{
+            .mtp = mtpChoiceFor(mtp_flag orelse true, mtp_flag != null, config),
+            .acceptance = generate_mod.mtpAcceptanceFor(config.mtp_acceptance_override),
+            .greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
+            .kv = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_flag orelse transformer_mod.KVQuantConfig.engine_default, kv_flag != null),
+        };
+    }
+};
+
+const LaunchGlobals = struct {
+    fast: bool,
+    acceptance: mtp_acceptance_mod.Mode,
+    acceptance_explicit: bool,
+    greedy_tail_explicit: bool,
+
+    fn save() LaunchGlobals {
+        return .{
+            .fast = model_settings.fast,
+            .acceptance = generate_mod.mtp_acceptance_default,
+            .acceptance_explicit = generate_mod.mtp_acceptance_explicit,
+            .greedy_tail_explicit = generate_mod.mtp_greedy_tail_explicit,
+        };
+    }
+
+    fn restore(self: LaunchGlobals) void {
+        model_settings.fast = self.fast;
+        generate_mod.mtp_acceptance_default = self.acceptance;
+        generate_mod.mtp_acceptance_explicit = self.acceptance_explicit;
+        generate_mod.mtp_greedy_tail_explicit = self.greedy_tail_explicit;
+    }
+};
+
+test "--fast: its preset, named --fast, outranks model-settings.json; an explicit flag outranks --fast; no --fast, no change" {
+    const saved = LaunchGlobals.save();
+    defer saved.restore();
+    (LaunchGlobals{ .fast = false, .acceptance = .exact, .acceptance_explicit = false, .greedy_tail_explicit = false }).restore();
+    const p = model_settings.fast_preset;
+    var file = ModelConfig{};
+    file.mtp_override = !p.mtp.?;
+    file.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
+    file.mtp_greedy_tail_override = !p.mtp_greedy_tail.?;
+    file.kv_quant_override = .dense;
+
+    const unfast = LaunchPicks.of(null, null, &file);
+    try testing.expectEqual(!p.mtp.?, unfast.mtp.on);
+    try testing.expectEqual(model_settings.Source.model_settings, unfast.mtp.source);
+    try testing.expectEqual(model_settings.Source.model_settings, unfast.acceptance.source);
+    try testing.expectEqual(model_settings.Pick(bool){ .value = !p.mtp_greedy_tail.?, .source = .model_settings }, unfast.greedy_tail);
+    try testing.expectEqualStrings("model-settings.json", unfast.kv.sourceName());
+
+    model_settings.fast = true;
+    for ([_]ModelConfig{ .{}, file }) |cfg| {
+        const got = LaunchPicks.of(null, null, &cfg);
+        try testing.expectEqual(p.mtp.?, got.mtp.on);
+        try testing.expectEqualStrings("--fast", got.mtp.sourceName());
+        try testing.expect(std.meta.eql(p.mtp_acceptance.?, got.acceptance.value));
+        try testing.expectEqualStrings("--fast", model_settings.sourceLabel(got.acceptance.source, model_settings.acceptanceFlagName(got.acceptance.value)));
+        try testing.expectEqual(model_settings.Pick(bool){ .value = p.mtp_greedy_tail.?, .source = .fast }, got.greedy_tail);
+        try testing.expectEqual(p.kv_quant.?, got.kv.config);
+        try testing.expectEqualStrings("--fast", got.kv.sourceName());
+    }
+
+    generate_mod.mtp_acceptance_default = .{ .typical = .{ .delta = 0.1 } };
+    generate_mod.mtp_acceptance_explicit = true;
+    generate_mod.mtp_greedy_tail_explicit = true;
+    const flagged = LaunchPicks.of(false, transformer_mod.KVQuantConfig.affine(4), &file);
+    try testing.expect(!flagged.mtp.on);
+    try testing.expectEqualStrings("--no-mtp", flagged.mtp.sourceName());
+    try testing.expectEqual(@as(f32, 0.1), flagged.acceptance.value.typical.delta);
+    try testing.expectEqual(model_settings.Source.flag, flagged.acceptance.source);
+    try testing.expectEqual(model_settings.Source.flag, flagged.greedy_tail.source);
+    try testing.expectEqualStrings("kv4", flagged.kv.label());
+    try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
+}
+
+test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp still refuses" {
+    const saved = LaunchGlobals.save();
+    defer saved.restore();
+    model_settings.fast = true;
+    const gate = mtpChoiceFor(true, false, &ModelConfig{});
+    try testing.expect(gate.on);
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.off, mtpStreamingVerdict(gate));
+    var streamed = ModelConfig{};
+    streamed.expert_streaming = true;
+    const loaded = mtpChoiceFor(true, false, &streamed);
+    try testing.expect(!loaded.on);
+    try testing.expectEqualStrings("--fast", loaded.sourceName());
+    try testing.expect(!loaded.forced());
+    const asked = mtpChoiceFor(true, true, &ModelConfig{});
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked));
+    try testing.expect(mtpChoiceFor(true, true, &streamed).on);
 }
 
 pub const SsdBudgetChoice = struct {
@@ -3248,7 +3357,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         params.config.expert_layout = layout;
         const split = try model_mod.streamingResidentSplit(sch.io, sch.allocator, params.model_dir, layout);
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
-        switch (expert_stream_mod.mtpUnderStreaming(mtp.on, mtp.source == .model_settings, mtp.source == .default)) {
+        if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
+        switch (mtpStreamingVerdict(mtp)) {
             .refuse => {
                 log.err("[expert-stream] {s}; MTP is on ({s}), pass --no-mtp\n", .{ expert_stream_mod.MTP_UNSUPPORTED, mtp.sourceName() });
                 return error.ExpertStreamingMtpUnsupported;
