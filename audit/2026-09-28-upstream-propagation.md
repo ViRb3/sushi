@@ -26,7 +26,7 @@ sushi's EXL3, MiMo, cache, and attention work.
 | Upstream | Status / adaptation | Validation |
 |---|---|---|
 | [#558 · 3dc1dab5](https://github.com/ddalcu/mlx-serve/pull/558) GDN verify norm-gate and rollback concat in recurrence | **Missing follow-up to the already ported #517.** Sushi's `gdn_decode.zig` still emits recurrence then runs the norm-gate epilogue. | Port only the non-Hadamard path into `gdn_decode.zig`, `transformer.zig`, and needed MLX bindings. Compare output, every captured rollback state, and partial acceptance with the existing chain; then measure EXL3 MTP. |
-| [#554 · 080a62e2](https://github.com/ddalcu/mlx-serve/pull/554) GQA-aware causal SDPA split | **Missing.** Sushi's causal split retains the fixed 6–9-row envelope; upstream sizes groups by `min(8, 32/gqa)` for hd=256. | Port geometry selection and causal-window tests. Exercise GQA=12 at widths 3–15, short/dense attention and MTP head attention. Preserve sushi's packed QSA routing. |
+| [#554 · 080a62e2](https://github.com/ddalcu/mlx-serve/pull/554) GQA-aware causal SDPA split | **Correction: Qwen4's served widths are already covered.** Before the older fixed-width fallback, sushi routes GQA=12 at widths 2–9 through `sdpaTickIdenticalGroups`, preserving the decode tick's window and split boundaries. | Preserve this path. Upstream's broader 10–15-row/other-GQA policy is a separate unmeasured extension, not a missing optimization for current Qwen4 MTP. |
 | [#584 · 42b34e2c](https://github.com/ddalcu/mlx-serve/pull/584) batched Qwen4 decode ladder | **Missing.** Sushi has the generic opt-in ladder, not the Qwen4 batched default or its deferred-PLE guard. | Carry both `h` and deferred `mlp_out` into early eval. Flush the host-filled PLE leaf only when token IDs are available; otherwise skip the ladder. Adapt without requiring the optional GPU PLE port. Test lazy/eager IDs, batch and solo, explicit off, and output equality before measuring stride 4. |
 | [#545 · 22749988](https://github.com/ddalcu/mlx-serve/pull/545) lazy next-round greedy MTP draft | **Missing new mechanism, despite older pre-draft code being present.** No padded `HeadPlace`/`forwardPlaced` or lazy built/kept counters. | Separate larger port in `generate.zig` and `transformer.zig`, explicitly Qwen4-only. Adapt all tagged-union switches for sushi's MiMo arm. Test full/partial/zero acceptance, cancellation, EOS/token budget, prefix reuse, lookup, and coexistence with the already landed greedy tail. |
 | [#539 · e541ec86](https://github.com/ddalcu/mlx-serve/pull/539), [d500d429](https://github.com/ddalcu/mlx-serve/commit/d500d429) GPU PLE gather and opt-in default | **Absent; optional experiment.** Sushi uses host PLE and its own mmap/page-cache policy. | Treat both upstream commits as one proposal: `--ple-gpu` stays off by default. Port buffer lifetime, deferred gather, memory accounting and CLI precedence together. Verify host/GPU n-gram parity and memory pressure with EXL3 resident and bf16 streamed weights. Do not assume upstream throughput gains transfer. |
@@ -64,7 +64,7 @@ current two-model sushi scope.
 
 1. Separate correctness commits: #601, #550, #552, then #553. Each starts with a
    failing behavioral regression and updates the matching engine/server doc.
-2. Independent measured kernel ports: #558 and #554; then the guarded #584 ladder.
+2. Measured #558 kernel port, then the guarded #584 ladder; preserve sushi's existing Qwen4-specific #554 equivalent.
 3. Qwen4-only #545 MTP orchestration after the smaller changes settle. Keep MiMo
    behavior unchanged and test both served families.
 4. Separate feature work for prefill sharing, live KV telemetry and `ignore_eos`.
@@ -85,3 +85,27 @@ Update NOTICE with the upstream author and adaptation in the same landing.
 No builds, model loads, GPU tests, benchmarks, commits or pushes were performed
 for this inventory. Implementation readiness here means identified source
 changes, dependencies, exclusions and regression gates, not validated patches.
+
+
+## Follow-up: first performance port
+
+Correctness ports #601/#550/#552/#553 were rebased over `--fast` and merged into
+main as `6c9ae932`. The completed worktree was reused on
+`codex/qwen4-upstream-perf`, based on `ad47f8bb`. Upstream was refreshed through
+`a4285ef7` (the extra commit changes release validation, not engine kernels).
+
+The #558 adaptation is implemented on that performance branch. It preserves
+sushi's stored bf16 carry state and probes pipeline capability on independent
+inputs so deferred PLE remains lazy. The width sweep found a two-row win and a
+five-row regression, so the default serves two rows only; see
+[the measurements](../docs/perf-baselines.md#gdn-verify-fold). The next missing
+port is #584; #545 and optional GPU PLE remain separate work.
+
+
+Validation of the two-row default: ReleaseFast build succeeds; the final full
+suite reports **2732 passed, 93 skipped, zero failures**. Six saved live MTP/serial
+output pairs (chat, streaming chat, Messages and copy tasks with lookup on/off)
+match byte for byte. The last live boot was initially refused by memory preflight;
+after memory settled, its three remaining checks passed (fixed depth, seeded
+stream/non-stream equality and lookup engagement). GPU locks were released and
+fans restored to auto. The performance commits have not been merged into main.
