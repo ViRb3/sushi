@@ -109,7 +109,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 
 - **A lookup stands in for the chain when the output copies its context** (`mtpLookupChain`, ported from mlx-serve
   #523/#533): the last 3 committed tokens plus t1 matched earlier in the prompt or output, agreeing back 8+ tokens,
-  make the drafts with no head forward. On by default for the qwen4 head; `SUSHI_MTP_LOOKUP=0` turns it off.
+  make the drafts with no head forward. Off by default for the qwen4 head; `SUSHI_MTP_LOOKUP=1` opts in.
 - **An ordinary match (suffix under 32) must agree past the start of a line**: a unified diff echoes the file's
   lines behind a `-`/`+`/space prefix, so its matches agree to the end of one line and fail at the next (-4.8% on
   the diff before the rule, -1.6% after). A line's own last token (`):\n`) agrees whatever the next line starts

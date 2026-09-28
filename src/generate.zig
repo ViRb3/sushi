@@ -5950,10 +5950,10 @@ pub const Generator = struct {
 
     pub var mtp_lookup_env_cache: ?bool = null;
 
-    /// On by default (mlx-serve #533); `SUSHI_MTP_LOOKUP=0` turns it off.
+    /// Opt-in: `SUSHI_MTP_LOOKUP=1` enables prompt lookup inside MTP.
     pub fn mtpLookupEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
+        const value = raw orelse return false;
+        return value.len > 0 and value[0] != '0';
     }
 
     fn mtpLookupEnabled() bool {
@@ -21143,10 +21143,10 @@ test "mtpRoundAcceptObserve: a lookup round feeds only the lookup counters, an M
     try testing.expectApproxEqAbs(mtp_lookup.driftStep(lookup_before), g.mtp_lookup_ema, 1e-6);
 }
 
-test "mtpLookupEnabledFromEnv: on by default, 0 turns it off" {
-    try testing.expect(Generator.mtpLookupEnabledFromEnv(null));
+test "mtpLookupEnabledFromEnv: off by default, explicit opt-in enables it" {
+    try testing.expect(!Generator.mtpLookupEnabledFromEnv(null));
     try testing.expect(Generator.mtpLookupEnabledFromEnv("1"));
-    try testing.expect(Generator.mtpLookupEnabledFromEnv(""));
+    try testing.expect(!Generator.mtpLookupEnabledFromEnv(""));
     try testing.expect(!Generator.mtpLookupEnabledFromEnv("0"));
 }
 

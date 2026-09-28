@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- MTP prompt lookup is now off by default; set `SUSHI_MTP_LOOKUP=1` to enable it.
+
 - `--prompt` (also `-p` and `run <model> -p`) honors thinking, sampling and generation flags, then exits after one reply.
 
 - `--prefill-decode-share` reserves a target share of prefill wall time for active decoders and narrows prefill chunks while they run (mlx-serve #568, thanks @STRML).

@@ -348,8 +348,8 @@ else
 fi
 stop_server
 
-echo "── MTP server (default-on) ──"
-start_server ""
+echo "── MTP server (default-on), prompt lookup explicitly enabled ──"
+SUSHI_MTP_LOOKUP=1 start_server ""
 # The qwen4_exp head is the checkpoint's own layer and logs its own line.
 if ! grep -q "MTP head ready\|\[qwen4\] MTP head loaded" "$LOG"; then
     echo "FAIL: server did not auto-load the MTP sidecar"; tail -5 "$LOG"; FAIL=$((FAIL+1))
