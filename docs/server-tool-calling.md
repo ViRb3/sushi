@@ -25,6 +25,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 ## Templates
 
+- One-shot CLI prompts carry the same thinking fields through the chat request policy; no CLI render may hardcode thinking off.
+
 - **Control bytes**: ONE raw byte <0x20 in history kills the strict render → SILENT `fallbackFormatChat` (model loses
   its stop token). Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A
   NUL byte truncated the rendered prompt (`jinja_render_chat` returns its LENGTH; tell: the same `prompt=` count on

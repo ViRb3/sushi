@@ -128,7 +128,7 @@ pub fn bindAddress(host: []const u8, port: u16) error{InvalidHost}!std.Io.net.Ip
 }
 
 pub fn startListener(host: []const u8, port: u16) (error{InvalidHost} || std.Io.net.IpAddress.ListenError)!std.Io.net.Server {
-    const addr = try bindAddress(host, port);
+    var addr = try bindAddress(host, port);
     const ip4 = addr.ip4;
     const rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     switch (std.posix.errno(rc)) {
@@ -163,6 +163,10 @@ pub fn startListener(host: []const u8, port: u16) (error{InvalidHost} || std.Io.
         .ADDRINUSE => return error.AddressInUse,
         else => return error.Unexpected,
     }
+    var bound: std.posix.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(@TypeOf(bound));
+    if (std.posix.errno(std.posix.system.getsockname(fd, @ptrCast(&bound), &bound_len)) != .SUCCESS) return error.Unexpected;
+    addr.ip4.port = std.mem.bigToNative(u16, bound.port);
     return .{ .socket = .{ .handle = fd, .address = addr }, .options = {} };
 }
 
@@ -525,7 +529,18 @@ fn parseKvAttnExplicit(root: std.json.ObjectMap) ?bool {
     }
 }
 
+fn closeEmbeddedListener(io: std.Io, listener: *std.Io.net.Server, client: ?std.Thread) void {
+    listener.deinit(io);
+    if (client) |thread| thread.join();
+}
+
+pub fn requestShutdown() void {
+    shutdown_requested.store(true, .release);
+}
+
 pub const ServerConfig = struct {
+    /// Starts an embedded client only after this process owns its listening socket.
+    on_ready: ?*const fn (u16) anyerror!std.Thread = null,
     /// Maximum context size (0 = unlimited). `--ctx-size N`.
     max_context_size: u32 = 0,
     /// Request timeout in seconds (0 = no timeout). `--timeout N`.
@@ -1889,7 +1904,10 @@ pub fn serve(
         }
         return err;
     };
-    defer server.deinit(io);
+    var client_thread: ?std.Thread = null;
+    defer closeEmbeddedListener(io, &server, client_thread);
+    listen_port = server.socket.address.ip4.port;
+    client_thread = if (server_config.on_ready) |ready| try ready(listen_port) else null;
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
@@ -1946,7 +1964,7 @@ pub fn serve(
     if (generate_mod.max_mtp_ctx != 0) {
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
-    log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
+    log.info("\nServer listening on http://{s}:{d}\n", .{ host, listen_port });
     if (g_api_key != null) {
         log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health and the chat page stay open)\n", .{});
     }
@@ -1965,7 +1983,7 @@ pub fn serve(
     log.info("  POST /tokenize\n", .{});
     log.info("  POST /detokenize\n\n", .{});
     var chat_url_buf: [96]u8 = undefined;
-    log.info("chat in your browser: {s}\n\n", .{chatPageUrl(&chat_url_buf, host, port)});
+    log.info("chat in your browser: {s}\n\n", .{chatPageUrl(&chat_url_buf, host, listen_port)});
 
     // Print system metrics once at startup
     const rss = metrics.getAppRssMb();
@@ -24486,4 +24504,69 @@ test "settingsPropsJson: /props reports the prefill decode share" {
     defer parsed.deinit();
     const v = parsed.value.object.get("prefill_decode_share") orelse return error.MissingShare;
     try testing.expectApproxEqAbs(@as(f64, 0.5), v.float, 1e-6);
+}
+
+test "one-shot listener reports its private ephemeral port" {
+    var listener = try startListener("127.0.0.1", 0);
+    defer listener.deinit(std.testing.io);
+    try std.testing.expect(listener.socket.address.ip4.port != 0);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &listener.socket.address.ip4.bytes);
+}
+
+test "format corpus: one-shot thinking reaches served templates and effort budgets" {
+    const a = std.testing.allocator;
+    const cli = @import("cli.zig");
+    const families = .{
+        .{ "qwen4_exp", @embedFile("fixtures/qwen38_chat_template.jinja") },
+        .{ "mimo_v2", @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+    };
+    inline for (families) |family| {
+        const arms = [_]cli.Think{ .model_default, .on, .{ .effort = .off }, .{ .effort = .low }, .{ .effort = .medium }, .{ .effort = .xhigh } };
+        for (arms) |think| {
+            const body = try cli.buildPromptBody(a, "  literal prompt\n", think, .{});
+            defer a.free(body);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            const effort = try parseReasoningEffort(root, 77, false, model_mod.effortArms(family[0]));
+            const enable = resolveEnableThinking(root, effort, true);
+            try std.testing.expectEqual(think != .model_default and (think != .effort or think.effort != .off), enable);
+            if (think == .effort) {
+                try std.testing.expectEqual(@as(i32, switch (think.effort) {
+                    .low => 2048,
+                    .medium => 8192,
+                    else => 77,
+                }), effort.?.budget);
+            }
+            var cc: chat_mod.ChatConfig = .{ .chat_template = family[1], .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+            const rendered = try chat_mod.renderChatTemplate(a, &.{.{ .role = "user", .content = root.get("messages").?.array.items[0].object.get("content").?.string }}, &cc, null, null, enable, if (effort) |e| e.effort else null, false);
+            defer a.free(rendered);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "literal prompt") != null);
+            if (std.mem.eql(u8, family[0], "qwen4_exp")) {
+                try std.testing.expectEqual(enable, chat_mod.promptTailOpensThink(rendered));
+            } else {
+                try std.testing.expect(std.mem.endsWith(u8, rendered, if (enable) "<|im_start|>assistant\n" else "<think></think>"));
+            }
+            if (std.mem.eql(u8, family[0], "qwen4_exp") and think == .effort and think.effort == .xhigh)
+                try std.testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to xhigh.") != null);
+        }
+    }
+}
+
+test "one-shot shutdown closes an unaccepted connection before joining its client" {
+    const Waiter = struct {
+        fd: std.posix.socket_t,
+        disconnected: bool = false,
+        fn run(self: *@This()) void {
+            var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            self.disconnected = (std.posix.poll(&fds, 500) catch 0) > 0;
+        }
+    };
+    var listener = try startListener("127.0.0.1", 0);
+    const client = try listener.socket.address.connect(std.testing.io, .{ .mode = .stream });
+    defer client.close(std.testing.io);
+    var waiter: Waiter = .{ .fd = client.socket.handle };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    closeEmbeddedListener(std.testing.io, &listener, thread);
+    try std.testing.expect(waiter.disconnected);
 }

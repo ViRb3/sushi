@@ -825,9 +825,16 @@ pub fn parseModelEfforts(allocator: std.mem.Allocator, body: []const u8) !ModelE
 /// /v1/chat/completions request body for the REPL conversation so far;
 /// `tools` is the OpenAI tools array to offer, null for none.
 pub fn buildReplChatBody(allocator: std.mem.Allocator, history: []const Turn, think: Think, tools: ?[]const u8) ![]u8 {
+    return buildChatBody(allocator, history, think, tools, null);
+}
+
+pub const PromptSampling = struct { max_tokens: u32 = 100, temperature: f32 = 0, top_p: f32 = 1, top_k: u32 = 0 };
+
+fn buildChatBody(allocator: std.mem.Allocator, history: []const Turn, think: Think, tools: ?[]const u8, sampling: ?PromptSampling) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"model\":\"sushi\",\"stream\":true,\"stream_options\":{\"include_usage\":true},");
+    if (sampling) |v| try out.print(allocator, "\"max_tokens\":{d},\"temperature\":{d},\"top_p\":{d},\"top_k\":{d},\"repeat_penalty\":1,\"presence_penalty\":0,", .{ v.max_tokens, v.temperature, v.top_p, v.top_k });
     switch (think) {
         .model_default => {},
         .on => try out.appendSlice(allocator, "\"enable_thinking\":true,"),
@@ -2238,4 +2245,158 @@ test "cli: list tree walk descends into symlinked model dirs" {
     }
     // 1 definition + 3 in this test + at least 2 call sites in the walk.
     try testing.expect(found >= 6);
+}
+
+pub fn isPromptFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--prompt") or std.mem.eql(u8, arg, "-p");
+}
+
+pub fn buildPromptBody(allocator: std.mem.Allocator, prompt: []const u8, think: Think, sampling: PromptSampling) ![]u8 {
+    return buildChatBody(allocator, &.{.{ .role = "user", .content = prompt }}, if (think == .model_default) .{ .effort = .off } else think, null, sampling);
+}
+
+test "cli: one-shot prompt aliases" {
+    try testing.expect(isPromptFlag("--prompt"));
+    try testing.expect(isPromptFlag("-p"));
+    try testing.expect(!isPromptFlag("--prompt=hi"));
+}
+
+test "cli: one-shot request preserves prompt and sampling with every thinking arm" {
+    const a = testing.allocator;
+    const prompt = "\n  literal \\\" text\t\x00🦀\n";
+    const arms = [_]Think{ .model_default, .on, .{ .effort = .off }, .{ .effort = .low }, .{ .effort = .medium }, .{ .effort = .xhigh } };
+    for (arms) |think| {
+        const body = try buildPromptBody(a, prompt, think, .{ .max_tokens = 37, .temperature = 0.25, .top_p = 0.75, .top_k = 12 });
+        defer a.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try testing.expectEqualStrings(prompt, root.get("messages").?.array.items[0].object.get("content").?.string);
+        try testing.expect(root.get("max_tokens") != null);
+        try testing.expectEqual(@as(i64, 37), root.get("max_tokens").?.integer);
+        try testing.expectEqual(@as(f64, 0.25), root.get("temperature").?.float);
+        try testing.expect(root.get("stream").?.bool);
+        try testing.expectEqual(@as(f64, 0.75), root.get("top_p").?.float);
+        try testing.expectEqual(@as(i64, 12), root.get("top_k").?.integer);
+        switch (think) {
+            .model_default => {
+                try testing.expect(root.get("enable_thinking") == null);
+                try testing.expectEqualStrings("off", root.get("reasoning_effort").?.string);
+            },
+            .on => try testing.expect(root.get("enable_thinking").?.bool),
+            .effort => |e| try testing.expectEqualStrings(@tagName(e), root.get("reasoning_effort").?.string),
+        }
+    }
+}
+
+/// The one-shot client uses the same request and decode policy as the HTTP API.
+/// Buffering changes delivery only; both modes consume the same SSE bytes.
+pub fn runPrompt(allocator: std.mem.Allocator, io: std.Io, port: u16, body: []const u8, stream: bool, api_key: ?[]const u8) !void {
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/chat/completions", .{port});
+    defer allocator.free(url);
+    const auth = if (api_key) |key| try std.fmt.allocPrint(allocator, "Bearer {s}", .{key}) else null;
+    defer if (auth) |v| allocator.free(v);
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    var req = try client.request(.POST, try std.Uri.parse(url), .{
+        .keep_alive = false,
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .accept_encoding = .{ .override = "identity" },
+            .authorization = if (auth) |v| .{ .override = v } else .omit,
+        },
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = body.len };
+    var request_body = try req.sendBodyUnflushed(&.{});
+    try request_body.writer.writeAll(body);
+    try request_body.end();
+    try req.connection.?.flush();
+    var head_buffer: [8192]u8 = undefined;
+    var response = try req.receiveHead(&head_buffer);
+    var read_buffer: [64 * 1024]u8 = undefined;
+    const r = response.reader(&read_buffer);
+    if (response.head.status != .ok) {
+        const detail = try r.allocRemaining(allocator, .limited(64 * 1024));
+        defer allocator.free(detail);
+        log.err("prompt HTTP {d}: {s}\n", .{ @backingInt(response.head.status), detail });
+        return error.PromptHttpStatus;
+    }
+    var out_buf: [16 * 1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var buffered: std.Io.Writer.Allocating = .init(allocator);
+    defer buffered.deinit();
+    const target = if (stream) &stdout.interface else &buffered.writer;
+    defer stdout.interface.flush() catch {};
+    try readPromptStream(allocator, r, target);
+    if (!stream) try stdout.interface.writeAll(buffered.written());
+}
+
+fn readPromptStream(allocator: std.mem.Allocator, r: *std.Io.Reader, w: *std.Io.Writer) !void {
+    var in_thought = false;
+    while (try r.takeDelimiter('\n')) |line| {
+        const delta = parseReplLine(allocator, line) orelse continue;
+        defer delta.deinit(allocator);
+        if (delta.err) |e| {
+            if (!@import("builtin").is_test) log.err("prompt: {s}\n", .{e});
+            return error.PromptGenerationFailed;
+        }
+        if (delta.reasoning) |thought| {
+            if (!in_thought) try w.writeAll("<think>\n");
+            in_thought = true;
+            try w.writeAll(thought);
+        }
+        if (delta.content.len > 0) {
+            if (in_thought) try w.writeAll("\n</think>\n\n");
+            in_thought = false;
+            try w.writeAll(delta.content);
+        }
+        try w.flush();
+        if (delta.done) return;
+    }
+    return error.PromptStreamIncomplete;
+}
+
+test "cli: one-shot stream preserves reasoning and content without terminal markup" {
+    var r: std.Io.Reader = .fixed(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"  answer\\n\"}}]}\n\n" ++
+            "data: [DONE]\n\n",
+    );
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try readPromptStream(testing.allocator, &r, &w.writer);
+    try testing.expectEqualStrings("<think>\nhmm\n</think>\n\n  answer\n", w.written());
+}
+
+test "cli: one-shot incomplete stream is a failure" {
+    var r: std.Io.Reader = .fixed("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n");
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try testing.expectError(error.PromptStreamIncomplete, readPromptStream(testing.allocator, &r, &w.writer));
+}
+
+test "cli: one-shot generation error is a failure even with a done marker" {
+    var r: std.Io.Reader = .fixed("data: {\"error\":{\"message\":\"decode failed\"}}\n\ndata: [DONE]\n\n");
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try testing.expectError(error.PromptGenerationFailed, readPromptStream(testing.allocator, &r, &w.writer));
+}
+
+test "cli: one-shot omission preserves thinking-off while REPL keeps the model default" {
+    const a = testing.allocator;
+    const prompt = try buildPromptBody(a, "hello", .model_default, .{});
+    defer a.free(prompt);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, prompt, .{});
+    defer parsed.deinit();
+    const effort = parsed.value.object.get("reasoning_effort");
+    try testing.expect(effort != null);
+    try testing.expectEqualStrings("off", effort.?.string);
+    const repl = try buildReplChatBody(a, &.{.{ .role = "user", .content = "hello" }}, .model_default, null);
+    defer a.free(repl);
+    const parsed_repl = try std.json.parseFromSlice(std.json.Value, a, repl, .{});
+    defer parsed_repl.deinit();
+    try testing.expect(parsed_repl.value.object.get("reasoning_effort") == null);
+    try testing.expect(parsed_repl.value.object.get("enable_thinking") == null);
 }

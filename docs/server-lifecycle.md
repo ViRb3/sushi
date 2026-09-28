@@ -55,6 +55,22 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   outlives the server. An exec that cannot happen logs `[update] cannot run …` and exits 1; the outcome lands in the
   cache so `/props.update.error` names a failure after the relaunch.
 
+## One-shot prompts
+
+- `sushi --model <path> --prompt "text"` (shorthand `-p`) and `sushi run <model> -p "text"` execute one request
+  and exit, even with redirected stdin. The prompt is passed verbatim, including leading/trailing whitespace.
+- Explicit prompts use the normal scheduler and chat request policy through a private loopback listener on an OS-assigned
+  port. They never connect to an existing server or enter the REPL; the client is joined and the listener closes on exit.
+- `--think` enables thinking; `--think off|low|medium|xhigh` selects a supported effort (MiMo also supports high/max).
+  Omission preserves one-shot thinking-off; the interactive REPL still uses the model default. Unsupported efforts fail
+  with the accepted list and a nonzero exit.
+- `--fast`, MTP/KV settings, context, timeout, reasoning budgets, and sampling flags follow the serving policy, including
+  model-settings precedence. One-shot sampling retains its defaults: 100 output tokens, temperature 0, top-p 1, top-k 0.
+- `--stream` flushes the same reply incrementally; otherwise it buffers until success. Stdout contains only the reply,
+  with reasoning in `<think>` tags; diagnostics go to stderr. HTTP/decode errors and incomplete streams exit nonzero.
+- `serve`, `--serve`, `--host`, `--port`, and `--tool on` conflict with explicit prompts and fail before loading.
+  Use the REPL for client-side tools. Guard: `tests/test_prompt_flags.py`; `SUSHI_PROMPT_MODEL` enables live Qwen checks.
+
 ## What loads
 
 - A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.

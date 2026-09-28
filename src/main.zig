@@ -52,6 +52,26 @@ fn replThreadMain(allocator: std.mem.Allocator, io: std.Io, port: u16, opts: cli
     std.posix.raise(std.posix.SIG.TERM) catch {};
 }
 
+const PromptClient = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    body: []const u8,
+    stream: bool,
+    err: ?anyerror = null,
+
+    fn ready(port: u16) !std.Thread {
+        return std.Thread.spawn(.{}, run, .{ prompt_client.?, port });
+    }
+
+    fn run(self: *PromptClient, port: u16) void {
+        defer server_mod.requestShutdown();
+        cli_mod.runPrompt(self.allocator, self.io, port, self.body, self.stream, server_mod.g_api_key) catch |err| {
+            self.err = err;
+        };
+    }
+};
+var prompt_client: ?*PromptClient = null;
+
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
@@ -113,7 +133,7 @@ fn printUsage(io: std.Io) void {
         \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
         \\                      (default auto = the model's declared window; over-limit
         \\                      inputs get a 400 naming index/count/limit, never truncation)
-        \\  --prompt <text>     Run single prompt (interactive mode)
+        \\  --prompt, -p <text> Run one prompt and exit (also with run <model>)
         \\  --stream            Stream tokens as they are generated (with --prompt)
         \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
         \\                      mode, the default for requests that omit the field
@@ -452,6 +472,7 @@ pub fn main(init: std.process.Init) !void {
     var parent_pid: ?std.posix.pid_t = null;
     var no_update_check = false;
     var serve_mode = false;
+    var serve_explicit = false;
     var stream_mode = false;
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
@@ -556,6 +577,7 @@ pub fn main(init: std.process.Init) !void {
             host_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--serve")) {
             serve_mode = true;
+            serve_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--think")) {
             const f = cli_mod.parseThinkFlag(if (i + 1 < args.len) args[i + 1] else null);
             run_opts.think = f.think;
@@ -568,7 +590,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--stream")) {
             stream_mode = true;
-        } else if (std.mem.eql(u8, args[i], "--prompt") and i + 1 < args.len) {
+        } else if (cli_mod.isPromptFlag(args[i]) and i + 1 < args.len) {
             i += 1;
             prompt = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
@@ -912,7 +934,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const bind = server_mod.resolveBind(host_flag, port_flag);
+    if (prompt != null and (serve_explicit or (use_default_models_root and run_model_dir == null) or host_flag != null or port_flag != null or run_opts.tools)) {
+        log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
+        return error.PromptModeConflict;
+    }
+    const bind = server_mod.resolveBind(host_flag, if (prompt != null) @as(u16, 0) else port_flag);
     const host = bind.host;
     const port = bind.port;
 
@@ -944,6 +970,19 @@ pub fn main(init: std.process.Init) !void {
         serve_mode = true;
     }
     if (use_default_models_root) serve_mode = true;
+    if (prompt != null) {
+        if (model_dir.len == 0) {
+            log.err("--prompt/-p requires --model <path> or run <model>\n", .{});
+            return error.PromptModelRequired;
+        }
+        serve_mode = true;
+        repl_after_serve = false;
+    }
+    const prompt_body = if (prompt) |text| try cli_mod.buildPromptBody(allocator, text, run_opts.think, .{ .max_tokens = max_tokens, .temperature = temperature, .top_p = top_p_flag orelse 1.0, .top_k = top_k_flag orelse 0 }) else null;
+    defer if (prompt_body) |body| allocator.free(body);
+    var prompt_state: PromptClient = .{ .allocator = allocator, .io = io, .body = prompt_body orelse "", .stream = stream_mode };
+    prompt_client = if (prompt != null) &prompt_state else null;
+    defer prompt_client = null;
     // An unspecified `--model-dir` falls back to the shared models root that
     // `pull`/`list`/the app already agree on. Gated so `--model <path> --serve`
     // still serves exactly the one model it named (cli.shouldDefaultModelsRoot).
@@ -987,7 +1026,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
-    if (serve_mode) update_mod.startDailyCheck(io, no_update_check, transformer_mod.diagEnvOn("SUSHI_NO_UPDATE_CHECK"));
+    if (serve_mode and prompt == null) update_mod.startDailyCheck(io, no_update_check, transformer_mod.diagEnvOn("SUSHI_NO_UPDATE_CHECK"));
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1380,6 +1419,7 @@ pub fn main(init: std.process.Init) !void {
             .metrics = server_mod.g_metrics,
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
+            .on_ready = if (prompt != null) PromptClient.ready else null,
             .max_context_size = ctx_size,
             .request_timeout_sec = timeout,
             .default_reasoning_budget = reasoning_budget,
@@ -1394,6 +1434,7 @@ pub fn main(init: std.process.Init) !void {
             .kv_attn_mode = kv_attn_mode,
             .default_force_mtp = force_mtp,
         });
+        if (prompt_state.err) |err| return err;
     } else {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
@@ -1741,4 +1782,3 @@ fn parseSizeArg(s: []const u8) !u64 {
     const n = std.fmt.parseInt(u64, s[0..end], 10) catch return error.InvalidSize;
     return n * mult;
 }
-
