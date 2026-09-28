@@ -8459,10 +8459,13 @@ pub const KVCache = struct {
             kv_cap_buf_grows += 1;
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
-            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
-            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
-            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, .bfloat16);
-            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, .bfloat16);
+            // Quantizer scales retain the activation dtype through allocation and growth.
+            const ksc_dt = mlx.mlx_array_dtype(new_kq.scales);
+            const vsc_dt = mlx.mlx_array_dtype(new_vq.scales);
+            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
+            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
             entry.initialized = true;
         }
 
@@ -71158,4 +71161,32 @@ test "QSA checkpoint copy failure preserves the destination pooled bank" {
     try testing.expect(mlx.fault.didFire());
     try testing.expectEqual(original, dst.layers[0].qsa_pooled.ctx);
     try testing.expectEqualSlices(c_int, &shape, mlx.getShape(dst.layers[0].qsa_pooled));
+}
+
+test "upstream bugfix: KVCache affine quant keeps its dtype through growth" {
+    const s = mlx.gpuStream();
+    for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dt| {
+        var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
+        defer cache.deinit();
+        for (0..2) |pass| {
+            const count: c_int = if (pass == 0) 4 else @intCast(KVCache.bufferCapacity(cache.entries[0].keys) + 1);
+            const old_cap = if (pass == 0) 0 else KVCache.bufferCapacity(cache.entries[0].keys);
+            const shape = [_]c_int{ 1, 2, count, 64 };
+            var k = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k);
+            try mlx.check(mlx.mlx_ones(&k, &shape, 4, dt, s));
+            var dv = try cache.update(0, k, k, s, 0);
+            defer dv.deinit();
+            try testing.expect(KVCache.bufferCapacity(cache.entries[0].keys) > old_cap);
+            try testing.expectEqual(dt, mlx.mlx_array_dtype(dv.k));
+            try testing.expectEqual(dt, mlx.mlx_array_dtype(dv.v));
+            var restored = try cache.denseView(0, s);
+            defer restored.deinit();
+            try testing.expectEqual(dt, mlx.mlx_array_dtype(restored.k));
+            try testing.expectEqual(dt, mlx.mlx_array_dtype(restored.v));
+            for ([_]mlx.mlx_array{ cache.entries[0].keys_scales, cache.entries[0].keys_biases, cache.entries[0].values_scales, cache.entries[0].values_biases }) |arr| {
+                try testing.expectEqual(dt, mlx.mlx_array_dtype(arr));
+            }
+        }
+    }
 }

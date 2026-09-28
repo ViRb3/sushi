@@ -82,6 +82,8 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 ## Constrained JSON
 
+- Constrained generation reports each returned token against its raw logits before the grammar mask, including forced choices; those logprobs have no one-token delay.
+
 - The payload offset is AUTHORITATIVE (`reasoning_protocol.Delivery`, all surfaces, stream + non-stream).
 - The grammar mask never walks the whole vocabulary (`token_mask.buildMask`); every grammar state has a legal byte;
   no whitespace OUTSIDE the root value, the model's OWN layout inside (`MAX_FREE_WS` 16).

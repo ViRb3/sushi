@@ -11292,6 +11292,21 @@ pub const Generator = struct {
     /// grammar by the sampled token's bytes, and pre-launches the next forward
     /// pass to overlap with the next mask build.
     fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        if (self.logprobs_n == 0 or !self.has_pending_logits) return self.nextConstrainedToken(allocator);
+        // A constrained token belongs to these raw logits, before the grammar mask.
+        var logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_set(&logits, self.pending_logits));
+        const token = (try self.nextConstrainedToken(allocator)) orelse return null;
+        const lp = try computeLogprobs(allocator, logits, token, self.logprobs_n, self.xfm.s);
+        if (self.last_logprob) |old| allocator.free(old.top_logprobs);
+        self.pending_logprob = lp;
+        self.last_logprob = self.pending_logprob;
+        self.pending_logprob = null;
+        return token;
+    }
+
+    fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (!self.has_pending_logits) {
             self.done = true;
             return null;
@@ -21131,4 +21146,60 @@ test "mtpLookupEnabledFromEnv: on by default, 0 turns it off" {
     try testing.expect(Generator.mtpLookupEnabledFromEnv("1"));
     try testing.expect(Generator.mtpLookupEnabledFromEnv(""));
     try testing.expect(!Generator.mtpLookupEnabledFromEnv("0"));
+}
+
+test "upstream bugfix: constrained logprobs describe the returned token before masking" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    // Each call is the final allowed token, so no model forward is needed.
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    var bytes = try token_mask.TokenBytes.init(std.heap.ArenaAllocator.init(a), &.{ null, "true", "false", "invalid" }, null);
+    defer bytes.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"boolean\"}", .{});
+    defer parsed.deinit();
+    var gen = Generator{
+        .xfm = &xfm,
+        .ctx = undefined,
+        .tok = undefined,
+        .next_token_id = 0,
+        .step = 0,
+        .max_tokens = 1,
+        .sampling = .{ .temperature = 0 },
+        .prompt_tokens = 0,
+        .completion_tokens = 0,
+        .finish_reason = "length",
+        .done = false,
+        .eos_token_ids = &.{},
+        .generated_ids = .empty,
+        .timeout_ns = 0,
+        .timer = io_util.Stopwatch.init(testing.io),
+        .last_hidden = .{ .ctx = null },
+        .has_last_hidden = false,
+        .logprobs_n = 4,
+    };
+    defer gen.generated_ids.deinit(a);
+    defer if (gen.last_logprob) |lp| a.free(lp.top_logprobs);
+    defer if (gen.has_pending_logits) {
+        _ = mlx.mlx_array_free(gen.pending_logits);
+    };
+    for ([_][4]f32{ .{ 0, 2, 1, 4 }, .{ 0, 1, 3, 5 } }, [_]u32{ 1, 2 }) |values, want| {
+        var sc: SchemaConstraint = undefined;
+        try sc.initFromValue(a, parsed.value, &bytes);
+        defer sc.deinit();
+        gen.sampling.constraint = &sc.constraint;
+        gen.max_tokens = gen.step + 1;
+        gen.done = false;
+        gen.pending_logits = mlx.mlx_array_new_data(&values, &.{ 1, 1, 4 }, 3, .float32);
+        gen.has_pending_logits = true;
+        const expected = try computeLogprobs(a, gen.pending_logits, want, 4, s);
+        defer a.free(expected.top_logprobs);
+        try testing.expectEqual(@as(?u32, want), try gen.nextConstrained(a));
+        const got = gen.last_logprob orelse return error.NoLogprobs;
+        try testing.expectApproxEqAbs(expected.token_logprob, got.token_logprob, 1e-6);
+        try testing.expectEqual(@as(u32, 3), got.top_logprobs[0].token_id);
+        try testing.expectEqual(@as(?u32, null), try gen.nextConstrained(a));
+    }
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, gen.generated_ids.items);
 }

@@ -130,8 +130,13 @@ print("── [3/7] /v1/completions: integer logprobs, four parallel arrays ─�
 r = post("/v1/completions", {"model": MODEL, "prompt": "Count from one to five:",
                              "max_tokens": 24, "temperature": 0, "logprobs": 5})
 lp = r["choices"][0].get("logprobs")
-ck("[completions] logprobs present", lp is not None, f"got {lp}")
-if lp:
+if r["usage"]["completion_tokens"] == 0:
+    ck("[completions] empty stop has no token entries", r["choices"][0]["text"] == ""
+       and r["choices"][0]["finish_reason"] == "stop" and not (lp or {}).get("tokens"), f"response={r!r}")
+    print("  NOTE  immediate EOS; legacy token-shape checks have no tokens to inspect")
+else:
+    ck("[completions] logprobs present", bool((lp or {}).get("tokens")), f"response={r!r}")
+if lp and lp.get("tokens"):
     keys = ("tokens", "token_logprobs", "top_logprobs", "text_offset")
     ck("[completions] all four arrays present", all(lp.get(k) is not None for k in keys), f"{list(lp)}")
     if all(lp.get(k) is not None for k in keys):
@@ -173,13 +178,19 @@ print("── [5/7] STREAMING /v1/completions carries the legacy shape ──")
 CREQ = {"model": MODEL, "prompt": "Count from one to five:", "max_tokens": 24,
         "temperature": 0, "logprobs": 5}
 ns = post("/v1/completions", {**CREQ, "stream": False})["choices"][0]
-resp = post("/v1/completions", {**CREQ, "stream": True}, stream=True)
+resp = post("/v1/completions", {**CREQ, "stream": True, "stream_options": {"include_usage": True}}, stream=True)
 toks, tlp, tops, offs, sawkey, text = [], [], [], [], 0, ""
+completion_usage, completion_finish = None, None
 for raw in resp:
     line = raw.decode().strip()
     if not line.startswith("data: ") or line == "data: [DONE]":
         continue
-    for ch in json.loads(line[6:]).get("choices", []):
+    event = json.loads(line[6:])
+    if event.get("usage") is not None:
+        completion_usage = event["usage"]
+    for ch in event.get("choices", []):
+        if ch.get("finish_reason") is not None:
+            completion_finish = ch["finish_reason"]
         if "logprobs" in ch:
             sawkey += 1
         text += ch.get("text") or ""
@@ -188,7 +199,11 @@ for raw in resp:
             toks += lp["tokens"]; tlp += lp["token_logprobs"]
             tops += lp["top_logprobs"]; offs += lp["text_offset"]
 ck("[cmpl-stream] every chunk carries a logprobs key", sawkey > 0, f"{sawkey} chunks had it")
-ck("[cmpl-stream] entries delivered", bool(toks), "none")
+if completion_usage is not None and completion_usage.get("completion_tokens") == 0:
+    ck("[cmpl-stream] empty stop has no token entries", not text and not toks and completion_finish == "stop")
+    print("  NOTE  immediate EOS; legacy streamed-token checks have no tokens to inspect")
+else:
+    ck("[cmpl-stream] entries delivered", bool(toks), f"stream_text={text!r}; usage={completion_usage!r}; non_stream={ns!r}")
 if toks:
     ck("[cmpl-stream] arrays parallel", len(tlp) == len(toks) == len(tops) == len(offs),
        f"{len(toks)} {len(tlp)} {len(tops)} {len(offs)}")
@@ -260,6 +275,40 @@ if sents:
     ck("[think stream] entries reconstruct the content deltas",
        sjoined.strip() == sc.strip(),
        f"{len(sents)} entries -> {sjoined[:44]!r} vs deltas {sc[:44]!r}")
+
+print("── constrained JSON logprobs ──")
+for response_format in (
+    {"type": "json_object"},
+    {"type": "json_schema", "json_schema": {"name": "answer", "strict": True,
+      "schema": {"type": "object", "properties": {"answer": {"type": "boolean"}},
+                 "required": ["answer"], "additionalProperties": False}}},
+):
+    req = {**REQ, "messages": [{"role": "user", "content": "Return JSON with answer true."}],
+           "max_tokens": 64, "enable_thinking": False, "response_format": response_format,
+           "enable_mtp": False}
+    choice = post("/v1/chat/completions", {**req, "stream": False})["choices"][0]
+    text = choice["message"].get("content") or ""
+    entries = (choice.get("logprobs") or {}).get("content") or []
+    label = response_format["type"]
+    ck(f"[{label}] logprobs reconstruct content", bool(entries) and
+       "".join(e["token"] for e in entries).strip() == text.strip())
+    stream_text, stream_entries = "", []
+    for raw in post("/v1/chat/completions", {**req, "stream": True}, stream=True):
+        line = raw.decode().strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        for ch in json.loads(line[6:]).get("choices", []):
+            stream_text += (ch.get("delta") or {}).get("content") or ""
+            stream_entries.extend((ch.get("logprobs") or {}).get("content") or [])
+    ck(f"[{label}] streaming logprobs reconstruct content", bool(stream_entries) and
+       "".join(e["token"] for e in stream_entries).strip() == stream_text.strip())
+    # Grammar can force a token below rank one in the raw model distribution.
+    for entry in entries + stream_entries:
+        ck(f"[{label}] token logprob is nonpositive", entry["logprob"] <= 0)
+        for alt in entry.get("top_logprobs") or []:
+            if alt.get("bytes") == entry.get("bytes"):
+                ck(f"[{label}] matching token has matching probability",
+                   abs(alt["logprob"] - entry["logprob"]) < 1e-6)
 
 print("── [7/7] every response body is valid UTF-8 ──")
 ck("no response carried a split multi-byte token as raw bytes", not utf8_bad,

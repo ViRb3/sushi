@@ -798,7 +798,8 @@ pub const ModelRegistry = struct {
     /// Browser downloads models while the server runs, and a boot-only scan
     /// can't see them). Add-only: an id or path already registered wins
     /// (first-wins, like boot) and live entries are never re-pointed or
-    /// removed. Returns the number of stubs added. No roots (a `--model`-only
+    /// removed. A failed load at the same path becomes retryable. Returns the
+    /// number of stubs added. No roots (a `--model`-only
     /// server) rescans nothing.
     pub fn rescan(self: *ModelRegistry) !u32 {
         const roots = if (self.discovery) |d| d.roots else &.{};
@@ -809,7 +810,13 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (found.models) |m| {
-            if (self.entries.get(m.id) != null) continue;
+            if (self.entries.get(m.id)) |e| {
+                if (e.state == .error_state and std.mem.eql(u8, e.path, m.path)) {
+                    self.markUnloadedLocked(e);
+                    e.bytes_on_disk = m.bytes_on_disk;
+                }
+                continue;
+            }
             if (self.peekByPathLocked(m.path) != null) continue;
             _ = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
             added += 1;
@@ -2047,4 +2054,49 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), try reg.rescan());
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "upstream bugfix: ModelRegistry: rescan clears a failed load so the completed dir can load again" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "org/broken");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/broken/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/broken/model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "org/fine");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/fine/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/fine/model.safetensors", .data = "0123" });
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    const broken = reg.peek("org/broken") orelse return error.TestExpectedResult;
+    reg.mutex.lockUncancelable(io);
+    reg.markErrorLocked(broken, "FileNotFound");
+    reg.mutex.unlock(io);
+
+    const fine = reg.peek("org/fine") orelse return error.TestExpectedResult;
+    // A concurrent load and a failed entry pointing elsewhere must not be reset.
+    fine.state = .loading;
+    defer fine.state = .unloaded;
+    try tmp.dir.createDirPath(io, "org/moved");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/moved/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/moved/model.safetensors", .data = "0123" });
+    const moved = try reg.registerStubWithArch("org/moved", "/missing/old-location", 4, "qwen4_exp");
+    reg.markErrorLocked(moved, "FileNotFound");
+
+    // The download finishes after the failed load.
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/broken/model.safetensors", .data = "01234567" });
+
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(LoadState.unloaded, broken.state);
+    try testing.expectEqual(@as(?[]const u8, null), broken.error_name);
+    try testing.expectEqual(@as(?u64, 8), broken.bytes_on_disk);
+    try testing.expectEqual(LoadState.loading, fine.state);
+    try testing.expectEqual(LoadState.error_state, moved.state);
+    try testing.expectEqual(@as(?u64, 4), fine.bytes_on_disk);
 }

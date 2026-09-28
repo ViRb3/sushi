@@ -6,6 +6,11 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- SSD prompt-cache accounting retains existing QSA files across in-place commits (mlx-serve #601, thanks @brandondyal).
+- Rescanning models clears a failed load when its directory is still present, allowing a retry (mlx-serve #550, thanks @brandondyal).
+- JSON-constrained replies return logprobs paired with their emitted tokens (mlx-serve #552, thanks @brandondyal).
+- Quantized KV retains f16 or bf16 activations through cache growth and reconstruction (mlx-serve #553, thanks @jasontitus).
+
 - **sushi updates itself**: `sushi update` installs the newest release after checking its SHA-256, its signature and
   that it runs, keeping the old install for `sushi update --rollback`; a server checks for a release once a day
   (`--no-update-check` turns that off), and the chat page and `sushi run`'s `/update` install it and restart.

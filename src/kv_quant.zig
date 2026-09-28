@@ -163,7 +163,7 @@ pub fn quantizeAffine(
     return out;
 }
 
-/// Affine dequantize a `(q, scales, biases)` triple to dense bf16. Caller
+/// Affine dequantize a `(q, scales, biases)` triple to the scales dtype. Caller
 /// owns the returned array.
 pub fn dequantizeAffine(
     s: mlx.mlx_stream,
@@ -184,7 +184,7 @@ pub fn dequantizeAffine(
         mlx.mlx_optional_int.some(@intCast(bits)),
         "affine",
         .{}, // global_scale (null)
-        .{ .value = .bfloat16, .has_value = true },
+        .{ .value = mlx.mlx_array_dtype(scales), .has_value = true },
         s,
     ));
     return out;

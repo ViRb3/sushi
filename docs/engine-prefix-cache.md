@@ -78,6 +78,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 ## Budget
 
+- An in-place SSD commit keeps the bill for an owned QSA history file when no new QSA checkpoint arrives; sidecar-only commits bill the change in all retained non-chunk files, including rings.
+
 - A commit declines and frees its incoming snapshot when checked-out residents prevent satisfying either the entry-count or byte cap; the request continues and one `[hot-cache]` line names the limiting cap.
   The byte cap is judged AFTER the new entry sheds checkpoints (`retainNewEntry`): a qwen4_exp trim is priced against
   its shed survivors, and judging it unshed declined every session past the budget, so each turn cold-prefilled.

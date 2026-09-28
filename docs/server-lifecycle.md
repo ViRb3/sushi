@@ -57,6 +57,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 ## What loads
 
+- A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.
+
 - **Bind**: `server.resolveBind` defaults to `127.0.0.1:12345`; `--host` takes an IPv4 literal, `0.0.0.0` or
   `localhost` (= 127.0.0.1; anything else is refused by name, never widened). Before any model loads,
   `ensurePortFree` probes the address with a connect AND a bind, so a listener or a bound-but-silent socket both refuse
