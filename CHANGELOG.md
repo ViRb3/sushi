@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- Batched Qwen4 decode overlaps GPU execution with graph construction through a PLE-safe async ladder; serial decode stays off by default (mlx-serve #584, thanks @cowboycoderhq).
+
 - Two-row Qwen4 MTP verification folds GDN normalization, gating and rollback history into the recurrence without changing output (mlx-serve #558, thanks @STRML).
 
 - SSD prompt-cache accounting retains existing QSA files across in-place commits (mlx-serve #601, thanks @brandondyal).

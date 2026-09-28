@@ -109,3 +109,12 @@ match byte for byte. The last live boot was initially refused by memory prefligh
 after memory settled, its three remaining checks passed (fixed depth, seeded
 stream/non-stream equality and lookup engagement). GPU locks were released and
 fans restored to auto. The performance commits have not been merged into main.
+
+
+## Authorized next stage
+
+The Qwen performance round includes #558 (two-row default only) and #584
+(batched stride 4 with deferred-PLE protection). Ladder measurements and exact
+sample counts are recorded in [the performance notes](../docs/perf-baselines.md#qwen4-decode-ladder).
+After committing, pushing and cleaning up this round, proceed ONLY with #568
+prefill/decode sharing. #545 and GPU PLE remain deferred.

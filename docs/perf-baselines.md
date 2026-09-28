@@ -582,3 +582,41 @@ Parity covers sigmoid and Swish, widths 2–8, both small and real head geometry
 all outputs and rollback states, the pipeline thread-limit fallback, and keeping
 real lazy inputs unevaluated during the probe. The production-path test also
 checks rollback at every acceptance position against serial decode.
+
+
+<a id="qwen4-decode-ladder"></a>
+## Flash-Next: PLE-safe batched decode ladder
+
+`4f329a4a`, ReleaseFast, M5 Max 128 GB, Sushi-3bpw, llmprobe 0.6.12 on
+2026-09-28. Flags: `--ctx-size 65536 --kv-quant 8 --no-mtp --no-pld --no-drafter
+--max-concurrent 2 --prefix-cache-entries 0`. Off sets `SUSHI_DECODE_ASYNC_LADDER=0`;
+on leaves it unset (batched stride 4, serial off). Probe flags: `--bench-only
+--rungs 4k,32k --runs 3 --concurrency 2 --reasoning off --no-save`.
+
+Boot order was off/on/on/off/off/on. Each boot takes its own GPU lock, restores
+QoS with `taskpolicy -a`, sets fans to max and cools before starting; cleanup
+restores automatic fan control. No builds or unit tests ran alongside timing.
+The harness runs three serial samples per rung but only ONE concurrent burst per
+rung per boot. These are independent boot samples, not nine bursts per arm.
+
+The final boot was stopped at the user's request to shorten the run, after its
+4K burst completed and before its 32K burst. Its completed 4K values come from
+llmprobe's progress log; the other five boots have complete JSON reports. No
+missing 32K value was imputed.
+
+| Context | Off per-stream decode, tok/s (three boots) | On per-stream decode, tok/s | Median change |
+|---|---|---|---|
+| 4K | 35.3 / 35.7 / 35.4 | 39.9 / 39.8 / 39.1 (three boots) | 35.4 → 39.8, +12.4% |
+| 32K | 25.7 / 25.9 / 25.6 | 28.7 / 28.5 (two boots) | 25.7 → 28.6, +11.3% |
+
+At 4K, aggregate burst throughput including prefill moves from a median 42.6 to
+46.1 tok/s (+8.2%). At 32K it is effectively flat (9.5 vs 9.55 tok/s): cold prefill
+dominates the request wall time. No claim is made for MTP or single-stream speed.
+All on samples exceed all off samples for per-stream decode at both contexts.
+The five complete reports mark sustained-load drift steady; the third off boot's
+short serial samples varied from 62.4 to 66.6 tok/s and were retained.
+
+Every on boot records the N=2 stride-4 ladder engagement; no off boot does.
+Correctness: synthetic eager/lazy PLE and N=2 logits/history parity, full suite
+2735 passed / 93 skipped, plus the live batched-equivalence suite (short and long
+serial/batched checks, concurrent streams, logprob isolation and kv8 crash guard).
