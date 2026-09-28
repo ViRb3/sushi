@@ -37,7 +37,7 @@ brew bundle
 mkdir -p ~/.local/bin && ln -s "$PWD/zig-out/bin/sushi" ~/.local/bin/sushi   # or any directory on your PATH
 ```
 
-The server listens on `127.0.0.1:12345` by default.
+The server listens on `127.0.0.1:12345`, the model's own MTP draft head and the 8-bit KV cache are on by default.
 
 ## Memory
 
@@ -63,8 +63,6 @@ the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at
 | 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M |
 
 ## Recommended launch
-
-The model's own MTP draft head and the 8-bit KV cache are on by default.
 
 **48 GB Mac, Sushi-2bpw**
 
