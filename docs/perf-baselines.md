@@ -543,3 +543,42 @@ Live runs:
 - Residual n42 cost, same session, new binary, forward meter: 2.6bpw vs 3bpw read 17.93 vs 17.80 ms at 1 row, and
   28.72 vs 27.04 ms at 4 verify rows.
 - Greedy 1024-token outputs are byte-identical across arms: MiMo 8/8, Sushi-2.6bpw 4/4.
+
+
+<a id="gdn-verify-fold"></a>
+## Flash-Next: GDN verify epilogues in the recurrence
+
+`92fd9b71`, ReleaseFast binary built 2026-09-28 10:43:30 (SHA-256
+`e79b345002454001b49cf3b1bde86fcc407fb7b3cd7087385de4eaad86926638`), M5 Max 128 GB,
+Sushi-3bpw, `--ctx-size 65536 --kv-quant 8 --prefix-cache-entries 0 --no-mtp`.
+The forward meter prefills 32768 tokens, captures verify state, and runs 40 forwards
+per arm with `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`, widths `1,2,3,5,7,9` and
+`SUSHI_ROUND_COST_PERSIST=0`. A B B A in one process: A is the existing fused
+recurrence plus norm-gate and convolution concat; B folds both epilogues into it.
+There was no recorded fold-only comparison on this base, so both arms were measured.
+
+`taskpolicy -a`; GPU lock `codex-gdn-fold-bench`; fans max, 10 seconds idle from
+67.4 °C, restored to auto afterward. No other model, build or unit-test job ran
+beside the measurement; GUI/background processes remained active. These are
+forward timings, not end-to-end generation throughput.
+
+| Rows | A passes, ms/forward | B passes, ms/forward | Change in mean |
+|---|---|---|---|
+| 1 (control, no fold) | 18.289 / 18.389 | 18.411 / 18.180 | -0.24% |
+| 2 | 22.641 / 22.430 | 22.206 / 21.850 | -2.25% |
+| 3 | 24.942 / 25.473 | 24.942 / 25.598 | +0.25% |
+| 5 | 32.265 / 32.988 | 33.919 / 33.333 | +3.06% |
+| 7 | 41.969 / 42.903 | 41.894 / 42.160 | -0.96% |
+| 9 (control, no fold) | 51.353 / 51.388 | 51.040 / 51.127 | -0.56% |
+
+At widths 2–7 every B pass records 1548 folded launches (36 layers × 43 warm/timed
+forwards), every A pass zero. The folded path removes 72 graph ops per forward.
+Two-row B passes beat both A passes; five-row B passes lose to both A passes.
+The default therefore serves two rows only. Widths 3–8 remain available to the
+parity tests and timing override, not the shipping dispatch. The sub-1% cells are
+not evidence of a speedup. Widths 4, 6 and 8 have parity coverage but no timing here.
+
+Parity covers sigmoid and Swish, widths 2–8, both small and real head geometry,
+all outputs and rollback states, the pipeline thread-limit fallback, and keeping
+real lazy inputs unevaluated during the probe. The production-path test also
+checks rollback at every acceptance position against serial decode.

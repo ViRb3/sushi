@@ -130,3 +130,5 @@ Existing tools:
 - `tests/test_logprobs.sh` also checks JSON-object and JSON-schema constrained logprobs on streaming and non-streaming chat; masked choices need not be raw rank one. Hermetic regression: `upstream bugfix: constrained logprobs` in `generate.zig`.
 - `python3 tests/test_rescan_retry.py` boots a server over a malformed tiny model, fails its load, then checks that HTTP rescan clears the error and refreshes disk bytes without adding an entry. No real model is loaded.
 - Legacy-completions logprob checks branch on the model returning immediate EOS: zero-token usage, empty text and a normal stop permit no entries; nonempty replies still require token logprobs.
+
+- `gdn verify fold:` covers bit-identical output and every rollback state at widths 2–8, lazy-input preservation during the independent pipeline probe, clean thread-limit fallback, and the measured two-row default.

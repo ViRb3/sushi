@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- Two-row Qwen4 MTP verification folds GDN normalization, gating and rollback history into the recurrence without changing output (mlx-serve #558, thanks @STRML).
+
 - SSD prompt-cache accounting retains existing QSA files across in-place commits (mlx-serve #601, thanks @brandondyal).
 - Rescanning models clears a failed load when its directory is still present, allowing a retry (mlx-serve #550, thanks @brandondyal).
 - JSON-constrained replies return logprobs paired with their emitted tokens (mlx-serve #552, thanks @brandondyal).

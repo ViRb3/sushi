@@ -197,7 +197,8 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
   * GDN verify norm-gate and rollback-history folding (`src/gdn_decode.zig`,
     `src/transformer.zig`, `src/mlx.zig`), from mlx-serve #558 by Samuel Reed
     (@STRML). Modifications: bf16-only with sushi's per-token state rounding;
-    the pipeline probe uses independent dummy inputs to preserve deferred PLE.
+    the pipeline probe uses independent dummy inputs to preserve deferred PLE,
+    and the default dispatch serves two rows only.
   * The fused QSA pooled-key kernel (`sushi_qsa_pool_rope`,
     `qsaPoolNormRopeFused` in `src/transformer.zig`): the indexer's block mean,
     key RMSNorm and partial RoPE in one dispatch, bit-identical to the MLX op

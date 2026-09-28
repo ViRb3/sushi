@@ -28495,7 +28495,7 @@ pub const Transformer = struct {
                 .k_scale = inv_sqrt_sc,
             };
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-            if (self.spec_capture_ssm and (gdn_verify_fold_override orelse true)) {
+            if (self.spec_capture_ssm and gdnVerifyFoldFor(seq_len)) {
                 if (try gdn_decode.stepFold(geo, seq_len, inputs, z_proj, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, self.s)) |result| {
                     var f = result;
                     defer f.deinit();
@@ -35698,6 +35698,12 @@ var gdn_verify_recur_engaged: bool = false;
 pub var gdn_verify_fold_override: ?bool = null; // parity and same-process timing
 pub var gdn_verify_fold_calls: u64 = 0;
 var gdn_verify_fold_engaged = false;
+
+fn gdnVerifyFoldFor(seq_len: c_int) bool {
+    // Wider captures increase shared-memory pressure; keep their existing path.
+    return seq_len >= 2 and seq_len <= gdn_decode.MAX_SEQ and (gdn_verify_fold_override orelse (seq_len == 2));
+}
+
 var gdn_check_env: ?bool = null;
 
 /// `gdn_decode.step` + the norm-gate in place of prework -> recurrence -> norm-gate, so it
@@ -61090,7 +61096,7 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
     const out = try xfm.gatedDeltaNetProjected(x, la, fused, 0, 1, seq, seq > 1, null, false);
     errdefer _ = mlx.mlx_array_free(out);
     try testing.expect(engaged.*);
-    if (capture and (gdn_verify_fold_override orelse true) and !gdn_decode.foldDeclined(seq)) try testing.expect(gdn_verify_fold_engaged);
+    if (capture and gdnVerifyFoldFor(seq) and !gdn_decode.foldDeclined(seq)) try testing.expect(gdn_verify_fold_engaged);
     try qkvExpectBitsEqual(s, out_chain, out);
     try qkvExpectBitsEqual(s, chain.conv_state, fused.conv_state);
     try qkvExpectBitsEqual(s, chain.ssm_state, fused.ssm_state);
@@ -71293,4 +71299,16 @@ test "gdn verify fold: unsupported threadgroup declines without poisoning later 
     gdn_decode.fold_nt_override = null;
     try gdnRecurParityCase(s, 2, 8, 2, true);
     try testing.expect(!mlx.errorPending());
+}
+
+
+test "gdn verify fold: default serves two rows and timing overrides stay within the kernel envelope" {
+    const saved = gdn_verify_fold_override;
+    defer gdn_verify_fold_override = saved;
+    gdn_verify_fold_override = null;
+    for (0..10) |rows| try testing.expectEqual(rows == 2, gdnVerifyFoldFor(@intCast(rows)));
+    gdn_verify_fold_override = true;
+    for (0..10) |rows| try testing.expectEqual(rows >= 2 and rows <= 8, gdnVerifyFoldFor(@intCast(rows)));
+    gdn_verify_fold_override = false;
+    try testing.expect(!gdnVerifyFoldFor(2));
 }

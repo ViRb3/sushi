@@ -19,10 +19,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   then the norm-gate, bit-identical to the chain, ~0.4 ms per forward
   ([perf-baselines](perf-baselines.md#gdn-decode-recur)); either chain switch off keeps the chain. A/B seam:
   `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
-- Capturing GDN verify (B=1, S 2..8, separate projections) folds the norm-gate and rollback convolution history
+- Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
   an unsupported threadgroup limit falls back to the existing recurrence and epilogue. Parity includes every
-  captured state with bf16 carry rounding. Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
+  captured state with bf16 carry rounding. Wider captures keep the existing path after the S=5 regression
+  in [the width sweep](perf-baselines.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
   `gated_delta_step_seq` carries the stored bf16 state to the next token, so serial decode and rollback agree; a
   kernel that carries f32 (upstream's verbatim verify kernel) differs from verify row 1 on.
