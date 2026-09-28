@@ -28481,7 +28481,8 @@ pub const Transformer = struct {
             !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and !qwen4Standin().gdn_recur and
             !diagEnvOnCached(&gdn_check_env, "QWEN4_GDN_CHECK") and gdnDecodeRecurEnabled())
         recur: {
-            var r = (try gdn_decode.step(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, seq_len, .{
+            const geo = gdn_decode.Geometry{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv };
+            const inputs = gdn_decode.Inputs{
                 .qkv = qkv,
                 .a = a_proj,
                 .b = b_proj,
@@ -28492,7 +28493,34 @@ pub const Transformer = struct {
                 .dt_bias = la.dt_bias,
                 .q_scale = inv_scale_sq,
                 .k_scale = inv_sqrt_sc,
-            }, self.s)) orelse break :recur;
+            };
+            if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
+            if (self.spec_capture_ssm and (gdn_verify_fold_override orelse true)) {
+                if (try gdn_decode.stepFold(geo, seq_len, inputs, z_proj, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, self.s)) |result| {
+                    var f = result;
+                    defer f.deinit();
+                    if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+                    ssm.spec_conv_input = f.conv_input;
+                    f.conv_input = .{ .ctx = null };
+                    if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+                    ssm.spec_state_seq = f.state_seq;
+                    f.state_seq = .{ .ctx = null };
+                    _ = mlx.mlx_array_free(ssm.conv_state);
+                    ssm.conv_state = f.conv_state;
+                    f.conv_state = .{ .ctx = null };
+                    _ = mlx.mlx_array_free(ssm.ssm_state);
+                    ssm.ssm_state = f.ssm_state;
+                    f.ssm_state = .{ .ctx = null };
+                    gdn_verify_recur_engaged = true;
+                    gdn_verify_fold_calls += 1;
+                    if (!gdn_verify_fold_engaged) {
+                        gdn_verify_fold_engaged = true;
+                        log.info("[gdn] verify fold engaged: S={d} Hk={d} Hv={d}\n", .{ seq_len, num_k_heads, num_v_heads });
+                    }
+                    return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
+                }
+            }
+            var r = (try gdn_decode.step(geo, seq_len, inputs, self.s)) orelse break :recur;
             defer r.deinit();
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
             const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse break :recur;
@@ -35667,6 +35695,9 @@ pub fn gdnDecodeFusedEnabled() bool {
 pub var gdn_decode_recur_override: ?bool = null; // test and fwd-ubench arm seam
 var gdn_decode_recur_engaged: bool = false;
 var gdn_verify_recur_engaged: bool = false;
+pub var gdn_verify_fold_override: ?bool = null; // parity and same-process timing
+pub var gdn_verify_fold_calls: u64 = 0;
+var gdn_verify_fold_engaged = false;
 var gdn_check_env: ?bool = null;
 
 /// `gdn_decode.step` + the norm-gate in place of prework -> recurrence -> norm-gate, so it
@@ -60837,7 +60868,7 @@ fn gdnChainRecurrence(s: mlx.mlx_stream, pre: *const GdnPrework, state: mlx.mlx_
     return r;
 }
 
-fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int) !void {
+fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, folded: bool) !void {
     var prng = std.Random.DefaultPrng.init(0x6D5E + @as(u64, @intCast(t_len * 131 + hv)));
     const rnd = prng.random();
     const dk: c_int = 128;
@@ -60891,6 +60922,43 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int) !vo
     const flat = (try gdnNormGateFused(s, got.y, z, 0, value_dim, norm_w, eps_arr, false, hv, dv, 1, t_len)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(flat);
 
+    if (folded) {
+        for ([_]bool{ false, true }) |swish| {
+            var available = false;
+            if (!swish) {
+                try mlx.check(mlx._mlx_array_is_available(&available, qkv));
+                try testing.expect(!available);
+            }
+            const f = (try gdn_decode.stepFold(geo, t_len, in, z, norm_w, eps_arr, swish, s)) orelse {
+                if (gdn_decode.fold_nt_override != null and gdn_decode.foldDeclined(t_len)) return;
+                return error.FoldDeclined;
+            };
+            defer f.deinit();
+            if (!swish) {
+                try mlx.check(mlx._mlx_array_is_available(&available, qkv));
+                try testing.expect(!available);
+            }
+            const want = (try gdnNormGateFused(s, got.y, z, 0, value_dim, norm_w, eps_arr, swish, hv, dv, 1, t_len)) orelse return error.FusedDeclined;
+            defer _ = mlx.mlx_array_free(want);
+            try qkvExpectBitsEqual(s, want, f.gated);
+            try qkvExpectBitsEqual(s, got.conv_state, f.conv_state);
+            try qkvExpectBitsEqual(s, got.ssm_state, f.ssm_state);
+            var t: c_int = 0;
+            while (t + 1 < t_len) : (t += 1) {
+                const a_row = try gdnRecurRowsAxis0(got.state_seq, t, s);
+                defer _ = mlx.mlx_array_free(a_row);
+                const b_row = try gdnRecurRowsAxis0(f.state_seq, t, s);
+                defer _ = mlx.mlx_array_free(b_row);
+                try qkvExpectBitsEqual(s, a_row, b_row);
+            }
+            const vec = mlx.mlx_vector_array_new_data(&.{ conv_state, qkv }, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var conv_input = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(conv_input);
+            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, s));
+            try qkvExpectBitsEqual(s, conv_input, f.conv_input);
+        }
+    }
     try qkvExpectBitsEqual(s, ref[0], got.y);
     try qkvExpectBitsEqual(s, flat_ref, flat);
     try qkvExpectBitsEqual(s, pre.conv_state, got.conv_state);
@@ -60972,7 +61040,7 @@ test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate at S 
     defer gdn_decode_fused_override = null;
     for ([_][2]c_int{ .{ 16, 48 }, .{ 2, 8 } }) |heads| {
         var t: c_int = 1;
-        while (t <= gdn_decode.MAX_SEQ) : (t += 1) try gdnRecurParityCase(s, heads[0], heads[1], t);
+        while (t <= gdn_decode.MAX_SEQ) : (t += 1) try gdnRecurParityCase(s, heads[0], heads[1], t, false);
     }
 
     // The chain serves bf16 only (its prework and norm-gate decline anything else, and its
@@ -61017,10 +61085,12 @@ fn gdnRecurArms(xfm: *Transformer, la: *const LinearAttnWeights, chain: *SSMCach
     defer _ = mlx.mlx_array_free(out_chain);
     const engaged = if (seq == 1) &gdn_decode_recur_engaged else &gdn_verify_recur_engaged;
     engaged.* = false;
+    gdn_verify_fold_engaged = false;
     gdn_decode_recur_override = true;
     const out = try xfm.gatedDeltaNetProjected(x, la, fused, 0, 1, seq, seq > 1, null, false);
     errdefer _ = mlx.mlx_array_free(out);
     try testing.expect(engaged.*);
+    if (capture and (gdn_verify_fold_override orelse true) and !gdn_decode.foldDeclined(seq)) try testing.expect(gdn_verify_fold_engaged);
     try qkvExpectBitsEqual(s, out_chain, out);
     try qkvExpectBitsEqual(s, chain.conv_state, fused.conv_state);
     try qkvExpectBitsEqual(s, chain.ssm_state, fused.ssm_state);
@@ -71189,4 +71259,38 @@ test "upstream bugfix: KVCache affine quant keeps its dtype through growth" {
             }
         }
     }
+}
+
+
+test "gdn verify fold: output and every rollback state remain bit-identical" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const s = mlx.gpuStream();
+    gdn_prework_override = true;
+    defer gdn_prework_override = null;
+    gdn_decode_fused_override = true;
+    defer gdn_decode_fused_override = null;
+    for ([_][2]c_int{ .{ 2, 8 }, .{ 16, 48 } }) |heads| {
+        var t: c_int = 2;
+        while (t <= gdn_decode.MAX_SEQ) : (t += 1) try gdnRecurParityCase(s, heads[0], heads[1], t, true);
+    }
+}
+
+
+test "gdn verify fold: unsupported threadgroup declines without poisoning later work" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const s = mlx.gpuStream();
+    gdn_prework_override = true;
+    defer gdn_prework_override = null;
+    gdn_decode_fused_override = true;
+    defer gdn_decode_fused_override = null;
+    gdn_decode.fold_nt_override = 2048;
+    defer gdn_decode.fold_nt_override = null;
+    try gdnRecurParityCase(s, 2, 8, 2, true);
+    try testing.expect(gdn_decode.foldDeclined(2));
+    try testing.expect(!mlx.errorPending());
+    gdn_decode.fold_nt_override = null;
+    try gdnRecurParityCase(s, 2, 8, 2, true);
+    try testing.expect(!mlx.errorPending());
 }

@@ -3628,6 +3628,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // decode step (`gdn_decode.step`) as off, on, on, off passes in this one process.
             const gdn_arms = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_GDN_ARMS") != null;
             defer transformer_mod.gdn_decode_recur_override = null;
+            const fold_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS");
+            defer transformer_mod.gdn_verify_fold_override = null;
             // SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS=1: each width runs A B B A, A the composed QSA
             // pooled-key chain and B the fused kernel; each arm logs its fused launches.
             const pool_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS");
@@ -3635,9 +3637,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var arm_buf: [8]UbenchArm = undefined;
             for (widths[0..n_widths]) |rows| {
             for (ubenchArms(&arm_buf, rows, xfm_ptr.config.isMimo(), row_arms, pool_arms)) |arm| {
-            for (@as([]const ?bool, if (gdn_arms) &.{ false, true, true, false } else &.{null})) |gdn_arm| {
-            transformer_mod.gdn_decode_recur_override = gdn_arm;
-            if (gdn_arm) |on| log.info("[fwd-ubench] gdn recur arm: {s}\n", .{if (on) "on" else "off"});
+            for (@as([]const ?bool, if (gdn_arms or fold_arms) &.{ false, true, true, false } else &.{null})) |gdn_arm| {
+            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else gdn_arm;
+            transformer_mod.gdn_verify_fold_override = if (fold_arms) gdn_arm else null;
+            transformer_mod.gdn_verify_fold_calls = 0;
+            if (gdn_arm) |on| log.info("[fwd-ubench] gdn {s} arm: {s}\n", .{ if (fold_arms) "fold" else "recur", if (on) "on" else "off" });
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
             defer sch.allocator.free(tok_slice);
             for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
@@ -3677,6 +3681,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 _ = mlx.mlx_array_free(lg);
                 done += 1;
             }
+            if (fold_arms) log.info("[fwd-ubench] gdn fold launches: {d}\n", .{transformer_mod.gdn_verify_fold_calls});
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
             log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{

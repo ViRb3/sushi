@@ -101,6 +101,7 @@ pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
 
 // Metal
 pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
+pub extern "c" fn _mlx_array_is_available(res: *bool, arr: mlx_array) c_int;
 
 // Array creation
 pub extern "c" fn mlx_array_new() mlx_array;
@@ -844,6 +845,17 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// Consume the latch only when its message contains `needle`; any other error stays latched.
+pub fn takeErrorIf(needle: []const u8) bool {
+    if (!mlx_error_latched.load(.acquire)) return false;
+    lockErrBuf();
+    defer unlockErrBuf();
+    if (std.mem.indexOf(u8, mlx_error_buf[0..mlx_error_len], needle) == null) return false;
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return true;
+}
+
 /// Drop a latch a best-effort op raised and its caller already reported, so an
 /// optional write or a diagnostic can never become an unrelated request's
 /// `MlxFailure`. `had_error` is the caller's `errorPending()` from BEFORE the op:
@@ -1020,4 +1032,17 @@ test "a DECODE-time MLX failure is attributed to the decoding request, not the n
     try checkError();
     try checkErrorDecode();
     try t.expect(!errorPending());
+}
+
+
+test "takeErrorIf leaves unrelated errors latched" {
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+    defer _ = takeError(&buf);
+    latchErrorForTest("unrelated allocation failure");
+    try std.testing.expect(!takeErrorIf("maximum allowed threads per threadgroup"));
+    try std.testing.expectEqualStrings("unrelated allocation failure", takeError(&buf).?);
+    latchErrorForTest("exceeds maximum allowed threads per threadgroup");
+    try std.testing.expect(takeErrorIf("maximum allowed threads per threadgroup"));
+    try std.testing.expect(!errorPending());
 }

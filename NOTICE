@@ -194,6 +194,10 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     the bf16 output, state and capture buffers of sushi's own chain and carry
     each stored capture state to the next token as sushi's capture kernel does;
     the Hadamard norm-gate-rotate kernel is not ported.
+  * GDN verify norm-gate and rollback-history folding (`src/gdn_decode.zig`,
+    `src/transformer.zig`, `src/mlx.zig`), from mlx-serve #558 by Samuel Reed
+    (@STRML). Modifications: bf16-only with sushi's per-token state rounding;
+    the pipeline probe uses independent dummy inputs to preserve deferred PLE.
   * The fused QSA pooled-key kernel (`sushi_qsa_pool_rope`,
     `qsaPoolNormRopeFused` in `src/transformer.zig`): the indexer's block mean,
     key RMSNorm and partial RoPE in one dispatch, bit-identical to the MLX op
