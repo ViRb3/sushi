@@ -2,7 +2,7 @@
 
 # SUSHI
 
-A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) masterpiece, focused only on serving selected models on Apple Silicon with custom sushi quants. Sushi mixes EXL3 and affine formats tailored for M5 Max-class chips; other chips still run well. While Sushi works as a stand alone engine, it aims to stay within mlx-serve as a guest engine.
+A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) masterpiece, focused only on serving selected models on Apple Silicon with custom sushi quants. Sushi mixes EXL3 and affine formats tailored for M5 Pro/Max-class chips. M1-M4 chips still run well. While Sushi works as a stand alone engine, it aims to stay within mlx-serve as a guest engine.
 
 ## Model support list
 
@@ -13,15 +13,13 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 ## Install
 
 With Homebrew (adds the `beamivalice/tap` tap and installs sushi in one command):
-
 ```bash
 brew install beamivalice/tap/sushi
 ```
 
-Update with `brew upgrade sushi`.
+Update with `brew upgrade sushi`
 
-Or from the release tarball:
-
+With Tarball.
 ```bash
 curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz | tar xz
 ./sushi-macos-arm64/sushi --version
@@ -29,8 +27,7 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 
 Update with `sushi update` (or the button in the chat page).
 
-Or build from source (needs Xcode 26.2+ with its Metal toolchain; `brew bundle` installs cmake and webp):
-
+Build from source (needs Xcode 26.2+ with its Metal toolchain; `brew bundle` installs cmake and webp):
 ```bash
 git clone --recurse-submodules https://github.com/beamivalice/sushi && cd sushi
 brew bundle
@@ -45,7 +42,7 @@ The server listens on `127.0.0.1:12345` by default.
 
 The model's own MTP draft head and the 8-bit KV cache are on by default.
 
-**64 GB Mac, Sushi-2.6bpw**
+**64 GB Mac, Sushi-2.6bpw or 3bpw**
 
 Set the GPU memory limit first (it resets at reboot). 59,000 MB is the ceiling for this box: above it macOS runs out
 of memory before the model does, and the kernel panics rather than the server refusing.
@@ -72,7 +69,7 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw --local-dir ~/.sushi/models
 
 At 4-bit KV the quality cost: mean KLD 0.1355 at 8-bit KV to 0.1458, and next-token agreement 89.08% to 88.84%.
 
-Sushi-3bpw also fits a 64 GB Mac, for lower KLD (0.1047 against 0.1355) at about half the context: the same commands
+Sushi-3bpw also fits a 64 GB Mac, for ~30% better quality (0.1047 against 0.1355) at about half the context: the same commands
 with its model path and `--ctx-size 128000` at 8-bit KV or `--ctx-size 248000` at 4-bit.
 
 **96 GB+ Mac, Sushi-4bpw**
