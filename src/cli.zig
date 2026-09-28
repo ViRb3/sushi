@@ -1216,7 +1216,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     var state_buf: [512]u8 = undefined;
     try writeReadyBanner(w, vision, port, formatPromptStatus(&state_buf, driver.tools.root, homeDir(), opts.tools));
     var version_buf: [64]u8 = undefined;
-    try writeUpdateNotice(w, update.availableVersion(&version_buf));
+    try writeUpdateNotice(w, update.availableVersion(&version_buf), update.homebrewInstall());
     try w.flush();
 
     var history = std.ArrayList(Turn).empty;
@@ -1299,8 +1299,9 @@ pub fn writeReadyBanner(w: *std.Io.Writer, vision: bool, port: u16, state: []con
 }
 
 /// The REPL's line for a newer release found by the daily check; nothing without one.
-pub fn writeUpdateNotice(w: *std.Io.Writer, latest: ?[]const u8) !void {
+pub fn writeUpdateNotice(w: *std.Io.Writer, latest: ?[]const u8, brew: bool) !void {
     const v = latest orelse return;
+    if (brew) return w.print(">>> sushi {s} is available: run {s}\n", .{ v, update.brew_upgrade });
     try w.print(">>> sushi {s} is available: /update installs it and restarts this chat on the same model\n", .{v});
 }
 
@@ -1842,13 +1843,16 @@ test "cli: the ready banner shows the folder, the tools state, /cd and the brows
     }
 }
 
-test "cli: the REPL names a newer release and /update, and says nothing without one" {
+test "cli: the REPL names a newer release and /update, or brew for a Homebrew install, and says nothing without one" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeUpdateNotice(&w, null);
+    try writeUpdateNotice(&w, null, false);
     try testing.expectEqualStrings("", w.buffered());
-    try writeUpdateNotice(&w, "1.1.0");
+    try writeUpdateNotice(&w, "1.1.0", false);
     try testing.expectEqualStrings(">>> sushi 1.1.0 is available: /update installs it and restarts this chat on the same model\n", w.buffered());
+    w = .fixed(&buf);
+    try writeUpdateNotice(&w, "1.1.0", true);
+    try testing.expectEqualStrings(">>> sushi 1.1.0 is available: run brew upgrade sushi\n", w.buffered());
 }
 
 test "cli: the prompt status shows the tools' folder (~ for home, the tail when long) and the tools state" {

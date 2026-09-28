@@ -33,6 +33,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **Refused by name**: a source build (under `zig-out/bin`, or in a checkout holding `build.zig`), an app bundle, a
   folder without `lib/`, an unwritable install or parent, another process running from the install (`proc_pidpath`;
   `--force` skips it), and an install folder holding anything the release does not ship (the swap would carry it off).
+- **A Homebrew install** (real path under `/Cellar/sushi/`, any prefix; tap `beamivalice/homebrew-tap`) is brew's:
+  `sushi update` and `--rollback` print `brew upgrade sushi` and exit 0, `/v1/update` and `/update` refuse naming it.
 - **Steps**: curl into `<parent>/.<install>.update` (same volume; the tarball resumes), SHA-256 against the `.sha256`
   asset, `tar -x`, `codesign --verify --strict` (a Developer ID install takes only its own TeamIdentifier; an ad-hoc
   one takes either), `renamex_np(RENAME_SWAP)` (three self-undoing renames where the volume lacks it), then

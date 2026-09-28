@@ -1300,7 +1300,8 @@ function showUpdate(update) {
   if (!update || $("updateButton").disabled) return;
   updateFrom = update.current;
   $("updateBanner").hidden = !update.available;
-  $("updateText").textContent = `sushi ${update.latest} is available (this is ${update.current}).`;
+  $("updateText").textContent = `sushi ${update.latest} is available (this is ${update.current})` + (update.command ? `: run ${update.command}` : ".");
+  $("updateButton").hidden = !!update.command;
   $("updateNotes").hidden = !update.url;
   if (update.url) $("updateNotes").href = update.url;
 }

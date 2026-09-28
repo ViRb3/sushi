@@ -14,6 +14,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **`--mtp-greedy-tail`**: beside `--mtp-typical`, sampled decoding drafts its later speculative tokens by argmax
   for faster output at slightly more predictable text; off by default, or per model with `"mtp_greedy_tail": true`
   in model-settings.json.
+- **Install with Homebrew**: `brew install beamivalice/tap/sushi`; a Homebrew install updates with
+  `brew upgrade sushi`, which `sushi update`, the chat page and `/update` name instead of replacing its files.
 
 ---
 

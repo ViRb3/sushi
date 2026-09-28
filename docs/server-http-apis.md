@@ -116,15 +116,16 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 ## Self-update (`POST /v1/update`, `/props.update`)
 
-- `/props` carries `update: {current, latest, available, checked_at, url, error}` with or without a model
+- `/props` carries `update: {current, latest, available, checked_at, url, error, command}` with or without a model
   (`update.propsJson`): `latest`/`checked_at`/`url` stay null until a daily check has answered; `error` is why the
-  last update failed, cleared by the next success.
+  last update failed, cleared by the next success; `command` is `brew upgrade sushi` for a Homebrew install (the page
+  shows it in place of its button), else null.
 - `update.guard`, first refusal wins: a non-loopback bind 403 (update on the server with `sushi update`), a
   non-loopback peer 403, `--api-key` set and not presented 401 FROM LOOPBACK TOO, no Origin or one other than the bind's
   own `http://<host>:<port>` (127.0.0.1 and localhost interchangeable; DNS rebinding carries its own name) 403,
   `--parent-pid` 403 (the host updates its engine), a request decoding or queued or a model loading 409 `update_busy`
-  (refused, never queued), an install that cannot replace itself (source build, app bundle, unwritable) 409 by name,
-  no newer release known 409.
+  (refused, never queued), an install that cannot replace itself (Homebrew, source build, app bundle, unwritable) 409
+  by name, no newer release known 409.
 - Accepted: 202 `{"status":"updating","from","to"}`, then the SIGTERM shutdown path and the in-place updater
   ([server-lifecycle](server-lifecycle.md#self-update)).
 

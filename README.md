@@ -12,6 +12,16 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 
 ## Install
 
+With Homebrew (adds the `beamivalice/tap` tap and installs sushi in one command):
+
+```bash
+brew install beamivalice/tap/sushi
+```
+
+Update with `brew upgrade sushi`.
+
+Or from the release tarball:
+
 ```bash
 curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz | tar xz
 ./sushi-macos-arm64/sushi --version

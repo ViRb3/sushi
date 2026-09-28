@@ -150,9 +150,29 @@ pub fn isSourceBuild(io: std.Io, exe_dir: []const u8) bool {
     return false;
 }
 
+pub const brew_upgrade = "brew upgrade sushi";
+const brew_notice = "sushi was installed with Homebrew; run: " ++ brew_upgrade;
+
+/// A real directory inside a Homebrew keg, `<prefix>/Cellar/sushi/<version>/…`: brew owns the files.
+pub fn isHomebrewKeg(real_dir: []const u8) bool {
+    return std.mem.indexOf(u8, real_dir, "/Cellar/sushi/") != null;
+}
+
+/// Set once from the running binary's real path by `startDailyCheck` or `cmdUpdate`.
+var homebrew = std.atomic.Value(bool).init(false);
+
+pub fn homebrewInstall() bool {
+    return homebrew.load(.acquire);
+}
+
+fn upgradeCommand() []const u8 {
+    return if (homebrewInstall()) brew_upgrade else "sushi update";
+}
+
 /// Why the install at `dir` (the real directory of the running binary) cannot replace itself, or null.
 pub fn installRefusal(io: std.Io, dir: []const u8, buf: []u8) ?[]const u8 {
     const cwd = std.Io.Dir.cwd();
+    if (isHomebrewKeg(dir)) return brew_notice;
     if (isSourceBuild(io, dir)) return "built from source: git pull and rebuild";
     if (std.mem.indexOf(u8, dir, ".app/Contents/") != null) return "part of an app bundle: update the app";
     const lib = std.fmt.bufPrint(buf, "{s}/lib", .{dir}) catch return "install path too long";
@@ -335,6 +355,8 @@ pub fn propsJson(allocator: Allocator) ![]u8 {
         .checked_at = if (p.checked_at > 0) @as(?i64, p.checked_at) else null,
         .url = nonEmpty(p.url),
         .@"error" = nonEmpty(p.@"error"),
+        // What the chat page tells the user to run instead of offering its button.
+        .command = if (homebrewInstall()) @as(?[]const u8, brew_upgrade) else null,
     }, .{}, &out.writer);
     return out.toOwnedSlice();
 }
@@ -363,6 +385,7 @@ pub fn checkChoice(flag_off: bool, env_off: bool, source_build: bool) CheckChoic
 pub fn startDailyCheck(io: std.Io, flag_off: bool, env_off: bool) void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_dir = selfDir(io, &ebuf) orelse "";
+    homebrew.store(isHomebrewKeg(exe_dir), .release);
     const choice = checkChoice(flag_off, env_off, isSourceBuild(io, exe_dir));
     log.info("[update] daily check {s} ({s})\n", .{ if (choice.on) "on" else "off", choice.source });
     if (!choice.on) return;
@@ -401,7 +424,7 @@ fn checkOnce(io: std.Io) i64 {
         } else |err| log.debug("[update] check failed: {t}\n", .{err});
     }
     publish(c);
-    if (isNewer(c.latest, version)) log.info("sushi {s} is available: run `sushi update`\n", .{c.latest});
+    if (isNewer(c.latest, version)) log.info("sushi {s} is available: run `{s}`\n", .{ c.latest, upgradeCommand() });
     return wait;
 }
 
@@ -713,6 +736,10 @@ pub fn cmdUpdate(allocator: Allocator, io: std.Io, args: []const []const u8) !vo
     }
     defer log.closeFile();
     logStart(io);
+    var ebuf: [std.fs.max_path_bytes]u8 = undefined;
+    homebrew.store(isHomebrewKeg(selfDir(io, &ebuf) orelse ""), .release);
+    // Exit 0, as for "up to date": the install is healthy and brew is the way to update it.
+    if (homebrewInstall() and !opts.check and opts.relaunch == null) return log.info(brew_notice ++ "\n", .{});
 
     const result = if (opts.check) check(arena, io, opts) else if (opts.rollback) rollback(arena, io, opts) else update(arena, io, opts);
     if (opts.relaunch) |argv| relaunch(arena, io, argv, result);
@@ -731,7 +758,7 @@ fn logStart(io: std.Io) void {
 fn check(arena: Allocator, io: std.Io, opts: Options) !void {
     const r = try checkNow(arena, io, opts.pre) orelse return fail("no release carries {s}", .{asset});
     if (isNewer(r.version, version)) {
-        log.info("sushi {s} is available (this is {s}): run `sushi update`\n  {s}\n", .{ r.version, version, r.page });
+        log.info("sushi {s} is available (this is {s}): run `{s}`\n  {s}\n", .{ r.version, version, upgradeCommand(), r.page });
     } else {
         log.info("sushi {s} is up to date (latest release {s})\n", .{ version, r.version });
     }
@@ -1000,6 +1027,17 @@ fn tmpPath(tmp: *testing.TmpDir, sub: []const u8) ![:0]u8 {
     return tmp.dir.realPathFileAlloc(testing.io, sub, testing.allocator);
 }
 
+test "update: a Homebrew keg is known by its real path under any prefix, and leaves updates to brew" {
+    try testing.expect(isHomebrewKeg("/opt/homebrew/Cellar/sushi/1.0.5/libexec"));
+    try testing.expect(isHomebrewKeg("/usr/local/Cellar/sushi/1.0.5/libexec"));
+    try testing.expect(isHomebrewKeg("/Users/me/.brew/Cellar/sushi/1.1.0_1/libexec"));
+    try testing.expect(!isHomebrewKeg("/Users/me/sushi-macos-arm64"));
+    try testing.expect(!isHomebrewKeg("/opt/homebrew/Cellar/sushi-nightly/1.0.5/libexec"));
+    try testing.expect(!isHomebrewKeg("/Users/me/Cellar-sushi/1.0.5"));
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("sushi was installed with Homebrew; run: brew upgrade sushi", installRefusal(testing.io, "/opt/homebrew/Cellar/sushi/1.0.5/libexec", &buf).?);
+}
+
 test "update: a source build refuses by name; a release install passes" {
     const io = testing.io;
     const cwd = std.Io.Dir.cwd();
@@ -1133,12 +1171,17 @@ test "update: /props carries null fields until a check answers, then the newer r
     defer publish(.{});
     const empty = try propsJson(testing.allocator);
     defer testing.allocator.free(empty);
-    try testing.expectEqualStrings(",\"update\":{\"current\":\"" ++ version ++ "\",\"latest\":null,\"available\":false,\"checked_at\":null,\"url\":null,\"error\":null}", empty);
+    try testing.expectEqualStrings(",\"update\":{\"current\":\"" ++ version ++ "\",\"latest\":null,\"available\":false,\"checked_at\":null,\"url\":null,\"error\":null,\"command\":null}", empty);
 
     publish(.{ .checked_at = 1_790_000_000, .latest = "999.0.0", .url = "https://example.test/v999.0.0", .etag = "e", .@"error" = "SHA-256 mismatch" });
     const found = try propsJson(testing.allocator);
     defer testing.allocator.free(found);
-    try testing.expectEqualStrings(",\"update\":{\"current\":\"" ++ version ++ "\",\"latest\":\"999.0.0\",\"available\":true,\"checked_at\":1790000000,\"url\":\"https://example.test/v999.0.0\",\"error\":\"SHA-256 mismatch\"}", found);
+    try testing.expectEqualStrings(",\"update\":{\"current\":\"" ++ version ++ "\",\"latest\":\"999.0.0\",\"available\":true,\"checked_at\":1790000000,\"url\":\"https://example.test/v999.0.0\",\"error\":\"SHA-256 mismatch\",\"command\":null}", found);
+    homebrew.store(true, .release);
+    defer homebrew.store(false, .release);
+    const brew = try propsJson(testing.allocator);
+    defer testing.allocator.free(brew);
+    try testing.expect(std.mem.endsWith(u8, brew, ",\"command\":\"brew upgrade sushi\"}"));
     var buf: [32]u8 = undefined;
     try testing.expectEqualStrings("999.0.0", availableVersion(&buf).?);
     publish(.{ .checked_at = 1, .latest = version });

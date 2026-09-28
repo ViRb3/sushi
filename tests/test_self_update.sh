@@ -4,8 +4,8 @@
 # tree built with the next patch version. Covers `sushi update --check`, a running sushi refused, a corrupt tarball
 # refused on SHA-256, a new build that does not run swapped back out, the update and the version after,
 # `--rollback`, a source build refused, the daily-check switches, and the chat-page path (POST /v1/update, the
-# server replaced in place by the updater and relaunched on the same pid and argv), failure included.
-# No model loads, so no GPU lock.
+# server replaced in place by the updater and relaunched on the same pid and argv), failure included, and a
+# Homebrew keg leaving every update to `brew upgrade sushi`. No model loads, so no GPU lock.
 #
 # Usage: ./tests/test_self_update.sh [port]
 # NEW_BINARY=<path> reuses a build of this tree made with -Dversion=<the next patch version>.
@@ -208,6 +208,7 @@ if boot; then
     wait_for available true 30
     check "/props reports $NEXT as available" "$(is "$(prop latest)" "$NEXT")"
     check "... with the release page" "$(is "$(prop url)" "https://github.com/beamivalice/sushi/releases/tag/v$NEXT")"
+    check "... and no command for a release install" "$(is "$(prop command)" null)"
     check "the check logged one line" "$(is "$(grep -c "sushi $NEXT is available: run \`sushi update\`" "$WORK/server.log")" 1)"
     check "GET /v1/update is 405" "$(is "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/update")" 405)"
     check "a POST without an Origin is 403" "$(is "$(post_update)" 403)"
@@ -269,6 +270,29 @@ if boot; then
     check "the server exits 1 instead of stopping cleanly" "$(is "$CODE" 1)"
     check "... naming why" "$(has "$WORK/server.log" "\[update\] cannot run $INST/sushi")"
     chmod +x "$INST/sushi"
+fi
+
+echo "[brew] a Homebrew keg leaves every update to brew"
+KEG="$WORK/brew/Cellar/sushi/$CUR/libexec"
+BREW_SAYS="sushi was installed with Homebrew; run: brew upgrade sushi"
+stage "$BINARY" "$KEG"
+publish good
+"$KEG/sushi" update > "$WORK/brew.log" 2>&1
+CODE=$?
+check "sushi update exits 0 naming brew upgrade" "$([ "$CODE" = 0 ] && grep -q "$BREW_SAYS" "$WORK/brew.log" && echo 1 || echo 0)"
+"$KEG/sushi" update --rollback > "$WORK/brew.log" 2>&1
+CODE=$?
+check "... and so does --rollback" "$([ "$CODE" = 0 ] && grep -q "$BREW_SAYS" "$WORK/brew.log" && echo 1 || echo 0)"
+check "... leaving the keg as it was" "$(is "$("$KEG/sushi" --version 2>/dev/null | head -1) $(ls -A "$WORK/brew/Cellar/sushi/$CUR")" "sushi $CUR libexec")"
+"$KEG/sushi" update --check > "$WORK/brew.log" 2>&1
+check "--check names $NEXT and brew upgrade" "$(has "$WORK/brew.log" "sushi $NEXT is available (this is $CUR): run \`brew upgrade sushi\`")"
+if INST="$KEG" boot; then
+    wait_for available true 30
+    check "/props names the brew command for the chat page" "$(is "$(prop command)" "brew upgrade sushi")"
+    check "the daily check's line names it too" "$(has "$WORK/server.log" "sushi $NEXT is available: run \`brew upgrade sushi\`")"
+    check "POST /v1/update from the page is 409" "$(is "$(post_update -H "Origin: $BASE")" 409)"
+    check "... naming brew upgrade" "$(has "$WORK/post.json" "$BREW_SAYS")"
+    stop_server
 fi
 
 # Opt-in, with a model (two loads per section, each under the GPU lock): SELF_UPDATE_MODEL=<pack dir>.
