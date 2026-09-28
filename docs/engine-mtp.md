@@ -188,6 +188,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   drafts every depth as a `[1]` id: the accept graph concatenates them.
 - `--fast` turns on MTP with `typical` and the greedy tail (plus kv8) in one flag
   ([server-lifecycle](server-lifecycle.md#settings)).
+- Sampled output under `typical` acceptance, and so under `--fast`, has been seen looping (2026-09-28): the README and
+  pack cards recommend neither until the cause is known.
 - **The greedy tail pays only beside `typical`, and pulls sampled text toward the argmax.** Sushi-2.6bpw at T=1.0 /
   top_k 20 / top_p 0.95, 16 fixture prompts x 512, 2 seeds, binary 506efc5b: typical 0.2 + tail decoded 95.9 / 92.6
   tok/s vs typical 84.0 / 89.0 and exact 74.3 / 74.6 (2.7-2.9 vs 2.5 vs 2.1 tokens per round). Its emitted-text NLL

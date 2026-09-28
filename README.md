@@ -134,7 +134,6 @@ sudo sysctl iogpu.wired_limit_mb=120000   # 128 GB Mac
 - `--prefill-chunk 2048` caps the prompt tokens forwarded per step; 4096 prefills faster but needs more memory.
 - `--prefix-cache-mem 1GB` keeps seen prompt prefixes hot in RAM, faster than the SSD.
 - `--prefix-cache-disk 20GB` keeps seen prompt prefixes on the SSD, so a repeated prompt skips its prefill.
-- `--mtp-typical 0.2` makes sampled decoding 15-20% faster (Sushi-4bpw, temperature 1.0) at a tiny quality cost.
 - `--prefix-cache-entries 1` keeps one conversation's prefix; raise it to 4-8 when several agents share the server.
 
 ## Coding agents
