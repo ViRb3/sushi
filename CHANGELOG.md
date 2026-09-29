@@ -6,6 +6,12 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Per-request live sessions on `/metrics.json`**: every in-flight request publishes its phase, context tokens
+  against the model's effective limit, cached and generated tokens, its `max_tokens`, a poll-stable `request_id`,
+  its age and the GPU bytes its KV/SSM state holds — refreshed at each decode cull, prefill entry and interleave
+  chunk boundary (mlx-serve sessions publish chain after `4e00f2af` (live KV residency), thanks @ddalcu;
+  upstream PR ref TBD).
+
 - MTP prompt lookup is now off by default; set `SUSHI_MTP_LOOKUP=1` to enable it.
 
 - `--prompt` (also `-p` and `run <model> -p`) honors thinking, sampling and generation flags, then exits after one reply.
