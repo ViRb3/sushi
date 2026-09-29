@@ -407,9 +407,30 @@ and 4-8% of a depth-3 verify; a matmul2d QSA prototype (branch `qsa-mpp-proto`) 
 <a id="mimo-decode"></a>
 ## MiMo
 
-MiMo speed for the shipped MiMo-V2.6-Flash-Sushi-2.25bpw pack will be recorded here after its v1.1 measurement.
 Its n36 experts reached the fast decode arms only with the rate-generic readers:
 [exl3-rate-generic](#exl3-rate-generic) (live decode 35 -> 61 tok/s with MTP).
+
+<a id="mimo-ladder"></a>
+### MiMo-V2.6-Flash-Sushi-2.3bpw, 4k-128k context ladder (1a7f92d1)
+
+Pack `MiMo-V2.6-Flash-Sushi-2.3bpw` (MCG K2.25 w12, last layer K4), binary built from `1a7f92d1` with MLX `d73eb752`
+(SHA-256 `a4dd6fe7`), `--ctx-size 1048576 --kv-quant 8 --mtp`, llmprobe 0.6.12 `--bench-only --rungs
+4k,8k,16k,32k,64k,128k --timeout 3600`, `taskpolicy -a`, lock `bench-mimo23-ladder`, quiet box, fans at max from a
+49 °C start, 2026-09-30. Headline cells: decode 70.0 tok/s, prefill 1132 tok/s at 2k, first token 327 ms, MTP 3.69
+tokens per step (predictable 80.5, novel 50.1). llmprobe saw a 12.1% sustained-load slide (70.0 -> 61.5) over the 12 min
+run. Each rung is one run.
+
+| context | decode tok/s | prefill tok/s | first token | tokens per step |
+|---|---|---|---|---|
+| 4k | 65.2 | 1091 | 3.8 s | 2.78 |
+| 8k | 60.1 | 1134 | 7.3 s | 2.09 |
+| 16k | 60.7 | 1100 | 14.8 s | 2.78 |
+| 33k | 61.8 | 1025 | 31.9 s | 2.56 |
+| 66k | 57.3 | 894 | 73.4 s | 2.46 |
+| 131k | 52.0 | 715 | 183.3 s | 3.05 |
+
+At `--ctx-size 1048576` the pack loads (preflight 96.7 of 102.9 GB) but admission then has 12.9 GB left, under the
+16.76 GiB bill of a 1M session at kv8; about 768k is the working maximum on a 128 GB Mac.
 
 <a id="mimo-attn-kernels"></a>
 ### MiMo attention kernels (attention only: no expert pack in these timings)
