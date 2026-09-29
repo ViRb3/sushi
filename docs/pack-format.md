@@ -8,8 +8,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
 [engine-exl3-experts](engine-exl3-experts.md), [quality-kld](quality-kld.md),
 [arch-qwen4exp](arch-qwen4exp.md), [arch-mimo-v2](arch-mimo-v2.md).
 
-Readers in this repo: `src/expert_quant.zig` (layout + `expert_quant` parse),
-`src/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),
+Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
+(`expert_quant` parse), `src/exl3/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),
 `src/model.zig` (weight loading).
 
 ## Routed-expert tensors
@@ -67,7 +67,7 @@ one scale vector per side and nothing else.
   rate a layer packs and is what the engine bills.
 - `codebook` — `mul1` or `mcg`. MCG is the codebook for new packs; MUL1 serves
   turboderp's packs; any other name is `ExpertLayoutUnsupported` (in a shard
-  stamp, `Exl3ShardStampMismatch`). The codebook and window follow the MODEL: `moeExl3` sets them
+  stamp, `Exl3ShardStampMismatch`). The codebook and window follow the MODEL: `exl3.moe` sets them
   (`expert_exl3_kernels.setDecodeParams`) before every dispatch, so packs with
   different codebooks can be resident together, and every weight kernel
   inlines its `exl3_pairh`.
@@ -139,8 +139,8 @@ decodes or requantizes. See README.md.
 
 ## Fixtures
 
-`src/fixtures/exl3_*_linear.safetensors` are committed and `@embedFile`d by
-`src/expert_exl3.zig` and `src/transformer.zig`. They are produced by the
+`src/exl3/fixtures/exl3_*_linear.safetensors` are committed and `@embedFile`d by
+`src/exl3/expert_exl3.zig` (`fixtures`, which `src/transformer.zig` reads). They are produced by the
 private converter; regenerate one only to change the format, and keep the one
 searched and decoded at window 12 (`exl3_k2p5_mcg_w12_linear.safetensors`),
 which is what certifies a narrowed window against the converter's own decode

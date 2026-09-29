@@ -4,8 +4,9 @@ const qwen4_mod = @import("qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_bf16 = @import("expert_bf16_kernels.zig");
 const imatrix_capture = @import("imatrix.zig");
-const expert_exl3_kernels = @import("expert_exl3_kernels.zig");
-const expert_exl3 = @import("expert_exl3.zig");
+const sushi_exl3 = @import("sushi_exl3");
+const expert_exl3_kernels = sushi_exl3.kernels;
+const expert_exl3 = sushi_exl3.format;
 const expert_quant_mod = @import("expert_quant.zig");
 const fp8_block = @import("fp8_block.zig");
 const gdn_decode = @import("gdn_decode.zig");
@@ -30644,94 +30645,15 @@ pub const Transformer = struct {
     /// router_x: input for routing (raw hidden states).
     /// expert_x: input for expert computation (possibly normalized).
     fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool) !mlx.mlx_array {
-        // Which kernel a dispatch picks is read off ONE process-global
-        // codebook, and several EXL3 packs can be resident at once: assert
-        // this model's here, not once at its load.
-        expert_exl3_kernels.setDecodeParams(.{
+        if (verify_rows) mtp_verify_expert_rows_calls +%= 1;
+        return sushi_exl3.moe(self.s, expert_x, .{
+            .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
+            .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
+            .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
+        }, inds, scores, .{
             .codebook = self.config.expert_quant_codebook,
             .window = self.config.expert_quant_window,
-        });
-        const xsh = mlx.getShape(expert_x);
-        const B = xsh[0];
-        const S = xsh[1];
-        const D = xsh[xsh.len - 1];
-        var x2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x2);
-        try mlx.check(mlx.mlx_reshape(&x2, expert_x, &[_]c_int{ B * S, D }, 2, self.s));
-        const ish = mlx.getShape(inds);
-        const K = ish[ish.len - 1];
-        var slots = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(slots);
-        try mlx.check(mlx.mlx_reshape(&slots, inds, &[_]c_int{B * S * K}, 1, self.s));
-        var sc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sc);
-        try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{B * S * K}, 1, self.s));
-        var slots_u = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(slots_u);
-        try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, self.s));
-        const rows: usize = @intCast(B * S);
-        if (rows >= 2 and rows <= expert_exl3_kernels.DECODE_ROWS_MAX) {
-            expert_exl3_kernels.dumpUnionHist(slots_u, rows, @intCast(K)) catch {};
-        }
-        if (rows <= expert_exl3_kernels.DECODE_ROWS_MAX or verify_rows) {
-            if (verify_rows) mtp_verify_expert_rows_calls +%= 1;
-            const xd = mlx.mlx_array_dtype(expert_x);
-            const y = try expert_exl3_kernels.moeSwigluFused(
-                self.s,
-                x2,
-                mw.switch_gate_w,
-                mw.switch_gate_s,
-                mw.switch_gate_b,
-                mw.switch_up_w,
-                mw.switch_up_s,
-                mw.switch_up_b,
-                mw.switch_down_w,
-                mw.switch_down_s,
-                mw.switch_down_b,
-                slots_u,
-                sc,
-                xd,
-            );
-            defer _ = mlx.mlx_array_free(y);
-            var out = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
-            if (mlx.mlx_array_dtype(out) != xd) {
-                var cast = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_astype(&cast, out, xd, self.s));
-                _ = mlx.mlx_array_free(out);
-                return cast;
-            }
-            return out;
-        }
-        const y = try expert_exl3_kernels.moePrefill(
-            self.s,
-            x2,
-            mw.switch_gate_w,
-            mw.switch_gate_s,
-            mw.switch_gate_b,
-            mw.switch_up_w,
-            mw.switch_up_s,
-            mw.switch_up_b,
-            mw.switch_down_w,
-            mw.switch_down_s,
-            mw.switch_down_b,
-            slots_u,
-            sc,
-            K,
-        );
-        defer _ = mlx.mlx_array_free(y);
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_reshape(&out, y, xsh.ptr, @intCast(xsh.len), self.s));
-        const xd = mlx.mlx_array_dtype(expert_x);
-        if (mlx.mlx_array_dtype(out) != xd) {
-            var cast = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&cast, out, xd, self.s));
-            _ = mlx.mlx_array_free(out);
-            return cast;
-        }
-        return out;
+        }, verify_rows);
     }
 
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x_in: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
@@ -41144,8 +41066,8 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const exl3 = @import("expert_exl3.zig");
-    const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+    const exl3 = expert_exl3;
+    const fixture = exl3.fixtures.k4;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -41307,8 +41229,8 @@ const Exl3MoeHarness = struct {
     const dim: usize = 128;
 
     fn init(alloc: std.mem.Allocator, s: mlx.mlx_stream, rows: usize, seed: u64) !Exl3MoeHarness {
-        const exl3 = @import("expert_exl3.zig");
-        const fixture = @embedFile("fixtures/exl3_k4_linear.safetensors");
+        const exl3 = expert_exl3;
+        const fixture = exl3.fixtures.k4;
         const header_len = std.mem.readInt(u64, fixture[0..8], .little);
         const header = fixture[8 .. 8 + header_len];
         const data = fixture[8 + header_len ..];
@@ -42079,16 +42001,6 @@ const SwitchMlpBank = struct {
 /// `[E, in/16, out/16, n]` at a rate the CONFIG's bill covers. Decode reads n
 /// off the tensor and a layer may carry fewer bits than the pack's widest — a
 /// wider one under-bills, and an under-bill here is an uncatchable Metal OOM.
-fn exl3TrellisAdmitted(shape: []const c_int, experts: u32, in_dim: u32, out_dim: u32, rate: expert_exl3.Rate) bool {
-    if (shape.len != 4) return false;
-    for (shape) |d| if (d <= 0) return false;
-    if (in_dim % 16 != 0 or out_dim % 16 != 0) return false;
-    const want = [3]u32{ experts, in_dim / 16, out_dim / 16 };
-    for (want, 0..) |w, i| if (w != @as(u32, @intCast(shape[i]))) return false;
-    const packed_rate = expert_exl3.kFromPackedDim(@intCast(shape[3])) orelse return false;
-    return packed_rate.n <= rate.n;
-}
-
 fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool, config: *const ModelConfig) error{ MissingWeight, Exl3TrellisGeometry }!SwitchMlpBank {
     if (exl3) {
         const bank: SwitchMlpBank = .{
@@ -42110,7 +42022,7 @@ fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8,
             .{ .w = bank.down_w, .in = inter, .out = h },
         };
         for (projs) |p| {
-            if (exl3TrellisAdmitted(mlx.getShape(p.w), config.num_experts, p.in, p.out, config.expert_quant_rate)) continue;
+            if (sushi_exl3.trellisAdmitted(mlx.getShape(p.w), config.num_experts, p.in, p.out, config.expert_quant_rate)) continue;
             var kbuf: [8]u8 = undefined;
             log.err("EXL3 TRELLIS GEOMETRY: {s}.layers.{d} packs {any}, config names [{d}, {d}, {d}, k={s}]\n", .{
                 prefix, layer, mlx.getShape(p.w), config.num_experts, p.in / 16, p.out / 16, config.expert_quant_rate.kText(&kbuf),
@@ -42130,26 +42042,6 @@ fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8,
         .down_s = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
         .down_b = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
     };
-}
-
-test "exl3 a layer may pack below the rate the config bills, never above it" {
-    const t = std.testing;
-    const E: u32 = 256;
-    const h: u32 = 4096;
-    const i: u32 = 2048;
-    const k4: expert_exl3.Rate = .{ .n = 64 };
-    const shape = struct {
-        fn at(n: c_int) [4]c_int {
-            return .{ @intCast(E), @intCast(h / 16), @intCast(i / 16), n };
-        }
-    }.at;
-    // A pack whose tail layers carry more bits than its body: the config bills
-    // the widest, so a narrower layer admits and a wider one cannot.
-    try t.expect(exl3TrellisAdmitted(&shape(64), E, h, i, k4));
-    try t.expect(exl3TrellisAdmitted(&shape(40), E, h, i, k4));
-    try t.expect(!exl3TrellisAdmitted(&shape(64), E, h, i, .{ .n = 40 }));
-    try t.expect(!exl3TrellisAdmitted(&shape(41), E, h, i, k4));
-    try t.expect(!exl3TrellisAdmitted(&shape(64), E, h, h, k4));
 }
 
 /// Build a "<container>.<leaf>" layer-weight suffix into `buf`. Used where the

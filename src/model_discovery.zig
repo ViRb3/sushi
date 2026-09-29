@@ -20,6 +20,7 @@ const dflash = @import("dflash.zig");
 const mtp = @import("mtp.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_quant = @import("expert_quant.zig");
+const sushi_exl3 = @import("sushi_exl3");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -991,7 +992,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
         if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
     }
     if (root.get("expert_quant")) |q| meta.quantized_experts = q == .object;
-    if (meta.quantized_experts) meta.expert_quant_rate = if (expert_quant.parseExpertQuant(root)) |spec| spec.rate else |_| null;
+    if (meta.quantized_experts) meta.expert_quant_rate = if (sushi_exl3.parseExpertQuant(root)) |spec| spec.rate else |_| null;
     meta.is_moe = cfgU32(root, text_cfg, "num_experts") > 0 or
         cfgU32(root, text_cfg, "num_local_experts") > 0 or
         cfgU32(root, text_cfg, "n_routed_experts") > 0;

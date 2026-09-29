@@ -87,7 +87,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | arch-qwen4exp |
 | `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
 | `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk kept as stored + its GEMV, rank-local QKV, stored-affine trunk, shard-stamp check | arch-mimo-v2 |
-| `expert_quant.zig` / `expert_exl3.zig` / `expert_exl3_kernels.zig` | expert layout, EXL3 decoders and kernels | engine-exl3-experts |
+| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3 decoders and kernels | engine-exl3-experts |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, round-cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |

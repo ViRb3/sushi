@@ -2,7 +2,7 @@
 
 How routed experts in turboderp's EXL3 trellis format are decoded and multiplied: the rate, codebook and window a
 pack names, the prefill GEMM and the four-dispatch decode chain, and the parity bars their tests hold. Read this
-before touching `src/expert_exl3.zig`, `src/expert_exl3_kernels.zig`, `src/expert_quant.zig` or `moeExl3`.
+before touching `src/exl3/`, `src/expert_quant.zig` or `moeExl3`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.md) (the on-disk contract),
 [engine-kernels](engine-kernels.md), [engine-expert-streaming](engine-expert-streaming.md),
@@ -12,10 +12,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 
 | File | Role |
 |---|---|
-| `src/expert_quant.zig` | Expert layout detection from PACKED shapes: `.quantized_split` (affine banks) vs `.exl3_k4` (trellis); affine (bits, group_size) solved from geometry; `expert_quant` parse |
-| `src/expert_exl3.zig` | Host reference decoders (MUL1, MCG), `Rate`, `Window`, `Decode`, fixtures |
-| `src/expert_exl3_kernels.zig` | Prefill run-aligned 32-row window GEMM (NAX body, K4 fast branch; simdgroup-matrix body off NAX; scalar body), decode chain (`moeSwigluFused`), `DECODE_ROWS_MAX` (16), `usesPrefillArm` |
+| `src/expert_quant.zig` | Expert layout detection from PACKED shapes: `.quantized_split` (affine banks) vs `.exl3_k4` (trellis); affine (bits, group_size) solved from geometry |
+| `src/exl3/root.zig` | The `sushi_exl3` module's host API: `expert_quant` parse (`parseExpertQuant`), `admitTopK`, `trellisAdmitted`, `moe` (the one dispatch) |
+| `src/exl3/expert_exl3.zig` | Host reference decoders (MUL1, MCG), `Rate`, `Window`, `Decode`, fixtures |
+| `src/exl3/expert_exl3_kernels.zig` | Prefill run-aligned 32-row window GEMM (NAX body, K4 fast branch; simdgroup-matrix body off NAX; scalar body), decode chain (`moeSwigluFused`), `DECODE_ROWS_MAX` (16), `usesPrefillArm` |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab (`gateUpSwiglu`; `downReduce`) for the unquantized HF checkpoint |
+
+**`src/exl3` is a module** (`sushi_exl3`), so another MLX host (mlx-serve) can serve EXL3 packs through the same code.
+It reaches `mlx`, `log` and `io_util` through an `mlx_host` import whose root file exposes them as `pub const`; here that
+root is `src/main.zig` (and `src/tests.zig` for tests), and it can never import a Sushi file by path. Its tests run as
+their own artifact (`exl3-test`) on `zig build test`.
 
 ## Format as the engine sees it
 
@@ -39,7 +45,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 - **The window is a pack field** (`expert_quant.window`, absent = 16, 8..16 admitted): the codeword is masked to the
   window in the one helper every weight kernel inlines, and kernel slots are keyed by codebook AND window. A w16
   bitstream decodes to different weights at every other window, so a window can never come from a flag.
-- **The codebook follows the MODEL at every dispatch**: `moeExl3` calls `expert_exl3_kernels.setDecodeParams`
+- **The codebook follows the MODEL at every dispatch**: `exl3.moe` calls `kernels.setDecodeParams`
   (codebook + window) before each dispatch because several EXL3 packs can be resident at once; every weight kernel
   inlines `exl3_pairh` from `codebookHelpers`, built per (codebook, window). A codebook name this build does not decode is refused at load
   ([pack-format](pack-format.md#configjson)). A/B lever:
