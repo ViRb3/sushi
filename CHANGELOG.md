@@ -6,11 +6,13 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- `/metrics.json` `sessions` also lists each hot-cache conversation no live request holds as a `cached` row, and `/props` reports `memory.kv_cache_bytes` including live requests (mlx-serve 4e00f2af and eca42620 (#590), thanks @ddalcu; builds on #13, thanks @yoyo930021).
+
 - **Per-request live sessions on `/metrics.json`**: every in-flight request publishes its phase, context tokens
   against the model's effective limit, cached and generated tokens, its `max_tokens`, a poll-stable `request_id`,
   its age and the GPU bytes its KV/SSM state holds — refreshed at each decode cull, prefill entry and interleave
   chunk boundary (mlx-serve sessions publish chain after `4e00f2af` (live KV residency), thanks @ddalcu;
-  upstream PR ref TBD).
+  mlx-serve #590).
 
 - MTP prompt lookup is now off by default; set `SUSHI_MTP_LOOKUP=1` to enable it.
 

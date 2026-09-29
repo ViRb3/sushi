@@ -7984,20 +7984,11 @@ pub const KVCache = struct {
         self.* = fresh;
     }
 
-    /// GPU bytes of the buffers this cache owns. A restored share is billed to
-    /// the hot-cache entry that owns its buffer (`shared_view`); a COW grow that
-    /// materialized the slot's own copy clears the flag and bills here. mlx-c
-    /// arrays carry their shape + dtype, so the sum is exact, not a heuristic
-    /// (same accounting as `HotPrefixCache.snapshotBytes`).
+    /// GPU bytes of the buffers this cache owns, at their capacity (a ringed layer's ring). A
+    /// restored share is billed to the hot-cache entry that owns its buffers (`shared_view`); the
+    /// COW grow that materializes the slot's own copy clears the flag and bills here.
     pub fn residentBytes(self: *const KVCache) u64 {
-        var total: u64 = 0;
-        for (self.entries) |e| {
-            if (!e.initialized or e.shared_view) continue;
-            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
-                if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
-            }
-        }
-        return total;
+        return kvEntriesBytes(self.entries);
     }
 
     /// Capture cache state for speculative-decoding rollback (PLD/drafter).
@@ -9284,21 +9275,32 @@ pub const QsaHeadMarkSet = struct {
     }
 };
 
-fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
-    const arr = if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state;
+fn arrayBytes(arr: mlx.mlx_array) u64 {
     if (arr.ctx == null) return 0;
     return @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
 }
 
-/// A live request's recurrent state: the hybrid's counterpart of its KV.
-/// The GDN pair plus the raw QSA indexer history (`qsa_key_buf` is the
-/// capacity buffer `aux_state` views; whichever is resident carries it).
-pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
+pub fn kvEntriesBytes(entries: []const KVCacheEntry) u64 {
     var total: u64 = 0;
-    inline for (.{ e.conv_state, e.ssm_state }) |arr| {
-        if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+    for (entries) |e| {
+        if (!e.initialized or e.shared_view) continue;
+        inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+            total += arrayBytes(arr);
+        }
     }
-    return total + qsaRawKeyBytes(e);
+    return total;
+}
+
+fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
+    return arrayBytes(if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state);
+}
+
+/// A live request's recurrent state, the hybrid's counterpart of its KV. Each QSA bank is billed
+/// by its capacity buffer when it has one, never again through the view that reads it.
+pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
+    return arrayBytes(e.conv_state) + arrayBytes(e.ssm_state) + qsaRawKeyBytes(e) +
+        arrayBytes(if (e.qsa_pooled_buf.ctx != null) e.qsa_pooled_buf else e.qsa_pooled) +
+        arrayBytes(if (e.qsa_score_buf.ctx != null) e.qsa_score_buf else e.qsa_score_bank);
 }
 
 fn qsaLeftoverAt(aux: mlx.mlx_array, hist: c_int, pos: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -11607,6 +11609,43 @@ test "QSA key history advances by S not 1" {
     defer _ = mlx.mlx_array_free(chunk);
     try xfm.qsaAppendKeys(&entry, chunk, 0);
     try t.expectEqual(@as(c_int, 4), qsaHistoryRows(&entry));
+}
+
+test "ssmEntryBytes bills each QSA capacity buffer once, never the view beside it" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const zeros = struct {
+        fn make(shape: []const c_int, st: mlx.mlx_stream) mlx.mlx_array {
+            var a = mlx.mlx_array_new();
+            _ = mlx.mlx_zeros(&a, shape.ptr, shape.len, .bfloat16, st);
+            return a;
+        }
+        fn rows(buf: mlx.mlx_array, n: c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            const sh = mlx.getShape(buf);
+            var v = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&v, buf, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ sh[0], n, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, st));
+            return v;
+        }
+    };
+    var e: SSMCacheEntry = .{ .conv_state = zeros.make(&.{ 1, 3, 8 }, s), .ssm_state = zeros.make(&.{ 1, 2, 4, 4 }, s), .initialized = true };
+    defer _ = mlx.mlx_array_free(e.conv_state);
+    defer _ = mlx.mlx_array_free(e.ssm_state);
+    e.qsa_key_buf = zeros.make(&.{ 1, 64, 16 }, s);
+    defer _ = mlx.mlx_array_free(e.qsa_key_buf);
+    e.aux_state = try zeros.rows(e.qsa_key_buf, 10, s);
+    defer _ = mlx.mlx_array_free(e.aux_state);
+    e.qsa_pooled_buf = zeros.make(&.{ 1, 32, 16 }, s);
+    defer _ = mlx.mlx_array_free(e.qsa_pooled_buf);
+    e.qsa_pooled = try zeros.rows(e.qsa_pooled_buf, 2, s);
+    defer _ = mlx.mlx_array_free(e.qsa_pooled);
+    const two: u64 = 2; // bf16
+    try testing.expectEqual(two * (3 * 8 + 2 * 4 * 4 + 64 * 16 + 32 * 16), ssmEntryBytes(&e));
+
+    // A restored entry holds only the tight arrays until its first append grows the buffers.
+    var restored: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    restored.aux_state = e.aux_state;
+    restored.qsa_pooled = e.qsa_pooled;
+    try testing.expectEqual(two * (10 * 16 + 2 * 16), ssmEntryBytes(&restored));
 }
 
 test "qsa raw-key ring is O(RING_ROWS) at N rows" {
@@ -50790,6 +50829,45 @@ test "a ring rewinds inside its retained window and declines below it" {
     // Zero is a reset, not a rewind.
     try c.truncate(0, s);
     try std.testing.expectEqual(@as(usize, 0), c.absSeqLen(0));
+}
+
+test "KVCache resident bytes are the buffers it owns, never a restored donor's" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testing.expectEqual(@as(u64, 0), cache.residentBytes());
+    const k = testKVWide(3, 64, s);
+    defer _ = mlx.mlx_array_free(k);
+    var dv = try cache.update(0, k, k, s, 0);
+    dv.deinit();
+    const e = cache.entries[0];
+    const want = 2 * @as(u64, mlx.mlx_array_size(e.keys)) * @as(u64, mlx.mlx_array_itemsize(e.keys));
+    try testing.expect(want > 0);
+    try testing.expectEqual(want, cache.residentBytes());
+    cache.entries[0].shared_view = true;
+    try testing.expectEqual(@as(u64, 0), cache.residentBytes());
+    cache.entries[0].shared_view = false;
+}
+
+test "a ringed layer's resident bytes are its ring, not the history it has seen" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    var c = try KVCache.init(testing.allocator, 1);
+    defer c.deinit();
+    c.setSwaRing(window);
+    var pos: c_int = 0;
+    while (pos < 2000) : (pos += 250) {
+        const k = try swaRingChunk(s, pos, 250, 1, 4);
+        defer _ = mlx.mlx_array_free(k);
+        var view = try c.update(0, k, k, s, slidingTailSpan(window, 250, SLIDING_TRIM_UNBOUNDED));
+        view.deinit();
+    }
+    const e = c.entries[0];
+    const row: u64 = 4 * @as(u64, mlx.mlx_array_itemsize(e.keys));
+    try testing.expectEqual(2 * @as(u64, @intCast(KVCache.bufferCapacity(e.keys))) * row, c.residentBytes());
+    try testing.expect(c.residentBytes() < 2 * 2000 * row);
 }
 
 /// Layer 0 global, layer 1 sliding: rows `[from, to)` in `chunk`-wide forwards.

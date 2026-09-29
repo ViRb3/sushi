@@ -294,7 +294,8 @@ check "prefill_tokens_total <= prompt_tokens_total" \
 # ── Phase 6: per-request live sessions ──
 #
 # `/metrics.json` ends with one row per live request (mlx-serve port): phase,
-# context occupancy against the model's limit, and a submit-stable request_id.
+# context occupancy against the model's limit, and a submit-stable request_id;
+# then one `cached` row per hot-cache entry no live row restored from.
 echo ""
 echo "── Phase 6: live per-request sessions ──"
 
@@ -314,7 +315,7 @@ for _ in $(seq 1 200); do
     read -r R N G <<< "$(curl -s -m 2 "$BASE/metrics.json" | python3 -c "
 import json,sys
 try:
-    ss = json.load(sys.stdin)['sessions']
+    ss = [r for r in json.load(sys.stdin)['sessions'] if r['phase'] != 'cached']
     if ss:
         r = ss[0]
         good = (r['context_length'] > 0 and r['max_tokens'] == 64 and
@@ -338,10 +339,63 @@ check "row carries context_length, requested max_tokens, age, prefill|decode pha
 check "request_id is stable across two polls of one request" "$STABLE_ID"
 
 sleep 2
-check "sessions empty again at rest (no resurrected rows)" \
-    "$(curl -s "$BASE/metrics.json" | python3 -c "
+REST6=$(curl -s "$BASE/metrics.json")
+check "no live rows again at rest (no resurrected rows)" \
+    "$(echo "$REST6" | python3 -c "
 import json,sys
-print(1 if json.load(sys.stdin).get('sessions') == [] else 0)" 2>/dev/null)"
+print(1 if all(r['phase'] == 'cached' for r in json.load(sys.stdin)['sessions']) else 0)" 2>/dev/null)"
+check "the finished request left cached rows with zero request fields and an entry's bytes" \
+    "$(echo "$REST6" | python3 -c "
+import json,sys
+ss = json.load(sys.stdin)['sessions']
+ok = any(r['state_bytes'] > 0 for r in ss) and all(
+    r['request_id'] == 0 and r['max_tokens'] == 0 and r['elapsed_seconds'] == 0 and
+    r['generated_tokens'] == 0 and r['context_tokens'] == r['cached_tokens'] > 0 and
+    r['context_length'] > 0 for r in ss)
+print(1 if ok else 0)" 2>/dev/null)"
+
+# A repeated prompt restores from the entry its first run committed: while it decodes, that
+# entry is listed once, as the live row, never also as a cached row.
+cached_lens() { curl -s "$BASE/metrics.json" | python3 -c "
+import json,sys
+print(' '.join(str(r['context_tokens']) for r in json.load(sys.stdin)['sessions'] if r['phase'] == 'cached'))"; }
+REQ7='{"model":"sushi","stream":false,"max_tokens":512,"temperature":0,"messages":[{"role":"user","content":"Count from one to three hundred in words, separated by commas."}]}'
+BEFORE7=$(cached_lens)
+curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$REQ7" >/dev/null
+sleep 1
+SEED_LEN=$(python3 -c "
+import sys
+before, after = sys.argv[1].split(), sys.argv[2].split()
+for x in before:
+    if x in after: after.remove(x)
+print(max(map(int, after)) if after else 0)" "$BEFORE7" "$(cached_lens)")
+check "the first run committed a cached entry ($SEED_LEN tokens)" \
+    "$([ "$SEED_LEN" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+
+curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$REQ7" >/dev/null &
+CURL_PID=$!
+RESTORED_POLLS=0
+DUP_POLLS=0
+for _ in $(seq 1 300); do
+    kill -0 $CURL_PID 2>/dev/null || break
+    read -r LIVE DUP <<< "$(curl -s -m 2 "$BASE/metrics.json" | python3 -c "
+import json,sys
+try:
+    ss = json.load(sys.stdin)['sessions']
+    # Early in the decode only: a poll between the final commit and the cull may see both.
+    live = [r for r in ss if r['phase'] == 'decode' and r['cached_tokens'] > 0 and r['generated_tokens'] <= 256]
+    dup = any(r['phase'] == 'cached' and r['context_tokens'] == $SEED_LEN for r in ss)
+    print(1 if live else 0, 1 if live and dup else 0)
+except Exception: print(0, 0)" 2>/dev/null)"
+    [ "$LIVE" = "1" ] && RESTORED_POLLS=$((RESTORED_POLLS + 1))
+    [ "$DUP" = "1" ] && DUP_POLLS=$((DUP_POLLS + 1))
+    sleep 0.2
+done
+wait $CURL_PID 2>/dev/null
+check "the repeated prompt decoded from a restore ($RESTORED_POLLS polls)" \
+    "$([ "$RESTORED_POLLS" -gt 0 ] && echo 1 || echo 0)"
+check "its restored entry was never listed beside it ($DUP_POLLS duplicate polls)" \
+    "$([ "$RESTORED_POLLS" -gt 0 ] && [ "$DUP_POLLS" -eq 0 ] && echo 1 || echo 0)"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""

@@ -407,6 +407,8 @@ pub const Slot = struct {
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64 = 0,
+    /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
+    restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
@@ -1251,6 +1253,8 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// KV + recurrent state the live slots own beyond what the hot caches bill, once per tick (`/props`).
+    resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -1263,6 +1267,9 @@ pub const Scheduler = struct {
     /// Submit sequence the session rows carry as `request_id`: taken under
     /// `queue_mu` in `submit`, immutable on the slot, never reused.
     req_seq: u64 = 0,
+    /// Every ready model's hot-cache entries for `/metrics.json`, under `digest_mu`.
+    cached_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
+    cached_session_count: usize = 0,
 
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
@@ -4275,7 +4282,6 @@ pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 fn reviseHotCacheBudgets(sch: *Scheduler) void {
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
-    defer sch.registry.mutex.unlock(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
     // current model goes last.
     for ([_]bool{ false, true }) |current_pass| {
@@ -4289,9 +4295,10 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
             var idle: u64 = 0;
             hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
             hc.ssd_idle_mem = idle;
-            if (current_pass) publishHotCacheResidency(sch);
         }
     }
+    sch.registry.mutex.unlock(sch.io);
+    publishHotCacheResidency(sch);
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
@@ -4300,6 +4307,34 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
     publishHotCacheDigests(sch);
+    if (sch.metrics != null) publishCachedSessions(sch);
+}
+
+/// Caller must not hold `registry.mutex`.
+fn publishCachedSessions(sch: *Scheduler) void {
+    var rows: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined;
+    var n: usize = 0;
+    {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        defer sch.registry.mutex.unlock(sch.io);
+        var it = sch.registry.entries.valueIterator();
+        outer: while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready) continue;
+            const hc = if (entry.prefix_cache) |*h| h else continue;
+            for (hc.entries.items) |*e| {
+                if (n == rows.len) break :outer;
+                const len: u32 = @intCast(@min(e.tokens.len, std.math.maxInt(u32)));
+                rows[n] = .init(entry.id, .cached, len, len, 0, e.kv_bytes);
+                rows[n].entry_id = e.id;
+                n += 1;
+            }
+        }
+    }
+    sch.digest_mu.lockUncancelable(sch.io);
+    defer sch.digest_mu.unlock(sch.io);
+    @memcpy(sch.cached_sessions[0..n], rows[0..n]);
+    sch.cached_session_count = n;
 }
 
 /// Swap in a fresh digest snapshot and free the one it supersedes (inference thread only).
@@ -4655,13 +4690,22 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
 /// `prefilling` is the slot mid-prefill, which is not in `decoding` yet.
-/// Zero-when-off: with no `--metrics` sink the rows have no reader
-/// (`/metrics.json` 503s), so the publish is a single store — no per-tick KV scan.
+/// The byte total feeds `/props` and is always published; the rows only with a `--metrics` sink.
 fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
+    const observe = sch.metrics != null;
     sch.live_session_count = 0;
-    if (sch.metrics == null) return;
-    if (prefilling) |p| recordLiveSession(sch, p, .prefill, slotStateBytes(p));
-    for (sch.decoding.items) |s| recordLiveSession(sch, s, .decode, slotStateBytes(s));
+    var bytes: u64 = 0;
+    if (prefilling) |p| {
+        const b = slotStateBytes(p);
+        bytes += b -| slotDonatedBytes(sch, p);
+        if (observe) recordLiveSession(sch, p, .prefill, b);
+    }
+    for (sch.decoding.items) |s| {
+        const b = slotStateBytes(s);
+        bytes += b -| slotDonatedBytes(sch, s);
+        if (observe) recordLiveSession(sch, s, .decode, b);
+    }
+    sch.resident_live_kv_bytes.store(bytes, .monotonic);
 }
 
 fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session.Phase, state_bytes: u64) void {
@@ -4676,20 +4720,31 @@ fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session
     session.max_tokens = s.max_tokens;
     const age_ns = s.request_start_ts.untilNow(sch.io, .boot).nanoseconds;
     session.elapsed_seconds = @as(f64, @floatFromInt(age_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    session.entry_id = s.restored_entry;
     sch.live_sessions[sch.live_session_count] = session;
     sch.live_session_count += 1;
 }
 
-/// GPU bytes the slot's own state holds: its KV layers plus the hybrid's
-/// recurrent entries. A restored share whose buffer the hot cache still owns
-/// is billed to that entry (`shared_view`), not here — the COW grow that
-/// materializes the slot's copy clears the flag and starts counting.
+/// GPU bytes the slot's own state holds: its KV layers, the hybrid's recurrent entries and the
+/// ring restore points it holds. A restored share whose buffer the hot cache still owns is billed
+/// to that entry (`shared_view`), not here.
 fn slotStateBytes(s: *const Slot) u64 {
     var bytes = s.cache.residentBytes();
     if (s.ssm_entries) |ents| for (ents) |*e| {
         bytes += transformer_mod.ssmEntryBytes(e);
     };
+    inline for (.{ s.ring_cps.fork, s.ring_cps.prompt_end }) |cp| {
+        if (cp) |c| bytes += transformer_mod.kvEntriesBytes(c.entries);
+    }
     return bytes;
+}
+
+/// The part of `slotStateBytes` that `resident_hot_cache_bytes` already bills: a donated checkout's
+/// buffers, when the slot's cache is the one published.
+fn slotDonatedBytes(sch: *const Scheduler, s: *const Slot) u64 {
+    const hc = if (s.model.prefix_cache) |*h| h else return 0;
+    if (sch.hot_prefix_cache != hc) return 0;
+    return hc.donatedBytes(@intFromPtr(s));
 }
 
 /// Shutdown exit: an armed activation capture is written HERE, the last point
@@ -5743,10 +5798,10 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const owed = runOwedDecodeTicks(prefillDecodeShare(), chunk_ns, first_ns, ic, interleaveDecodeTickOpaque);
     ic.ticks +|= owed.ticks;
     ic.decode_ns +|= owed.spent_ns;
-    if (ic.sch.metrics != null) {
+    {
         // Refresh the snapshot at the chunk boundary: the prefill row's token
-        // counts and every decode row's age move between chunks, and inside a
-        // long prefill this is the only point that republishes them.
+        // counts, its growing KV and every decode row's age move between chunks,
+        // and inside a long prefill this is the only point that republishes them.
         ic.sch.queue_mu.lockUncancelable(ic.sch.io);
         defer ic.sch.queue_mu.unlock(ic.sch.io);
         publishLiveKvResidency(ic.sch, ic.slot);
@@ -5963,6 +6018,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
                 hot_checked_out = lookup.checked_out;
+                slot.restored_entry = lookup.entry_id;
             }
             // The entry this request restored off may be evicted before it commits, so the fork
             // keeps its own restore point; a full reuse is covered by the prompt end.
@@ -9997,11 +10053,14 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     sch.decoding = .empty;
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/live-test";
+    model.prefix_cache = null;
     var slot: Slot = undefined;
     // Only the fields the publish path reads: rows are value copies.
     slot.model = &model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
+    slot.ring_cps = .{};
+    slot.restored_entry = 0;
     slot.full_prompt = &.{};
     slot.prompt_tokens = 1000;
     slot.completion_tokens = 7;
@@ -10065,4 +10124,69 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     sch.metrics = null;
     publishLiveKvResidency(&sch, &slot);
     try testing.expectEqual(@as(usize, 0), sch.live_session_count);
+}
+
+test "the live KV bill counts ring restore points and nets out a donated checkout the hot cache bills" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.metrics = null;
+    sch.live_session_count = 0;
+    sch.resident_live_kv_bytes = .init(999);
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/live-test";
+    model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    defer model.prefix_cache.?.entries.deinit(testing.allocator);
+    sch.hot_prefix_cache = &model.prefix_cache.?;
+
+    var cp_entries = [_]transformer_mod.KVCacheEntry{transformer_mod.newEmptyKVEntry()};
+    _ = mlx.mlx_zeros(&cp_entries[0].keys, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(cp_entries[0].keys);
+    _ = mlx.mlx_zeros(&cp_entries[0].values, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(cp_entries[0].values);
+    cp_entries[0].initialized = true;
+    const cp_bytes: u64 = 2 * (8 * 4) * 2;
+
+    var slot: Slot = undefined;
+    slot.model = &model;
+    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+    slot.ssm_entries = null;
+    slot.ring_cps = .{ .fork = .{ .entries = &cp_entries, .step = 8, .allocator = testing.allocator, .config = .dense } };
+    slot.full_prompt = &.{};
+    slot.prompt_tokens = 8;
+    slot.completion_tokens = 0;
+    slot.cached_tokens = 8;
+    slot.request_id = 1;
+    slot.max_tokens = 16;
+    slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
+    slot.restored_entry = 7;
+    var ptrs = [_]*Slot{&slot};
+    sch.decoding = .empty;
+    sch.decoding.items = &ptrs;
+    sch.decoding.capacity = ptrs.len;
+
+    // `/props` reads the bill without `--metrics`: no rows, but the bytes are published.
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(cp_bytes, sch.resident_live_kv_bytes.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), sch.live_session_count);
+
+    try model.prefix_cache.?.entries.append(testing.allocator, .{
+        .tokens = &.{},
+        .has_tools = false,
+        .snapshot = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense },
+        .last_used = 1,
+        .quant_config = .dense,
+        .kv_bytes = 48,
+        .checked_out_by = @intFromPtr(&slot),
+        .checkout_donated = true,
+        .donated_bytes = 48,
+    });
+    var mm = metrics_mod.Metrics.init();
+    sch.metrics = &mm;
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(cp_bytes - 48, sch.resident_live_kv_bytes.load(.monotonic));
+    const row = &sch.live_sessions[0];
+    try testing.expectEqual(cp_bytes, row.state_bytes);
+    try testing.expectEqual(@as(u64, 7), row.entry_id);
 }

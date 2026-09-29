@@ -294,13 +294,13 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 
 pub const MAX_SESSIONS = 32;
 
-/// One live request's context occupancy, published by the inference thread.
-/// `context_length` is the model's effective limit, filled at render time by the server.
-/// `request_id`, `max_tokens` and `elapsed_seconds` are sushi extensions over the
-/// upstream row: the stable submit sequence, the request's own output cap, and the
-/// age of the snapshot at publish time.
+/// One live request's context occupancy, or one idle hot-cache entry (`cached`), published by
+/// the inference thread. `context_length` is the model's effective limit, filled at render time
+/// by the server. `request_id`, `max_tokens` and `elapsed_seconds` are sushi extensions over the
+/// upstream row: the stable submit sequence, the request's own output cap, and the age of the
+/// snapshot at publish time; a cached row has no request and carries 0 in all three.
 pub const Session = struct {
-    pub const Phase = enum { prefill, decode };
+    pub const Phase = enum { prefill, decode, cached };
 
     model_buf: [256]u8 = undefined,
     model_len: u16 = 0,
@@ -317,6 +317,9 @@ pub const Session = struct {
     max_tokens: u32 = 0,
     /// Seconds from request arrival to the publish of this snapshot.
     elapsed_seconds: f64 = 0,
+    /// Hot-cache entry id: the entry a live row restored from, or a cached row's own; 0 = none.
+    /// Not rendered: it only lets `appendUnclaimedCached` list a conversation once.
+    entry_id: u64 = 0,
 
     pub fn init(model_id: []const u8, phase: Phase, context_tokens: u32, cached_tokens: u32, generated_tokens: u32, state_bytes: u64) Session {
         var s: Session = .{
@@ -336,6 +339,22 @@ pub const Session = struct {
         return self.model_buf[0..self.model_len];
     }
 };
+
+/// Appends to `buf[live_n..]` each cached row no live row in `buf[0..live_n]` restored from,
+/// so one conversation is listed once; returns the new row count.
+pub fn appendUnclaimedCached(buf: []Session, live_n: usize, cached: []const Session) usize {
+    var n = live_n;
+    for (cached) |c| {
+        if (n == buf.len) break;
+        const claimed = for (buf[0..live_n]) |l| {
+            if (c.entry_id != 0 and l.entry_id == c.entry_id and std.mem.eql(u8, l.model(), c.model())) break true;
+        } else false;
+        if (claimed) continue;
+        buf[n] = c;
+        n += 1;
+    }
+    return n;
+}
 
 /// Write all metrics as a JSON object to `w`.
 /// Called only on the scrape connection thread.
@@ -969,4 +988,45 @@ test "renderJson lists each live session's context against its model's limit" {
     const parsed0 = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w0.end], .{});
     defer parsed0.deinit();
     try testing.expectEqual(@as(usize, 0), parsed0.value.object.get("sessions").?.array.items.len);
+}
+
+test "a cached row renders the per-request fields as zero and keeps entry_id off the wire" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var row = Session.init("qwen", .cached, 800, 800, 0, 32);
+    row.entry_id = 7;
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{row}, &w);
+    try testing.expect(std.mem.endsWith(u8, buf[0..w.end],
+        \\"sessions":[{"model":"qwen","request_id":0,"phase":"cached","context_tokens":800,"context_length":0,"cached_tokens":800,"generated_tokens":0,"max_tokens":0,"elapsed_seconds":0,"state_bytes":32}]}
+    ));
+}
+
+test "renderJson appends sessions after every existing field" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{}, &w);
+    try testing.expect(std.mem.endsWith(u8, buf[0..w.end], "}},\"sessions\":[]}"));
+}
+
+test "a cached row is listed once, as the live row that restored from it" {
+    const testing = std.testing;
+    var buf: [2 * MAX_SESSIONS]Session = undefined;
+    var live = Session.init("qwen", .decode, 900, 800, 100, 64);
+    live.entry_id = 7;
+    buf[0] = live;
+    var restored = Session.init("qwen", .cached, 800, 800, 0, 32);
+    restored.entry_id = 7;
+    var other_model = Session.init("mimo", .cached, 500, 500, 0, 16);
+    other_model.entry_id = 7;
+    var idle = Session.init("qwen", .cached, 300, 300, 0, 8);
+    idle.entry_id = 9;
+    const n = appendUnclaimedCached(&buf, 1, &.{ restored, other_model, idle });
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(Session.Phase.decode, buf[0].phase);
+    try testing.expectEqualStrings("mimo", buf[1].model());
+    try testing.expectEqual(@as(u64, 9), buf[2].entry_id);
 }

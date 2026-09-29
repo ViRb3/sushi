@@ -2242,7 +2242,7 @@ fn handleConnection(
         if (g_metrics) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            var sessions: [instr.MAX_SESSIONS]instr.Session = undefined;
+            var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
             try instr.renderJson(m, liveSessions(registry, &sessions), &out.writer);
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
@@ -2614,26 +2614,30 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     return autoContextFor(config);
 }
 
-/// Live requests, each row stamped with its model's effective context limit.
-/// The connection-thread reader copies the inference thread's `queue_mu`
-/// snapshot under that same lock (the `hot_cache_digests` discipline): a
+/// Live requests, then each hot-cache entry no live row restored from, each row stamped with its
+/// model's effective context limit. The connection-thread reader copies the inference thread's
+/// `queue_mu` and `digest_mu` snapshots under those same locks: a
 /// Session is POD with an inline model buffer, so the copy stays valid after
 /// its slot frees. Rows carry no pointers into scheduler or registry state.
-fn liveSessions(registry: *ModelRegistry, buf: *[instr.MAX_SESSIONS]instr.Session) []instr.Session {
+fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Session) []instr.Session {
     const sch = global_scheduler orelse return buf[0..0];
     sch.queue_mu.lockUncancelable(sch.io);
     const live = sch.live_session_count;
     @memcpy(buf[0..live], sch.live_sessions[0..live]);
     sch.queue_mu.unlock(sch.io);
 
+    sch.digest_mu.lockUncancelable(sch.io);
+    const n = instr.appendUnclaimedCached(buf, live, sch.cached_sessions[0..sch.cached_session_count]);
+    sch.digest_mu.unlock(sch.io);
+
     registry.mutex.lockUncancelable(registry.io);
     defer registry.mutex.unlock(registry.io);
-    for (buf[0..live]) |*s| {
+    for (buf[0..n]) |*s| {
         const entry = registry.peekLocked(s.model()) orelse continue;
         if (entry.state != .ready) continue;
         if (entry.config) |cfg| s.context_length = getEffectiveContextLength(cfg);
     }
-    return buf[0..live];
+    return buf[0..n];
 }
 
 /// Metal's recommended max working-set size for the default device — the real
@@ -7133,6 +7137,8 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
+    /// KV of the hot prefix caches + live slots.
+    kv_cache_mem: u64,
     /// Leading-comma JSON fragments spliced before the root close (the ANE
     /// object, the qwen4 n-gram warm object). Concatenated by the handler.
     extra_json: []const u8,
@@ -7147,7 +7153,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}{s}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d}}}{s}}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -7157,7 +7163,7 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
-        extra_json,
+        kv_cache_mem,                   extra_json,
     });
 }
 
@@ -7355,7 +7361,11 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, update_json });
     defer allocator.free(extra_json);
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extra_json);
+    const kv_cache_mem: u64 = if (global_scheduler) |sch|
+        sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
+    else
+        0;
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, kv_cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -19973,7 +19983,7 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 0, "");
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
@@ -19991,7 +20001,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     // Spliced into a props body it stays valid JSON with the object present.
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5_moe";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20015,7 +20025,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     };
     const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
     defer testing.allocator.free(dual);
-    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, dual);
     defer testing.allocator.free(dual_body);
     var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
     defer dual_parsed.deinit();
@@ -20063,7 +20073,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20117,7 +20127,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
 
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen4_exp";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20132,7 +20142,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
     defer testing.allocator.free(ane);
     const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ ane, frag });
     defer testing.allocator.free(both);
-    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, both);
+    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, both);
     defer testing.allocator.free(body2);
     var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, body2, .{});
     defer parsed2.deinit();
@@ -20153,7 +20163,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 8888, "");
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
@@ -20169,6 +20179,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     // The missing 61 GB was MLX's reclaimable buffer pool, which nothing we
     // expose reported — so the bug was invisible from every surface.
     try testing.expect(std.mem.indexOf(u8, body, "\"cache_bytes\":4321") != null); // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"kv_cache_bytes\":8888") != null); // llmtop
 }
 
 test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {
@@ -24605,8 +24616,17 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
     row.request_id = 42;
     row.max_tokens = 32000;
     row.elapsed_seconds = 12.5;
+    row.entry_id = 7;
     sch.live_sessions[0] = row;
     sch.live_sessions[1] = instr.Session.init("org/never-loaded", .prefill, 512, 0, 0, 1024);
+    sch.digest_mu = .init;
+    var restored = instr.Session.init("org/live-test", .cached, 1200, 1200, 0, 2048);
+    restored.entry_id = 7;
+    var idle = instr.Session.init("org/live-test", .cached, 300, 300, 0, 512);
+    idle.entry_id = 9;
+    sch.cached_sessions[0] = restored;
+    sch.cached_sessions[1] = idle;
+    sch.cached_session_count = 2;
     const prev_sch = global_scheduler;
     defer global_scheduler = prev_sch;
     global_scheduler = &sch;
@@ -24622,9 +24642,13 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
     defer server_config.max_context_size = prev_ctx;
     server_config.max_context_size = 8192; // manualContext wins: no GPU sizing
 
-    var buf: [instr.MAX_SESSIONS]instr.Session = undefined;
+    var buf: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
     const rows = liveSessions(reg, &buf);
-    try t.expectEqual(@as(usize, 2), rows.len);
+    // The entry the decode row restored from is listed once, as that row.
+    try t.expectEqual(@as(usize, 3), rows.len);
+    try t.expectEqual(instr.Session.Phase.cached, rows[2].phase);
+    try t.expectEqual(@as(u32, 300), rows[2].context_tokens);
+    try t.expectEqual(@as(u32, 8192), rows[2].context_length);
     try t.expectEqualStrings("org/live-test", rows[0].model());
     try t.expectEqual(@as(u64, 42), rows[0].request_id);
     try t.expectEqual(@as(u32, 32000), rows[0].max_tokens);

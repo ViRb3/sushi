@@ -105,6 +105,15 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   effective limit, 0 = not ready/unknown), `cached_tokens`, `generated_tokens`, `max_tokens` (the request's own
   output cap), `elapsed_seconds` (age since arrival, refreshed every publish) and `state_bytes` (GPU bytes of the
   slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row).
+- A live row's `state_bytes` is at capacity: a ringed layer's ring, each QSA bank by its capacity buffer (never also
+  its view), and the ring restore points the slot holds.
+- After the live rows come `cached` rows, one per hot-cache entry of every ready model (cap 32, published under
+  `digest_mu`): `context_tokens` = `cached_tokens` = the entry's tokens, `state_bytes` its `kv_bytes`. A cached row has
+  no request, so `request_id`, `max_tokens`, `generated_tokens` and `elapsed_seconds` are 0.
+- An entry a live row restored from is listed once, as that row: the dedupe keys on an internal entry id that
+  `/metrics.json` does not emit.
+- `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
+  each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
 
 ## Chat page (`GET /`, `GET /chat`)
 

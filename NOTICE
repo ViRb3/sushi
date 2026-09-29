@@ -235,16 +235,16 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     `src/scheduler.zig`) and the one-token full-hit guard, from mlx-serve
     a456fd01 (#518) by David Dalcu. Modifications: only qwen4_exp's
     inference-thread admission pass takes the checkout.
-  * Per-request live sessions on `/metrics.json` (`Session` and
-    `renderJson` in `src/metrics.zig`, `publishLiveKvResidency` in
-    `src/scheduler.zig`, `liveSessions` and the `/metrics.json` handler in
-    `src/server.zig`), from the mlx-serve sessions publish chain that follows
-    4e00f2af (live KV residency) by David Dalcu (upstream PR ref TBD).
-    Modifications: the hot-cache `cached` rows and `entry_id` are not ported
-    (sushi tracks no restored-entry id); rows add sushi's poll-stable submit
-    sequence `request_id`, the request's `max_tokens` and `elapsed_seconds`;
-    `state_bytes` sums the slot's own KV and SSM arrays directly
-    (`KVCache.residentBytes`, `ssmEntryBytes`).
+  * Live-request KV residency and the per-request `/metrics.json` sessions
+    (`Session`, `renderJson` and `appendUnclaimedCached` in `src/metrics.zig`,
+    `publishLiveKvResidency` and `publishCachedSessions` in
+    `src/scheduler.zig`, `liveSessions`, the `/metrics.json` handler and
+    `/props` `kv_cache_bytes` in `src/server.zig`), from mlx-serve 4e00f2af
+    and eca42620 (#590) by David Dalcu. Modifications: rows add sushi's
+    poll-stable submit sequence `request_id`, the request's `max_tokens` and
+    `elapsed_seconds` (0 on a cached row) and do not emit `entry_id`; a
+    donated checkout is counted once, QSA banks by their capacity buffers, a
+    slot's ring restore points count, and `/props` gains only `kv_cache_bytes`.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)

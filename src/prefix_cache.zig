@@ -139,6 +139,8 @@ pub const LookupResult = struct {
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
+    /// `Entry.id` of the RAM entry restored from; 0 = none.
+    entry_id: u64 = 0,
 };
 
 /// A ringed slot's restore points (`KVCache.ringCheckpoint`), handed to the commit that owns
@@ -187,6 +189,8 @@ const Entry = struct {
     /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
     /// Eviction is fair across keys: the key holding the most entries pays first.
     cache_key: u64 = 0,
+    /// Stable identity for observers; `last_used` moves on every touch.
+    id: u64 = 0,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
     /// handles to the GPU buffers backing positions 0..tokens.len.
     snapshot: KVCacheSnapshot,
@@ -252,6 +256,8 @@ const Entry = struct {
     /// Has the slot's append donated these buffers in place (`donateCheckout`)? Until then the
     /// entry's handles are live and a slot that ends hands the entry back; only a donated checkout is dropped.
     checkout_donated: bool = false,
+    /// Snapshot bytes the donation handed the slot; `kv_bytes` keeps billing them until release.
+    donated_bytes: u64 = 0,
 };
 
 /// What a spec-snap adoption may do, decided before any mlx call.
@@ -1540,6 +1546,7 @@ pub const HotPrefixCache = struct {
             .full_match = full_match,
             .dflash_base = restoreDflash(e, dflash_target, matched, s),
             .mtp_base = restoreMtp(e, mtp_target, matched, s),
+            .entry_id = e.id,
         };
         if (!full_reuse) {
             res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
@@ -1613,9 +1620,19 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             if (e.checked_out_by != slot_id) continue;
             if (e.checkout_donated) continue;
+            e.donated_bytes = snapshotBytes(&e.snapshot);
             e.snapshot.releaseHandles();
             e.checkout_donated = true;
         }
+    }
+
+    /// Bytes this cache still bills that `slot_id` now owns (its donated checkout). Inference thread only.
+    pub fn donatedBytes(self: *const HotPrefixCache, slot_id: usize) u64 {
+        var total: u64 = 0;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by == slot_id and e.checkout_donated) total += e.donated_bytes;
+        }
+        return total;
     }
 
     /// End of a slot's life. Not donated: the entry never gave its handles up, hand it back
@@ -2214,6 +2231,7 @@ pub const HotPrefixCache = struct {
             .cache_key = cache_key,
             .media_start = eff_media_start,
             .snapshot = new_snap,
+            .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
             .quant_config = quant_config,
             .kv_bytes = new_bytes,
@@ -10287,4 +10305,65 @@ fn testCheckedOutRetentionCap(max_entries: u32, max_bytes: u64) !void {
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     try testing.expectEqual(max_bytes, hc.current_kv_bytes);
     try testing.expect(hc.entries.items[0].checked_out_by != null);
+}
+
+test "a restore names its entry, and a commit that extends it in place keeps the id" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tokens: [64]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var longer: [80]u32 = undefined;
+    for (&longer, 0..) |*t, i| t.* = @intCast(i + 7);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 64);
+    const id = hc.entries.items[0].id;
+    try testing.expect(id != 0);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &longer, false, 0, null, null, null, 0);
+    try testing.expectEqual(id, res.entry_id);
+
+    try testFillCache(&slot, s, 1, longer.len);
+    _ = try hc.commit(&slot, &longer, false);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(id, hc.entries.items[0].id);
+}
+
+test "a donated checkout names the bytes its slot now holds; a share names none" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 1024);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
+    try testing.expect(res.checked_out);
+    // Until the transfer the slot shares the entry's buffers, which the entry bills.
+    try testing.expectEqual(@as(u64, 0), slot.residentBytes());
+    try testing.expectEqual(@as(u64, 0), hc.donatedBytes(0xA11CE));
+
+    const billed = hc.residentBytes();
+    hc.donateCheckout(0xA11CE);
+    slot.adoptRestored();
+    // The entry keeps billing what the slot now owns, so a live count subtracts it.
+    try testing.expectEqual(billed, hc.residentBytes());
+    try testing.expect(slot.residentBytes() > 0);
+    try testing.expectEqual(slot.residentBytes(), hc.donatedBytes(0xA11CE));
+    try testing.expectEqual(@as(u64, 0), hc.donatedBytes(0xB0B));
+
+    hc.releaseCheckout(0xA11CE, "test");
+    try testing.expectEqual(@as(u64, 0), hc.donatedBytes(0xA11CE));
 }
