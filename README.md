@@ -62,6 +62,19 @@ the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at
 | 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 880k / 1M |
 | 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M |
 
+## Benchmarks
+
+Reported speed using llmprobe `--bench-only`:
+
+| Class | Typical RAM | Pack | Prefill tok/s | Gen tok/s |
+|---|---|---|---:|---:|
+| M1 Max | 64 GB | 3bpw | ~350 | ~32 |
+| M2 Max | 64 GB | 3bpw | ~400 | ~38-40 |
+| M3 Ultra 60c | 256 GB | 4bpw | ~420 | ~60 |
+| M5 Pro | 64 GB | 2.6bpw | ~900 | ~50-55 |
+| M5 Max | 128 GB | 3bpw | ~1,900 | ~95 |
+| M5 Max | 128 GB | 4bpw | ~1,750 | ~90 |
+
 ## Recommended launch
 
 **48 GB Mac, Sushi-2bpw**
