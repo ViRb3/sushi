@@ -930,3 +930,43 @@ test "decode_serial_total carries one labelled series per serial reason, never o
     try testing.expectEqual(@as(i64, 3), serial.get("spec_active").?.integer);
     try testing.expect(serial.get("ok") == null);
 }
+
+test "renderJson lists each live session's context against its model's limit" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var s1 = Session.init("org/pack \"q\"", .decode, 1700, 1200, 200, 4096);
+    s1.context_length = 8192;
+    s1.request_id = 42;
+    s1.max_tokens = 32000;
+    s1.elapsed_seconds = 12.5;
+    const s2 = Session.init("org/plain", .prefill, 512, 0, 0, 1024);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{ s1, s2 }, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("sessions").?.array.items;
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    const row = rows[0].object;
+    try testing.expectEqualStrings("org/pack \"q\"", row.get("model").?.string);
+    try testing.expectEqual(@as(i64, 42), row.get("request_id").?.integer);
+    try testing.expectEqualStrings("decode", row.get("phase").?.string);
+    try testing.expectEqual(@as(i64, 1700), row.get("context_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 8192), row.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 1200), row.get("cached_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 200), row.get("generated_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 32000), row.get("max_tokens").?.integer);
+    try testing.expectApproxEqAbs(@as(f64, 12.5), row.get("elapsed_seconds").?.float, 0.0001);
+    try testing.expectEqual(@as(i64, 4096), row.get("state_bytes").?.integer);
+    // The second row's phase tag renders from `@tagName`.
+    try testing.expectEqualStrings("prefill", rows[1].object.get("phase").?.string);
+
+    // Zero sessions (idle server, or an old reader of the same feed) still
+    // emit the key as an empty array — the contract's absence case.
+    var w0: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{}, &w0);
+    const parsed0 = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w0.end], .{});
+    defer parsed0.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed0.value.object.get("sessions").?.array.items.len);
+}

@@ -9986,3 +9986,83 @@ test "decode share: cancelled prefill stops its hosted ticks before touching the
     try testing.expectEqual(@as(u32, 1), result.ticks);
     try testing.expectEqual(@as(u64, 1), result.spent_ns);
 }
+
+test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" {
+    var mm = metrics_mod.Metrics.init();
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.metrics = &mm;
+    sch.live_sessions = undefined;
+    sch.live_session_count = 999; // a stale count must not survive a publish
+    sch.decoding = .empty;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/live-test";
+    var slot: Slot = undefined;
+    // Only the fields the publish path reads: rows are value copies.
+    slot.model = &model;
+    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+    slot.ssm_entries = null;
+    slot.full_prompt = &.{};
+    slot.prompt_tokens = 1000;
+    slot.completion_tokens = 7;
+    slot.cached_tokens = 900;
+    slot.request_id = 42;
+    slot.max_tokens = 32000;
+    slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
+    var ptrs = [_]*Slot{&slot};
+    sch.decoding.items = &ptrs;
+    sch.decoding.capacity = ptrs.len;
+
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(usize, 1), sch.live_session_count);
+    const d = &sch.live_sessions[0];
+    try testing.expectEqualStrings("org/live-test", d.model());
+    try testing.expectEqual(metrics_mod.Session.Phase.decode, d.phase);
+    // Decode row: prompt_tokens + completion_tokens, the generated tail split
+    // out for the dashboard's context-fill bar.
+    try testing.expectEqual(@as(u32, 1007), d.context_tokens);
+    try testing.expectEqual(@as(u32, 900), d.cached_tokens);
+    try testing.expectEqual(@as(u32, 7), d.generated_tokens);
+    try testing.expectEqual(@as(u64, 42), d.request_id);
+    try testing.expectEqual(@as(u32, 32000), d.max_tokens);
+    try testing.expectApproxEqAbs(@as(f64, 0), d.elapsed_seconds, 10.0);
+
+    // An empty KV cache and no SSM entries bill EXACTLY zero — the state
+    // bytes come from the slot's own arrays, never a modeled estimate.
+    try testing.expectEqual(@as(u64, 0), d.state_bytes);
+
+    // A republish (the next poll) carries the SAME request_id — the row
+    // identity a per-request downstream key needs — and a non-decreasing age.
+    const first_elapsed = d.elapsed_seconds;
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(u64, 42), sch.live_sessions[0].request_id);
+    try testing.expect(sch.live_sessions[0].elapsed_seconds >= first_elapsed);
+
+    // Prefilling slot (not in `decoding` yet) gets its own row: two live rows.
+    var prompt_ids: [64]u32 = undefined;
+    slot.full_prompt = &prompt_ids;
+    publishLiveKvResidency(&sch, &slot);
+    try testing.expectEqual(@as(usize, 2), sch.live_session_count);
+    try testing.expectEqual(metrics_mod.Session.Phase.prefill, sch.live_sessions[0].phase);
+    // The prefill row bills the FULL prompt (the decode row's `prompt_tokens`
+    // only lands at prefill completion): 64 + 7.
+    try testing.expectEqual(@as(u32, 71), sch.live_sessions[0].context_tokens);
+    try testing.expectEqual(metrics_mod.Session.Phase.decode, sch.live_sessions[1].phase);
+
+    // The step-5 cull republishes without the prefilling row; the slot still
+    // decoding keeps only its decode row.
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(usize, 1), sch.live_session_count);
+    // Culling the slot empties the snapshot: a poll must never resurrect a
+    // finished row.
+    _ = sch.decoding.orderedRemove(0);
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(usize, 0), sch.live_session_count);
+
+    // Zero-when-off: with no sink the publish is a single reset — no rows.
+    var ptrs2 = [_]*Slot{&slot};
+    sch.decoding.items = &ptrs2;
+    sch.metrics = null;
+    publishLiveKvResidency(&sch, &slot);
+    try testing.expectEqual(@as(usize, 0), sch.live_session_count);
+}
