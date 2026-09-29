@@ -39,10 +39,10 @@ passes them and keeps the names above is safe to hand over.
 
 ## MLX pins
 
-Each repo pins and builds its own MLX and mlx-c; the module adds no pin of its own and must
-build and run against both. Sushi pins MLX v0.32.2 and mlx-c 56b2d39. mlx-serve pins mlx-c
-56b2d39 and an MLX commit on v0.32.2 plus the sorted `gather_qmm` NAX 32K-row fix
-(ml-explore/mlx#3922). Check both before relying on MLX behaviour newer than v0.32.2.
+Each repo builds its own MLX and mlx-c; the module adds no pin of its own. Both repos pin the
+same commits: MLX d73eb752 (v0.32.2 plus the sorted `gather_qmm` NAX 32K-row fix,
+ml-explore/mlx#3922) and mlx-c 56b2d39. Move both pins together. MLX v0.32.3 needs a newer
+mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does not pass.
 
 ## Handing a new engine to mlx-serve
 
