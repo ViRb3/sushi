@@ -81,8 +81,10 @@ that shares no code with ours.
 | pack | KLD | top-1 | cosine loss | all positions |
 |---|---|---|---|---|
 | mlx-serve mixed-4-8bit (affine 4-bit gs64 / 8-bit; the control) | 0.0818 | 91.39% | 2.63% | 0.0752 |
-| Sushi-3bpw (MCG K3 w15; binary 7ed9795) | 0.1012 | 90.26% | 3.14% | 0.0931 |
-| Sushi-4bpw (MCG K4 w15; binary 30a27ba) | 0.0632 | 92.99% | 2.25% | 0.0588 |
+| Sushi-3bpw, first release (MCG K3 w15, bf16 table; binary 7ed9795) | 0.1012 | 90.26% | 3.14% | 0.0931 |
+| Sushi-4bpw, first release (MCG K4 w15, bf16 table; binary 30a27ba) | 0.0632 | 92.99% | 2.25% | 0.0588 |
+| Sushi-3bpw, published 2026-09-29 (MCG K3 w14, 4-bit g32 table; binary 942134d) | 0.1036 | 90.31% | 3.11% | 0.0941 |
+| Sushi-4bpw, published 2026-09-29 (MCG K4 w15, bf16 table; binary 942134d) | 0.0592 | 92.89% | 2.18% | 0.0554 |
 
 The control row ran on binaries a05d15f / 28d7fab (the KLD tool is unchanged between them). Sushi-4bpw reads below it.
 
@@ -99,9 +101,12 @@ n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi pack
 | mlx-serve mixed-4-8bit (ddalcu; the control above) | 70.13 | 0.0818 | 91.39% |
 | oMLX oQ4e (Jundot) | 69.21 | 0.1370 | 88.87% |
 | affine q3 | 54.94 | 0.1444 | 88.05% |
+| Vontra 4-bit g32 (TensorFold), as published | 75.60 | 0.2074 | 85.01% |
 | mlx-serve iQ-MLX 3.3bpw (ddalcu; imatrix-weighted affine) | 50.60 | 0.1987 | 86.28% |
-| Sushi-3bpw with mixed-4-8bit's 4-bit g32 n-gram table (the published Sushi-3bpw) | 49.33 | 0.1047 | 90.34% |
-| Sushi-4bpw with the same 4-bit g32 table | 63.68 | 0.0666 | 92.35% |
+| Sushi-3bpw first release with mixed-4-8bit's 4-bit g32 n-gram table (as first published) | 49.33 | 0.1047 | 90.34% |
+| Sushi-4bpw first release with the same 4-bit g32 table | 63.68 | 0.0666 | 92.35% |
+| Sushi-3bpw published 2026-09-29 with the bf16 table (binary 942134d) | 49.33 | 0.1006 | 90.80% |
+| Sushi-4bpw published 2026-09-29 with the 4-bit g32 table (binary 942134d) | 63.68 | 0.0654 | 92.72% |
 | Sushi-2.6bpw (binary ad5e6be8, 2026-09-27; Sushi-3bpw's 0.10123 and 0.1047 reproduce on it bit for bit) | 43.95 | 0.1303 | 89.33% |
 | Sushi-2.6bpw with the 4-bit g32 table (the published Sushi-2.6bpw) | 43.95 | 0.1355 | 89.08% |
 | Sushi-2bpw with the 4-bit g32 table (the published Sushi-2bpw; bf16 KV, see below) | 34.97 | 0.2080 | 85.94% |
@@ -124,6 +129,11 @@ Sushi-2bpw row: sushi v1.0.4 ReleaseFast, binary SHA-256
 `1c2c952090f2642c5119061fc94a552a131b30ca698779bd9593d1c60f9db934` (mtime 2026-09-26 19:51:49 +0700),
 `mlx-serve-bf16-16x512-raw`, `--kv-quant off` (bf16 KV, unlike every other row), no MTP, 7186 positions to first EOS:
 KLD 0.208021, top-1 85.94%, NLL 0.539001; all positions 0.189374 / 87.30% / 0.484980. M5 Max 128 GB, 2026-09-28.
+
+Rows published 2026-09-29: binary built from `942134d`, ReleaseFast SHA-256
+`baffa6de2624f403be75821caefc924cf4ca3fc087a0c11ce232acf60cdfd8cb` (mtime 2026-09-28 21:01:15 +0700),
+`mlx-serve-bf16-16x512-raw`, kv8, `--tokens 512 --top-k 10 --ctx-size 8192`, no MTP, 7186 positions to first EOS.
+M5 Max 128 GB, `taskpolicy -a`, GPU lock per run, 2026-09-29.
 
 
 <a id="kv-width"></a>

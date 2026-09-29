@@ -150,10 +150,9 @@ through environment variables. `--print` writes the config and prints the launch
 
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
-KLD against the bf16 model: 16 prompts x 512 tokens scored to the first EOS, kv8, every pack run by the same sushi
-build except Sushi-2bpw (sushi v1.0.4, bf16 KV cache). The light rings are the sushi packs with a 4-bit n-gram table
-(Sushi-2bpw, Sushi-2.6bpw and Sushi-3bpw ship that table, and Sushi-2bpw is plotted with it; either table works with
-any pack). Numbers: [docs/quality-kld.md](docs/quality-kld.md).
+KLD against the bf16 model: 16 prompts x 512 tokens scored to the first EOS, kv8, every pack scored by sushi (Sushi-2bpw
+with a bf16 KV cache). Each pack is plotted with the n-gram table it ships: bf16 in Sushi-4bpw, 4-bit in Sushi-2bpw,
+Sushi-2.6bpw and Sushi-3bpw; either table works with any pack. Numbers: [docs/quality-kld.md](docs/quality-kld.md).
 
 ## Speed
 

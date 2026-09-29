@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- Sushi-3bpw and Sushi-4bpw ship new expert weights on Hugging Face: Sushi-4bpw KLD 0.0632 -> 0.0592, Sushi-3bpw 0.1047 -> 0.1036 (each with the n-gram table it ships).
+
 - `/metrics.json` `sessions` also lists each hot-cache conversation no live request holds as a `cached` row, and `/props` reports `memory.kv_cache_bytes` including live requests (mlx-serve 4e00f2af and eca42620 (#590), thanks @ddalcu; builds on #13, thanks @yoyo930021).
 
 - **Per-request live sessions on `/metrics.json`**: every in-flight request publishes its phase, context tokens
