@@ -14,7 +14,7 @@ earlier history is mlx-serve's, in that project's changelog.
   chunk boundary (mlx-serve sessions publish chain after `4e00f2af` (live KV residency), thanks @ddalcu;
   mlx-serve #590).
 
-- MTP prompt lookup is now off by default; set `SUSHI_MTP_LOOKUP=1` to enable it.
+- A prompt-lookup draft is accepted with the exact rule under `--mtp-typical` and `--mtp-tokenv3`, so sampled replies no longer echo their context until the loop guard cuts them (mlx-serve #614, thanks @STRML).
 
 - `--prompt` (also `-p` and `run <model> -p`) honors thinking, sampling and generation flags, then exits after one reply.
 

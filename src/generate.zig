@@ -5942,6 +5942,17 @@ pub const Generator = struct {
         };
     }
 
+    /// A lookup draft is a point mass copied from the context, so it takes exact acceptance
+    /// (keep it with probability p) whatever the MTP mode: a lossy rule that accepts any
+    /// plausible token outright makes copying the context certain, and the output loops.
+    fn acceptGraphFor(self: *const Generator, lookup: bool) MtpGraphFn {
+        return if (lookup) mtpBatchedExactGraph else self.mtp_accept_graph;
+    }
+
+    fn acceptPrefixFor(self: *const Generator, lookup: bool) mtp_acceptance.PrefixFn {
+        return if (lookup) mtp_acceptance.exactPrefix else self.mtp_accept_prefix;
+    }
+
     // Prompt lookup inside the MTP round, ported from mlx-serve #523/#533 (Samuel Reed).
     comptime {
         // A lookup round commits up to MAX_DRAFT_STRONG drafts into `MtpHistStash`.
@@ -5950,10 +5961,10 @@ pub const Generator = struct {
 
     pub var mtp_lookup_env_cache: ?bool = null;
 
-    /// Opt-in: `SUSHI_MTP_LOOKUP=1` enables prompt lookup inside MTP.
+    /// On by default (mlx-serve #533); `SUSHI_MTP_LOOKUP=0` turns it off.
     pub fn mtpLookupEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return false;
-        return value.len > 0 and value[0] != '0';
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
     }
 
     fn mtpLookupEnabled() bool {
@@ -7840,7 +7851,7 @@ pub const Generator = struct {
             // The row's OWN acceptance mode, threshold and draw index: only the
             // filter is shared, so a seeded row keeps its own key.
             const gen = gens[i];
-            const bg = try gen.mtp_accept_graph(
+            const bg = try gen.acceptGraphFor(st.chain.lookup)(
                 row_probs,
                 st.chain.draft_arrs[0..st.chain.m],
                 if (st.chain.q_probs) |qs| qs[0..st.chain.m] else null,
@@ -7981,7 +7992,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_slice(&live_logits, verify_logits, &.{ 0, 0, 0 }, 3, &.{ vl_shape[0], @intCast(1 + m), vl_shape[2] }, 3, &.{ 1, 1, 1 }, 3, s));
             const probs_all = try probsAllPositions(live_logits, self.sampling, s);
             defer _ = mlx.mlx_array_free(probs_all);
-            const bg = try self.mtp_accept_graph(
+            const bg = try self.acceptGraphFor(chain.lookup)(
                 probs_all,
                 draft_arrs[0..m],
                 if (q_probs) |qs| qs[0..m] else null,
@@ -8188,7 +8199,7 @@ pub const Generator = struct {
                 const defer_ptr = mlx.mlx_array_data_bool(accept_defer_vec) orelse return error.MlxArrayDataNull;
                 defer_data = defer_ptr[0..m];
             }
-            accepted = self.mtp_accept_prefix(p_data[0..m], q_data, defer_data, &self.prng);
+            accepted = self.acceptPrefixFor(chain.lookup)(p_data[0..m], q_data, defer_data, &self.prng);
             accepted = capAcceptedForTokenBudget(
                 accepted,
                 self.completion_tokens,
@@ -17560,6 +17571,46 @@ test "greedy tail: each depth's verify q is the density its draft came from" {
     try testing.expectEqual(@as(i32, @intCast(other)), corr[1]);
 }
 
+test "a prompt-lookup draft is kept only as often as sampling would keep it under typical acceptance" {
+    // A copied token at p = 0.05 in a high-entropy row clears typical's floor (0.2 * e^-H), so
+    // the typical route keeps it every time; a lookup round must keep it about 5% of the time.
+    const s = mlx.gpuStream();
+    const V = 32;
+    var p_data: [2 * V]f32 = undefined;
+    p_data[0] = 0.05;
+    for (p_data[1..V]) |*v| v.* = 0.95 / @as(f32, V - 1);
+    for (p_data[V..]) |*v| v.* = 1.0 / @as(f32, V);
+    const p_shape = [_]c_int{ 1, 2, V };
+    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const id: i32 = 0;
+    const id_shape = [_]c_int{1};
+    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(draft);
+    const drafts = [_]mlx.mlx_array{draft};
+
+    var g: Generator = undefined;
+    g.mtp_accept_graph = Generator.mtpBatchedTypicalGraph;
+    g.mtp_accept_prefix = mtp_acceptance.typicalPrefix;
+    g.mtp_accept_param = 0.2;
+    var prng = std.Random.DefaultPrng.init(0x100C);
+    var kept: [2]u32 = .{ 0, 0 };
+    for ([_]bool{ false, true }, 0..) |lookup, arm| {
+        var bg = try g.acceptGraphFor(lookup)(probs, &drafts, null, 1, g.mtp_accept_param, .{}, s);
+        defer bg.deinit();
+        try mlx.check(mlx.mlx_array_eval(bg.accept_p));
+        const p = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.InvalidDtype;
+        var q: ?[]const f32 = null;
+        if (bg.accept_q.ctx != null) {
+            try mlx.check(mlx.mlx_array_eval(bg.accept_q));
+            q = (mlx.mlx_array_data_float32(bg.accept_q) orelse return error.InvalidDtype)[0..1];
+        }
+        for (0..400) |_| kept[arm] += g.acceptPrefixFor(lookup)(p[0..1], q, null, &prng);
+    }
+    try testing.expectEqual(@as(u32, 400), kept[0]);
+    try testing.expect(kept[1] > 0 and kept[1] < 60);
+}
+
 test "MTP TokenV3 batched graph uses full pi for sampled and one-hot drafts" {
     const s = mlx.gpuStream();
     const p_data = [_]f32{ 0.8, 0.19, 0.01, 0, 0, 0, 0, 1 };
@@ -21143,10 +21194,10 @@ test "mtpRoundAcceptObserve: a lookup round feeds only the lookup counters, an M
     try testing.expectApproxEqAbs(mtp_lookup.driftStep(lookup_before), g.mtp_lookup_ema, 1e-6);
 }
 
-test "mtpLookupEnabledFromEnv: off by default, explicit opt-in enables it" {
-    try testing.expect(!Generator.mtpLookupEnabledFromEnv(null));
+test "mtpLookupEnabledFromEnv: on by default, 0 turns it off" {
+    try testing.expect(Generator.mtpLookupEnabledFromEnv(null));
     try testing.expect(Generator.mtpLookupEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpLookupEnabledFromEnv(""));
+    try testing.expect(Generator.mtpLookupEnabledFromEnv(""));
     try testing.expect(!Generator.mtpLookupEnabledFromEnv("0"));
 }
 

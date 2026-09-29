@@ -109,7 +109,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 
 - **A lookup stands in for the chain when the output copies its context** (`mtpLookupChain`, ported from mlx-serve
   #523/#533): the last 3 committed tokens plus t1 matched earlier in the prompt or output, agreeing back 8+ tokens,
-  make the drafts with no head forward. Off by default for the qwen4 head; `SUSHI_MTP_LOOKUP=1` opts in.
+  make the drafts with no head forward. On by default for the qwen4 head; `SUSHI_MTP_LOOKUP=0` turns it off.
 - **An ordinary match (suffix under 32) must agree past the start of a line**: a unified diff echoes the file's
   lines behind a `-`/`+`/space prefix, so its matches agree to the end of one line and fail at the next (-4.8% on
   the diff before the rule, -1.6% after). A line's own last token (`):\n`) agrees whatever the next line starts
@@ -127,8 +127,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - **Declined on MiMo** (three drafts per round), under `SUSHI_MTP_FORCE_DEPTH` (the byte bar's measurement mode),
   for a batched head and in planner-owned rounds; a serial block (adaptive serial past 32k) runs none either.
 - **Output**: greedy is serial byte for byte (every row is a decode tick's); sampled under `exact` keeps the target
-  distribution, but seeded text differs from lookup-off because the draws land differently; `typical`/`tokenv3`
-  accept a lookup draft as leniently as a head draft.
+  distribution, but seeded text differs from lookup-off because the draws land differently. A lookup round always
+  verifies with `exact` (`acceptGraphFor`/`acceptPrefixFor`, keep the copy with probability p; MTP rounds keep the
+  installed mode): a draft is a point mass, so `typical`'s floor makes any plausible copy certain, the output echoes
+  its context and the loop guard cuts it (mlx-serve #614).
 - **Measured on Sushi-3bpw**: copies and edits of a file +16-21%, a write_file tool call +9-11%, long-context edits
   +18-24%; diff, new code and prose inside noise ([perf-baselines](perf-baselines.md#mtp-lookup)).
 - Engagement: `[mtp] prompt-lookup drafts engaged: k=… suffix=…` once, `[spec-stats] … lookup=rounds/drafted/landed`

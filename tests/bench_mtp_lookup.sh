@@ -7,7 +7,7 @@
 #
 # One arm per boot: `SUSHI_MTP_LOOKUP` is read once per process. An A/B is A B B A, e.g.
 #   scripts/gpu-lock.sh acquire lookup-ab && SUSHI_MTP_LOOKUP=0 taskpolicy -a tests/bench_mtp_lookup.sh A <pack>; scripts/gpu-lock.sh release lookup-ab
-#   scripts/gpu-lock.sh acquire lookup-ab && SUSHI_MTP_LOOKUP=1 taskpolicy -a tests/bench_mtp_lookup.sh B <pack>; scripts/gpu-lock.sh release lookup-ab
+#   scripts/gpu-lock.sh acquire lookup-ab && taskpolicy -a tests/bench_mtp_lookup.sh B <pack>; scripts/gpu-lock.sh release lookup-ab
 # A third boot with `--no-mtp` (label S) turns the compare's greedy byte line into the serial bar.
 # Speeds are the server's own `timings.predicted_per_second`; each request's `[spec-stats]` lines
 # are cut from the server log. The arm is proven by `lookup=R/D/L` and the one-shot
