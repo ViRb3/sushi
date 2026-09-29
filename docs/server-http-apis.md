@@ -98,6 +98,13 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 - `--api-key`: loopback exempt, `/health` + OPTIONS + `GET` of the chat page open, `constTimeEql`.
 - `--metrics`: zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`.
+- `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
+  by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
+  `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),
+  `phase`, `context_tokens` (prompt + decoded; the FULL prompt on a prefill row), `context_length` (the model's
+  effective limit, 0 = not ready/unknown), `cached_tokens`, `generated_tokens`, `max_tokens` (the request's own
+  output cap), `elapsed_seconds` (age since arrival, refreshed every publish) and `state_bytes` (GPU bytes of the
+  slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row).
 
 ## Chat page (`GET /`, `GET /chat`)
 

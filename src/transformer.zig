@@ -7984,6 +7984,22 @@ pub const KVCache = struct {
         self.* = fresh;
     }
 
+    /// GPU bytes of the buffers this cache owns. A restored share is billed to
+    /// the hot-cache entry that owns its buffer (`shared_view`); a COW grow that
+    /// materialized the slot's own copy clears the flag and bills here. mlx-c
+    /// arrays carry their shape + dtype, so the sum is exact, not a heuristic
+    /// (same accounting as `HotPrefixCache.snapshotBytes`).
+    pub fn residentBytes(self: *const KVCache) u64 {
+        var total: u64 = 0;
+        for (self.entries) |e| {
+            if (!e.initialized or e.shared_view) continue;
+            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+                if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+            }
+        }
+        return total;
+    }
+
     /// Capture cache state for speculative-decoding rollback (PLD/drafter).
     /// Snapshots own array handles that share the underlying buffer with the
     /// source via refcount — cheap (no data copy) and immune to subsequent
@@ -9272,6 +9288,17 @@ fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
     const arr = if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state;
     if (arr.ctx == null) return 0;
     return @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+}
+
+/// A live request's recurrent state: the hybrid's counterpart of its KV.
+/// The GDN pair plus the raw QSA indexer history (`qsa_key_buf` is the
+/// capacity buffer `aux_state` views; whichever is resident carries it).
+pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
+    var total: u64 = 0;
+    inline for (.{ e.conv_state, e.ssm_state }) |arr| {
+        if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+    }
+    return total + qsaRawKeyBytes(e);
 }
 
 fn qsaLeftoverAt(aux: mlx.mlx_array, hist: c_int, pos: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {

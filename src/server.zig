@@ -2242,7 +2242,8 @@ fn handleConnection(
         if (g_metrics) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            try instr.renderJson(m, &out.writer);
+            var sessions: [instr.MAX_SESSIONS]instr.Session = undefined;
+            try instr.renderJson(m, liveSessions(registry, &sessions), &out.writer);
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
@@ -2611,6 +2612,28 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     // Not pinned yet (a discovery stub that was never loaded): compute from
     // current GPU memory rather than a fixed 16K cap.
     return autoContextFor(config);
+}
+
+/// Live requests, each row stamped with its model's effective context limit.
+/// The connection-thread reader copies the inference thread's `queue_mu`
+/// snapshot under that same lock (the `hot_cache_digests` discipline): a
+/// Session is POD with an inline model buffer, so the copy stays valid after
+/// its slot frees. Rows carry no pointers into scheduler or registry state.
+fn liveSessions(registry: *ModelRegistry, buf: *[instr.MAX_SESSIONS]instr.Session) []instr.Session {
+    const sch = global_scheduler orelse return buf[0..0];
+    sch.queue_mu.lockUncancelable(sch.io);
+    const live = sch.live_session_count;
+    @memcpy(buf[0..live], sch.live_sessions[0..live]);
+    sch.queue_mu.unlock(sch.io);
+
+    registry.mutex.lockUncancelable(registry.io);
+    defer registry.mutex.unlock(registry.io);
+    for (buf[0..live]) |*s| {
+        const entry = registry.peekLocked(s.model()) orelse continue;
+        if (entry.state != .ready) continue;
+        if (entry.config) |cfg| s.context_length = getEffectiveContextLength(cfg);
+    }
+    return buf[0..live];
 }
 
 /// Metal's recommended max working-set size for the default device — the real
@@ -24569,4 +24592,53 @@ test "one-shot shutdown closes an unaccepted connection before joining its clien
     const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
     closeEmbeddedListener(std.testing.io, &listener, thread);
     try std.testing.expect(waiter.disconnected);
+}
+
+test "liveSessions copies the queue snapshot and stamps the effective context limit" {
+    const t = std.testing;
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.io = t.io;
+    sch.queue_mu = .init;
+    sch.live_sessions = undefined;
+    sch.live_session_count = 2;
+    var row = instr.Session.init("org/live-test", .decode, 1700, 1200, 200, 4096);
+    row.request_id = 42;
+    row.max_tokens = 32000;
+    row.elapsed_seconds = 12.5;
+    sch.live_sessions[0] = row;
+    sch.live_sessions[1] = instr.Session.init("org/never-loaded", .prefill, 512, 0, 0, 1024);
+    const prev_sch = global_scheduler;
+    defer global_scheduler = prev_sch;
+    global_scheduler = &sch;
+
+    const reg = try ModelRegistry.init(t.allocator, t.io, null, 1, 0, null);
+    defer reg.deinit();
+    const lm = try reg.registerStub("org/live-test", "/path/to/m", null);
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    lm.state = .ready;
+    lm.config = &cfg;
+    defer lm.config = null; // LoadedModel.deinit destroys a non-null config — detach first
+    const prev_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = prev_ctx;
+    server_config.max_context_size = 8192; // manualContext wins: no GPU sizing
+
+    var buf: [instr.MAX_SESSIONS]instr.Session = undefined;
+    const rows = liveSessions(reg, &buf);
+    try t.expectEqual(@as(usize, 2), rows.len);
+    try t.expectEqualStrings("org/live-test", rows[0].model());
+    try t.expectEqual(@as(u64, 42), rows[0].request_id);
+    try t.expectEqual(@as(u32, 32000), rows[0].max_tokens);
+    try t.expectEqual(@as(f64, 12.5), rows[0].elapsed_seconds);
+    // The ready model's row carries its EFFECTIVE limit (`--ctx-size` ranks
+    // above the model default, auto sizing never runs here).
+    try t.expectEqual(@as(u32, 8192), rows[0].context_length);
+    // An id the registry never resolved keeps 0 = unknown — a placeholder,
+    // never a modeled guess — and the queue snapshot itself is untouched:
+    // the reader copies, it never mutates the inference thread's rows.
+    try t.expectEqual(@as(u32, 0), rows[1].context_length);
+    try t.expectEqual(@as(u32, 0), sch.live_sessions[0].context_length);
+
+    // Before `serve()` wires a scheduler: an empty slice, not a crash.
+    global_scheduler = null;
+    try t.expectEqual(@as(usize, 0), liveSessions(reg, &buf).len);
 }

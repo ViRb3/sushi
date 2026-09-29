@@ -135,6 +135,11 @@ check "/metrics.json has 'histograms' key" "$(echo "$JBODY" | grep -q '"histogra
 check "/metrics.json has 'generation_tokens_live'" \
     "$(echo "$JBODY" | grep -q '"generation_tokens_live"' && echo 1 || echo 0)"
 check "/metrics.json has 'bucket_counts'"  "$(echo "$JBODY" | grep -q '"bucket_counts"' && echo 1 || echo 0)"
+check "/metrics.json 'sessions' is an empty array when idle" \
+    "$(echo "$JBODY" | python3 -c "
+import json,sys
+s = json.load(sys.stdin).get('sessions')
+print(1 if isinstance(s, list) and len(s) == 0 else 0)" 2>/dev/null)"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -285,6 +290,58 @@ check "forwarded + restored == billed ($F2 + $C2 == $P2)" \
 # The panel divides by this counter; it must never exceed the billed total.
 check "prefill_tokens_total <= prompt_tokens_total" \
     "$([ "$F2" -le "$P2" ] 2>/dev/null && echo 1 || echo 0)"
+
+# ── Phase 6: per-request live sessions ──
+#
+# `/metrics.json` ends with one row per live request (mlx-serve port): phase,
+# context occupancy against the model's limit, and a submit-stable request_id.
+echo ""
+echo "── Phase 6: live per-request sessions ──"
+
+REQ6=$(python3 -c "
+import json,sys
+print(json.dumps({'model':'sushi','stream':False,'max_tokens':64,'temperature':0,
+                  'messages':[{'role':'user','content':sys.stdin.read()}]}))" <<< "$BIG")
+curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$REQ6" >/dev/null &
+CURL_PID=$!
+
+SAW_ROW=0
+STABLE_ID=0
+GOOD_ROW=0
+PREV_ID=""
+for _ in $(seq 1 200); do
+    kill -0 $CURL_PID 2>/dev/null || break     # request finished
+    read -r R N G <<< "$(curl -s -m 2 "$BASE/metrics.json" | python3 -c "
+import json,sys
+try:
+    ss = json.load(sys.stdin)['sessions']
+    if ss:
+        r = ss[0]
+        good = (r['context_length'] > 0 and r['max_tokens'] == 64 and
+                r['elapsed_seconds'] > 0 and r['phase'] in ('prefill', 'decode'))
+        print(r['request_id'], len(ss), 1 if good else 0)
+    else: print(0, 0, 0)
+except Exception: print(0, 0, 0)" 2>/dev/null)"
+    if [ -n "$R" ] && [ "$R" != "0" ]; then
+        SAW_ROW=1
+        [ "$G" = "1" ] && GOOD_ROW=1
+        if [ -z "$PREV_ID" ]; then PREV_ID=$R
+        elif [ "$PREV_ID" = "$R" ]; then STABLE_ID=1; fi
+        [ "$STABLE_ID" = "1" ] && break
+    fi
+    sleep 0.2
+done
+wait $CURL_PID 2>/dev/null
+
+check "sessions row appears while a request is live" "$SAW_ROW"
+check "row carries context_length, requested max_tokens, age, prefill|decode phase" "$GOOD_ROW"
+check "request_id is stable across two polls of one request" "$STABLE_ID"
+
+sleep 2
+check "sessions empty again at rest (no resurrected rows)" \
+    "$(curl -s "$BASE/metrics.json" | python3 -c "
+import json,sys
+print(1 if json.load(sys.stdin).get('sessions') == [] else 0)" 2>/dev/null)"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""

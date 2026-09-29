@@ -507,6 +507,11 @@ pub const Slot = struct {
     completion_tokens: u32,
     prefill_tps: f64,
     decode_tps: f64,
+    /// Monotonic submit sequence stamped by `submit` under `queue_mu`. Immutable
+    /// after assignment; it is what keeps one request's `/metrics.json` session
+    /// row the same row across polls (the wire `chatcmpl` id is minted later,
+    /// at response time, and does not map to this).
+    request_id: u64 = 0,
     /// Monotonic timestamp captured in `Slot.init`, BEFORE the queue wait.
     /// Anchors the exact time-to-first-token measurement.
     request_start_ts: std.Io.Timestamp,
@@ -1249,6 +1254,16 @@ pub const Scheduler = struct {
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Per-slot context snapshot for `/metrics.json`, published by the inference
+    /// thread inside the `queue_mu` holds that already bracket the cull, the
+    /// prefill entry, and the interleave chunk boundaries; readers copy under the
+    /// same lock (the `hot_cache_digests` discipline, on the queue instead).
+    live_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
+    live_session_count: usize = 0,
+    /// Submit sequence the session rows carry as `request_id`: taken under
+    /// `queue_mu` in `submit`, immutable on the slot, never reused.
+    req_seq: u64 = 0,
+
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
@@ -1584,6 +1599,11 @@ pub const Scheduler = struct {
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
         try self.cleanup_queue.ensureUnusedCapacity(self.allocator, self.in_flight + 1);
+        // Stamp the stable id the `/metrics.json` session rows carry before the
+        // slot becomes visible to the inference thread; immutable from here.
+        slot.request_id = self.req_seq;
+        self.req_seq += 1;
+
         try self.pending.append(self.allocator, slot);
         self.in_flight += 1;
         self.queue_cond.broadcast(self.io);
@@ -4625,9 +4645,51 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     _ = sch.decoding.orderedRemove(i);
                 } else i += 1;
             }
+            // Republish the snapshot with this tick's survivors, under the same
+            // lock the conn-thread reader copies under.
+            publishLiveKvResidency(sch, null);
         }
     }
     flushImatrixCaptures(sch);
+}
+
+/// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
+/// `prefilling` is the slot mid-prefill, which is not in `decoding` yet.
+/// Zero-when-off: with no `--metrics` sink the rows have no reader
+/// (`/metrics.json` 503s), so the publish is a single store — no per-tick KV scan.
+fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
+    sch.live_session_count = 0;
+    if (sch.metrics == null) return;
+    if (prefilling) |p| recordLiveSession(sch, p, .prefill, slotStateBytes(p));
+    for (sch.decoding.items) |s| recordLiveSession(sch, s, .decode, slotStateBytes(s));
+}
+
+fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session.Phase, state_bytes: u64) void {
+    if (sch.live_session_count == sch.live_sessions.len) return;
+    const prompt: u32 = if (phase == .prefill) @intCast(s.full_prompt.len) else s.prompt_tokens;
+    var session = metrics_mod.Session.init(s.model.id, phase, prompt + s.completion_tokens, s.cached_tokens, s.completion_tokens, state_bytes);
+    // sushi extensions over the upstream row: the stable submit sequence, the
+    // request's own output cap, and its age — measured from the immutable
+    // arrival anchor `Slot.init` stamped, re-derived at every publish so a
+    // long tick never leaves a stale age behind.
+    session.request_id = s.request_id;
+    session.max_tokens = s.max_tokens;
+    const age_ns = s.request_start_ts.untilNow(sch.io, .boot).nanoseconds;
+    session.elapsed_seconds = @as(f64, @floatFromInt(age_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    sch.live_sessions[sch.live_session_count] = session;
+    sch.live_session_count += 1;
+}
+
+/// GPU bytes the slot's own state holds: its KV layers plus the hybrid's
+/// recurrent entries. A restored share whose buffer the hot cache still owns
+/// is billed to that entry (`shared_view`), not here — the COW grow that
+/// materializes the slot's copy clears the flag and starts counting.
+fn slotStateBytes(s: *const Slot) u64 {
+    var bytes = s.cache.residentBytes();
+    if (s.ssm_entries) |ents| for (ents) |*e| {
+        bytes += transformer_mod.ssmEntryBytes(e);
+    };
+    return bytes;
 }
 
 /// Shutdown exit: an armed activation capture is written HERE, the last point
@@ -5525,6 +5587,8 @@ fn liveDecodingCount(sch: *Scheduler) usize {
 
 const InterleaveCtx = struct {
     sch: *Scheduler,
+    /// The slot being prefilled: not in `decoding` yet, its KV still counts.
+    slot: *Slot,
     cancelled: *const std.atomic.Value(bool),
     chunk_sw: io_util.Stopwatch,
     decode_ns: u64 = 0,
@@ -5679,6 +5743,14 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const owed = runOwedDecodeTicks(prefillDecodeShare(), chunk_ns, first_ns, ic, interleaveDecodeTickOpaque);
     ic.ticks +|= owed.ticks;
     ic.decode_ns +|= owed.spent_ns;
+    if (ic.sch.metrics != null) {
+        // Refresh the snapshot at the chunk boundary: the prefill row's token
+        // counts and every decode row's age move between chunks, and inside a
+        // long prefill this is the only point that republishes them.
+        ic.sch.queue_mu.lockUncancelable(ic.sch.io);
+        defer ic.sch.queue_mu.unlock(ic.sch.io);
+        publishLiveKvResidency(ic.sch, ic.slot);
+    }
     ic.chunk_sw.reset();
 }
 
@@ -5737,7 +5809,15 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // prefill path executes NO extra instruction at all (the chunk loop's hook
     // is null too — see the `prefill_progress` option below).
     const observe = sch.metrics != null;
-    if (observe) _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+    if (observe) {
+        _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+        // Advertise the prefilling slot before its first chunk lands: the cull
+        // publish only lists `decoding`, so without this the row is invisible
+        // for the whole (possibly multi-minute) prefill.
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        publishLiveKvResidency(sch, slot);
+    }
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
@@ -6035,7 +6115,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
-    var interleave_ctx = InterleaveCtx{ .sch = sch, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+    var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
@@ -9901,8 +9981,88 @@ test "decode share: the kill switch disables the effective share and only live s
 
 test "decode share: cancelled prefill stops its hosted ticks before touching the scheduler" {
     var cancelled = std.atomic.Value(bool).init(true);
-    var ctx = InterleaveCtx{ .sch = undefined, .cancelled = &cancelled, .chunk_sw = undefined };
+    var ctx = InterleaveCtx{ .sch = undefined, .slot = undefined, .cancelled = &cancelled, .chunk_sw = undefined };
     const result = runOwedDecodeTicks(0.9, 1000, 1, &ctx, interleaveDecodeTickOpaque);
     try testing.expectEqual(@as(u32, 1), result.ticks);
     try testing.expectEqual(@as(u64, 1), result.spent_ns);
+}
+
+test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" {
+    var mm = metrics_mod.Metrics.init();
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.metrics = &mm;
+    sch.live_sessions = undefined;
+    sch.live_session_count = 999; // a stale count must not survive a publish
+    sch.decoding = .empty;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/live-test";
+    var slot: Slot = undefined;
+    // Only the fields the publish path reads: rows are value copies.
+    slot.model = &model;
+    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+    slot.ssm_entries = null;
+    slot.full_prompt = &.{};
+    slot.prompt_tokens = 1000;
+    slot.completion_tokens = 7;
+    slot.cached_tokens = 900;
+    slot.request_id = 42;
+    slot.max_tokens = 32000;
+    slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
+    var ptrs = [_]*Slot{&slot};
+    sch.decoding.items = &ptrs;
+    sch.decoding.capacity = ptrs.len;
+
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(usize, 1), sch.live_session_count);
+    const d = &sch.live_sessions[0];
+    try testing.expectEqualStrings("org/live-test", d.model());
+    try testing.expectEqual(metrics_mod.Session.Phase.decode, d.phase);
+    // Decode row: prompt_tokens + completion_tokens, the generated tail split
+    // out for the dashboard's context-fill bar.
+    try testing.expectEqual(@as(u32, 1007), d.context_tokens);
+    try testing.expectEqual(@as(u32, 900), d.cached_tokens);
+    try testing.expectEqual(@as(u32, 7), d.generated_tokens);
+    try testing.expectEqual(@as(u64, 42), d.request_id);
+    try testing.expectEqual(@as(u32, 32000), d.max_tokens);
+    try testing.expectApproxEqAbs(@as(f64, 0), d.elapsed_seconds, 10.0);
+
+    // An empty KV cache and no SSM entries bill EXACTLY zero — the state
+    // bytes come from the slot's own arrays, never a modeled estimate.
+    try testing.expectEqual(@as(u64, 0), d.state_bytes);
+
+    // A republish (the next poll) carries the SAME request_id — the row
+    // identity a per-request downstream key needs — and a non-decreasing age.
+    const first_elapsed = d.elapsed_seconds;
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(u64, 42), sch.live_sessions[0].request_id);
+    try testing.expect(sch.live_sessions[0].elapsed_seconds >= first_elapsed);
+
+    // Prefilling slot (not in `decoding` yet) gets its own row: two live rows.
+    var prompt_ids: [64]u32 = undefined;
+    slot.full_prompt = &prompt_ids;
+    publishLiveKvResidency(&sch, &slot);
+    try testing.expectEqual(@as(usize, 2), sch.live_session_count);
+    try testing.expectEqual(metrics_mod.Session.Phase.prefill, sch.live_sessions[0].phase);
+    // The prefill row bills the FULL prompt (the decode row's `prompt_tokens`
+    // only lands at prefill completion): 64 + 7.
+    try testing.expectEqual(@as(u32, 71), sch.live_sessions[0].context_tokens);
+    try testing.expectEqual(metrics_mod.Session.Phase.decode, sch.live_sessions[1].phase);
+
+    // The step-5 cull republishes without the prefilling row; the slot still
+    // decoding keeps only its decode row.
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(usize, 1), sch.live_session_count);
+    // Culling the slot empties the snapshot: a poll must never resurrect a
+    // finished row.
+    _ = sch.decoding.orderedRemove(0);
+    publishLiveKvResidency(&sch, null);
+    try testing.expectEqual(@as(usize, 0), sch.live_session_count);
+
+    // Zero-when-off: with no sink the publish is a single reset — no rows.
+    var ptrs2 = [_]*Slot{&slot};
+    sch.decoding.items = &ptrs2;
+    sch.metrics = null;
+    publishLiveKvResidency(&sch, &slot);
+    try testing.expectEqual(@as(usize, 0), sch.live_session_count);
 }
