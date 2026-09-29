@@ -71,7 +71,7 @@ Reported speed using llmprobe `--bench-only`:
 | M1 Max | 64 GB | 3bpw | ~350 | ~32 |
 | M2 Max | 64 GB | 3bpw | ~400 | ~38-40 |
 | M3 Ultra 60c | 256 GB | 4bpw | ~420 | ~60 |
-| M4 Max | 64 GB | 3bpw | — | ~60-65 |
+| M4 Max | 64 GB | 3bpw | ~690 | ~60-65 |
 | M5 Pro | 64 GB | 2.6bpw | ~900 | ~50-55 |
 | M5 Max | 128 GB | 3bpw | ~1,900 | ~95 |
 | M5 Max | 128 GB | 4bpw | ~1,750 | ~90 |
