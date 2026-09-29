@@ -1,6 +1,11 @@
 // Test root — imports all modules to run their embedded tests.
 // Run with: zig build test
 
+// src/exl3 reaches these through its host root.
+pub const mlx = @import("mlx.zig");
+pub const log = @import("log.zig");
+pub const io_util = @import("io_util.zig");
+
 const expert_stream = @import("expert_stream.zig");
 const expert_bf16_kernels = @import("expert_bf16_kernels.zig");
 
@@ -12,8 +17,6 @@ test {
     _ = @import("imatrix.zig");
     _ = @import("hidden_capture.zig");
     _ = @import("expert_quant.zig");
-    _ = @import("expert_exl3.zig");
-    _ = @import("expert_exl3_kernels.zig");
     _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");

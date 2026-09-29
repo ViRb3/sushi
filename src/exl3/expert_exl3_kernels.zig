@@ -1,8 +1,8 @@
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx_host").mlx;
+const log = @import("mlx_host").log;
+const io_util = @import("mlx_host").io_util;
 const exl3 = @import("expert_exl3.zig");
-const io_util = @import("io_util.zig");
 
 var ubench_mute: bool = false;
 var ubench_env: ?bool = null;
@@ -4630,7 +4630,7 @@ test "exl3 a NAX GEMM source the Metal toolchain rejects is declined at the prob
     try t.expect(!mlx.errorPending());
     try t.expect(buildNaxGemmKernel("this is not metal;", "", "sushi_exl3_probe_bad") == null);
     try t.expect(!mlx.errorPending());
-    if (!@import("transformer.zig").verifyQmmNaxAvailable()) return; // the real NAX kernel needs M5-class hardware
+    if (!gemmNaxOn()) return; // the real NAX kernel needs M5-class hardware
     const real = buildNaxGemmKernel(GEMM_NAX_SOURCE, naxHeader(.mul1, .w16), "sushi_exl3_k4_gemm_nax") orelse return error.TestUnexpectedResult;
     _ = mlx.mlx_fast_metal_kernel_free(real);
     try t.expect(!mlx.errorPending());

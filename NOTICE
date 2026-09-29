@@ -484,7 +484,7 @@ and they are listed because they made that work possible.
     DeepSeek-V4-Flash release, the reference for the `deepseek_v4` architecture
     and its chat template.
   * turboderp/exllamav3 (MIT), the EXL3 weight format served for routed
-    experts (`src/expert_exl3.zig`, `src/expert_exl3_kernels.zig`): the 16x16
+    experts (`src/exl3/`): the 16x16
     trellis tile packing, the MCG and MUL1 codebook decodes, the tensor-core
     permutation and the suh/svh Hadamard transforms are re-implemented from its
     reference; no exllamav3 code is shipped.

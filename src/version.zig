@@ -8,7 +8,7 @@
 //! for `sushi --guest-manifest` (the release tarball's `guest.json`).
 
 const std = @import("std");
-const expert_exl3 = @import("expert_exl3.zig");
+const expert_exl3 = @import("sushi_exl3").format;
 
 /// A host that runs sushi as an out-of-process engine refuses a `guest_api` it does not know.
 pub const guest_api = 1;

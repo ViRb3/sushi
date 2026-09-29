@@ -108,6 +108,7 @@ pub fn build(b: *std.Build) void {
     // enabled (the Homebrew bottle ships without them). MUST come before the
     // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
     addMlxLib(b, mod);
+    _ = addExl3Module(b, mod, target, optimize);
     // webp include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -161,6 +162,7 @@ pub fn build(b: *std.Build) void {
     addAneSources(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
+    const exl3_test_mod = addExl3Module(b, test_mod, target, optimize);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     test_mod.linkSystemLibrary("webp", .{});
@@ -185,8 +187,16 @@ pub fn build(b: *std.Build) void {
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
 
+    // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
+    const exl3_tests = b.addTest(.{
+        .name = "exl3-test",
+        .root_module = exl3_test_mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+
     const test_build = b.step("test-build", "Compile unit tests without running them");
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+    test_build.dependOn(&b.addInstallArtifact(exl3_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     if (qwen_preprocess_fixture) |fixture| {
@@ -197,6 +207,7 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&b.addRunArtifact(exl3_tests).step);
 }
 
 /// Translates a single C header into an importable module (`@import("name")`
@@ -234,6 +245,21 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {
     return b.root.root_dir.handle;
+}
+
+/// src/exl3: the EXL3 expert engine, a module so another MLX host (mlx-serve)
+/// can root it too. It reaches mlx, log and io_util through `mlx_host`, so the
+/// host root file must expose them as `pub const`.
+fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const exl3 = b.createModule(.{
+        .root_source_file = b.path("src/exl3/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    host.addImport("sushi_exl3", exl3);
+    return exl3;
 }
 
 /// Link the self-built mlx + mlx-c staged in lib/mlx by scripts/build-mlx.sh

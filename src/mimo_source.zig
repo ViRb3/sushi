@@ -9,7 +9,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
-const expert_exl3 = @import("expert_exl3.zig");
+const expert_exl3 = @import("sushi_exl3").format;
 const expert_quant = @import("expert_quant.zig");
 const fp8_block = @import("fp8_block.zig");
 

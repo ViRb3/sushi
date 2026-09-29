@@ -1,6 +1,6 @@
 const std = @import("std");
 const io_mod = @import("expert_io.zig");
-pub const expert_exl3 = @import("expert_exl3.zig");
+pub const expert_exl3 = @import("sushi_exl3").format;
 
 pub const Geometry = struct {
     layers: u16,
@@ -75,78 +75,6 @@ pub fn isExpertStreamingArch(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "mimo_v2");
 }
 
-pub const Exl3Spec = struct {
-    rate: expert_exl3.Rate,
-    codebook: expert_exl3.Codebook,
-    window: expert_exl3.Window = .w16,
-};
-
-/// `k` is a rate, integer or fractional: admitted only when 16k is an even
-/// whole number of halfwords per tile, which is what every reader indexes by.
-fn rateFromConfigK(k_v: std.json.Value) ?expert_exl3.Rate {
-    const scaled: f64 = switch (k_v) {
-        .integer => |i| @as(f64, @floatFromInt(i)) * 16.0,
-        .float => |f| f * 16.0,
-        else => return null,
-    };
-    const rounded = @round(scaled);
-    if (@abs(scaled - rounded) > 1e-6) return null;
-    if (rounded < 0 or rounded > 1024) return null;
-    return expert_exl3.kFromPackedDim(@intFromFloat(rounded));
-}
-
-/// `window` is the codeword width the pack's search hashed. Absent means 16,
-/// the whole sliding window; a width this build cannot decode is refused, not
-/// rounded — the same bitstream decodes to different weights at each width.
-fn windowFromConfig(v: ?std.json.Value) ?expert_exl3.Window {
-    const raw = v orelse return expert_exl3.Window.w16;
-    if (raw != .integer) return null;
-    return expert_exl3.Window.fromBits(raw.integer);
-}
-
-pub fn parseExpertQuant(obj: std.json.ObjectMap) !Exl3Spec {
-    const block = obj.get("expert_quant") orelse return error.ExpertLayoutUnsupported;
-    if (block != .object) return error.ExpertLayoutUnsupported;
-    const format = block.object.get("format") orelse return error.ExpertLayoutUnsupported;
-    if (format != .string or !std.mem.eql(u8, format.string, "exl3")) return error.ExpertLayoutUnsupported;
-    const k_v = block.object.get("k") orelse return error.ExpertLayoutUnsupported;
-    const rate = rateFromConfigK(k_v) orelse return error.ExpertLayoutUnsupported;
-    const cb_v = block.object.get("codebook") orelse return error.ExpertLayoutUnsupported;
-    if (cb_v != .string) return error.ExpertLayoutUnsupported;
-    const codebook = expert_exl3.Codebook.fromName(cb_v.string) orelse return error.ExpertLayoutUnsupported;
-    const window = windowFromConfig(block.object.get("window")) orelse return error.Exl3WindowUnsupported;
-    return .{ .rate = rate, .codebook = codebook, .window = window };
-}
-
-fn specFromConfigJson(allocator: std.mem.Allocator, raw: []const u8) !Exl3Spec {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    return parseExpertQuant(parsed.value.object);
-}
-
-test "an EXL3 pack's codeword window is 16 unless its config names one this build decodes" {
-    const t = std.testing;
-    const base = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\"";
-    try t.expectEqual(expert_exl3.Window.w16, (try specFromConfigJson(t.allocator, base ++ "}}")).window);
-    try t.expectEqual(expert_exl3.Window.w16, (try specFromConfigJson(t.allocator, base ++ ",\"window\":16}}")).window);
-    try t.expectEqual(expert_exl3.Window.w12, (try specFromConfigJson(t.allocator, base ++ ",\"window\":12}}")).window);
-    try t.expectEqual(expert_exl3.Window.w11, (try specFromConfigJson(t.allocator, base ++ ",\"window\":11}}")).window);
-    try t.expectEqual(expert_exl3.Window.w10, (try specFromConfigJson(t.allocator, base ++ ",\"window\":10}}")).window);
-    try t.expectEqual(expert_exl3.Window.w8, (try specFromConfigJson(t.allocator, base ++ ",\"window\":8}}")).window);
-    // The same bitstream decodes to different weights at each width, so an
-    // unreadable one is a refusal, never a fallback to 16.
-    try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, base ++ ",\"window\":17}}"));
-    try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, base ++ ",\"window\":7}}"));
-    try t.expectError(error.Exl3WindowUnsupported, specFromConfigJson(t.allocator, base ++ ",\"window\":\"12\"}}"));
-}
-
-test "an EXL3 pack naming a codebook this build does not decode is refused" {
-    const t = std.testing;
-    try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator,
-        \\{"expert_quant":{"format":"exl3","k":2.5,"codebook":"mul2","window":12}}
-    ));
-}
-
 pub fn kFromPackedDim(last: u64) ?expert_exl3.Rate {
     if (last > std.math.maxInt(u32)) return null;
     return expert_exl3.kFromPackedDim(@intCast(last));
@@ -155,12 +83,6 @@ pub fn kFromPackedDim(last: u64) ?expert_exl3.Rate {
 /// Routed experts are leading-index banks or individual source tensors.
 /// Both MXFP4 layouts use nine component ids with three absent bias slots.
 pub const Layout = enum { bf16_fused, quantized_split, exl3_k4, mxfp4_split, mxfp4_individual };
-
-pub const REDUCE_BANK_TOPK: u32 = 32;
-
-pub fn admitExl3TopK(topk: u32) !void {
-    if (topk > REDUCE_BANK_TOPK) return error.Exl3TopKExceedsReduceBank;
-}
 
 pub const Component = enum(u4) {
     gate_w,
@@ -1266,53 +1188,6 @@ test "routed expert layout is read off the weight map" {
     try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.switch_mlp.gate_proj.trellis"));
     try t.expect(isRoutedExpertKey(.exl3_k4, "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.suh"));
     try t.expect(!isRoutedExpertKey(.exl3_k4, "language_model.model.layers.3.mlp.shared_expert.down_proj.weight"));
-}
-
-test "exl3 top-k above reduce-bank is a named refusal" {
-    const t = std.testing;
-    try admitExl3TopK(10);
-    try admitExl3TopK(16);
-    try admitExl3TopK(32);
-    try t.expectError(error.Exl3TopKExceedsReduceBank, admitExl3TopK(33));
-}
-
-test "exl3 expert_quant admits integer and fractional K under every served codebook and refuses the rest" {
-    const t = std.testing;
-    const cases = [_]struct { text: []const u8, n: u32 }{
-        .{ .text = "2", .n = 32 },
-        .{ .text = "2.5", .n = 40 },
-        .{ .text = "2.75", .n = 44 },
-        .{ .text = "3", .n = 48 },
-        .{ .text = "3.5", .n = 56 },
-        .{ .text = "4", .n = 64 },
-    };
-    for (cases) |c| {
-        for ([_]expert_exl3.Codebook{ .mul1, .mcg }) |cb| {
-            var buf: [96]u8 = undefined;
-            const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"exl3\",\"k\":{s},\"codebook\":\"{s}\"}}}}", .{ c.text, @tagName(cb) });
-            const ok = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
-            defer ok.deinit();
-            const spec = try parseExpertQuant(ok.value.object);
-            try t.expectEqual(c.n, spec.rate.n);
-            try t.expectEqual(cb, spec.codebook);
-        }
-    }
-    // 2.3 is not a multiple of 1/16; 4.5 and 6 are off the served range.
-    for ([_][]const u8{ "2.3", "4.5", "6", "1", "2.0625" }) |bad| {
-        var buf: [96]u8 = undefined;
-        const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"exl3\",\"k\":{s},\"codebook\":\"mul1\"}}}}", .{bad});
-        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
-        defer parsed.deinit();
-        try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(parsed.value.object));
-    }
-    const bad_cb = try std.json.parseFromSlice(std.json.Value, t.allocator,
-        \\{"expert_quant":{"format":"exl3","k":4,"codebook":"mul2"}}
-    , .{});
-    defer bad_cb.deinit();
-    try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(bad_cb.value.object));
-    const missing = try std.json.parseFromSlice(std.json.Value, t.allocator, "{}", .{});
-    defer missing.deinit();
-    try t.expectError(error.ExpertLayoutUnsupported, parseExpertQuant(missing.value.object));
 }
 
 test "exl3 kFromPackedDim maps last dim to n" {
