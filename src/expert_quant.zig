@@ -1196,8 +1196,8 @@ test "exl3 kFromPackedDim maps last dim to n" {
     try t.expectEqual(@as(u32, 40), kFromPackedDim(40).?.n);
     try t.expectEqual(@as(u32, 48), kFromPackedDim(48).?.n);
     try t.expectEqual(@as(u32, 64), kFromPackedDim(64).?.n);
-    try t.expect(kFromPackedDim(80) == null);
-    try t.expect(kFromPackedDim(16) == null);
+    try t.expect(kFromPackedDim(130) == null);
+    try t.expect(kFromPackedDim(14) == null);
     try t.expect(kFromPackedDim(41) == null);
 }
 
@@ -1572,4 +1572,14 @@ test "an eight bit tensor beside four bit ones solves to its own width" {
     try t.expectEqual(io_mod.Dtype.u32, w.dtype);
     try t.expectEqual(io_mod.Dtype.bf16, sc.dtype);
     try t.expectEqual(QuantGeom{ .bits = 8, .group_size = 64 }, affineGeomFromShapes(w.shape[1], sc.shape[1], 2560).?);
+}
+
+test "exl3 Sushi CPU packed layout accepts every admitted rate" {
+    for (0..145) |n| {
+        const got = kFromPackedDim(n);
+        const admitted = n >= 16 and n <= 128 and n % 2 == 0;
+        try std.testing.expectEqual(admitted, got != null);
+        if (got) |rate| try std.testing.expectEqual(@as(u32, @intCast(n)), rate.n);
+    }
+    try std.testing.expect(kFromPackedDim(std.math.maxInt(u64)) == null);
 }

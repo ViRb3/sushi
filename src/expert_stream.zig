@@ -1657,7 +1657,7 @@ test "exl3 expert bytes bill the pack's own halfwords per tile" {
     const t = std.testing;
     const h: u64 = 2560;
     const i: u64 = 640;
-    for ([_]u32{ 64, 48, 40, 32 }) |n| {
+    for ([_]u32{ 16, 24, 32, 36, 40, 48, 64, 80, 104, 128 }) |n| {
         const b = try exl3ExpertBytes(.{ .layers = 48, .experts = 512, .hidden = h, .intermediate = i, .exl3_n = n });
         const tile: u64 = n;
         const gate_up = (h / 16) * (i / 16) * tile * 2 + h * 2 + i * 2;
@@ -2917,4 +2917,12 @@ test "expert stream: under streaming an MTP on by flag refuses, a settings mtp i
     try t.expectEqual(MtpUnderStreaming.off, mtpUnderStreaming(false, false, false));
     // The engine default never refuses a streamed load: it resolves off.
     try t.expectEqual(MtpUnderStreaming.drop_default, mtpUnderStreaming(true, false, true));
+}
+
+test "exl3 Sushi CPU expert bytes at K1 and K8 include all three scale pairs" {
+    for ([_]u32{ 16, 128 }) |n| {
+        const got = try exl3ExpertBytes(.{ .layers = 48, .experts = 256, .hidden = 4096, .intermediate = 2048, .exl3_n = n });
+        const packed_bytes: u64 = if (n == 16) 3 * 1048576 else 3 * 8388608;
+        try std.testing.expectEqual(packed_bytes + 3 * (4096 + 2048) * 2, got);
+    }
 }

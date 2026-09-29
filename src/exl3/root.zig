@@ -178,7 +178,7 @@ test "exl3 expert_quant admits integer and fractional K under every served codeb
         }
     }
     // 2.3 is not a multiple of 1/16; 4.5 and 6 are off the served range.
-    for ([_][]const u8{ "2.3", "4.5", "6", "1", "2.0625" }) |bad| {
+    for ([_][]const u8{ "2.3", "8.125", "9", "0.875", "2.0625" }) |bad| {
         var buf: [96]u8 = undefined;
         const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"exl3\",\"k\":{s},\"codebook\":\"mul1\"}}}}", .{bad});
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
@@ -218,4 +218,22 @@ test "exl3 a layer may pack below the rate the config bills, never above it" {
 test {
     _ = format;
     _ = kernels;
+}
+
+test "exl3 Sushi CPU config and packed shapes admit K1 through K8" {
+    const t = std.testing;
+    for (0..145) |n| {
+        const k = @as(f64, @floatFromInt(n)) / 16;
+        const admitted = n >= 16 and n <= 128 and n % 2 == 0;
+        try t.expectEqual(admitted, rateFromConfigK(.{ .float = k }) != null);
+        try t.expectEqual(admitted, trellisAdmitted(&.{ 2, 8, 16, @intCast(n) }, 2, 128, 256, .{ .n = 128 }));
+        if (!admitted) continue;
+        for ([_][]const u8{ "mul1", "mcg" }) |cb| {
+            const raw = try std.fmt.allocPrint(t.allocator, "{{\"expert_quant\":{{\"format\":\"exl3\",\"k\":{d},\"codebook\":\"{s}\"}}}}", .{ k, cb });
+            defer t.allocator.free(raw);
+            try t.expectEqual(@as(u32, @intCast(n)), (try specFromConfigJson(t.allocator, raw)).rate.n);
+        }
+        if (n > 16) try t.expect(!trellisAdmitted(&.{ 2, 8, 16, @intCast(n) }, 2, 128, 256, .{ .n = @intCast(n - 2) }));
+    }
+    for ([_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 }) |k| try t.expectEqual(@as(u32, @intCast(k * 16)), rateFromConfigK(.{ .integer = k }).?.n);
 }

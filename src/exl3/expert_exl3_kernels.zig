@@ -39,7 +39,7 @@ var funnel_off_for_test: bool = false;
 /// Every rate below K4 reads its weights through funnels whose shifts follow from
 /// n; K4 keeps its own packed branch, the same reads at a word-aligned rate.
 fn funnelReads(n: u32) bool {
-    return n < 64;
+    return n != 64;
 }
 
 /// How a decode GEMV threadgroup (`FUNNEL`, `OTPT`) reads the bank. The lane
@@ -403,6 +403,15 @@ const GEMM_SIMDMAT_FRAGS: [:0]const u8 =
     \\  if (N == 64u) {
     \\    const ulong m = ((ulong)words[(g + 31u) & 31u] << 32u) | (ulong)words[g];
     \\    SMAT_UNROLL for (uint j = 0u; j < 4u; j++) p[j] = smat_pair(uint(m >> (24u - 8u * j)), 4u, 0u);
+    \\  } else if (exl3_end(N, 3u) - exl3_end(N, 0u) > 16u || N / 2u - exl3_end(N, 4u) > 16u) {
+    \\    constexpr uint W = N / 2u;
+    \\    const ulong lo = exl3_window(words, W * g + exl3_end(N, 3u), W, true);
+    \\    const ulong hi = exl3_window(words, W * g + W, W, true);
+    \\    SMAT_UNROLL for (uint j = 0u; j < 4u; j++) {
+    \\      const ulong bits = j < 2u ? lo : hi;
+    \\      const uint end = j < 2u ? exl3_end(N, 3u) : W;
+    \\      p[j] = exl3_pairh(uint2(uint(bits >> (end - exl3_end(N, 2u * j))) & 0xffffu, uint(bits >> (end - exl3_end(N, 2u * j + 1u))) & 0xffffu));
+    \\    }
     \\  } else {
     \\    constexpr uint W = N / 2u;
     \\    constexpr uint L = smat_split(N);
@@ -902,18 +911,36 @@ fn codebookHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]co
         \\  const uint prev = last == 0u ? nwords - 1u : last - 1u;
         \\  const uint s = (0u - end) & 31u;
         \\  ulong bits = (((ulong)words[prev] << 32u) | (ulong)words[last]) >> s;
-        \\  if (full) bits |= ((ulong)words[prev == 0u ? nwords - 1u : prev - 1u] << 32u) << (32u - s);
+        \\  if (full && s != 0u) bits |= ((ulong)words[prev == 0u ? nwords - 1u : prev - 1u] << 32u) << (32u - s);
         \\  return bits;
         \\}
         \\// Lane l reads weights 8l..8l+7 from the bits ending at its group's last bit; weight
         \\// j's codeword ends exl3_lane_sh(N, j) bits before that. The least nonzero end % 32 is
         \\// W's lowest set bit, so a longer first codeword takes the third word.
         \\static inline constexpr uint exl3_lane_sh(uint N, uint j) { return N / 2u - exl3_end(N, j); }
+        \\template<bool Wide> struct exl3_lane_type {
+        \\  using type = ulong;
+        \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
+        \\    return exl3_window(words, end, W, full);
+        \\  }
+        \\};
+        \\template<> struct exl3_lane_type<true> {
+        \\  using type = ulong2;
+        \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
+        \\    return ulong2(exl3_window(words, end, W, full), exl3_window(words, end - 32u, W, true));
+        \\  }
+        \\};
+        \\template<uint N> using exl3_lane_bits = typename exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u)>::type;
+        \\static inline uint exl3_lane_word(ulong bits, uint sh) { return uint(bits >> sh); }
+        \\static inline uint exl3_lane_word(ulong2 bits, uint sh) {
+        \\  return sh <= 48u ? uint(bits.x >> sh) : uint(bits.y >> (sh - 32u));
+        \\}
         \\template<uint N>
-        \\static inline ulong exl3_lane(const device uint *words, uint lane) {
+        \\static inline exl3_lane_bits<N> exl3_lane(const device uint *words, uint lane) {
         \\  constexpr uint W = N / 2u;
         \\  constexpr uint low = W & (0u - W);
-        \\  return exl3_window(words, W * lane + W, W, exl3_lane_sh(N, 0u) + 16u > 32u + (low < 32u ? low : 32u));
+        \\  const uint end = W * lane + W;
+        \\  return exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u)>::read(words, end, W, exl3_lane_sh(N, 0u) + 16u > 32u + (low < 32u ? low : 32u));
         \\}
         \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
         \\// K = N/16; the pair (t0, t0+1) shares one 32-bit funnel read.
@@ -1709,28 +1736,16 @@ const INDEXED_COOP_SOURCE: [:0]const u8 =
     \\  }
     \\}
     \\} else {
-    \\  uint w0[4];
-    \\  uint w1[4];
-    \\  uint shv[4];
-    \\  uint frv[4];
-    \\  for (uint p = 0u; p < 4u; p++) {
-    \\    const exl3_win wv = exl3_pair_window(lane * 8u + p * 2u, N);
-    \\    w0[p] = wv.i0;
-    \\    w1[p] = wv.i1;
-    \\    shv[p] = wv.sh;
-    \\    frv[p] = wv.fresh;
-    \\  }
     \\  for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {
     \\    const device uint* words = trellis_e + ((size_t)tk * (size_t)OT + ot) * PACKED_W;
+    \\    const auto merged = exl3_lane<N>(words, lane);
     \\    const float in0 = float(x[xb + tk * TILE + row0]);
     \\    const float in1 = float(x[xb + tk * TILE + row1]);
     \\    const float in2 = float(x[xb + tk * TILE + row2]);
     \\    const float in3 = float(x[xb + tk * TILE + row3]);
     \\    const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
     \\    for (uint p = 0u; p < 4u; p++) {
-    \\      const ulong merged = ((ulong)words[w0[p]] << 32) | (ulong)words[w1[p]];
-    \\      const uint funnel = uint(merged >> shv[p]);
-    \\      const uint2 cw = uint2((funnel >> frv[p]) & 0xffffu, funnel & 0xffffu);
+    \\      const uint2 cw = uint2(exl3_lane_word(merged, exl3_lane_sh(N, p * 2u)), exl3_lane_word(merged, exl3_lane_sh(N, p * 2u + 1u))) & uint2(0xffffu);
     \\      const float2 w = exl3_decode2(cw);
     \\      acc[p * 2u] = fma(ins[p * 2u], w.x, acc[p * 2u]);
     \\      acc[p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[p * 2u + 1u]);
@@ -1946,7 +1961,7 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\  const threadgroup half *pp = prepared + (tk0 + sg) * TILE;
     \\  const uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
     \\  for (uint tk = tk0 + sg; tk < tk1; tk += 2u * SGS) {
-    \\    ulong merged[2][OTPT];
+    \\    exl3_lane_bits<N> merged[2][OTPT];
     \\    for (uint u = 0u; u < 2u; u++) {
     \\      for (uint o = 0u; o < uint(OTPT); o++) {
     \\        const device uint *words = wp + u * SGS * OT * PACKED_W + o * PACKED_W;
@@ -1961,7 +1976,7 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\      const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
     \\      for (uint o = 0u; o < uint(OTPT); o++) {
     \\        for (uint p = 0u; p < 4u; p++) {
-    \\          const uint2 cw = uint2(uint(merged[u][o] >> sh[p * 2u]), uint(merged[u][o] >> sh[p * 2u + 1u])) & uint2(0xffffu);
+    \\          const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\          const float2 w = exl3_decode2(cw);
     \\          acc[o][p * 2u] = fma(ins[p * 2u], w.x, acc[o][p * 2u]);
     \\          acc[o][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[o][p * 2u + 1u]);
@@ -2181,7 +2196,7 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\    const threadgroup half *pp = prepared + xb + sg * TILE;
     \\    const uint sh[8] = {exl3_lane_sh(N, 0u), exl3_lane_sh(N, 1u), exl3_lane_sh(N, 2u), exl3_lane_sh(N, 3u), exl3_lane_sh(N, 4u), exl3_lane_sh(N, 5u), exl3_lane_sh(N, 6u), exl3_lane_sh(N, 7u)};
     \\    for (uint tk = tk0 + sg; tk < tk1; tk += 2u * SGS) {
-    \\      ulong merged[2][OTPT];
+    \\      exl3_lane_bits<N> merged[2][OTPT];
     \\      for (uint u = 0u; u < 2u; u++) {
     \\        for (uint o = 0u; o < uint(OTPT); o++) {
     \\          const device uint *words = wp + u * SGS * OT * PACKED_W + o * PACKED_W;
@@ -2196,7 +2211,7 @@ const PAIR_GEMV_SOURCE: [:0]const u8 =
     \\        const float ins[8] = {in0, in1, in2, in3, in0, in1, in2, in3};
     \\        for (uint o = 0u; o < uint(OTPT); o++) {
     \\          for (uint p = 0u; p < 4u; p++) {
-    \\            const uint2 cw = uint2(uint(merged[u][o] >> sh[p * 2u]), uint(merged[u][o] >> sh[p * 2u + 1u])) & uint2(0xffffu);
+    \\            const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
     \\            const float2 w = exl3_decode2(cw);
     \\            acc[o][p * 2u] = fma(ins[p * 2u], w.x, acc[o][p * 2u]);
     \\            acc[o][p * 2u + 1u] = fma(ins[p * 2u + 1u], w.y, acc[o][p * 2u + 1u]);
@@ -3055,16 +3070,16 @@ pub fn moeSwigluHost(
     return y;
 }
 
-test "exl3 packedRate reads n from the last dim and refuses outside K2..K4" {
+test "exl3 packedRate reads n from the last dim and refuses outside K1..K8" {
     const t = std.testing;
     try t.expectEqual(@as(u32, 32), (try packedRate(32)).n);
     try t.expectEqual(@as(u32, 40), (try packedRate(40)).n);
     try t.expectEqual(@as(u32, 44), (try packedRate(44)).n);
     try t.expectEqual(@as(u32, 48), (try packedRate(48)).n);
     try t.expectEqual(@as(u32, 64), (try packedRate(64)).n);
-    try t.expectError(error.BadExl3Shape, packedRate(16));
+    try t.expectError(error.BadExl3Shape, packedRate(14));
     try t.expectError(error.BadExl3Shape, packedRate(41));
-    try t.expectError(error.BadExl3Shape, packedRate(80));
+    try t.expectError(error.BadExl3Shape, packedRate(130));
 }
 
 /// The fixture is `align(2)` so the u16 view below is a cast the caller has
@@ -7281,9 +7296,9 @@ fn weightReaderExact(comptime n: u32, comptime cb: exl3.Codebook, comptime win: 
         \\const uint lane = thread_position_in_grid.x % 32u;
         \\const uint tile = thread_position_in_grid.x / 32u;
         \\const device uint *words = (const device uint *)trellis + tile * (uint(NHW) / 2u);
-        \\const ulong bits = exl3_lane<uint(NHW)>(words, lane);
+        \\const auto bits = exl3_lane<uint(NHW)>(words, lane);
         \\for (uint j = 0u; j < 8u; j++) {
-        \\  const uint cw = uint(bits >> exl3_lane_sh(uint(NHW), j)) & 0xffffu;
+        \\  const uint cw = exl3_lane_word(bits, exl3_lane_sh(uint(NHW), j)) & 0xffffu;
         \\  result[tile * 256u + lane * 8u + j] = as_type<ushort>(exl3_pairh(uint2(cw)).x);
         \\}
     else
@@ -7807,7 +7822,7 @@ const GROUP_MEMBERS_SOURCE =
 /// One funnel iteration (two k-tiles, `OTPT` output tiles) over `mc` members; `member_ptr`
 /// points at member j's inputs for this iteration's first k-tile.
 fn groupFunnelStep(comptime mc: []const u8, comptime member_ptr: []const u8) []const u8 {
-    return "ulong merged[2][OTPT];\n" ++
+    return "exl3_lane_bits<N> merged[2][OTPT];\n" ++
         \\for (uint u = 0u; u < 2u; u++) {
         \\  for (uint o = 0u; o < uint(OTPT); o++) {
         \\    const device uint *words = wp + u * SGS * OT * PACKED_W + o * PACKED_W;
@@ -7824,7 +7839,7 @@ fn groupFunnelStep(comptime mc: []const u8, comptime member_ptr: []const u8) []c
         \\  }
         \\  for (uint o = 0u; o < uint(OTPT); o++) {
         \\    for (uint p = 0u; p < 4u; p++) {
-        \\      const uint2 cw = uint2(uint(merged[u][o] >> sh[p * 2u]), uint(merged[u][o] >> sh[p * 2u + 1u])) & uint2(0xffffu);
+        \\      const uint2 cw = uint2(exl3_lane_word(merged[u][o], sh[p * 2u]), exl3_lane_word(merged[u][o], sh[p * 2u + 1u])) & uint2(0xffffu);
         \\      const float2 w = exl3_decode2(cw);
         \\
     ++ "      for (uint j = 0u; j < " ++ mc ++ "; j++) {\n" ++
@@ -8220,7 +8235,7 @@ fn funnelLayoutBytesMatch(c: MimoMoeCase) !void {
         outs[arm][0], outs[arm][1] = try pairGemv(s, a[8], a[3], a[3], a[0], a[1], a[7], hidden, inter, nslots, @intCast(c.topk), 0);
         outs[arm][2] = try downGemvFusedMid(s, outs[0][0].?, outs[0][1].?, a[2], a[4], a[4], a[5], a[7], inter, hidden, nslots);
         outs[arm][3] = try downGemvPreparedMid(s, outs[0][0].?, outs[0][1].?, a[2], a[4], a[4], a[5], a[7], inter, hidden, nslots, 0);
-        const funnel = arm == 1 and c.rate.n < 64;
+        const funnel = arm == 1 and c.rate.n != 64;
         for ([_]FunnelArm{ .pair, .fused_mid_down, .prepared_down }) |fa| try std.testing.expectEqual(funnel, funnel_engaged[@backingInt(fa)]);
     }
     for (outs[0], outs[1]) |want, got| try std.testing.expectEqualSlices(u8, try gemvOutBytes(want.?), try gemvOutBytes(got.?));
@@ -8273,7 +8288,7 @@ fn mimoChainBytesMatch(c: MimoMoeCase) !void {
         funnel_engaged = @splat(false);
         grouped_engaged = false;
         ys[arm] = try moeSwigluFused(s, ar[8], ar[0], ar[3], ar[4], ar[1], ar[3], ar[4], ar[2], ar[5], ar[6], ar[7], ar[9], .bfloat16);
-        const fast = arm == 1 and c.rate.n < 64;
+        const fast = arm == 1 and c.rate.n != 64;
         try std.testing.expectEqual(fast, funnel_engaged[@backingInt(FunnelArm.pair)]);
         try std.testing.expectEqual(fast, funnel_engaged[@backingInt(FunnelArm.prepared_down)]);
         try std.testing.expectEqual(fast and c.rows >= 2, grouped_engaged);
@@ -8288,9 +8303,9 @@ fn mimoChainBytesMatch(c: MimoMoeCase) !void {
 // generic reader fails here. K4 (n64) keeps its own packed branch, one tile a threadgroup.
 test "exl3 every admitted rate takes the fast arms, bit-identical to the generic reader" {
     const w12: exl3.Decode = .{ .codebook = .mcg, .window = .w12 };
-    inline for (16..33) |half| {
+    inline for (exl3.Rate.min_n / 2..exl3.Rate.max_n / 2 + 1) |half| {
         const n: u32 = 2 * half;
-        if (n < 64) try weightReaderExact(n, .mcg, .w16, true, .lane);
+        if (n != 64) try weightReaderExact(n, .mcg, .w16, true, .lane);
         inline for (.{ .nax, .simdmat }) |reader| try weightReaderExact(n, .mcg, .w16, true, reader);
         for ([_]usize{ 1, 4 }) |rows| {
             try funnelLayoutBytesMatch(.{ .e = 16, .hidden = 1024, .inter = 512, .topk = 8, .rows = rows, .rate = .{ .n = n }, .dec = w12, .seed = 418 + n + rows, .banks = MIMO_BANKS, .x_scale = 3 });
@@ -8303,7 +8318,7 @@ test "exl3 every admitted rate takes the fast arms, bit-identical to the generic
             funnel_engaged = @splat(false);
             try sortedGemmParity(.{ .n = n }, w12, 32, 718 + n);
             const arm: FunnelArm = if (gemmNaxOn()) .nax else .simdmat;
-            try std.testing.expectEqual(n < 64, funnel_engaged[@backingInt(arm)]);
+            try std.testing.expectEqual(n != 64, funnel_engaged[@backingInt(arm)]);
         }
     }
 }
@@ -8391,5 +8406,49 @@ test "exl3 MCG K2.5 BF16 decode and NAX preserve f32 truth across seeds" {
     }
     for (0..PARITY_SEEDS) |seed| {
         try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 8, .rows = 33, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 318 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, false);
+    }
+}
+
+test "exl3 Sushi CPU dispatch selects fast layouts for every rate" {
+    for (8..65) |half| {
+        const n: u32 = @intCast(half * 2);
+        try std.testing.expectEqual(n != 64, funnelReads(n));
+        try std.testing.expectEqual(GemvLayout{ .funnel = n != 64, .tiles = if (n == 64) 1 else 2 }, gemvLayout(n, 128));
+        try std.testing.expectEqual(n, (try packedRate(@intCast(n))).n);
+    }
+}
+
+test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" {
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    defer prepared_mid_force = null;
+    defer gemm_simdmat_force = null;
+    defer mimo_prefill_force = null;
+    for ([_]u32{ 16, 24, 48, 80, 128 }) |n| {
+        for ([_]exl3.Codebook{ .mul1, .mcg }) |cb| {
+            const dec: exl3.Decode = .{ .codebook = cb, .window = .w12 };
+            for (0..3) |seed| {
+                try indexedParity(.{ .n = n }, 256, 128, 8, 4, 913 + seed, dec);
+                for ([_]bool{ false, true }) |prepared| {
+                    prepared_mid_force = prepared;
+                    for ([_]usize{ 1, 4 }) |rows| try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 4, .rows = rows, .rate = .{ .n = n }, .dec = dec, .seed = 913 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, true);
+                }
+                prepared_mid_force = null;
+                for (0..3) |arm| {
+                    var env: FallbackEnv = .{};
+                    if (arm != 0) env.force();
+                    defer if (arm != 0) env.restore();
+                    gemm_simdmat_force = arm != 2;
+                    funnel_engaged = @splat(false);
+                    const expect_nax = arm == 0 and gemmNaxAvailable();
+                    try sortedGemmParity(.{ .n = n }, dec, 32, 913 + seed);
+                    try std.testing.expectEqual(expect_nax, funnel_engaged[@backingInt(FunnelArm.nax)]);
+                    try std.testing.expectEqual(!expect_nax and arm != 2, funnel_engaged[@backingInt(FunnelArm.simdmat)]);
+                    for ([_]bool{ false, true }) |metadata| {
+                        mimo_prefill_force = metadata;
+                        try bf16TruthCaseAnyArm(.{ .e = 8, .hidden = 256, .inter = 128, .topk = 4, .rows = 33, .rate = .{ .n = n }, .dec = dec, .seed = 913 + seed, .banks = MIMO_BANKS, .x_scale = 3 }, 32, false);
+                    }
+                }
+            }
+        }
     }
 }

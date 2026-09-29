@@ -1856,11 +1856,11 @@ test "EXL3 shard stamp rejects invalid and nonfinite rates" {
     var config: model.ModelConfig = undefined;
     config.expert_layout = .exl3_k4;
     config.expert_quant_rate = .{ .n = 64 };
-    for ([_][]const u8{ "0", "1.5", "2.0625", "nan", "inf", "-inf" }) |k| {
+    for ([_][]const u8{ "0", "0.5", "2.0625", "4.5", "nan", "inf", "-inf" }) |k| {
         try source.stamps.put("expert.safetensors", .{ .k = k });
         try std.testing.expectError(error.Exl3ShardStampMismatch, validateShardStamps(&source, &config));
     }
-    for ([_][]const u8{ "2", "2.125", "2.5", "3", "4" }) |k| {
+    for ([_][]const u8{ "1", "1.5", "2", "2.125", "2.5", "3", "4" }) |k| {
         try source.stamps.put("expert.safetensors", .{ .k = k });
         try validateShardStamps(&source, &config);
     }
