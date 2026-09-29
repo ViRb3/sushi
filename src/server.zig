@@ -2242,7 +2242,8 @@ fn handleConnection(
         if (g_metrics) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            try instr.renderJson(m, &out.writer);
+            var sessions: [instr.MAX_SESSIONS]instr.Session = undefined;
+            try instr.renderJson(m, liveSessions(registry, &sessions), &out.writer);
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
@@ -2611,6 +2612,28 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     // Not pinned yet (a discovery stub that was never loaded): compute from
     // current GPU memory rather than a fixed 16K cap.
     return autoContextFor(config);
+}
+
+/// Live requests, each row stamped with its model's effective context limit.
+/// The connection-thread reader copies the inference thread's `queue_mu`
+/// snapshot under that same lock (the `hot_cache_digests` discipline): a
+/// Session is POD with an inline model buffer, so the copy stays valid after
+/// its slot frees. Rows carry no pointers into scheduler or registry state.
+fn liveSessions(registry: *ModelRegistry, buf: *[instr.MAX_SESSIONS]instr.Session) []instr.Session {
+    const sch = global_scheduler orelse return buf[0..0];
+    sch.queue_mu.lockUncancelable(sch.io);
+    const live = sch.live_session_count;
+    @memcpy(buf[0..live], sch.live_sessions[0..live]);
+    sch.queue_mu.unlock(sch.io);
+
+    registry.mutex.lockUncancelable(registry.io);
+    defer registry.mutex.unlock(registry.io);
+    for (buf[0..live]) |*s| {
+        const entry = registry.peekLocked(s.model()) orelse continue;
+        if (entry.state != .ready) continue;
+        if (entry.config) |cfg| s.context_length = getEffectiveContextLength(cfg);
+    }
+    return buf[0..live];
 }
 
 /// Metal's recommended max working-set size for the default device — the real
