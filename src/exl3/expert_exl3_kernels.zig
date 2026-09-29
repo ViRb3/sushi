@@ -2039,7 +2039,7 @@ const DOWN_FUSED_SOURCE: [:0]const u8 =
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
 ;
 
-fn downGemvFusedMid(
+pub fn downGemvFusedMid(
     s: mlx.mlx_stream,
     ig: mlx.mlx_array,
     iu: mlx.mlx_array,
@@ -2461,7 +2461,7 @@ fn applyOuts(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []con
 }
 
 /// `group_ask` > 0 asks for the expert-grouped kernel; only the lane funnel has one.
-fn pairGemv(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array, in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, group_ask: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
+pub fn pairGemv(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array, in_dim: c_int, out_dim: c_int, nslots: c_int, topk: c_int, group_ask: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
     const tsh = mlx.getShape(tg);
     const ush = mlx.getShape(tu);
     const rate = try packedRate(tsh[tsh.len - 1]);
@@ -2537,7 +2537,7 @@ fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: 
 /// than Metal allows threads.
 pub const REDUCE_MAX_TOPK: c_int = 32;
 
-fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
+pub fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
     if (topk < 1 or topk > REDUCE_MAX_TOPK) return error.Exl3TopkUnsupported;
     const key = DecodeReduceKey{ .out_dim = out_dim, .rows = rows, .topk = topk, .dtype = out_dtype };
     const cfg = reduce_cfgs.get(key) orelse blk: {

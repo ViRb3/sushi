@@ -597,6 +597,7 @@ pub const ExpertStore = struct {
     }
 
     pub fn openLayout(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, chosen: quant.Layout) !ExpertStore {
+        if (chosen == .exl3_k4) return error.Exl3RaggedStreamingUnsupported;
         if (chosen == .bf16_fused) return open(allocator, model_dir, geometry);
         const q = try quant.QuantStore.openForLayout(allocator, model_dir, .{
             .layers = geometry.layers,
@@ -2925,4 +2926,8 @@ test "exl3 Sushi CPU expert bytes at K1 and K8 include all three scale pairs" {
         const packed_bytes: u64 = if (n == 16) 3 * 1048576 else 3 * 8388608;
         try std.testing.expectEqual(packed_bytes + 3 * (4096 + 2048) * 2, got);
     }
+}
+
+test "sushi coder streaming refuses EXL3 before opening shards" {
+    try std.testing.expectError(error.Exl3RaggedStreamingUnsupported, ExpertStore.openLayout(std.testing.allocator, "/missing-sushi-coder-pack", .{ .layers = 2, .experts = 4, .hidden = 128, .intermediate = 128 }, .exl3_k4));
 }

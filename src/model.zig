@@ -1518,6 +1518,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 var k_buf: [8]u8 = undefined;
                 log.info("[expert-exl3] engaged K={s} codebook={s} window={d}\n", .{ spec.rate.kText(&k_buf), @tagName(spec.codebook), spec.window.bits() });
             }
+        } else if (expert_quant.hasGroupedExl3Index(allocator, io, model_dir)) {
+            return error.ExpertLayoutUnsupported;
         }
     }
 
@@ -4152,6 +4154,7 @@ pub fn loadWeightsForConfig(
         log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2 only)\n", .{config.model_type});
         return error.ArchitectureUnsupported;
     }
+    if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
     if (load_vision) return loadWeightsWithVision(io, allocator, model_dir);

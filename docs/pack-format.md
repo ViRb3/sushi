@@ -56,6 +56,25 @@ converter's per-expert global codebook scale is **folded into `suh`** — it is
 divided out there and never stored as a separate field, so the engine applies
 one scale vector per side and nothing else.
 
+### Rate groups (per-expert rates, uneven expert counts)
+
+A layer's routed experts may be split into **rate groups**: contiguous runs of experts, each group an ordinary
+stacked bank per projection with its own rate, read from its own trellis shape.
+- Names: `<prefix>.<gate|up|down>_proj.gN.<trellis|suh|svh>`, `N` from 0 with no gaps, at most 32 groups;
+  `<prefix>` is `language_model.model.layers.L.mlp.switch_mlp` (Qwen), `language_model.mtp.layers.0.mlp.switch_mlp`
+  (Qwen MTP) or `model.layers.L.mlp.switch_mlp` (MiMo). A layer without `.gN` names is one group, as before; a layer
+  never mixes the two.
+- Each group holds all nine tensors: U16 trellis `[E_g, in/16, out/16, n]`, F16 `suh` `[E_g, in]`, F16 `svh`
+  `[E_g, out]`. Gate, up and down may each have their own n.
+- The layer's expert count is the sum of its group sizes and must equal the router's rows; router rows (and MiMo's
+  correction bias) follow the concatenated group order, so router index e is (group, local) by cumulative sizes.
+  Pruned experts are simply absent. Top-k must fit the layer.
+- No new config field: `expert_quant.k` stays the ceiling every group's rate must fit under.
+- Refused by name: `Exl3GroupNameInvalid`, `Exl3GroupMissing`, `Exl3GroupGeometry`, `Exl3GroupDtype`,
+  `Exl3MixedGroupLayout`, `Exl3TrellisGeometry` (a rate this build cannot decode), `Exl3RouterWidthMismatch`,
+  `Exl3TopKExceedsExperts`, and `Exl3RaggedStreamingUnsupported` (SSD streaming serves uniform banks only).
+- Each group is one decode pass per layer (3 kernel calls, 4 when gate and up differ); keep a layer to 1-2 groups.
+
 ## `config.json`
 
 ```json

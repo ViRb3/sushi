@@ -383,17 +383,26 @@ const EXL3_PREFIXES = [_][]const u8{ "language_model.model.layers.", "model.laye
 
 fn exl3BankComplete(map: std.json.ObjectMap, prefix: []const u8, first_moe_layer: u16, layers: u16) bool {
     if (first_moe_layer >= layers) return false;
-    var buf: [192]u8 = undefined;
-    var layer: u16 = first_moe_layer;
-    while (layer < layers) : (layer += 1) {
-        for ([_][]const u8{ "gate", "up", "down" }) |proj| {
-            for ([_][]const u8{ "trellis", "suh", "svh" }) |part| {
-                const key = std.fmt.bufPrint(&buf, "{s}{d}.mlp.switch_mlp.{s}_proj.{s}", .{
-                    prefix, layer, proj, part,
-                }) catch return false;
-                if (!stringAt(map, key)) return false;
-            }
+    const gl = @import("sushi_exl3").group_layout;
+    for (first_moe_layer..layers) |layer| {
+        var buf: [192]u8 = undefined;
+        const start = std.fmt.bufPrint(&buf, "{s}{d}.mlp.switch_mlp.", .{ prefix, layer }) catch return false;
+        var masks: [gl.max_groups]u16 = @splat(0);
+        var count: usize = 0;
+        var grouped: ?bool = null;
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, start)) continue;
+            if (entry.value_ptr.* != .string) return false;
+            const name = gl.Name.parse(key[start.len..]) catch return false;
+            if (grouped) |g| if (g != name.grouped) return false;
+            grouped = name.grouped;
+            masks[name.group] |= @as(u16, 1) << @intCast(name.projection * 3 + name.part);
+            count = @max(count, name.group + 1);
         }
+        if (count == 0) return false;
+        for (masks[0..count]) |mask| if (mask != 511) return false;
     }
     return true;
 }
@@ -421,17 +430,15 @@ fn hasAnyAffineKey(map: std.json.ObjectMap, layers: u16) bool {
 }
 
 fn hasAnyExl3Key(map: std.json.ObjectMap, layers: u16) bool {
-    var buf: [192]u8 = undefined;
-    for (EXL3_PREFIXES) |prefix| {
-        for (0..layers) |layer| {
-            for ([_][]const u8{ "gate", "up", "down" }) |proj| {
-                for ([_][]const u8{ "trellis", "suh", "svh" }) |part| {
-                    const key = std.fmt.bufPrint(&buf, "{s}{d}.mlp.switch_mlp.{s}_proj.{s}", .{
-                        prefix, layer, proj, part,
-                    }) catch return true;
-                    if (map.get(key) != null) return true;
-                }
-            }
+    _ = layers;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        for (EXL3_PREFIXES) |prefix| {
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            const at = std.mem.indexOf(u8, key, ".mlp.switch_mlp.") orelse continue;
+            _ = @import("sushi_exl3").group_layout.Name.parse(key[at + ".mlp.switch_mlp.".len ..]) catch continue;
+            return true;
         }
     }
     return false;
@@ -567,6 +574,27 @@ pub fn layoutOfDirWithFirstMoe(
     const raw = dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(64 * 1024 * 1024)) catch return null;
     defer allocator.free(raw);
     return layoutFromIndexJsonWithFirstMoe(allocator, model_type, raw, layers, first_moe_layer);
+}
+
+pub fn hasGroupedExl3Index(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(64 * 1024 * 1024)) catch return false;
+    defer allocator.free(raw);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const map = parsed.value.object.get("weight_map") orelse return false;
+    if (map != .object) return false;
+    for (map.object.keys()) |key| {
+        for (EXL3_PREFIXES) |prefix| {
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            for ([_][]const u8{ ".mlp.switch_mlp.gate_proj.g", ".mlp.switch_mlp.up_proj.g", ".mlp.switch_mlp.down_proj.g" }) |marker| {
+                if (std.mem.indexOf(u8, key, marker) != null) return true;
+            }
+        }
+    }
+    return false;
 }
 
 pub fn layoutOfDir(allocator: std.mem.Allocator, io: std.Io, model_type: []const u8, model_dir: []const u8, layers: u16) ?Layout {
@@ -1582,4 +1610,27 @@ test "exl3 Sushi CPU packed layout accepts every admitted rate" {
         if (got) |rate| try std.testing.expectEqual(@as(u32, @intCast(n)), rate.n);
     }
     try std.testing.expect(kFromPackedDim(std.math.maxInt(u64)) == null);
+}
+
+test "sushi coder index recognizes grouped qwen4 and mimo layouts" {
+    const t = std.testing;
+    for (EXL3_PREFIXES) |prefix| {
+        var map: std.json.ObjectMap = .empty;
+        defer {
+            for (map.keys()) |key| t.allocator.free(key);
+            map.deinit(t.allocator);
+        }
+        for (0..2) |layer| {
+            for (0..2) |group| {
+                for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+                    for ([_][]const u8{ "trellis", "suh", "svh" }) |part| {
+                        const key = try std.fmt.allocPrint(t.allocator, "{s}{d}.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ prefix, layer, proj, group, part });
+                        try map.put(t.allocator, key, .{ .string = "experts.safetensors" });
+                    }
+                }
+            }
+        }
+        try t.expect(exl3BankComplete(map, prefix, 0, 2));
+        try t.expect(hasAnyExl3Key(map, 2));
+    }
 }

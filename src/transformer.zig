@@ -13956,6 +13956,8 @@ const AneChanRest = struct {
 };
 
 pub const MoeMlpWeights = struct {
+    exl3_groups: [sushi_exl3.group_layout.max_groups]sushi_exl3.Bank = undefined,
+    exl3_group_count: usize = 0,
     router_w: mlx.mlx_array,
     router_s: mlx.mlx_array,
     router_b: mlx.mlx_array,
@@ -30712,6 +30714,10 @@ pub const Transformer = struct {
     /// expert_x: input for expert computation (possibly normalized).
     fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool) !mlx.mlx_array {
         if (verify_rows) mtp_verify_expert_rows_calls +%= 1;
+        if (mw.exl3_group_count > 0) return sushi_exl3.moeGroups(self.s, expert_x, mw.exl3_groups[0..mw.exl3_group_count], inds, scores, .{
+            .codebook = self.config.expert_quant_codebook,
+            .window = self.config.expert_quant_window,
+        }, verify_rows);
         return sushi_exl3.moe(self.s, expert_x, .{
             .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
             .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
@@ -32757,6 +32763,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                .exl3_groups = switch_bank.groups,
+                .exl3_group_count = switch_bank.group_count,
                 .switch_gate_w = switch_bank.gate_w,
                 .switch_gate_s = switch_bank.gate_s,
                 .switch_gate_b = switch_bank.gate_b,
@@ -32828,6 +32836,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                .exl3_groups = switch_bank.groups,
+                .exl3_group_count = switch_bank.group_count,
                 .switch_gate_w = switch_bank.gate_w,
                 .switch_gate_s = switch_bank.gate_s,
                 .switch_gate_b = switch_bank.gate_b,
@@ -33264,6 +33274,11 @@ fn appendHybridMlpWeights(vec: mlx.mlx_vector_array, hw: *const HybridMlpWeights
     // so they don't pollute the eval batch. Mirrors `appendLinearAttnWeights`.
     switch (hw.*) {
         .moe => |*mw| {
+            for (mw.exl3_groups[0..mw.exl3_group_count]) |bank| {
+                for ([_]sushi_exl3.Proj{ bank.gate, bank.up, bank.down }) |proj| {
+                    for ([_]mlx.mlx_array{ proj.trellis, proj.suh, proj.svh }) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+                }
+            }
             inline for (comptime structFields(MoeMlpWeights)) |field| {
                 if (field.type == ?mlx.mlx_array) {
                     if (@field(mw, field.name)) |arr| {
@@ -42052,6 +42067,8 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
 }
 
 const SwitchMlpBank = struct {
+    groups: [sushi_exl3.group_layout.max_groups]sushi_exl3.Bank = undefined,
+    group_count: usize = 0,
     gate_w: mlx.mlx_array,
     gate_s: mlx.mlx_array,
     gate_b: mlx.mlx_array,
@@ -42067,35 +42084,65 @@ const SwitchMlpBank = struct {
 /// `[E, in/16, out/16, n]` at a rate the CONFIG's bill covers. Decode reads n
 /// off the tensor and a layer may carry fewer bits than the pack's widest — a
 /// wider one under-bills, and an under-bill here is an uncatchable Metal OOM.
-fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool, config: *const ModelConfig) error{ MissingWeight, Exl3TrellisGeometry }!SwitchMlpBank {
+fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool, config: *const ModelConfig) !SwitchMlpBank {
     if (exl3) {
-        const bank: SwitchMlpBank = .{
-            .gate_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.trellis"),
-            .gate_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.suh"),
-            .gate_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.svh"),
-            .up_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.trellis"),
-            .up_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.suh"),
-            .up_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.up_proj.svh"),
-            .down_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.trellis"),
-            .down_s = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.suh"),
-            .down_b = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.down_proj.svh"),
-        };
-        const h = config.hidden_size;
-        const inter = config.moe_intermediate_size;
-        const projs = [_]struct { w: mlx.mlx_array, in: u32, out: u32 }{
-            .{ .w = bank.gate_w, .in = h, .out = inter },
-            .{ .w = bank.up_w, .in = h, .out = inter },
-            .{ .w = bank.down_w, .in = inter, .out = h },
-        };
-        for (projs) |p| {
-            if (sushi_exl3.trellisAdmitted(mlx.getShape(p.w), config.num_experts, p.in, p.out, config.expert_quant_rate)) continue;
-            var kbuf: [8]u8 = undefined;
-            log.err("EXL3 TRELLIS GEOMETRY: {s}.layers.{d} packs {any}, config names [{d}, {d}, {d}, k={s}]\n", .{
-                prefix, layer, mlx.getShape(p.w), config.num_experts, p.in / 16, p.out / 16, config.expert_quant_rate.kText(&kbuf),
-            });
-            return error.Exl3TrellisGeometry;
+        var plan = sushi_exl3.GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
+        var groups: [sushi_exl3.group_layout.max_groups]sushi_exl3.Bank = undefined;
+        const start = try std.fmt.bufPrint(buf, "{s}.layers.{d}.mlp.switch_mlp.", .{ prefix, layer });
+        var it = weights.map.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, start)) continue;
+            const arr = entry.value_ptr.*;
+            const shape = mlx.getShape(arr);
+            if (shape.len > 4) return error.Exl3TrellisGeometry;
+            var dims: [4]u64 = undefined;
+            for (shape, 0..) |d, i| {
+                if (d <= 0) return error.Exl3TrellisGeometry;
+                dims[i] = @intCast(d);
+            }
+            const name = plan.add(entry.key_ptr.*[start.len..], dims[0..shape.len], switch (mlx.mlx_array_dtype(arr)) {
+                .uint16 => .u16,
+                .float16 => .f16,
+                else => .other,
+            }) catch |err| {
+                if (err == error.Exl3GroupGeometry) return error.Exl3TrellisGeometry;
+                return err;
+            };
+            const bank = &groups[name.group];
+            const proj = switch (name.projection) {
+                0 => &bank.gate,
+                1 => &bank.up,
+                else => &bank.down,
+            };
+            switch (name.part) {
+                0 => proj.trellis = arr,
+                1 => proj.suh = arr,
+                else => proj.svh = arr,
+            }
         }
-        return bank;
+        const router = getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.weight");
+        var experts = config.num_experts;
+        if (router) |r| {
+            const sh = mlx.getShape(r);
+            if (sh.len != 2 or sh[0] <= 0) return error.Exl3RouterWidthMismatch;
+            experts = @intCast(sh[0]);
+        }
+        try plan.finish(experts, config.num_experts_per_tok, config.expert_streaming, config.num_experts);
+        if (config.moe_n_group > 1 and (plan.grouped.? or experts != config.num_experts)) return error.Exl3RouterGroupsUnsupported;
+        const g = groups[0];
+        return .{
+            .gate_w = g.gate.trellis,
+            .gate_s = g.gate.suh,
+            .gate_b = g.gate.svh,
+            .up_w = g.up.trellis,
+            .up_s = g.up.suh,
+            .up_b = g.up.svh,
+            .down_w = g.down.trellis,
+            .down_s = g.down.suh,
+            .down_b = g.down.svh,
+            .groups = groups,
+            .group_count = if (plan.grouped.?) plan.count else 0,
+        };
     }
     return .{
         .gate_w = try getLayerWeight(weights, buf, prefix, layer, "mlp.switch_mlp.gate_proj.weight"),
@@ -71650,4 +71697,118 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
             }
         }
     }
+}
+
+test "sushi coder uniform qwen4 and mimo banks preserve stored handles" {
+    const t = std.testing;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    for ([_][]const u8{ "language_model.model", "model", "language_model.mtp" }) |prefix| {
+        var w = Weights.init(t.allocator);
+        defer w.deinit();
+        var buf: [256]u8 = undefined;
+        for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+            for ([_][]const u8{ "trellis", "suh", "svh" }) |part| {
+                const shape: []const c_int = if (std.mem.eql(u8, part, "trellis")) &.{ 4, 8, 8, 48 } else &.{ 4, 128 };
+                var arr = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_zeros(&arr, shape.ptr, @intCast(shape.len), if (shape.len == 4) .uint16 else .float16, s));
+                const key = try std.fmt.allocPrint(t.allocator, "{s}.layers.0.mlp.switch_mlp.{s}_proj.{s}", .{ prefix, proj, part });
+                try w.map.put(key, arr);
+            }
+        }
+        const cfg = exl3SwitchBankConfig(.{ .n = 48 });
+        const bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
+        const key = try std.fmt.bufPrint(&buf, "{s}.layers.0.mlp.switch_mlp.gate_proj.trellis", .{prefix});
+        try t.expectEqual(w.get(key).?.ctx, bank.gate_w.ctx);
+        try t.expectEqualSlices(c_int, &.{ 4, 8, 8, 48 }, mlx.getShape(bank.gate_w));
+    }
+}
+
+test "sushi coder GPU grouped binders cover qwen mimo and MTP" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    for ([_][]const u8{ "language_model.model", "model", "language_model.mtp" }) |prefix| {
+        var w = Weights.init(t.allocator);
+        defer w.deinit();
+        var buf: [256]u8 = undefined;
+        var router = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&router, &[_]c_int{ 3, 128 }, 2, .bfloat16, s));
+        try w.map.put(try std.fmt.allocPrint(t.allocator, "{s}.layers.0.mlp.gate.weight", .{prefix}), router);
+        for (0..2) |group| {
+            const e: c_int = @intCast(group + 1);
+            for ([_][]const u8{ "gate", "up", "down" }, 0..) |proj, p| {
+                const n: c_int = @intCast(32 + 16 * ((group + p) % 3));
+                for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
+                    const shape: []const c_int = if (i == 0) &.{ e, 8, 8, n } else &.{ e, 128 };
+                    var arr = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_zeros(&arr, shape.ptr, @intCast(shape.len), if (i == 0) .uint16 else .float16, s));
+                    try w.map.put(try std.fmt.allocPrint(t.allocator, "{s}.layers.0.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ prefix, proj, group, part }), arr);
+                }
+            }
+        }
+        var cfg = exl3SwitchBankConfig(.{ .n = 64 });
+        cfg.num_experts = 512;
+        cfg.num_experts_per_tok = 2;
+        const bank = try loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg);
+        try t.expectEqual(@as(usize, 2), bank.group_count);
+        try t.expectEqual(@as(c_int, 2), mlx.getShape(bank.groups[1].up.trellis)[0]);
+        try t.expectEqual(@as(c_int, 64), mlx.getShape(bank.groups[1].up.trellis)[3]);
+        cfg.num_experts_per_tok = 4;
+        try t.expectError(error.Exl3TopKExceedsExperts, loadSwitchMlpBank(&w, &buf, prefix, 0, true, &cfg));
+    }
+}
+
+test "sushi coder GPU grouped layer matches the original uniform bank" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var h = try Exl3MoeHarness.init(arena.allocator(), s, 1, 181);
+    defer h.deinit();
+    h.xfm.config.num_experts = 512;
+    h.xfm.config.num_experts_per_tok = 4;
+    const original = try h.xfm.moeMLP(h.x, &h.mw);
+    defer _ = mlx.mlx_array_free(original);
+    var slices: [18]mlx.mlx_array = undefined;
+    var built: usize = 0;
+    defer for (slices[0..built]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (0..2) |group| {
+        const bank = &h.mw.exl3_groups[group];
+        for ([_]*sushi_exl3.Proj{ &bank.gate, &bank.up, &bank.down }) |proj| {
+            for ([_]mlx.mlx_array{ h.mw.switch_gate_w, h.mw.switch_gate_s, h.mw.switch_gate_b }, 0..) |a, part| {
+                const sh = mlx.getShape(a);
+                var starts: [4]c_int = @splat(0);
+                var ends: [4]c_int = @splat(0);
+                const strides: [4]c_int = @splat(1);
+                @memcpy(ends[0..sh.len], sh);
+                starts[0] = @intCast(group * 2);
+                ends[0] = starts[0] + 2;
+                var slice = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice(&slice, a, &starts, sh.len, &ends, sh.len, &strides, sh.len, s));
+                slices[built] = slice;
+                built += 1;
+                switch (part) {
+                    0 => proj.trellis = slice,
+                    1 => proj.suh = slice,
+                    else => proj.svh = slice,
+                }
+            }
+        }
+    }
+    h.mw.exl3_group_count = 2;
+    const grouped = try h.xfm.moeMLP(h.x, &h.mw);
+    defer _ = mlx.mlx_array_free(grouped);
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    var b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_astype(&a, original, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b, grouped, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a));
+    try mlx.check(mlx.mlx_array_eval(b));
+    const av = mlx.mlx_array_data_float32(a).?;
+    const bv = mlx.mlx_array_data_float32(b).?;
+    for (0..128) |i| try t.expectApproxEqAbs(av[i], bv[i], 0.002 + @abs(av[i]) * 0.002);
 }

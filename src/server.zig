@@ -12288,6 +12288,15 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards. For MiMo, repack the checkpoint first; raw per-expert HF shards cannot be streamed directly." },
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
         error.ExpertLayoutUnsupported => .{ .type = "expert_layout_unsupported", .message = "This checkpoint's routed experts are not a pack layout this build can load. An EXL3 pack's expert_quant names format exl3, a k, and codebook mcg or mul1; re-convert the pack." },
+        error.Exl3GroupMissing => .{ .type = "exl3_group_missing", .message = "An EXL3 rate group or projection tensor is missing." },
+        error.Exl3GroupNameInvalid => .{ .type = "exl3_group_name_invalid", .message = "EXL3 rate groups must use contiguous g0 through g31 names." },
+        error.Exl3MixedGroupLayout => .{ .type = "exl3_mixed_group_layout", .message = "A layer mixes grouped and ungrouped EXL3 tensors." },
+        error.Exl3GroupGeometry => .{ .type = "exl3_group_geometry", .message = "EXL3 group expert counts or projection dimensions disagree." },
+        error.Exl3GroupDtype => .{ .type = "exl3_group_dtype", .message = "EXL3 trellises must be U16 and axis scales must be F16." },
+        error.Exl3RouterWidthMismatch => .{ .type = "exl3_router_width_mismatch", .message = "The router width must equal the sum of its layer expert group sizes." },
+        error.Exl3TopKExceedsExperts => .{ .type = "exl3_topk_exceeds_experts", .message = "The routed top-k exceeds this layer expert count." },
+        error.Exl3RaggedStreamingUnsupported => .{ .type = "exl3_ragged_streaming_unsupported", .message = "EXL3 rate groups and pruned expert layers require resident loading." },
+        error.Exl3RouterGroupsUnsupported => .{ .type = "exl3_router_groups_unsupported", .message = "Reordered or pruned EXL3 experts require n_group=1 routing." },
         error.Exl3TopKExceedsReduceBank => .{ .type = "exl3_topk_exceeds_reduce_bank", .message = "This EXL3 pack's num_experts_per_tok exceeds the decode reduce-bank (32). Re-convert with top-k <= 32." },
         error.Exl3TrellisGeometry => .{ .type = "exl3_trellis_geometry", .message = "This EXL3 pack has a routed-expert trellis this build cannot decode, or one that disagrees with the expert count, shape or k its config.json names. Re-convert the pack." },
         error.Exl3WindowUnsupported => .{ .type = "exl3_window_unsupported", .message = "This EXL3 pack names a codeword window this build cannot decode: expert_quant.window must be an integer from 8 to 16, or absent for 16." },
@@ -24665,4 +24674,10 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
     // Before `serve()` wires a scheduler: an empty slice, not a crash.
     global_scheduler = null;
     try t.expectEqual(@as(usize, 0), liveSessions(reg, &buf).len);
+}
+
+test "sushi coder load refusals retain named group errors" {
+    for ([_]anyerror{ error.Exl3GroupMissing, error.Exl3GroupNameInvalid, error.Exl3MixedGroupLayout, error.Exl3GroupGeometry, error.Exl3GroupDtype, error.Exl3RouterWidthMismatch, error.Exl3TopKExceedsExperts, error.Exl3RaggedStreamingUnsupported, error.Exl3RouterGroupsUnsupported }) |err| {
+        try std.testing.expect(loadRefusalFor(err) != null);
+    }
 }
