@@ -1113,7 +1113,12 @@ fn gpuArch(buf: []u8) ?[]const u8 {
 }
 
 fn gemmNaxOn() bool {
-    if (gemm_nax_failed) return false;
+    return !gemm_nax_failed and gemmNaxAvailable();
+}
+
+// Capability is independent of the dispatch failure latch: tests must still
+// probe the real kernel after an earlier dispatch fell back to SIMD.
+fn gemmNaxAvailable() bool {
     if (std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK")) |p| {
         const v = std.mem.span(p);
         if (v.len > 0 and v[0] == '1') return false;
@@ -4630,7 +4635,14 @@ test "exl3 a NAX GEMM source the Metal toolchain rejects is declined at the prob
     try t.expect(!mlx.errorPending());
     try t.expect(buildNaxGemmKernel("this is not metal;", "", "sushi_exl3_probe_bad") == null);
     try t.expect(!mlx.errorPending());
-    if (!gemmNaxOn()) return; // the real NAX kernel needs M5-class hardware
+    // Exercise the regression: an earlier failed dispatch may already have
+    // latched NAX off, but that must not turn this capability check into a pass.
+    if (!gemmNaxAvailable()) return; // the real NAX kernel needs M5-class hardware
+    const previous_failure = gemm_nax_failed;
+    defer gemm_nax_failed = previous_failure;
+    gemm_nax_failed = true;
+    try t.expect(gemmNaxAvailable());
+    try t.expect(!gemmNaxOn());
     const real = buildNaxGemmKernel(GEMM_NAX_SOURCE, naxHeader(.mul1, .w16), "sushi_exl3_k4_gemm_nax") orelse return error.TestUnexpectedResult;
     _ = mlx.mlx_fast_metal_kernel_free(real);
     try t.expect(!mlx.errorPending());

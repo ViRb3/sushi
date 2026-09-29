@@ -23,6 +23,11 @@ It reaches `mlx`, `log` and `io_util` through an `mlx_host` import whose root fi
 root is `src/main.zig` (and `src/tests.zig` for tests), and it can never import a Sushi file by path. Its tests run as
 their own artifact (`exl3-test`) on `zig build test`.
 
+The NAX compile-probe regression test checks hardware capability independently
+of the runtime failure latch. It deliberately latches dispatch off before
+probing the real kernel, so an earlier SIMD fallback cannot hide a broken NAX
+kernel on supported hardware.
+
 ## Format as the engine sees it
 
 - Routed experts are stacked per layer as `[E, ...]` so gather kernels index expert e on axis 0; 16x16 tiles,
