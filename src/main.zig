@@ -20,6 +20,7 @@ const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const imatrix_cmd = @import("imatrix_cmd.zig");
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
@@ -105,6 +106,7 @@ fn printUsage(io: std.Io) void {
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider). `sushi launch <agent> -h`
         \\                      for options
+        \\  imatrix capture     Capture prefill-only expert statistics; `sushi imatrix --help`
         \\  kld capture|compare Write a teacher fixture (full-vocab logits at
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
@@ -448,6 +450,9 @@ pub fn main(init: std.process.Init) !void {
             }
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "imatrix")) {
+            try imatrix_cmd.cmdCapture(allocator, io, args[2..]);
+            return;
         } else if (std.mem.eql(u8, cmd, "kld")) {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
@@ -455,7 +460,7 @@ pub fn main(init: std.process.Init) !void {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, imatrix, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }

@@ -16940,6 +16940,10 @@ pub const Transformer = struct {
             imatrix = try imatrix_capture.Collector.forModel(allocator, s, config.model_type, config.num_hidden_layers, @intCast(config.num_experts));
         }
 
+        if (imatrix == null and config.expert_layout == .exl3_k4) {
+            imatrix = try imatrix_capture.Collector.forModel(allocator, s, config.model_type, config.num_hidden_layers, @intCast(config.num_experts));
+        }
+
         const profile_head_shape = mlx.getShape(lm_head_w);
         const profile_head_n: c_int = if (profile_head_shape.len == 2) profile_head_shape[0] else 0;
         const uniform_profile_bits = config.quant_bits == 4 or config.quant_bits == 6 or config.quant_bits == 8;
@@ -24998,7 +25002,7 @@ pub const Transformer = struct {
         _ = mlx.mlx_array_free(h);
         // Every row, even when this chunk skips the projection: each is a row
         // some position's logits are read from.
-        if (self.imatrix) |c| try c.observeLinear(.lm_head, final_normed);
+        if (!ctx.skip_lm_head) if (self.imatrix) |c| try c.observeLinear(.lm_head, final_normed);
 
         // Inkling muP logit scaling: hidden ÷ logits_mup_width_multiplier
         // before the unembed projection (0-dim scalar — no dtype promotion).
@@ -30714,6 +30718,25 @@ pub const Transformer = struct {
     /// expert_x: input for expert computation (possibly normalized).
     fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool) !mlx.mlx_array {
         if (verify_rows) mtp_verify_expert_rows_calls +%= 1;
+        if (self.imatrix) |col| {
+            if (self.moe_layers) |layers| for (layers, 0..) |*lw, layer| {
+                if (lw.mlp != .moe or &lw.mlp.moe != mw) continue;
+                if (mw.exl3_group_count > 1) return error.ImatrixExl3RateGroupsUnsupported;
+                const shape = mlx.getShape(expert_x);
+                var tap = (try ImatrixTap.forLayer(col, @intCast(layer), inds, shape[0] * shape[1], mlx.getShape(inds)[2], self.s)).?;
+                defer tap.deinit();
+                try tap.observeInput(self.s, expert_x, shape[0] * shape[1], shape[2]);
+                const bank: sushi_exl3.Bank = if (mw.exl3_group_count == 1) mw.exl3_groups[0] else .{
+                    .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
+                    .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
+                    .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
+                };
+                return sushi_exl3.moeWithCapture(self.s, expert_x, bank, inds, scores, .{
+                    .codebook = self.config.expert_quant_codebook,
+                    .window = self.config.expert_quant_window,
+                }, verify_rows, .{ .context = &tap, .observe = ImatrixTap.observeExl3 });
+            };
+        }
         if (mw.exl3_group_count > 0) return sushi_exl3.moeGroups(self.s, expert_x, mw.exl3_groups[0..mw.exl3_group_count], inds, scores, .{
             .codebook = self.config.expert_quant_codebook,
             .window = self.config.expert_quant_window,
@@ -39655,6 +39678,17 @@ const ImatrixTap = struct {
         return .{ .collector = collector, .layer = layer, .global_ids = ids_2d };
     }
 
+    fn observeExl3(raw: *anyopaque, activation: mlx.mlx_array, outputs: mlx.mlx_array, ids: mlx.mlx_array, scores: mlx.mlx_array) !void {
+        const self: *ImatrixTap = @ptrCast(@alignCast(raw));
+        const s = self.collector.s;
+        const n = mlx.getShape(outputs)[0];
+        try self.observeDown(s, activation, ids, n);
+        var ids2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids2);
+        try mlx.check(mlx.mlx_reshape(&ids2, ids, &[_]c_int{ n, 1 }, 2, s));
+        try self.collector.observeOutputs(self.layer, outputs, ids2, scores);
+    }
+
     fn deinit(self: ImatrixTap) void {
         _ = mlx.mlx_array_free(self.global_ids);
     }
@@ -41085,6 +41119,7 @@ test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode"
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
+    xfm.imatrix = null;
     xfm.s = s;
     xfm.config = .{
         .expert_layout = .exl3_k4,
@@ -41188,6 +41223,7 @@ test "exl3 MTP fused rows match N solo calls on the same kernel" {
     const rw = try alloc.alloc(u16, dim * E);
     for (rw) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 0.05);
     var xfm: Transformer = undefined;
+    xfm.imatrix = null;
     xfm.s = s;
     xfm.config = .{
         .expert_layout = .exl3_k4,
@@ -70162,6 +70198,7 @@ test "exl3 shared add releases routed output study3" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var xfm: Transformer = undefined;
+    xfm.imatrix = null;
     xfm.config = .{};
     xfm.bits_cache = .{};
     xfm.compiled_geglu = null;
@@ -71811,4 +71848,8 @@ test "sushi coder GPU grouped layer matches the original uniform bank" {
     const av = mlx.mlx_array_data_float32(a).?;
     const bv = mlx.mlx_array_data_float32(b).?;
     for (0..128) |i| try t.expectApproxEqAbs(av[i], bv[i], 0.002 + @abs(av[i]) * 0.002);
+}
+
+test "imatrix capture-off CPU tap returns before touching arrays or stream" {
+    try std.testing.expect(try ImatrixTap.forLayer(null, 0, .{ .ctx = null }, 16384, 32, .{ .ctx = null }) == null);
 }

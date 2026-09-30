@@ -423,3 +423,283 @@ fn moeMixedDecode(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, slots: mlx.ml
     defer _ = mlx.mlx_array_free(inner);
     return kernels.downFinishReduce(s, inner, d.svh, slots, scores, hidden, rows, topk, dtype);
 }
+
+test "imatrix GPU capture K2 K3 K4 parity and sorted slot alignment" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const HostProj = struct { trellis: []u16, suh: [256]u16, svh: [256]u16 };
+    const Probe = struct {
+        calls: usize = 0,
+        host: [3]HostProj,
+        input: []const f32,
+        global_ids: []const u32,
+        rate: format.Rate,
+        fn expectStageBound(self: *const @This(), row: usize, expert: usize, projection: []const u8, stage: []const u8, values: []const f32) !void {
+            var peak: f32 = 0;
+            for (values) |v| {
+                if (!std.math.isFinite(v)) {
+                    peak = std.math.inf(f32);
+                    break;
+                }
+                peak = @max(peak, @abs(v));
+            }
+            if (peak >= 1e4) {
+                std.debug.print("imatrix host oracle exceeds f16 safety bound: K{d} row={d} expert={d} {s}.{s} max_abs={d}, required < 10000\n", .{ @divExact(self.rate.n, 16), row, expert, projection, stage, peak });
+                return error.ImatrixFixtureExceedsF16Bound;
+            }
+        }
+        fn boundedHostProject(self: *const @This(), row: usize, expert: usize, projection: usize, input: []const f32, output: *[128]f32) !void {
+            const name = ([_][]const u8{ "gate", "up", "down" })[projection];
+            const bank = self.host[projection];
+            const stride = 8 * 8 * self.rate.n;
+            var prepared: [128]f32 = undefined;
+            try self.expectStageBound(row, expert, name, "input", input);
+            for (input, &prepared, 0..) |v, *scaled, channel| scaled.* = v * format.f16BitsToF32(bank.suh[expert * 128 + channel]);
+            try self.expectStageBound(row, expert, name, "input_times_suh", &prepared);
+            format.hadamard128(&prepared);
+            try self.expectStageBound(row, expert, name, "input_hadamard", &prepared);
+            var weights: [128 * 128]u16 = undefined;
+            format.reconstructInner(bank.trellis[expert * stride ..][0..stride], 128, 128, self.rate, .mcg, &weights);
+            for (output, 0..) |*v, column| {
+                v.* = 0;
+                for (prepared, 0..) |x, k| v.* += x * format.f16BitsToF32(weights[k * 128 + column]);
+            }
+            try self.expectStageBound(row, expert, name, "inner", output);
+            format.hadamard128(output);
+            try self.expectStageBound(row, expert, name, "output_hadamard", output);
+            for (output, 0..) |*v, channel| v.* *= format.f16BitsToF32(bank.svh[expert * 128 + channel]);
+            try self.expectStageBound(row, expert, name, "output", output);
+        }
+        fn expectFiniteHostOracle(self: *const @This()) !void {
+            for (0..self.input.len / 128) |row| {
+                const input = self.input[row * 128 ..][0..128];
+                var outputs: [2][128]f32 = undefined;
+                for (&outputs, 0..) |*expected, expert| {
+                    var gate: [128]f32 = undefined;
+                    var up: [128]f32 = undefined;
+                    var sigmoid: [128]f32 = undefined;
+                    var silu: [128]f32 = undefined;
+                    var mid: [128]f32 = undefined;
+                    try self.boundedHostProject(row, expert, 0, input, &gate);
+                    try self.boundedHostProject(row, expert, 1, input, &up);
+                    for (&sigmoid, &silu, &mid, gate, up) |*sig, *si, *v, g, u| {
+                        sig.* = 1 / (1 + @exp(-g));
+                        si.* = g * sig.*;
+                        v.* = si.* * u;
+                    }
+                    try self.expectStageBound(row, expert, "swiglu", "sigmoid", &sigmoid);
+                    try self.expectStageBound(row, expert, "swiglu", "silu", &silu);
+                    try self.expectStageBound(row, expert, "swiglu", "activation", &mid);
+                    try self.boundedHostProject(row, expert, 2, &mid, expected);
+                    for ([_][]const f32{ &gate, &up, &mid, expected }) |values| for (values) |v| try t.expect(std.math.isFinite(v));
+                }
+                var max_difference: f32 = 0;
+                var norm: [2]f32 = .{ 0, 0 };
+                for (outputs[0], outputs[1]) |a, b| {
+                    max_difference = @max(max_difference, @abs(a - b));
+                    norm[0] += a * a;
+                    norm[1] += b * b;
+                }
+                const tolerance = 0.02 * @sqrt(@max(norm[0], norm[1]) / 128) + 1e-6;
+                if (max_difference <= 2 * tolerance) {
+                    std.debug.print("imatrix host experts are not distinguishable for the same input: K{d} row={d} max_difference={d}, required > {d}\n", .{ @divExact(self.rate.n, 16), row, max_difference, 2 * tolerance });
+                    return error.ImatrixFixtureExpertsIndistinguishable;
+                }
+            }
+        }
+        fn observe(raw: *anyopaque, activation: mlx.mlx_array, outputs: mlx.mlx_array, ids: mlx.mlx_array, scores: mlx.mlx_array) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try mlx.check(mlx.mlx_array_eval(ids));
+            try mlx.check(mlx.mlx_array_eval(scores));
+            try mlx.check(mlx.mlx_array_eval(activation));
+            try mlx.check(mlx.mlx_array_eval(outputs));
+            const p = mlx.mlx_array_data_uint32(ids).?;
+            const w = mlx.mlx_array_data_float32(scores).?;
+            const act = mlx.mlx_array_data_float32(activation).?;
+            const out = mlx.mlx_array_data_float32(outputs).?;
+            const stride = 8 * 8 * self.rate.n;
+            for (0..mlx.mlx_array_size(ids)) |i| {
+                const original: usize = @intFromFloat((w[i] - 0.125) * 512);
+                try t.expect(original < self.global_ids.len);
+                try t.expectEqual(self.global_ids[original], p[i]);
+                const e: usize = p[i];
+                const input = self.input[original / 2 * 128 ..][0..128];
+                var transformed: [128]f32 = undefined;
+                var inner: [128]f32 = undefined;
+                var gate: [128]f32 = undefined;
+                var up: [128]f32 = undefined;
+                var mid: [128]f32 = undefined;
+                var expected: [128]f32 = undefined;
+                for ([_]HostProj{ self.host[0], self.host[1] }, [_]*[128]f32{ &gate, &up }) |projection, dest| {
+                    format.project(input, projection.trellis[e * stride ..][0..stride], projection.suh[e * 128 ..][0..128], projection.svh[e * 128 ..][0..128], 128, 128, self.rate, .mcg, &transformed, &inner, dest);
+                }
+                for (&mid, gate, up) |*v, g, u| v.* = (g / (1 + @exp(-g))) * u;
+                const down = self.host[2];
+                format.project(&mid, down.trellis[e * stride ..][0..stride], down.suh[e * 128 ..][0..128], down.svh[e * 128 ..][0..128], 128, 128, self.rate, .mcg, &transformed, &inner, &expected);
+                for ([_][]const f32{ &mid, &expected }, [_][]const f32{ act[i * 128 ..][0..128], out[i * 128 ..][0..128] }) |truth, actual| {
+                    var norm: f32 = 0;
+                    for (truth) |v| norm += v * v;
+                    const tolerance = 0.02 * @sqrt(norm / 128) + 1e-6;
+                    for (truth, actual) |want, got| {
+                        try t.expect(std.math.isFinite(want) and std.math.isFinite(got));
+                        try t.expectApproxEqAbs(want, got, tolerance);
+                    }
+                }
+            }
+        }
+    };
+    for ([_]c_int{ 32, 48, 64 }) |n| {
+        var bank: Bank = undefined;
+        var host: [3]HostProj = undefined;
+        var word_buffers: std.ArrayList([]u16) = .empty;
+        defer {
+            for (word_buffers.items) |words| t.allocator.free(words);
+            word_buffers.deinit(t.allocator);
+        }
+        var held: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (held.items) |a| _ = mlx.mlx_array_free(a);
+            held.deinit(t.allocator);
+        }
+        for ([_]*Proj{ &bank.gate, &bank.up, &bank.down }, 0..) |p, projection| {
+            const words = try t.allocator.alloc(u16, @intCast(2 * 8 * 8 * n));
+            try word_buffers.append(t.allocator, words);
+            for (words, 0..) |*v, i| v.* = @truncate(i *% 7919 +% 23 +% projection * 103);
+            const input_scale: [256]u16 = @splat(format.f32ToF16Bits(if (projection == 2) 0.03125 else 0.0078125));
+            const output_scale: [256]u16 = @splat(format.f32ToF16Bits(0.5));
+            host[projection] = .{ .trellis = words, .suh = input_scale, .svh = output_scale };
+            p.trellis = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ 2, 8, 8, n }, 4, .uint16);
+            try held.append(t.allocator, p.trellis);
+            p.suh = mlx.mlx_array_new_data(&input_scale, &[_]c_int{ 2, 128 }, 2, .float16);
+            try held.append(t.allocator, p.suh);
+            p.svh = mlx.mlx_array_new_data(&output_scale, &[_]c_int{ 2, 128 }, 2, .float16);
+            try held.append(t.allocator, p.svh);
+        }
+        for (host) |projection| {
+            const stride = projection.trellis.len / 2;
+            try t.expect(!std.mem.eql(u16, projection.trellis[0..stride], projection.trellis[stride..]));
+        }
+        for (0..host.len) |i| for (i + 1..host.len) |j| {
+            try t.expect(!std.mem.eql(u16, host[i].trellis, host[j].trellis));
+            const stride = host[i].trellis.len / 2;
+            for (0..2) |expert| {
+                const start = expert * stride;
+                try t.expect(!std.mem.eql(u16, host[i].trellis[start..][0..stride], host[j].trellis[start..][0..stride]));
+            }
+        };
+        for ([_]usize{ 1, 33 }) |rows| {
+            for ([_]f32{ 1, 128 }) |magnitude| {
+                for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
+                    const xh = try t.allocator.alloc(f32, rows * 128);
+                    defer t.allocator.free(xh);
+                    for (xh, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) * 0.25 * magnitude;
+                    const ih = try t.allocator.alloc(u32, rows * 2);
+                    defer t.allocator.free(ih);
+                    const wh = try t.allocator.alloc(f32, rows * 2);
+                    defer t.allocator.free(wh);
+                    for (ih, wh, 0..) |*id, *w, i| {
+                        id.* = @intCast((i + i / 2) % 2);
+                        w.* = 0.125 + @as(f32, @floatFromInt(i)) / 512;
+                    }
+                    const raw_x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ 1, @intCast(rows), 128 }, 3, .float32);
+                    defer _ = mlx.mlx_array_free(raw_x);
+                    var x = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_astype(&x, raw_x, dtype, s));
+                    defer _ = mlx.mlx_array_free(x);
+                    const ids = mlx.mlx_array_new_data(ih.ptr, &[_]c_int{ 1, @intCast(rows), 2 }, 3, .uint32);
+                    defer _ = mlx.mlx_array_free(ids);
+                    const weights = mlx.mlx_array_new_data(wh.ptr, &[_]c_int{ 1, @intCast(rows), 2 }, 3, .float32);
+                    defer _ = mlx.mlx_array_free(weights);
+                    var probe = Probe{ .host = host, .input = xh, .global_ids = ih, .rate = format.kFromPackedDim(@intCast(n)).? };
+                    try probe.expectFiniteHostOracle();
+                    const normal = try moe(s, x, bank, ids, weights, .mcg, false);
+                    defer _ = mlx.mlx_array_free(normal);
+                    try mlx.check(mlx.mlx_array_eval(normal));
+                    var normal32 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(normal32);
+                    try mlx.check(mlx.mlx_astype(&normal32, normal, .float32, s));
+                    try mlx.check(mlx.mlx_array_eval(normal32));
+                    for (mlx.mlx_array_data_float32(normal32).?[0..xh.len], 0..) |v, i| {
+                        if (!std.math.isFinite(v)) {
+                            std.debug.print("imatrix normal arm is non-finite before capture-off parity: K{d} rows={d} magnitude={d} dtype={s} index={d} value={d}\\n", .{ @divExact(n, 16), rows, magnitude, @tagName(dtype), i, v });
+                            return error.TestExpectedEqual;
+                        }
+                    }
+                    const off = try moeWithCapture(s, x, bank, ids, weights, .mcg, false, null);
+                    defer _ = mlx.mlx_array_free(off);
+                    try mlx.check(mlx.mlx_array_eval(off));
+                    if (dtype == .float32) {
+                        try t.expectEqualSlices(f32, mlx.mlx_array_data_float32(normal).?[0..xh.len], mlx.mlx_array_data_float32(off).?[0..xh.len]);
+                    } else {
+                        try t.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(normal).?[0..xh.len], mlx.mlx_array_data_bfloat16(off).?[0..xh.len]);
+                    }
+                    const captured = try moeWithCapture(s, x, bank, ids, weights, .mcg, false, .{ .context = &probe, .observe = Probe.observe });
+                    defer _ = mlx.mlx_array_free(captured);
+                    try mlx.check(mlx.mlx_array_eval(captured));
+                    try t.expectEqual(@as(usize, 1), probe.calls);
+                    var actual32 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(actual32);
+                    var expected32 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(expected32);
+                    try mlx.check(mlx.mlx_astype(&actual32, captured, .float32, s));
+                    try mlx.check(mlx.mlx_astype(&expected32, normal, .float32, s));
+                    try mlx.check(mlx.mlx_array_eval(actual32));
+                    try mlx.check(mlx.mlx_array_eval(expected32));
+                    const actual = mlx.mlx_array_data_float32(actual32).?;
+                    const expected = mlx.mlx_array_data_float32(expected32).?;
+                    var norm: f32 = 0;
+                    for (expected[0..xh.len]) |v| norm += v * v;
+                    const tolerance = 0.02 * @sqrt(norm / @as(f32, @floatFromInt(xh.len))) + 1e-6;
+                    for (0..xh.len) |i| {
+                        try t.expect(std.math.isFinite(actual[i]) and std.math.isFinite(expected[i]));
+                        try t.expectApproxEqAbs(expected[i], actual[i], tolerance);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub const Capture = struct {
+    context: *anyopaque,
+    observe: *const fn (*anyopaque, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) anyerror!void,
+};
+
+var capture_engaged = false;
+
+pub fn moeWithCapture(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, capture: ?Capture) !mlx.mlx_array {
+    const tap = capture orelse return moe(s, x, bank, inds, scores, dec, verify_rows);
+    kernels.setDecodeParams(dec);
+    const shape = mlx.getShape(x);
+    const rows = shape[0] * shape[1];
+    const hidden = shape[2];
+    const topk = mlx.getShape(inds)[2];
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows, hidden }, 2, s));
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_reshape(&ids, inds, &[_]c_int{rows * topk}, 1, s));
+    var slots = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(slots);
+    try mlx.check(mlx.mlx_astype(&slots, ids, .uint32, s));
+    var weights = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weights);
+    try mlx.check(mlx.mlx_reshape(&weights, scores, &[_]c_int{rows * topk}, 1, s));
+    const g = bank.gate;
+    const u = bank.up;
+    const d = bank.down;
+    const captured = try kernels.moeCapture(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots, weights, topk, verify_rows);
+    defer captured.deinit();
+    try tap.observe(tap.context, captured.activation, captured.outputs, captured.slots, captured.scores);
+    if (!capture_engaged) {
+        capture_engaged = true;
+        @import("mlx_host").log.info("[exl3] imatrix capture engaged: unfused SwiGLU and unweighted f32 down outputs\n", .{});
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, captured.output, shape.ptr, @intCast(shape.len), s));
+    return out;
+}

@@ -8452,3 +8452,117 @@ test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" 
         }
     }
 }
+
+pub const CapturedMoe = struct {
+    output: mlx.mlx_array,
+    activation: mlx.mlx_array,
+    outputs: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+
+    pub fn deinit(self: CapturedMoe) void {
+        for ([_]mlx.mlx_array{ self.output, self.activation, self.outputs, self.slots, self.scores }) |a| _ = mlx.mlx_array_free(a);
+    }
+};
+
+const FINISH_CAPTURE_SOURCE = blk: {
+    @setEvalBranchQuota(20000);
+    var source: [FINISH_SOURCE.len + 4:0]u8 = undefined;
+    _ = std.mem.replace(u8, FINISH_SOURCE, "half(", "float(", &source);
+    source[source.len] = 0;
+    break :blk source;
+};
+
+fn finishCapture(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
+    const inputs = [_][*:0]const u8{ "inner", "svh", "slots" };
+    const outputs = [_][*:0]const u8{"y"};
+    const iv = mlx.mlx_vector_string_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outputs, outputs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const kernel = mlx.mlx_fast_metal_kernel_new("sushi_exl3_capture_finish", iv, ov, &FINISH_CAPTURE_SOURCE, "", true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    const shape = mlx.getShape(inner);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(32 * @divExact(shape[1], 128)), @intCast(shape[0]), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ODIM", shape[1]));
+    return applyUnary(s, kernel, &.{ inner, svh, slots }, cfg);
+}
+
+pub fn moeCapture(s: mlx.mlx_stream, x: mlx.mlx_array, gate_t: mlx.mlx_array, gate_suh: mlx.mlx_array, gate_svh: mlx.mlx_array, up_t: mlx.mlx_array, up_suh: mlx.mlx_array, up_svh: mlx.mlx_array, down_t: mlx.mlx_array, down_suh: mlx.mlx_array, down_svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, verify_rows: bool) !CapturedMoe {
+    const shape = mlx.getShape(x);
+    const rows = shape[0];
+    const hidden = shape[1];
+    const nslots = rows * topk;
+    var order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order);
+    try mlx.check(mlx.mlx_argsort_axis(&order, slots, 0, s));
+    var order_i = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order_i);
+    try mlx.check(mlx.mlx_astype(&order_i, order, .int32, s));
+    var sorted = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sorted);
+    try mlx.check(mlx.mlx_take_axis(&sorted, slots, order, 0, s));
+    var sorted_scores = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sorted_scores);
+    try mlx.check(mlx.mlx_take_axis(&sorted_scores, scores, order, 0, s));
+    const decode = rows <= DECODE_ROWS_MAX or verify_rows;
+    const inners = if (decode) blk: {
+        const inter = mlx.getShape(gate_t)[2] * 16;
+        const paired = mlx.getShape(gate_t)[3] == mlx.getShape(up_t)[3];
+        const gu = try pairGemv(s, x, gate_suh, if (paired) up_suh else gate_suh, gate_t, if (paired) up_t else gate_t, slots, hidden, inter, nslots, topk, 0);
+        defer _ = mlx.mlx_array_free(gu[0]);
+        defer _ = mlx.mlx_array_free(gu[1]);
+        const uu = if (paired) null else try pairGemv(s, x, up_suh, up_suh, up_t, up_t, slots, hidden, inter, nslots, topk, 0);
+        defer if (uu) |pair| {
+            _ = mlx.mlx_array_free(pair[0]);
+            _ = mlx.mlx_array_free(pair[1]);
+        };
+        var g = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(g);
+        try mlx.check(mlx.mlx_take_axis(&g, gu[0], order, 0, s));
+        var u = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(u);
+        try mlx.check(mlx.mlx_take_axis(&u, if (uu) |pair| pair[0] else gu[1], order, 0, s));
+        break :blk .{ g, u };
+    } else blk: {
+        const prep = try pairPrepareFromTokens(s, x, gate_suh, up_suh, sorted, order_i, hidden, nslots, topk);
+        defer _ = mlx.mlx_array_free(prep[0]);
+        defer _ = mlx.mlx_array_free(prep[1]);
+        const g = try innerGemmSorted(s, prep[0], gate_t, sorted);
+        errdefer _ = mlx.mlx_array_free(g);
+        const u = try innerGemmSorted(s, prep[1], up_t, sorted);
+        break :blk .{ g, u };
+    };
+    const ig = inners[0];
+    defer _ = mlx.mlx_array_free(ig);
+    const iu = inners[1];
+    defer _ = mlx.mlx_array_free(iu);
+    const gate = try finishCapture(s, ig, gate_svh, sorted);
+    defer _ = mlx.mlx_array_free(gate);
+    const up = try finishCapture(s, iu, up_svh, sorted);
+    defer _ = mlx.mlx_array_free(up);
+    var sigmoid = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sigmoid);
+    try mlx.check(mlx.mlx_sigmoid(&sigmoid, gate, s));
+    var silu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(silu);
+    try mlx.check(mlx.mlx_multiply(&silu, gate, sigmoid, s));
+    var activation = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(activation);
+    try mlx.check(mlx.mlx_multiply(&activation, silu, up, s));
+    const down_x = try prepareIndexed(s, activation, down_suh, sorted);
+    defer _ = mlx.mlx_array_free(down_x);
+    const inner = if (decode) try indexedGemvCoopF16(s, down_x, down_t, sorted) else try innerGemmSorted(s, down_x, down_t, sorted);
+    defer _ = mlx.mlx_array_free(inner);
+    const outputs = try finishCapture(s, inner, down_svh, sorted);
+    errdefer _ = mlx.mlx_array_free(outputs);
+    const unsorted = try scatterSorted(s, inner, order_i, hidden, nslots);
+    defer _ = mlx.mlx_array_free(unsorted);
+    const output = try downFinishReduce(s, unsorted, down_svh, slots, scores, hidden, rows, topk, mlx.mlx_array_dtype(x));
+    return .{ .output = output, .activation = activation, .outputs = outputs, .slots = sorted, .scores = sorted_scores };
+}

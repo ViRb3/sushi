@@ -89,6 +89,10 @@ file as per-channel mean squares under their source weight names ([arch-mimo-v2]
 converter repo. Routed counts reconcile to
 tokens x top-k exactly on every layer; the two load-time warmup forwards add a few tokens.
 
+- **Prefill-only capture** (`sushi imatrix capture --model <dir> --prompts <jsonl> --out <abs>.safetensors`): prompt
+  ids forwarded with a fresh cache per prompt, no decode, logits or HTTP; publishes through `<out>.partial` after a
+  self-check. On a resident EXL3 pack an unfused capture arm (`moeWithCapture`) also records `gate_mass` and `reap`
+  (REAP saliency = reap / rows); a pack with more than one rate group is refused. The MTP head is not observed.
 - **Hidden capture** (`SUSHI_HIDDEN_OUT=<abs dir>`): `sushi kld capture` (no prefix cache, no warmup) appends every
   prompt token's residual at each block boundary (`boundary-XX.bin`, raw bf16 [tokens, hidden]; 00 = layer 0's input,
   b = layer b-1's output), then its ids (`tokens.bin`, u32); `forwardMoeWith` only; logits bit-identical.

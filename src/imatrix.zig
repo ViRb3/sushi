@@ -8,6 +8,9 @@
 //!   <experts>.gate_up_proj.rows   [E] tokens routed to each expert
 //! The values are sum(x^2) over the rows routed to the expert divided by the
 //! LAYER's token count, so a busy expert keeps its larger vote.
+//! The resident EXL3 capture arm adds two raw sums (readers treat them as optional):
+//!   <experts>.gate_mass           [E] router weights routed to the expert
+//!   <experts>.reap                [E] router weight x f32 L2 norm of the expert's unweighted output
 //!
 //! `<experts>` is the SOURCE checkpoint's own name for the layer's expert
 //! block, which is per-arch (`Arch`): Qwen3.8-Flash-Next stores the routed
@@ -66,12 +69,16 @@ const Layer = struct {
     gu: mlx.mlx_array = .{ .ctx = null },
     down: mlx.mlx_array = .{ .ctx = null },
     rows: mlx.mlx_array = .{ .ctx = null },
+    gate_mass: mlx.mlx_array = .{ .ctx = null },
+    reap: mlx.mlx_array = .{ .ctx = null },
     tokens: u64 = 0,
 
     fn deinit(self: *Layer) void {
         if (self.gu.ctx != null) _ = mlx.mlx_array_free(self.gu);
         if (self.down.ctx != null) _ = mlx.mlx_array_free(self.down);
         if (self.rows.ctx != null) _ = mlx.mlx_array_free(self.rows);
+        if (self.gate_mass.ctx != null) _ = mlx.mlx_array_free(self.gate_mass);
+        if (self.reap.ctx != null) _ = mlx.mlx_array_free(self.reap);
         self.* = .{};
     }
 };
@@ -259,6 +266,47 @@ pub const Collector = struct {
         try self.addOuter(&self.layers[layer].down, cnt, act_rows);
     }
 
+    pub fn observeOutputs(self: *Collector, layer: usize, outputs: mlx.mlx_array, ids: mlx.mlx_array, scores: mlx.mlx_array) !void {
+        if (layer >= self.layers.len) return error.ImatrixLayerOutOfRange;
+        const os = mlx.getShape(outputs);
+        const is = mlx.getShape(ids);
+        if (os.len != 2 or is.len != 2 or is[0] != os[0] or is[1] != 1 or os[0] <= 0 or mlx.mlx_array_size(scores) != @as(usize, @intCast(os[0]))) return error.ImatrixBadShape;
+        const cnt = try self.counts(ids, os[0], 1);
+        defer _ = mlx.mlx_array_free(cnt);
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_astype(&v, outputs, .float32, self.s));
+        var sq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sq);
+        try mlx.check(mlx.mlx_square(&sq, v, self.s));
+        var sums = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sums);
+        try mlx.check(mlx.mlx_sum_axis(&sums, sq, 1, true, self.s));
+        var norm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(norm);
+        try mlx.check(mlx.mlx_sqrt(&norm, sums, self.s));
+        var weights = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(weights);
+        try mlx.check(mlx.mlx_astype(&weights, scores, .float32, self.s));
+        var column = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(column);
+        try mlx.check(mlx.mlx_reshape(&column, weights, &[_]c_int{ os[0], 1 }, 2, self.s));
+        var weighted_norm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(weighted_norm);
+        try mlx.check(mlx.mlx_multiply(&weighted_norm, column, norm, self.s));
+        for ([_]mlx.mlx_array{ column, weighted_norm }, [_]*mlx.mlx_array{ &self.layers[layer].gate_mass, &self.layers[layer].reap }) |values, acc| {
+            var routed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(routed);
+            try mlx.check(mlx.mlx_multiply(&routed, cnt, values, self.s));
+            var term = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_sum_axis(&term, routed, 0, false, self.s)) catch |e| {
+                _ = mlx.mlx_array_free(term);
+                return e;
+            };
+            try self.fold(acc, term);
+        }
+    }
+
     /// A dense linear's input `x` ([..., in], any leading shape): its per-channel
     /// sum of squares over every row.
     pub fn observeLinear(self: *Collector, which: Linear, x: mlx.mlx_array) !void {
@@ -356,6 +404,13 @@ pub const Collector = struct {
             const down_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}.mlp.experts.down_proj", .{ prefix, li }, 0);
             try mlx.check(mlx.mlx_map_string_to_array_insert(map, down_key.ptr, down));
             entries += 3;
+            if (slot.gate_mass.ctx != null and slot.reap.ctx != null) {
+                for ([_][]const u8{ "gate_mass", "reap" }, [_]mlx.mlx_array{ slot.gate_mass, slot.reap }) |suffix, value| {
+                    const key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}.mlp.experts.{s}", .{ prefix, li, suffix }, 0);
+                    try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, value));
+                    entries += 1;
+                }
+            }
         }
         var name_buf: [192]u8 = undefined;
         for (self.o_proj, 0..) |*d, li| {
@@ -368,12 +423,10 @@ pub const Collector = struct {
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
         _ = mlx.mlx_map_string_to_string_insert(meta, "keys", "SOURCE checkpoint weight names");
-        _ = mlx.mlx_map_string_to_string_insert(meta, "values", "experts: sum(x^2)/layer tokens, per expert concatenated; dense linears: sum(x^2)/rows");
+        _ = mlx.mlx_map_string_to_string_insert(meta, "values", "experts: sum(x^2)/layer tokens, per expert concatenated; gate_mass: sum(router weight); reap: sum(router weight * f32 output L2 norm); dense linears: sum(x^2)/rows");
         _ = mlx.mlx_map_string_to_string_insert(meta, "producer", "sushi " ++ ENV_VAR);
 
-        const path_z = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{self.path}, 0);
-        defer self.allocator.free(path_z);
-        try mlx.check(mlx.mlx_save_safetensors(path_z.ptr, map, meta));
+        try saveExact(self.allocator, self.path, map, meta);
         const io = std.Io.Threaded.global_single_threaded.io();
         const stat = std.Io.Dir.cwd().statFile(io, self.path, .{}) catch |e| {
             log.warn("[imatrix] wrote {s}: size unavailable ({s})\n", .{ self.path, @errorName(e) });
@@ -652,4 +705,98 @@ test "imatrix records a dense linear's input rows under its source weight name" 
     defer _ = mlx.mlx_array_free(absent);
     try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, "model.layers.0.self_attn.o_proj.weight") != 0);
     try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, "model.layers.1.mlp.experts.gate_up_proj") != 0);
+}
+
+test "imatrix CPU REAP sums align duplicated slots and unused experts" {
+    const device = mlx.mlx_device_new_type(.cpu, 0);
+    defer _ = mlx.mlx_device_free(device);
+    var previous = mlx.mlx_device_new();
+    defer _ = mlx.mlx_device_free(previous);
+    try mlx.check(mlx.mlx_get_default_device(&previous));
+    try mlx.check(mlx.mlx_set_default_device(device));
+    defer _ = mlx.mlx_set_default_device(previous);
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/capture.safetensors.partial", .{dir}, 0);
+    defer testing.allocator.free(path);
+    const col = try Collector.init(testing.allocator, s, path, 1, 3, .qwen4_exp);
+    defer col.deinit();
+    const x = mlx.mlx_array_new_data(&[_]f32{ 1, 2, 3, 4, 5, 6 }, &[_]c_int{ 3, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const ids = mlx.mlx_array_new_data(&[_]i32{ 0, 1, 1, 1, 0, 1 }, &[_]c_int{ 3, 2 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const flat = mlx.mlx_array_new_data(&[_]i32{ 0, 1, 1, 1, 0, 1 }, &[_]c_int{ 6, 1 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(flat);
+    const act = mlx.mlx_array_new_data(&[_]f32{ 1, 2, 3, 4, 5, 6 }, &[_]c_int{ 6, 1 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(act);
+    const outputs = mlx.mlx_array_new_data(&[_]f32{ 3, 4, 0, 2, 0, 3, 0, 4, 5, 12, 8, 15 }, &[_]c_int{ 6, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(outputs);
+    const scores = mlx.mlx_array_new_data(&[_]f32{ 0.25, 0.75, 0.5, 0.5, 0.75, 0.25 }, &[_]c_int{6}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    try col.observeGateUp(0, x, ids);
+    try col.observeDown(0, act, flat);
+    try col.observeOutputs(0, outputs, flat, scores);
+    try testing.expectEqual(@as(u64, 3), col.layers[0].tokens);
+    for ([_]f32{ 26, 40, 44, 72, 0, 0 }, 0..) |want, i| try testing.expectEqual(want, try f32At(col.layers[0].gu, i));
+    for ([_]f32{ 26, 65, 0 }, 0..) |want, i| try testing.expectEqual(want, try f32At(col.layers[0].down, i));
+    for ([_]f32{ 2, 4, 0 }, 0..) |want, i| try testing.expectEqual(want, try f32At(col.layers[0].rows, i));
+    for ([_]f32{ 1, 2, 0 }, 0..) |want, i| try testing.expectEqual(want, try f32At(col.layers[0].gate_mass, i));
+    for ([_]f32{ 11, 9.25, 0 }, 0..) |want, i| try testing.expectEqual(want, try f32At(col.layers[0].reap, i));
+    try col.observeOutputs(0, outputs, flat, scores);
+    for ([_]f32{ 2, 4, 0 }, 0..) |want, i| try testing.expectEqual(want, try f32At(col.layers[0].gate_mass, i));
+    for ([_]f32{ 22, 18.5, 0 }, 0..) |want, i| try testing.expectEqual(want, try f32At(col.layers[0].reap, i));
+    _ = try col.flush();
+    var arrays = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(arrays);
+    var meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_load_safetensors(&arrays, &meta, path, s));
+    for ([_][*:0]const u8{ QWEN_PREFIX ++ "0.mlp.experts.gate_mass", QWEN_PREFIX ++ "0.mlp.experts.reap" }, [_][3]f32{ .{ 2, 4, 0 }, .{ 22, 18.5, 0 } }) |name, expected| {
+        var value = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(value);
+        try mlx.check(mlx.mlx_map_string_to_array_get(&value, arrays, name));
+        try testing.expectEqual(.float32, mlx.mlx_array_dtype(value));
+        try testing.expectEqualSlices(c_int, &.{3}, mlx.getShape(value));
+        for (expected, 0..) |want, i| try testing.expectEqual(want, try f32At(value, i));
+    }
+    var gu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gu);
+    try mlx.check(mlx.mlx_map_string_to_array_get(&gu, arrays, QWEN_PREFIX ++ "0.mlp.experts.gate_up_proj"));
+    try testing.expectApproxEqAbs(@as(f32, 26.0 / 3.0), try f32At(gu, 0), 1e-6);
+}
+
+test "imatrix writer CPU preserves an exact partial filename" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/capture.safetensors.partial", .{root});
+    defer testing.allocator.free(path);
+    const arrays = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(arrays);
+    const metadata = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(metadata);
+    try saveExact(testing.allocator, path, arrays, metadata);
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try testing.expect(stat.size > 8);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "capture.safetensors.partial.safetensors", .{}));
+}
+
+fn saveExact(allocator: std.mem.Allocator, path: []const u8, arrays: mlx.mlx_map_string_to_array, metadata: mlx.mlx_map_string_to_string) !void {
+    const name = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(name);
+    if (std.mem.endsWith(u8, path, ".safetensors")) {
+        try mlx.check(mlx.mlx_save_safetensors(name, arrays, metadata));
+        return;
+    }
+    const staged = try std.fmt.allocPrintSentinel(allocator, "{s}.safetensors", .{path}, 0);
+    defer allocator.free(staged);
+    try mlx.check(mlx.mlx_save_safetensors(staged, arrays, metadata));
+    if (std.c.rename(staged, name) != 0) return error.ImatrixRenameFailed;
 }

@@ -15,6 +15,7 @@ test {
     _ = @import("mimo_quant_test.zig");
     _ = @import("expert_io.zig");
     _ = @import("imatrix.zig");
+    _ = @import("imatrix_cmd.zig");
     _ = @import("hidden_capture.zig");
     _ = @import("expert_quant.zig");
     _ = @import("log.zig");
