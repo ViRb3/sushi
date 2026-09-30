@@ -61487,7 +61487,9 @@ fn gdnRecurParityCase(s: mlx.mlx_stream, hk: c_int, hv: c_int, t_len: c_int, fol
                 try testing.expect(!available);
             }
             const f = (try gdn_decode.stepFold(geo, t_len, in, z, norm_w, eps_arr, swish, s)) orelse {
-                if (gdn_decode.fold_nt_override != null and gdn_decode.foldDeclined(t_len)) return;
+                // A GPU whose threadgroup limit is below the fold's width declines it and serves the unfolded
+                // path; only the two-row default must fold.
+                if (gdn_decode.foldDeclined(t_len) and (gdn_decode.fold_nt_override != null or t_len > 2)) return;
                 return error.FoldDeclined;
             };
             defer f.deinit();

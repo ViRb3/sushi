@@ -21,7 +21,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
 - Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
-  an unsupported threadgroup limit falls back to the existing recurrence and epilogue. Parity includes every
+  an unsupported threadgroup limit falls back to the existing recurrence and epilogue (an M1 declines S 3..8 and
+  folds S=2), so the parity test skips a declined width above two. Parity includes every
   captured state with bf16 carry rounding. Wider captures keep the existing path after the S=5 regression
   in [the width sweep](perf-baselines.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
