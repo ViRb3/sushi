@@ -5433,8 +5433,8 @@ pub const WarmPrefix = struct {
         return seq > self.capacity_tokens;
     }
 
-    /// Does the decode outgrow the restored buffers? The prefill fits inside them, then the first
-    /// decode step past capacity grows every KV layer to the reservation inside one forward.
+    /// Does the reservation outgrow restored buffers that hold the whole prompt? Then no append
+    /// in the prefill grows them; `KVCache.growToReservation` does, before the first chunk.
     pub fn decodeOutgrows(self: WarmPrefix, seq: u64, reserved: u64) bool {
         if (self.matched_tokens == 0) return false;
         return seq <= self.capacity_tokens and reserved > self.capacity_tokens;
@@ -5467,8 +5467,13 @@ fn attnLayersPerEvalWindow(config: *const model_mod.ModelConfig, window: u32) u3
 /// the whole layer loop and therefore does pay the whole old cache.
 fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, reserved: u64, kv_per_tok: u64) u64 {
     if (warm.grows(seq)) return oldBuffersInEvalWindow(config, warm.capacity_tokens, seq -| warm.matched_tokens, kv_per_tok);
-    // A decode step evaluates once for every layer, so all the old buffers coexist with the new.
-    if (warm.decodeOutgrows(seq, reserved)) return warm.capacity_tokens *| kv_per_tok;
+    if (warm.decodeOutgrows(seq, reserved)) {
+        // Unreserved, the first decode step past C grows every layer inside one forward.
+        if (!transformer_mod.KVCache.kvReservationEnabled()) return warm.capacity_tokens *| kv_per_tok;
+        // Reserved, the prefill grows each layer first (`KVCache.growToReservation`), one eval at a
+        // time; a share's old rows stay the entry's.
+        return if (warm.will_donate) oldBuffersInEvalWindow(config, warm.capacity_tokens, 1 << 20, kv_per_tok) else 0;
+    }
     // An SSD restore installs each layer at exactly its restored rows, so the first append grows
     // it beside the restored buffer. A ringed arch's admission never sees the restore (it bills a
     // warm request cold), so with a disk tier it bills that coexistence at the prompt's length.
@@ -5505,9 +5510,9 @@ pub const PrefillRequestTerms = struct {
     /// Bytes of the KV terms above already resident in the buffer the restore handed this slot
     /// (`WarmPrefix`). KV only; subtracted once, in `prefillMemoryNeeded`.
     shared_resident_bytes: u64 = 0,
-    /// Old KV buffers that coexist with the new ones while a warm append, or the first decode
-    /// step past the restored capacity, GROWS the cache. Zero when nothing grows, and on every
-    /// arch that does not reserve its capacity.
+    /// Old KV buffers that coexist with the new ones while a warm append, or the grow to the
+    /// reservation before it, GROWS the cache. Zero when nothing grows, and on every arch that
+    /// does not reserve its capacity.
     grow_coexist_bytes: u64 = 0,
     qsa_ring_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
@@ -19498,13 +19503,13 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 4_989), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
     try t.expectEqual(@as(u64, 6_480), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
-    // A buffer the previous turn sized above this prompt grows nothing in the prefill, but the
-    // first decode step past it grows every attention layer to the reservation beside it.
+    // A buffer the previous turn sized above this prompt but below the reservation is grown to
+    // it before the prefill writes, one attention layer per eval: one window of old rows.
     const fits = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 450_048, .will_donate = true };
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
     try t.expect(reserved > 450_048);
-    try t.expectEqual(450_048 *| kv_per_tok, f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 11_412), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expectEqual(450_048 *| kv_per_tok / 12, f.grow_coexist_bytes);
+    try t.expectEqual(@as(u64, 4_991), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.
@@ -24315,9 +24320,9 @@ test "mimo_v2 admission credits the hot cache: a gap the cache covers is an evic
     try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(creditedAdmissionBill(&other, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096)));
 }
 
-test "a warm restore whose decode outgrows its capacity bills the old rows beside the reservation" {
-    // seq <= C < R: the prefill appends inside the restored buffers and the first decode step
-    // past C grows every KV layer to R inside one forward, the C-row buffers still alive.
+test "a warm restore whose buffers hold the prompt but not the reservation bills one window of old rows" {
+    // seq <= C < R: the prefill grows each KV layer to R before it writes, one eval at a time
+    // (`KVCache.growToReservation`), so only one window's C-row buffers are alive beside the new.
     const t = std.testing;
     const saved_disk = prefix_cache_disk_bytes;
     defer prefix_cache_disk_bytes = saved_disk;
@@ -24334,17 +24339,18 @@ test "a warm restore whose decode outgrows its capacity bills the old rows besid
         const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
         const reserved = @max(reservedCacheTokens(seq, 32_000, chunk, getEffectiveContextLength(cfg)), seq);
         try t.expect(seq <= capacity and capacity < reserved);
+        const window = capacity * kv / cfg.kvPerTokenLayerCount() * attnLayersPerEvalWindow(cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+        try t.expect(window > 0 and window < capacity * kv);
         for ([_]bool{ true, false }) |donate| {
             const warm = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = donate };
             const terms = prefillRequestTerms(cfg, seq, 32_000, kv_bits, chunk, warm);
             const kv_bill = seq * kv + terms.reserved_kv_bytes + terms.grow_coexist_bytes - terms.shared_resident_bytes;
-            // New bytes at the grow beyond what is already resident: the R-row buffers, plus the
-            // C-row copy a shared restore's first append made.
-            const new_bytes = reserved * kv + (if (donate) 0 else capacity * kv);
-            try t.expect(kv_bill >= new_bytes);
-            try t.expectEqual(capacity * kv, terms.grow_coexist_bytes);
+            // A donated grow frees each old buffer after its window; a share's stay with the entry.
+            const peak = if (donate) reserved * kv - capacity * kv + window else reserved * kv;
+            try t.expect(kv_bill >= peak);
+            try t.expectEqual(if (donate) window else 0, terms.grow_coexist_bytes);
         }
-        // The decode never outgrows a restore that already holds the reservation.
+        // Nothing grows for a restore that already holds the reservation.
         const roomy = prefillRequestTerms(cfg, seq, 32_000, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = reserved, .will_donate = true });
         try t.expectEqual(@as(u64, 0), roomy.grow_coexist_bytes);
     }

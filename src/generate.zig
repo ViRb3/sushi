@@ -1384,6 +1384,15 @@ pub fn reservedPrefillTokens(
     );
 }
 
+/// Reserve this request's cache capacity, and grow the restored layers to it, before the
+/// prefill's first chunk writes (`KVCache.growToReservation`). Returns the reserved tokens.
+pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelConfig, total_ctx: u64, max_tokens: u64, chunk: u64, s: mlx.mlx_stream) !u64 {
+    const reserved = reservedPrefillTokens(config, total_ctx, max_tokens, chunk);
+    cache.reserve(@intCast(reserved));
+    try cache.growToReservation(s);
+    return reserved;
+}
+
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
 /// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
 /// equal images) — so vision prefills skip checkpointing even now that they
@@ -2838,13 +2847,7 @@ pub const Generator = struct {
             const cp_thin: transformer_mod.ThinPolicy =
                 if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
 
-            const reserved_tokens = reservedPrefillTokens(
-                &xfm.config,
-                total_ctx_for_chunk,
-                max_tokens,
-                default_chunk,
-            );
-            ctx.cache.reserve(@intCast(reserved_tokens));
+            const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
             // The arch's own per-request buffers reserve at the same length.
             if (mtp_cache) |*mc| mc.activate();
             transformer_mod.reserveQsaHistoryWithHead(
@@ -19603,6 +19606,71 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     defer cache.deinit();
     cache.reserve(0);
     try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
+}
+
+test "a warm prefill grows its restored layers to the reservation before the first chunk writes" {
+    // seq <= C < R: left to the decode, the first step past C grows every layer inside one forward.
+    if (mlx.noGpuBackend()) return;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const KVC = transformer_mod.KVCache;
+    const seq: u64 = 40_000;
+    const matched: c_int = 36_000;
+    const capacity: usize = 40_960;
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 1_048_576 };
+    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192, .max_position_embeddings = 1_048_576 };
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_zeros(&rows, &[_]c_int{ 1, 2, matched, 64 }, 4, .bfloat16, s));
+    var tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail);
+    try mlx.check(mlx.mlx_zeros(&tail, &[_]c_int{ 1, 2, @intCast(seq - @as(u64, @intCast(matched))), 64 }, 4, .bfloat16, s));
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_zeros(&one, &[_]c_int{ 1, 2, 1, 64 }, 4, .bfloat16, s));
+    for ([_]*const model_mod.ModelConfig{ &qwen4, &mimo }) |cfg| {
+        const ring: u32 = if (cfg.swaRingTokens() > 0) cfg.sliding_window else 0;
+        for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8) }) |kvq| {
+            for ([_]bool{ true, false }) |donate| {
+                // The previous turn's cache: it reserved C and holds the matched rows. Layer 1 rings on MiMo.
+                var donor = try KVC.initWithConfig(t.allocator, 2, kvq);
+                defer donor.deinit();
+                donor.setSwaRing(ring);
+                donor.reserve(capacity);
+                for (0..2) |li| {
+                    var v = try donor.update(@intCast(li), rows, rows, s, if (li == 1) ring else 0);
+                    v.deinit();
+                }
+                var snap = try donor.snapshotRetained(s);
+                defer snap.deinit();
+                var warm = try KVC.initWithConfig(t.allocator, 2, kvq);
+                defer warm.deinit();
+                warm.setSwaRing(ring);
+                try warm.restore(&snap);
+                if (donate) {
+                    snap.releaseHandles();
+                    warm.adoptRestored();
+                }
+                const ring_cap = mlx.getShape(warm.entries[1].keys)[2];
+
+                const reserved = try reserveRequestCapacity(&warm, cfg, seq, 32_000, 2048, s);
+                try t.expect(seq <= capacity and capacity < reserved);
+                try t.expectEqual(@as(c_int, capacity), mlx.getShape(donor.entries[0].keys)[2]);
+                try t.expect(mlx.getShape(warm.entries[0].keys)[2] >= reserved);
+                try t.expect(mlx.getShape(warm.entries[0].values)[2] >= reserved);
+                try t.expectEqual(@as(usize, @intCast(matched)), warm.entries[0].offset);
+                if (ring > 0) try t.expectEqual(ring_cap, mlx.getShape(warm.entries[1].keys)[2]);
+
+                // The prefill's rows and the first decode step write in place: nothing grows.
+                const grows = KVC.kv_cap_buf_grows;
+                var pv = try warm.update(0, tail, tail, s, 0);
+                pv.deinit();
+                var dv = try warm.update(0, one, one, s, 0);
+                dv.deinit();
+                try t.expectEqual(grows, KVC.kv_cap_buf_grows);
+            }
+        }
+    }
 }
 
 test "a block decoder's entry token stops the round before it drafts" {

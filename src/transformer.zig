@@ -8341,6 +8341,37 @@ pub const KVCache = struct {
         return n_chunks * chunk_step;
     }
 
+    /// Grow every restored non-ringed layer below the reservation to it, one layer per eval.
+    /// Called before a warm prefill writes: left to the decode, the first step past the restored
+    /// capacity grows every layer inside one forward, all the old buffers alive beside the new.
+    pub fn growToReservation(self: *KVCache, s: mlx.mlx_stream) !void {
+        if (self.reserve_tokens == 0) return;
+        const new_cap: c_int = @intCast((self.reserve_tokens + chunk_step - 1) / chunk_step * chunk_step);
+        const n: usize = if (self.config.scheme == .off) 2 else 6;
+        for (self.entries) |*entry| {
+            if (!entry.initialized or entry.ringed) continue;
+            if (bufferCapacity(entry.keys) >= self.reserve_tokens) continue;
+            const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
+            for (views) |view| {
+                _ = mlx.mlx_array_free(view.*);
+                view.* = mlx.mlx_array_new();
+            }
+            const bufs = [_]*mlx.mlx_array{ &entry.keys, &entry.values, &entry.keys_scales, &entry.keys_biases, &entry.values_scales, &entry.values_biases };
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (bufs[0..n]) |buf| {
+                const sh = mlx.getShape(buf.*);
+                try growQuantBuf(s, buf, true, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.*));
+                _ = mlx.mlx_vector_array_append_value(vec, buf.*);
+            }
+            // The grown buffers are this cache's own; a shared restore's rows stay with the entry.
+            entry.shared_view = false;
+            kv_cap_buf_grows += 1;
+            try mlx.check(mlx.mlx_eval(vec));
+            _ = mlx.mlx_clear_cache();
+        }
+    }
+
     /// Kill-switch for the growth policy: `SUSHI_KV_GROW=linear` restores
     /// the pre-#110 fixed +256 growth for same-boot A/Bs.
     var kv_grow_linear_cache: ?bool = null;
@@ -44956,6 +44987,78 @@ test "KVCache: a donated restore appends in place, at the entry's own capacity" 
     }
 }
 
+test "KVCache.growToReservation: the attention reads the same rows, and the decode never grows" {
+    // A warm restore holding the prompt (C = 1024) but not the reservation (R = 2048): grown
+    // before the prefill, or left to the decode step past C, every view must be bit-identical.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |cfg| {
+        for ([_]bool{ true, false }) |donate| {
+            var donor: KVCache = undefined;
+            var snap: KVCacheSnapshot = undefined;
+            var eager: KVCache = undefined;
+            const k = try sharedRestoreFixture(s, cfg, 1024, 1000, &donor, &snap, &eager);
+            defer _ = mlx.mlx_array_free(k);
+            defer donor.deinit();
+            defer snap.deinit();
+            defer eager.deinit();
+            var lazy = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+            defer lazy.deinit();
+            try lazy.restore(&snap);
+            if (donate) {
+                // Each cache owns its buffers, as a donated checkout does.
+                donor.deinit();
+                donor = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+                snap.releaseHandles();
+                eager.adoptRestored();
+                try cowAffineOrDense(&lazy, s);
+            }
+            eager.reserve(2048);
+            lazy.reserve(2048);
+            try eager.growToReservation(s);
+            try testing.expectEqual(@as(usize, 2048), KVCache.bufferCapacity(eager.entries[0].keys));
+            try testing.expectEqual(@as(usize, 1000), eager.entries[0].offset);
+
+            const rows = try qkvIdentityArray(s, 2, 64, 64, 0.9, .bfloat16);
+            defer _ = mlx.mlx_array_free(rows);
+            var lazy_grows: usize = 0;
+            // A 16-row prefill, then single-row decode steps past C = 1024.
+            var at: c_int = 0;
+            while (at < 64) {
+                const w: c_int = if (at == 0) 16 else 1;
+                const step = try sliceAttentionSeq(s, rows, at, at + w);
+                defer _ = mlx.mlx_array_free(step);
+                const g0 = KVCache.kv_cap_buf_grows;
+                var ev = try eager.update(0, step, step, s, 0);
+                defer ev.deinit();
+                try testing.expectEqual(g0, KVCache.kv_cap_buf_grows);
+                var lv = try lazy.update(0, step, step, s, 0);
+                defer lv.deinit();
+                lazy_grows += KVCache.kv_cap_buf_grows - g0;
+                try qkvExpectBitsEqual(s, ev.k, lv.k);
+                try qkvExpectBitsEqual(s, ev.v, lv.v);
+                at += w;
+            }
+            try testing.expect(lazy_grows > 0);
+        }
+    }
+}
+
+/// Give a restored cache its own copy of every buffer, as a donated checkout owns them.
+fn cowAffineOrDense(cache: *KVCache, s: mlx.mlx_stream) !void {
+    for (cache.entries) |*e| {
+        if (!e.initialized) continue;
+        const bufs = [_]*mlx.mlx_array{ &e.keys, &e.values, &e.keys_scales, &e.keys_biases, &e.values_scales, &e.values_biases };
+        const n: usize = if (cache.config.scheme == .off) 2 else 6;
+        for (bufs[0..n]) |buf| {
+            const owned = try materializedOwnedCopy(s, buf.*);
+            _ = mlx.mlx_array_free(buf.*);
+            buf.* = owned;
+        }
+        e.shared_view = false;
+    }
+}
+
 test "KVCache snapshot/restore in a tight loop does not leak" {
     // testing.allocator is a TrackingAllocator — any unfreed allocation here
     // surfaces as a test failure at the leak-detection step.
@@ -63645,6 +63748,71 @@ test "qwen4 deferred PLE: the captured hidden the MTP head reads matches the eag
         for (lazy.entries) |*e| ssmFreeSpecCapture(e);
     }
     if (mismatched) return error.DeferredPleCaptureMismatch;
+}
+
+test "qwen4 grow to the reservation before the prefill keeps greedy logits bit-identical (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.qwen4 != null);
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+
+    const grown = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+    defer grown.deinit(allocator);
+    const lazy = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+    defer lazy.deinit(allocator);
+
+    // The warm shape: the prompt's buffers hold 256 rows, the reservation 1024. One slot grows
+    // before the next chunk; the other at the decode step past 256.
+    const prompt = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2 };
+    for ([_]*Qwen4TestSlot{ grown, lazy }) |sl| {
+        const l = try sl.forward(&xfm, &prompt);
+        defer _ = mlx.mlx_array_free(l);
+        try mlx.check(mlx.mlx_array_eval(l));
+        sl.cache.reserve(1024);
+    }
+    try grown.cache.growToReservation(s);
+    for (grown.cache.entries) |*e| {
+        if (e.initialized and !e.ringed) try testing.expect(KVCache.bufferCapacity(e.keys) >= 1024);
+    }
+
+    var chunk: [40]i32 = undefined;
+    for (&chunk, 0..) |*r, i| r.* = @intCast(3 + (i * 37) % 900);
+    var ids: []const i32 = &chunk;
+    var next: [1]i32 = undefined;
+    var step: usize = 0;
+    while (step < 220) : (step += 1) {
+        const g = try grown.forward(&xfm, ids);
+        defer _ = mlx.mlx_array_free(g);
+        const l = try lazy.forward(&xfm, ids);
+        defer _ = mlx.mlx_array_free(l);
+        const a = try qwen4ReadF32(allocator, g, s);
+        defer allocator.free(a);
+        const b = try qwen4ReadF32(allocator, l, s);
+        defer allocator.free(b);
+        try testing.expectEqual(a.len, b.len);
+        for (a, b) |x, y| try testing.expectEqual(@as(u32, @bitCast(x)), @as(u32, @bitCast(y)));
+        const vocab: usize = @intCast(mlx.getShape(g)[2]);
+        const last = a[a.len - vocab ..];
+        var best: usize = 0;
+        for (last, 0..) |x, i| {
+            if (x > last[best]) best = i;
+        }
+        next[0] = @intCast(best);
+        ids = &next;
+    }
 }
 
 test "qwen4 MTP verify token values equal serial ticks without near-tie acquittals (QWEN4_TEST_MODEL)" {
