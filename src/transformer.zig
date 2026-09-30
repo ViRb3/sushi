@@ -31196,6 +31196,7 @@ pub const Transformer = struct {
                 .imatrix = tap,
                 .shared_gated = shared_early,
             });
+            errdefer _ = mlx.mlx_array_free(slab_result);
             engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
             try handOffStreamedResult(slab_result, rows);
             return slab_result;
@@ -31222,6 +31223,10 @@ pub const Transformer = struct {
         }, rows, self.expert_bf16_kernels);
         defer _ = mlx.mlx_array_free(row_out);
         var expert_sum = mlx.mlx_array_new();
+        var sum_owned = true;
+        errdefer if (sum_owned) {
+            _ = mlx.mlx_array_free(expert_sum);
+        };
         try mlx.check(mlx.mlx_reshape(&expert_sum, row_out, &[_]c_int{ x_shape[0], x_shape[1], mlx.getShape(row_out)[1] }, 3, self.s));
         if (std.mem.eql(u8, self.config.model_type, "mimo_v2") and
             mlx.mlx_array_dtype(expert_sum) != mlx.mlx_array_dtype(expert_x))
@@ -31236,8 +31241,10 @@ pub const Transformer = struct {
             try handOffStreamedResult(expert_sum, rows);
             return expert_sum;
         }
-        defer _ = mlx.mlx_array_free(expert_sum);
         const result = try self.moeAddGatedShared(expert_sum, expert_x, mw);
+        _ = mlx.mlx_array_free(expert_sum);
+        sum_owned = false;
+        errdefer _ = mlx.mlx_array_free(result);
         engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
         try handOffStreamedResult(result, rows);
         return result;

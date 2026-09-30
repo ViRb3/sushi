@@ -1143,7 +1143,39 @@ const LayerState = struct {
     stats: LayerStats = .{},
     spec_host: []i32 = &.{},
     spec_slots: mlx.mlx_array = .{ .ctx = null },
+
+    /// Brings the host map and its GPU copy up to the cache. The pair only ever
+    /// changes together: a failure leaves no GPU map and a host map that forces
+    /// the next call to rebuild.
+    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator) !void {
+        const experts = self.cache.expert_to_slot.len;
+        if (self.spec_host.len != experts) {
+            if (self.spec_host.len != 0) allocator.free(self.spec_host);
+            self.spec_host = &.{};
+            self.spec_host = try allocator.alloc(i32, experts);
+            @memset(self.spec_host, -2);
+        }
+        if (!refreshSpecMap(self.cache.expert_to_slot, self.cache.ready, self.spec_host) and self.spec_slots.ctx != null) return;
+        errdefer {
+            if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
+            self.spec_slots = .{ .ctx = null };
+            @memset(self.spec_host, -2);
+        }
+        const gpu = try allocator.alloc(i32, experts);
+        defer allocator.free(gpu);
+        for (gpu, self.spec_host) |*slot, host| slot.* = @max(host, 0);
+        if (@import("builtin").is_test and spec_alloc_fail_for_test) {
+            spec_alloc_fail_for_test = false;
+            return error.ExpertSpecMapAlloc;
+        }
+        const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
+        if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
+        self.spec_slots = fresh;
+    }
 };
+
+var spec_alloc_fail_for_test = false;
 
 /// Writes the slot each expert reads from as the cache stands (-1 = not a ready
 /// hit) into `out`; returns whether any entry changed.
@@ -1543,21 +1575,8 @@ pub const Engine = struct {
         const layer = &self.layers[layer_index];
         if (!layer.active or layer.slabs.len != self.store.componentCount()) return null;
         const experts = layer.cache.expert_to_slot.len;
-        if (layer.spec_host.len != experts) {
-            if (layer.spec_host.len != 0) self.allocator.free(layer.spec_host);
-            layer.spec_host = &.{};
-            layer.spec_host = try self.allocator.alloc(i32, experts);
-            @memset(layer.spec_host, -2);
-        }
-        if (refreshSpecMap(layer.cache.expert_to_slot, layer.cache.ready, layer.spec_host) or layer.spec_slots.ctx == null) {
-            const gpu = try self.allocator.alloc(i32, experts);
-            defer self.allocator.free(gpu);
-            for (gpu, layer.spec_host) |*slot, host| slot.* = @max(host, 0);
-            const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
-            if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
-            if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
-            layer.spec_slots = fresh;
-        }
+        _ = experts;
+        try layer.refreshSpec(self.allocator);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
         return .{ .slots = layer.spec_slots, .host = layer.spec_host, .operands = operands };
@@ -3458,4 +3477,28 @@ test "spec result is kept only when every id resolved to its gathered slot" {
     try t.expect(!specMatches(&map, &.{ 0, 1 }, &.{ 3, 5 }, false));
     try t.expect(!specMatches(&map, &.{ 0, 2 }, &.{ 3, 1 }, false));
     try t.expect(!specMatches(&map, &.{9}, &.{0}, false));
+}
+
+test "a failed spec map refresh leaves no GPU map until a rebuild matches the cache" {
+    const t = std.testing;
+    var layer = LayerState{ .cache = try GroupCache.init(t.allocator, 2, 4) };
+    defer {
+        if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
+        t.allocator.free(layer.spec_host);
+        layer.cache.deinit();
+    }
+    var first = try layer.cache.resolve(t.allocator, &.{ 0, 1 });
+    defer first.deinit(t.allocator);
+    markResolvedReady(&layer.cache, &first);
+    try layer.refreshSpec(t.allocator);
+    var second = try layer.cache.resolve(t.allocator, &.{ 0, 2 });
+    defer second.deinit(t.allocator);
+    markResolvedReady(&layer.cache, &second);
+    spec_alloc_fail_for_test = true;
+    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator));
+    try t.expect(layer.spec_slots.ctx == null);
+    try layer.refreshSpec(t.allocator);
+    const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
+    for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
+    try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
 }
