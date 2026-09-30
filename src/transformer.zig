@@ -31009,6 +31009,14 @@ pub const Transformer = struct {
         }
     };
 
+    fn restoreStreamH(h: *mlx.mlx_array, saved: *mlx.mlx_array) void {
+        // Transfer the rollback handle so a later MLX failure leaves cleanup
+        // with one live owner and needs no fallible reference allocation.
+        _ = mlx.mlx_array_free(h.*);
+        h.* = saved.*;
+        saved.* = .{ .ctx = null };
+    }
+
     fn verifyQwenMoe(self: *Transformer, deferred: *?DeferredQwenMoe, h: *mlx.mlx_array, pending: *?HcPending, batch: c_int, seq: c_int) !bool {
         const d = &(deferred.* orelse return true);
         // The successor owns different slabs; no cache state from its wrong route
@@ -31025,8 +31033,7 @@ pub const Transformer = struct {
         if (!kept) {
             if (pending.*) |*pd| pd.deinit();
             pending.* = null;
-            _ = mlx.mlx_array_free(h.*);
-            h.* = try standinRef(d.h);
+            restoreStreamH(h, &d.h);
             const next = @as(usize, d.moe.stream_ctx.layer) + 1;
             try self.hcWriteOrDefer(h, exact, d.inj, batch, seq, self.moe_layers.?[next].hc_attn.?.inject_flat, pending);
         }
@@ -74229,4 +74236,35 @@ test "the GPU expert pick matches the host substitution on one row" {
             try testing.expectEqual(@max(map[want], 0), slots[i]);
         }
     }
+}
+
+test "streamed rollback owns HC handle after injected MLX failure" {
+    const current_data = [_]f32{3};
+    const saved_data = [_]f32{7};
+    var h = mlx.mlx_array_new_data(&current_data, &[_]c_int{1}, 1, .float32);
+    var saved = mlx.mlx_array_new_data(&saved_data, &[_]c_int{1}, 1, .float32);
+    const saved_ctx = saved.ctx;
+    // Check ownership before reading h; the source owns cleanup until
+    // transfer succeeds, including an injected reference failure.
+    defer if (saved.ctx != null) {
+        _ = mlx.mlx_array_free(saved);
+    } else {
+        _ = mlx.mlx_array_free(h);
+    };
+    const Rollback = struct {
+        fn run(dst: *mlx.mlx_array, src: *mlx.mlx_array) !void {
+            Transformer.restoreStreamH(dst, src);
+            try mlx.check(mlx.mlx_array_eval(dst.*));
+        }
+    };
+    mlx.fault.arm(1);
+    const result = Rollback.run(&h, &saved);
+    const fired = mlx.fault.didFire();
+    mlx.fault.disarm();
+    try testing.expectError(error.MlxError, result);
+    try testing.expect(fired);
+    try testing.expectEqual(saved_ctx, h.ctx);
+    try testing.expect(saved.ctx == null);
+    try mlx.check(mlx.mlx_array_eval(h));
+    try testing.expectEqual(@as(f32, 7), mlx.mlx_array_data_float32(h).?[0]);
 }

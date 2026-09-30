@@ -68,7 +68,8 @@ zero-copy slabs. With no budget a pack loads resident as before.
   from the preceding MLP's exact output; PLE and full-attention successors verify first. Cache resolution and its
   accounting occur only after the predecessor passes, so discarded routes never fill or touch LRU state.
 - Deferred HC writes belong to the speculative stream: rollback restores the preceding MLP's stream and injection
-  gate, then replaces the pending write with its exact result. Profiling, dtype tracing, layer captures, stand-ins,
+  gate, then replaces the pending write with its exact result. Rollback transfers the saved HC handle, so a later
+  MLX error leaves one valid cleanup owner. Profiling, dtype tracing, layer captures, stand-ins,
   imatrix collection, batched/wide forwards and lossy expert picking keep synchronous verification.
 - `SUSHI_EXPERT_DEFER_SYNC=1` selects synchronous verification for an exact schedule comparison: deferred
   verification overlaps host work on hits but spends an extra GDN build and speculative compute on misses.
