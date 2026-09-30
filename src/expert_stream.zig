@@ -295,12 +295,77 @@ pub const GroupResolution = struct {
     }
 };
 
+pub const MAX_PICK_TOLERANCE: f32 = 0.6;
+
+pub var pick_tolerance: f32 = 0;
+
+pub fn parsePickTolerance(raw: []const u8) error{InvalidPickTolerance}!f32 {
+    const value = std.fmt.parseFloat(f32, raw) catch return error.InvalidPickTolerance;
+    if (!(value >= 0) or value > MAX_PICK_TOLERANCE) return error.InvalidPickTolerance;
+    return value;
+}
+
+pub const PICK_STARVE_LIMIT: u8 = 3;
+
+pub fn substituteMisses(ids: []u16, logits: []const f32, cached: []const bool, tolerance: f32, k: usize, taken: []bool, loading: []bool, starved: []u8) u32 {
+    if (!(tolerance > 0) or k == 0 or k > 32) return 0;
+    const experts = cached.len;
+    const floor_gap: f32 = @log(1.0 - @min(tolerance, MAX_PICK_TOLERANCE));
+    @memset(loading[0..experts], false);
+    var swapped: u32 = 0;
+    var row: usize = 0;
+    while ((row + 1) * k <= ids.len) : (row += 1) {
+        const row_ids = ids[row * k ..][0..k];
+        const row_logits = logits[row * experts ..][0..experts];
+        var order: [32]u8 = undefined;
+        var misses: usize = 0;
+        for (row_ids, 0..) |expert, pos| {
+            if (cached[expert] or loading[expert]) continue;
+            var at = misses;
+            while (at > 0 and row_logits[row_ids[order[at - 1]]] < row_logits[expert]) : (at -= 1) order[at] = order[at - 1];
+            order[at] = @intCast(pos);
+            misses += 1;
+        }
+        if (misses == 0) continue;
+        @memset(taken[0..experts], false);
+        for (row_ids) |expert| taken[expert] = true;
+        for (order[0..misses]) |pos| {
+            const missed = row_ids[pos];
+            if (starved[missed] >= PICK_STARVE_LIMIT) {
+                starved[missed] = 0;
+                loading[missed] = true;
+                continue;
+            }
+            var best: ?usize = null;
+            var best_logit: f32 = -std.math.inf(f32);
+            for (0..experts) |candidate| {
+                if (taken[candidate] or !(cached[candidate] or loading[candidate])) continue;
+                const logit = row_logits[candidate];
+                if (!(logit - row_logits[missed] >= floor_gap) or !(logit > best_logit)) continue;
+                best = candidate;
+                best_logit = logit;
+            }
+            if (best) |pick| {
+                taken[pick] = true;
+                row_ids[pos] = @intCast(pick);
+                starved[missed] +|= 1;
+                swapped += 1;
+            } else {
+                starved[missed] = 0;
+                loading[missed] = true;
+            }
+        }
+    }
+    return swapped;
+}
+
 pub const GroupCache = struct {
     allocator: std.mem.Allocator,
     expert_to_slot: []i32,
     slot_to_expert: []u16,
     ages: []u64,
     ready: []bool,
+    swap_starved: []u8,
     tick: u64 = 0,
 
     fn empty(allocator: std.mem.Allocator) GroupCache {
@@ -310,6 +375,7 @@ pub const GroupCache = struct {
             .slot_to_expert = &.{},
             .ages = &.{},
             .ready = &.{},
+            .swap_starved = &.{},
         };
     }
 
@@ -322,11 +388,14 @@ pub const GroupCache = struct {
         const ages = try allocator.alloc(u64, capacity);
         errdefer allocator.free(ages);
         const ready = try allocator.alloc(bool, capacity);
+        errdefer allocator.free(ready);
+        const swap_starved = try allocator.alloc(u8, expert_count);
+        @memset(swap_starved, 0);
         @memset(expert_to_slot, -1);
         @memset(slot_to_expert, std.math.maxInt(u16));
         @memset(ages, 0);
         @memset(ready, false);
-        return .{ .allocator = allocator, .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .ready = ready };
+        return .{ .allocator = allocator, .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .ready = ready, .swap_starved = swap_starved };
     }
 
     pub fn deinit(self: *GroupCache) void {
@@ -334,7 +403,15 @@ pub const GroupCache = struct {
         self.allocator.free(self.slot_to_expert);
         self.allocator.free(self.ages);
         self.allocator.free(self.ready);
+        self.allocator.free(self.swap_starved);
         self.* = undefined;
+    }
+
+    pub fn cachedMask(self: *const GroupCache, out: []bool) void {
+        for (out, 0..) |*flag, expert| {
+            const raw_slot = if (expert < self.expert_to_slot.len) self.expert_to_slot[expert] else -1;
+            flag.* = raw_slot >= 0 and self.ready[@intCast(raw_slot)];
+        }
     }
 
     pub fn markReady(self: *GroupCache, slot: u16) void {
@@ -1313,6 +1390,13 @@ pub const Engine = struct {
 
     pub fn noteExpertCompute(self: *Engine, layer: u16, nanoseconds: u64) void {
         if (layer < self.layers.len) self.layers[layer].stats.compute_ns += nanoseconds;
+    }
+
+    pub fn pickState(self: *Engine, layer: u16, cached_out: []bool) ?[]u8 {
+        if (layer >= self.layers.len) return null;
+        const cache = &self.layers[layer].cache;
+        cache.cachedMask(cached_out);
+        return cache.swap_starved;
     }
 
     pub fn layerHits(self: *const Engine, layer: u16) u64 {
@@ -3141,4 +3225,150 @@ test "MiMo EXL3 streaming CPU geometry ledger and slab ids cross the dense prefi
 
 test "MiMo EXL3 streaming imported slabs warm and reuse different layer rates" {
     try checkMimoExl3Streaming(true);
+}
+
+test "expert pick tolerance accepts 0 through 0.6 and names a bad value" {
+    const t = std.testing;
+    try t.expectEqual(@as(f32, 0.0), try parsePickTolerance("0"));
+    try t.expectEqual(@as(f32, 0.3), try parsePickTolerance("0.3"));
+    try t.expectEqual(@as(f32, 0.6), try parsePickTolerance("0.6"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("0.61"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("1"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("1.5"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("-0.1"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("nan"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("nope"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance(""));
+}
+
+fn PickScratch(comptime experts: usize) type {
+    return struct {
+        taken: [experts]bool = undefined,
+        loading: [experts]bool = undefined,
+        starved: [experts]u8 = @splat(0),
+
+        fn run(self: *@This(), ids: []u16, logits: []const f32, cached: []const bool, tolerance: f32, k: usize) u32 {
+            return substituteMisses(ids, logits, cached, tolerance, k, &self.taken, &self.loading, &self.starved);
+        }
+    };
+}
+
+test "expert substitution with zero tolerance changes nothing" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.0, 1.9, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    try t.expectEqual(@as(u32, 0), sc.run(&ids, &logits, &cached, 0.0, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2 }, &ids);
+}
+
+test "expert substitution swaps a missed expert for the best cached one within tolerance" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.7, 2.0, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 3 }, &ids);
+}
+
+test "expert substitution keeps a miss whose cached alternatives fall below the tolerance" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 0.5, 0.4, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    try t.expectEqual(@as(u32, 0), sc.run(&ids, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2 }, &ids);
+}
+
+test "expert substitution never picks an uncached or already selected expert" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.79, 2.78, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, false, true, true };
+    try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 4 }, &ids);
+}
+
+test "expert substitution scores each row alone and gives two misses different replacements" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{
+        3.0, 2.9, 2.8, 2.7, 2.6, -30.0,
+        2.6, 2.7, 2.8, 2.9, 3.0, -30.0,
+    };
+    var ids = [_]u16{ 0, 1, 2, 4, 3, 2 };
+    const cached = [_]bool{ true, false, false, true, true, true };
+    try t.expectEqual(@as(u32, 3), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 3, 4, 4, 3, 0 }, &ids);
+}
+
+test "expert substitution lets the more probable miss take the better substitute" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.5, 2.9, 2.8, 2.7, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, false, false, true, true, true };
+    try t.expectEqual(@as(u32, 2), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 4, 3 }, &ids);
+}
+
+test "expert substitution survives non-finite logits and a trailing partial row" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    const logits = [_]f32{ nan, nan, nan, nan, nan, nan, -inf, -inf, -inf, -inf, -inf, -inf };
+    var ids = [_]u16{ 0, 1, 2, 3, 4 };
+    const cached = [_]bool{ true, false, false, true, true, true };
+    try t.expectEqual(@as(u32, 0), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 4 }, &ids);
+}
+
+test "expert substitution reuses an expert another row is fetching anyway" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{
+        3.0, 2.9, 2.0, -30.0, -30.0, -30.0,
+        3.0, 2.9, 2.8, 2.9, -30.0, -30.0,
+    };
+    var ids = [_]u16{ 0, 1, 2, 0, 1, 3 };
+    const cached = [_]bool{ true, true, false, false, true, true };
+    try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2, 0, 1, 2 }, &ids);
+}
+
+test "expert substitution stops swapping an expert out after the starvation limit" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.7, 2.0, -30.0 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    for (0..PICK_STARVE_LIMIT) |_| {
+        var ids = [_]u16{ 0, 1, 2 };
+        try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.3, 3));
+        try t.expectEqualSlices(u16, &.{ 0, 1, 3 }, &ids);
+    }
+    var kept = [_]u16{ 0, 1, 2 };
+    try t.expectEqual(@as(u32, 0), sc.run(&kept, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2 }, &kept);
+    var again = [_]u16{ 0, 1, 2 };
+    try t.expectEqual(@as(u32, 1), sc.run(&again, &logits, &cached, 0.3, 3));
+}
+
+test "group cache reports only ready residents as cached" {
+    const t = std.testing;
+    var cache = try GroupCache.init(t.allocator, 3, 8);
+    defer cache.deinit();
+    var first = try cache.resolve(t.allocator, &.{ 0, 1, 2 });
+    defer first.deinit(t.allocator);
+    var mask: [8]bool = undefined;
+    cache.cachedMask(&mask);
+    try t.expectEqualSlices(bool, &@as([8]bool, @splat(false)), &mask);
+    cache.markReady(first.bindings[0].slot.?);
+    cache.markReady(first.bindings[1].slot.?);
+    cache.cachedMask(&mask);
+    try t.expect(mask[0] and mask[1] and !mask[2] and !mask[3]);
 }

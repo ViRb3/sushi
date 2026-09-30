@@ -4,6 +4,16 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **Faster SSD streaming**: a streamed layer's expert compute is handed to the GPU as soon as it is built and the
+  shared expert runs while the host reads the router ids; Sushi-2bpw at a 20 GB budget on an M1 Max decodes 12 -> 18
+  tok/s with identical output.
+- **`--expert-pick-tolerance <n>`** (0 to 0.6, default off): a streamed pack may serve a cached expert in place of a
+  missed one when the router rates it at least `1 - n` as likely; lossy, trading a little accuracy for fewer SSD reads.
+
+---
+
 ## v1.1.1 — Long MiMo prompts and agent sessions
 
 - **MiMo long prompts are admitted again**: a resident MiMo server now sizes requests against the GPU limit you set

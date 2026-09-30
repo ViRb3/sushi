@@ -30456,6 +30456,22 @@ pub const Transformer = struct {
         return result;
     }
 
+    fn moeSharedGated(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+        const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
+        defer _ = mlx.mlx_array_free(down);
+        const seg_w = mw.shared_expert_gate_w.?;
+        const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
+        const gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
+        defer _ = mlx.mlx_array_free(gate_logit);
+        var gate_sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate_sig);
+        try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate_logit, self.s));
+        var shared_gated = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(shared_gated);
+        try mlx.check(mlx.mlx_multiply(&shared_gated, gate_sig, down, self.s));
+        return shared_gated;
+    }
+
     fn moeAddGatedShared(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
         defer _ = mlx.mlx_array_free(down);
@@ -30614,13 +30630,38 @@ pub const Transformer = struct {
         inds: mlx.mlx_array,
         norm_scores: mlx.mlx_array,
         imatrix: ?ImatrixTap = null,
+        shared_gated: ?mlx.mlx_array = null,
     };
 
     fn moeMLPStreamed(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, mw: *const MoeMlpWeights, layer: u16) !mlx.mlx_array {
         return self.moeMLP2WithRouter(x, x, mw, null, false, .{ .ctx = ctx, .layer = layer }, null);
     }
 
-    fn streamedMoeResult(self: *Transformer, stream_ctx: MoeStreamCtx, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights) anyerror!mlx.mlx_array {
+    fn swapMissedExperts(self: *Transformer, engine: *expert_stream_mod.Engine, layer: u16, occurrences: []u16, logits: mlx.mlx_array, tolerance: f32) !void {
+        const experts: usize = @intCast(self.config.num_experts);
+        const k: usize = @intCast(self.config.num_experts_per_tok);
+        if (k == 0) return;
+        const rows = occurrences.len / k;
+        if (rows * k != occurrences.len or @as(usize, @intCast(mlx.mlx_array_size(logits))) != rows * experts) return;
+        try mlx.check(mlx.mlx_array_eval(logits));
+        const logits_ptr = mlx.mlx_array_data_float32(logits) orelse return error.ExpertLogitsUnreadable;
+        const flags = try self.allocator.alloc(bool, experts * 3);
+        defer self.allocator.free(flags);
+        const starved = engine.pickState(layer, flags[0..experts]) orelse return;
+        const swapped = expert_stream_mod.substituteMisses(occurrences, logits_ptr[0 .. rows * experts], flags[0..experts], tolerance, k, flags[experts .. experts * 2], flags[experts * 2 ..], starved);
+        expert_swap_total_swapped +%= swapped;
+        expert_swap_total_ids +%= occurrences.len;
+        if (!expert_swap_logged) {
+            expert_swap_logged = true;
+            log.info("[expert-swap] engaged: tolerance={d:.2} (lossy: a missed expert is replaced by a cached one within that relative probability)\n", .{tolerance});
+        }
+        if (expert_swap_total_ids -% expert_swap_last_report >= 100_000) {
+            expert_swap_last_report = expert_swap_total_ids;
+            log.info("[expert-swap] swapped {d} of {d} routed ids so far\n", .{ expert_swap_total_swapped, expert_swap_total_ids });
+        }
+    }
+
+    fn streamedMoeResult(self: *Transformer, stream_ctx: MoeStreamCtx, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, router_logits: mlx.mlx_array, mw: *const MoeMlpWeights) anyerror!mlx.mlx_array {
         try self.flushDeferredPle(stream_ctx.ctx);
         const engine = self.expert_stream orelse return error.MissingExpertStream;
         var detail = expert_stream_mod.RouteDetail{};
@@ -30631,10 +30672,36 @@ pub const Transformer = struct {
         var ids_contiguous = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ids_contiguous);
         try mlx.check(mlx.mlx_contiguous(&ids_contiguous, ids_i32, false, self.s));
+        var shared_early: ?mlx.mlx_array = null;
+        defer if (shared_early) |value| {
+            _ = mlx.mlx_array_free(value);
+        };
+        const shared_eligible = streamSharedEarlyApplies(self.config.expert_layout == .exl3_k4 and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared, mlx.getShape(inds));
+        const swap_tolerance = expert_stream_mod.pick_tolerance;
+        var swap_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(swap_logits);
+        if (expertSwapApplies(swap_tolerance, mw.expert_bias != null, self.imatrix != null, mlx.getShape(inds)) and router_logits.ctx != null) {
+            var logits_f32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(logits_f32);
+            try mlx.check(mlx.mlx_astype(&logits_f32, router_logits, .float32, self.s));
+            try mlx.check(mlx.mlx_contiguous(&swap_logits, logits_f32, false, self.s));
+        }
         detail.build_ns = sync_clock.lap();
         if (engine.routeProbeActive()) {
             try mlx.check(mlx.mlx_array_eval(expert_x));
             detail.x_wait_ns = sync_clock.lap();
+        }
+        if (shared_eligible or swap_logits.ctx != null) {
+            const with_logits = swap_logits.ctx != null;
+            const ids_vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ ids_contiguous, if (with_logits) swap_logits else ids_contiguous }, if (with_logits) 2 else 1);
+            defer _ = mlx.mlx_vector_array_free(ids_vec);
+            try mlx.check(mlx.mlx_async_eval(ids_vec));
+        }
+        if (shared_eligible) {
+            shared_early = try self.moeSharedGated(expert_x, mw);
+            const early_vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{shared_early.?}, 1);
+            defer _ = mlx.mlx_vector_array_free(early_vec);
+            try mlx.check(mlx.mlx_async_eval(early_vec));
         }
         try mlx.check(mlx.mlx_array_eval(ids_contiguous));
         detail.ids_wait_ns = sync_clock.lap();
@@ -30646,6 +30713,7 @@ pub const Transformer = struct {
             if (ids_ptr[i] < 0 or ids_ptr[i] >= self.config.num_experts) return error.ExpertOutOfRange;
             expert.* = @intCast(ids_ptr[i]);
         }
+        if (swap_logits.ctx != null) try self.swapMissedExperts(engine, stream_ctx.layer, occurrences, swap_logits, swap_tolerance);
         detail.read_ns = sync_clock.lap();
         engine.noteRoute(stream_ctx.layer, self.moe_layers.?[stream_ctx.layer].attn == .full, detail);
         var prepared = try engine.prepareHost(stream_ctx.layer, occurrences);
@@ -30679,8 +30747,10 @@ pub const Transformer = struct {
                 .inds = slab_inds,
                 .norm_scores = norm_scores,
                 .imatrix = tap,
+                .shared_gated = shared_early,
             });
             engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
+            try handOffStreamedResult(slab_result, rows);
             return slab_result;
         }
         const remapped_inds = mlx.mlx_array_new_data(remapped_host.ptr, &[_]c_int{ rows, topk }, 2, .int32);
@@ -30716,11 +30786,13 @@ pub const Transformer = struct {
         }
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) {
             engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
+            try handOffStreamedResult(expert_sum, rows);
             return expert_sum;
         }
         defer _ = mlx.mlx_array_free(expert_sum);
         const result = try self.moeAddGatedShared(expert_sum, expert_x, mw);
         engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
+        try handOffStreamedResult(result, rows);
         return result;
     }
 
@@ -31120,7 +31192,7 @@ pub const Transformer = struct {
             norm_scores = scaled_scores;
         }
 
-        if (stream_ctx) |info| return self.streamedMoeResult(info, expert_x, inds, norm_scores, mw);
+        if (stream_ctx) |info| return self.streamedMoeResult(info, expert_x, inds, norm_scores, router_logits, mw);
         if (moeDumpDir() != null) {
             moeDumpTensor(self.s, "x", moe_dump_layer, expert_x);
             if (router_logits.ctx != null) moeDumpTensor(self.s, "rlogits", moe_dump_layer, router_logits);
@@ -31132,6 +31204,13 @@ pub const Transformer = struct {
             if (moeDumpDir() != null) {
                 moeDumpTensor(self.s, "y", moe_dump_layer, y);
             }
+            if (routing_override) |given| if (given.shared_gated) |shared_gated| {
+                defer _ = mlx.mlx_array_free(y);
+                var summed = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(summed);
+                try mlx.check(mlx.mlx_add(&summed, y, shared_gated, self.s));
+                return summed;
+            };
             if (skip_shared or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
             defer _ = mlx.mlx_array_free(y);
             return self.moeAddGatedShared(y, expert_x, mw);
@@ -35334,6 +35413,55 @@ test "moe dump waits for a real forward before writing tensors" {
     var count: usize = 0;
     while (try files.next(t.io)) |_| count += 1;
     try t.expectEqual(@as(usize, 2), count);
+}
+
+var expert_swap_logged: bool = false;
+var expert_swap_total_swapped: u64 = 0;
+var expert_swap_total_ids: u64 = 0;
+var expert_swap_last_report: u64 = 0;
+
+const STREAM_DECODE_MAX_ROWS: c_int = 16;
+
+fn streamRows(shape: []const c_int) c_int {
+    var rows: c_int = 1;
+    for (shape[0 .. shape.len - 1]) |d| rows *= d;
+    return rows;
+}
+
+fn streamHandoffApplies(rows: c_int) bool {
+    return rows <= STREAM_DECODE_MAX_ROWS;
+}
+
+fn streamSharedEarlyApplies(eligible: bool, inds_shape: []const c_int) bool {
+    return eligible and streamRows(inds_shape) <= STREAM_DECODE_MAX_ROWS;
+}
+
+fn expertSwapApplies(tolerance: f32, biased_router: bool, imatrix_armed: bool, inds_shape: []const c_int) bool {
+    return tolerance > 0 and !biased_router and !imatrix_armed and streamRows(inds_shape) <= STREAM_DECODE_MAX_ROWS;
+}
+
+fn handOffStreamedResult(result: mlx.mlx_array, rows: c_int) !void {
+    if (!streamHandoffApplies(rows)) return;
+    const vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{result}, 1);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_async_eval(vec));
+}
+
+test "streamed expert work is handed to the GPU early only at decode widths" {
+    try testing.expect(streamHandoffApplies(1));
+    try testing.expect(streamHandoffApplies(16));
+    try testing.expect(!streamHandoffApplies(17));
+    try testing.expect(streamSharedEarlyApplies(true, &.{ 1, 1, 10 }));
+    try testing.expect(!streamSharedEarlyApplies(true, &.{ 1, 512, 10 }));
+    try testing.expect(!streamSharedEarlyApplies(false, &.{ 1, 1, 10 }));
+}
+
+test "expert swap applies only to unbiased routers at decode widths without a capture" {
+    try testing.expect(expertSwapApplies(0.3, false, false, &.{ 1, 4, 10 }));
+    try testing.expect(!expertSwapApplies(0, false, false, &.{ 1, 1, 10 }));
+    try testing.expect(!expertSwapApplies(0.3, true, false, &.{ 1, 1, 10 }));
+    try testing.expect(!expertSwapApplies(0.3, false, true, &.{ 1, 1, 10 }));
+    try testing.expect(!expertSwapApplies(0.3, false, false, &.{ 1, 512, 10 }));
 }
 
 pub fn diagEnvOn(name: [*:0]const u8) bool {

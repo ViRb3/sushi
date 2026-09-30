@@ -56,6 +56,24 @@ zero-copy slabs. With no budget a pack loads resident as before.
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
   routes; dense prefix layers are skipped.
 
+## Decode schedule
+
+- A streamed layer is latency-bound: one GPU→host read of the router ids per layer. The layer's expert compute is
+  submitted with `mlx_async_eval` as soon as it is built, and at decode widths (<= 16 rows) the shared expert is
+  submitted between the ids and the blocking read, so the GPU runs it during the host round trip. Same ops, same
+  order; output is bit-identical.
+
+## Lossy expert pick (`--expert-pick-tolerance <n>`, 0..0.6, default 0 = exact)
+
+- On a cache miss at decode widths, a routed expert may be replaced by the best cached expert outside the row's top-k
+  when its router probability is at least `(1-n)` times the missed one's (`ln(1-n)` on the logit difference). The substitute keeps the
+  missed expert's routing weight. `expert_stream.substituteMisses`; skipped for biased routers and imatrix capture.
+- A row's expert is swapped at most `PICK_STARVE_LIMIT` (3) times in a row, then fetched, so a hot expert cannot stay
+  out of the cache. Misses are taken in descending logit order, and a missed expert another row is already fetching
+  counts as loading, not as a swap target.
+- Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
+  non-zero tolerance: the teacher is exact routing. Numbers: [quality-kld](quality-kld.md#lossy-expert-pick).
+
 ## I/O
 
 - `FillPool` = F_NOCACHE + F_RDAHEAD 0 positioned preads, fd cache validated by (dev, ino, size, mtime), spans sorted

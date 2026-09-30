@@ -252,6 +252,16 @@ width; the context grows ~7.3k keys over a boot. ms per forward:
   (72.8 / 73.6 °C die vs 90.6-then-3-min / 53.2 °C); the kernel is ~1% of a round and cannot reach prefill by 13%
   (the recorded v1.0.4 cell reads 1671).
 
+## Sushi-2bpw streamed decode on an M1 Max 32 GB (`--ssd-budget-gb 20`, kv8)
+
+| arm | tok/s |
+|---|---|
+| before: v1.1.1 (711572e9), per-layer sync, shared expert after the ids | 12 |
+| async hand-off + early shared expert | 18 |
+| + `--expert-pick-tolerance 0.2` | 18.0-18.8 (about +3-5% over exact in the same session; the machine drifts 10% warm) |
+
+Decode is ~48 dependent GPU→host reads per token (~70 ms of a 55-83 ms token); SSD fills are ~4 ms/token at 92% hit.
+
 <a id="m2max-64gb"></a>
 ## Flash-Next Sushi-3bpw on an M2 Max 64 GB
 

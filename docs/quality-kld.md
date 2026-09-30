@@ -69,6 +69,22 @@ Both are heavy GPU jobs: take the lock per run (CLAUDE.md, Team process).
 - `SUSHI_NGRAM_BF16_DIR=<hf checkpoint>` serves a Flash-Next pack with the original bf16 n-gram table to isolate
   the PLE table's cost.
 
+## Lossy expert pick
+
+`--expert-pick-tolerance` on Sushi-2bpw, `--ssd-budget-gb 20` (251 slots/layer), kv8, 16 prompts x 128 tokens,
+teacher = the same pack with exact routing (`kld compare --expert-pick-tolerance n`).
+
+| tolerance | KLD | top-1 | NLL | KLD to first EOS | cache hit |
+|---|---|---|---|---|---|
+| 0 | 0 | 100% | 0.4004 | 0 | 81.6% |
+| 0.2 | 0.0216 | 94.5% | 0.4174 | 0.0298 | 83.2% |
+| 0.3 | 0.0264 | 93.7% | 0.4272 | 0.0355 | 83.8% |
+
+The pack's own KLD against the bf16 teacher is 0.208, so 0.2 adds about a tenth of it.
+
+Repetition: 8 prompts x 600 tokens at temperature 0 and 1, tolerance 0 / 0.2 / 0.3: mean distinct 4-grams 0.997-0.999
+in every arm (worst run 0.983), no loop-stop cut in any of the 48 runs.
+
 ## Cross-engine check
 
 mlx-lm's MiMo support (upstream PR 1219, router patched to f32), streamed one layer at a time, against our MiMo

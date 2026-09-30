@@ -16,6 +16,7 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const expert_stream_mod = @import("expert_stream.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
@@ -298,6 +299,13 @@ fn printUsage(io: std.Io) void {
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 8, integers 2..32).
+        \\  --expert-pick-tolerance <n>
+        \\                      LOSSY, streamed packs only (default: 0 = off,
+        \\                        exact routing). A routed expert missing from the
+        \\                        cache is replaced by the best cached expert the
+        \\                        router did not pick, when that expert's probability
+        \\                        is at least (1 - n) x the missed one's. 0..0.6;
+        \\                        0.3 is a mild setting.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -839,6 +847,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
                 log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--expert-pick-tolerance") and i + 1 < args.len) {
+            i += 1;
+            expert_stream_mod.pick_tolerance = expert_stream_mod.parsePickTolerance(args[i]) catch {
+                log.err("--expert-pick-tolerance: expected a number from 0 to 0.6, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
