@@ -2774,24 +2774,26 @@ fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
     return wiredCeilingFloorForRam(config, metrics.getTotalMemBytes());
 }
 
-test "an engaged MiMo stream honors the declared wired limit without enabling long-context paths" {
+test "MiMo honors the declared wired limit streamed or resident, without enabling long-context paths" {
     const prior = wired_limit_mb_override;
     wired_limit_mb_override = 120000;
     defer wired_limit_mb_override = prior;
+    const floor = wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, wired_limit_margin_bytes);
     var c = model_mod.ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
     try std.testing.expect(!c.longCtxGated());
-    try std.testing.expectEqual(
-        wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, wired_limit_margin_bytes),
-        wiredCeilingFloorForRam(&c, 128 << 30),
-    );
+    try std.testing.expectEqual(floor, wiredCeilingFloorForRam(&c, 128 << 30));
     c.expert_streaming = false;
-    try std.testing.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(&c, 128 << 30));
+    try std.testing.expectEqual(floor, wiredCeilingFloorForRam(&c, 128 << 30));
+    // An arch the engine does not serve keeps the free-RAM ceiling.
+    const other = model_mod.ModelConfig{ .model_type = "llama" };
+    try std.testing.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(&other, 128 << 30));
 }
 
 /// PURE: the floor for a machine with `total_ram` bytes; the wrapper above reads the machine.
 fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
     const c = config orelse return 0;
-    if (!c.longCtxGated() and !c.expert_streaming) return 0;
+    // Resident MiMo fills a 128 GB Mac, so its ceiling is the declared limit, not what other apps leave free.
+    if (!c.longCtxGated() and !c.expert_streaming and !c.isMimo()) return 0;
     const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, wired_limit_margin_bytes);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
         log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
