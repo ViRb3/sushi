@@ -14,11 +14,12 @@ earlier history is mlx-serve's, in that project's changelog.
   the next request no longer starts with a GPU wake-up delay.
 - **With MTP, the first token streams when prefill ends** instead of after the first speculative round (when that
   token is visible: a template-opened thought or thinking off).
-- **Faster SSD streaming**: a streamed layer's expert compute is handed to the GPU as soon as it is built and the
-  shared expert runs while the host reads the router ids; Sushi-2bpw at a 20 GB budget on an M1 Max decodes 12 -> 18
-  tok/s with identical output.
+- **Faster SSD streaming**: a streamed decode layer queues its experts from a GPU copy of the expert cache map
+  before the host reads the router ids, and verifies them one layer later; Sushi-2bpw at a 20 GB budget on an M1 Max
+  decodes 10.3 -> 19.6 tok/s (llmprobe, 512 context) with byte-identical output.
 - **`--expert-pick-tolerance <n>`** (0 to 0.6, default off): a streamed pack may serve a cached expert in place of a
-  missed one when the router rates it at least `1 - n` as likely; lossy, trading a little accuracy for fewer SSD reads.
+  missed one when the router rates it at least `1 - n` as likely; lossy, trading a little accuracy for fewer SSD reads (KLD in `docs/quality-kld.md`; 22.3 tok/s greedy at 0.2 on the same
+  M1 Max).
 - **A reply cut short while thinking streams the reasoning the non-streamed reply returns**: no lone `<think>` as
   reasoning (MiMo at `max_tokens: 1`), no empty Anthropic thinking block, and no dropped thought of a few characters.
 

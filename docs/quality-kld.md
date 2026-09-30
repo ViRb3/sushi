@@ -80,7 +80,8 @@ teacher = the same pack with exact routing (`kld compare --expert-pick-tolerance
 | 0.2 | 0.0216 | 94.5% | 0.4174 | 0.0298 | 83.2% |
 | 0.3 | 0.0264 | 93.7% | 0.4272 | 0.0355 | 83.8% |
 
-The pack's own KLD against the bf16 teacher is 0.208, so 0.2 adds about a tenth of it.
+The pack's own KLD against the bf16 teacher is 0.208, so 0.2 adds about a tenth of it. The GPU-side pick reads the
+same KLD to the ninth digit (0.021600648): it picks exactly what the host picks.
 
 Repetition: 8 prompts x 600 tokens at temperature 0 and 1, tolerance 0 / 0.2 / 0.3: mean distinct 4-grams 0.997-0.999
 in every arm (worst run 0.983), no loop-stop cut in any of the 48 runs.

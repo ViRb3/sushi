@@ -62,7 +62,10 @@ zero-copy slabs. With no budget a pack loads resident as before.
   submitted with `mlx_async_eval` as soon as it is built, and at decode widths (<= 16 rows) the shared expert is
   submitted between the ids and the blocking read, so the GPU runs it during the host round trip. Same ops, same
   order; output is bit-identical.
-
+- At decode widths each layer's experts are queued from a GPU copy of the cache map (`Engine.specRoute`: expert →
+  slot, -1 where not ready) before the host reads the router ids. The host keeps that result only when every routed
+  id resolved to the slot the GPU gathered (`specMatches`), else rebuilds it; a union workspace always rebuilds. The
+  host map and its GPU copy change together (`LayerState.refreshSpec`), or a stale GPU map could pass the check.
 - Qwen4 single-token decode keeps at most one unresolved layer while submitting the next GDN MoE layer's router
   and cache-map expert compute. A cache miss discards that successor, restores its recurrent handles, and rebuilds
   from the preceding MLP's exact output; PLE and full-attention successors verify first. Cache resolution and its
@@ -70,7 +73,8 @@ zero-copy slabs. With no budget a pack loads resident as before.
 - Deferred HC writes belong to the speculative stream: rollback restores the preceding MLP's stream and injection
   gate, then replaces the pending write with its exact result. Rollback transfers the saved HC handle, so a later
   MLX error leaves one valid cleanup owner. Profiling, dtype tracing, layer captures, stand-ins,
-  imatrix collection, batched/wide forwards and lossy expert picking keep synchronous verification.
+  imatrix collection and batched/wide forwards keep synchronous verification; a lossy pick defers only when the
+  GPU made it (below).
 - `SUSHI_EXPERT_DEFER_SYNC=1` selects synchronous verification for an exact schedule comparison: deferred
   verification overlaps host work on hits but spends an extra GDN build and speculative compute on misses.
 
@@ -82,6 +86,9 @@ zero-copy slabs. With no budget a pack loads resident as before.
 - A row's expert is swapped at most `PICK_STARVE_LIMIT` (3) times in a row, then fetched, so a hot expert cannot stay
   out of the cache. Misses are taken in descending logit order, and a missed expert another row is already fetching
   counts as loading, not as a swap target.
+- At one-row decode the pick runs on the GPU (`expertPickGpu`, the same algorithm as `substituteMisses`, fed the
+  layer's map and starvation counts) and the experts are queued from its slots; the picked ids ride the ids' command
+  buffer. The host still makes its own pick and keeps the GPU result only when both agree.
 - Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
   non-zero tolerance: the teacher is exact routing. Numbers: [quality-kld](quality-kld.md#lossy-expert-pick).
 

@@ -291,13 +291,25 @@ width; the context grows ~7.3k keys over a boot. ms per forward:
 
 ## Sushi-2bpw streamed decode on an M1 Max 32 GB (`--ssd-budget-gb 20`, kv8)
 
-| arm | tok/s |
-|---|---|
-| before: v1.1.1 (711572e9), per-layer sync, shared expert after the ids | 12 |
-| async hand-off + early shared expert | 18 |
-| + `--expert-pick-tolerance 0.2` | 18.0-18.8 (about +3-5% over exact in the same session; the machine drifts 10% warm) |
+Greedy 300-token decode of one prompt after a warm-up (tok/s; same box, arms run back to back):
 
-Decode is ~48 dependent GPU→host reads per token (~70 ms of a 55-83 ms token); SSD fills are ~4 ms/token at 92% hit.
+| change | exact | `--expert-pick-tolerance 0.2` |
+|---|---|---|
+| v1.1.1 (per-layer id sync) | 12 | - |
+| async expert hand-off + early shared expert | 14.1 | 15.3 |
+| experts queued from the GPU cache map before the id read | 17.9 | 15.3 |
+| deferred verification across one GDN successor | 19.1 | - |
+| lossy pick on the GPU, deferral in tolerance mode | 19.3 | 22.3 |
+
+llmprobe `--bench-only --rungs 512,2k` (ctx 32768): v1.1.1 10.3 / 9.4 tok/s decode, this branch exact 19.6 / 17.1,
+tolerance 0.2 at 2k 18.9. A 3869-token prompt (QSA engaged), 200 greedy tokens: v1.1.1 8.7 / 9.1 (cold / warm), this
+branch 15.2 / 16.9. Exact output is byte-identical to v1.1.1 on every single-stream check, and `kld compare` against the
+exact teacher reads KLD 0 (NLL 0.4004 unchanged). Two concurrent streams can differ from a single stream by arrival
+order alone (batched and solo decode are not bit-identical); v1.1.1 does the same.
+
+Anatomy of an exact token at the end (~52 ms): GPU work ~31 ms (MoE ~13, GDN ~9, HC ~5, attention ~3); SSD fills
+~0.63 ms per missed expert, ~18 misses a token (fill tuning: splitting reads or more than 4 workers is slower);
+the rest is host round trips on full-attention/PLE layers and rollbacks. Tolerance 0.2 cuts misses to ~7 a token.
 
 <a id="m2max-64gb"></a>
 ## Flash-Next Sushi-3bpw on an M2 Max 64 GB
