@@ -5432,6 +5432,13 @@ pub const WarmPrefix = struct {
         if (!self.will_donate or self.matched_tokens == 0) return false;
         return seq > self.capacity_tokens;
     }
+
+    /// Does the decode outgrow the restored buffers? The prefill fits inside them, then the first
+    /// decode step past capacity grows every KV layer to the reservation inside one forward.
+    pub fn decodeOutgrows(self: WarmPrefix, seq: u64, reserved: u64) bool {
+        if (self.matched_tokens == 0) return false;
+        return seq <= self.capacity_tokens and reserved > self.capacity_tokens;
+    }
 };
 
 /// PURE: the most KV-caching layers that fall inside one window of `window` consecutive layers,
@@ -5458,8 +5465,10 @@ fn attnLayersPerEvalWindow(config: *const model_mod.ModelConfig, window: u32) u3
 /// until it EVALUATES, so the coexistence window is the prefill loop's eval cadence rather than
 /// the size of the cache. A forward narrower than `prefillEvalCadenceApplies` runs one eval for
 /// the whole layer loop and therefore does pay the whole old cache.
-fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, kv_per_tok: u64) u64 {
+fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, reserved: u64, kv_per_tok: u64) u64 {
     if (warm.grows(seq)) return oldBuffersInEvalWindow(config, warm.capacity_tokens, seq -| warm.matched_tokens, kv_per_tok);
+    // A decode step evaluates once for every layer, so all the old buffers coexist with the new.
+    if (warm.decodeOutgrows(seq, reserved)) return warm.capacity_tokens *| kv_per_tok;
     // An SSD restore installs each layer at exactly its restored rows, so the first append grows
     // it beside the restored buffer. A ringed arch's admission never sees the restore (it bills a
     // warm request cold), so with a disk tier it bills that coexistence at the prompt's length.
@@ -5496,9 +5505,9 @@ pub const PrefillRequestTerms = struct {
     /// Bytes of the KV terms above already resident in the buffer the restore handed this slot
     /// (`WarmPrefix`). KV only; subtracted once, in `prefillMemoryNeeded`.
     shared_resident_bytes: u64 = 0,
-    /// Old KV buffers that coexist with the new ones while a warm append GROWS the cache.
-    /// Zero when nothing grows, when the restore was shared (the whole copy is billed
-    /// uncredited instead), and on every arch outside the gate.
+    /// Old KV buffers that coexist with the new ones while a warm append, or the first decode
+    /// step past the restored capacity, GROWS the cache. Zero when nothing grows, and on every
+    /// arch that does not reserve its capacity.
     grow_coexist_bytes: u64 = 0,
     qsa_ring_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
@@ -5748,7 +5757,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
-        .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
+        .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dequant_scratch_bytes = kvDequantScratchBytes(config, seq, @min(chunk, seq)),
@@ -19489,11 +19498,13 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 4_989), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
     try t.expectEqual(@as(u64, 6_480), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
-    // A buffer the previous turn sized above this prompt grows nothing, so no window at all.
+    // A buffer the previous turn sized above this prompt grows nothing in the prefill, but the
+    // first decode step past it grows every attention layer to the reservation beside it.
     const fits = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 450_048, .will_donate = true };
     const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
-    try t.expectEqual(@as(u64, 0), f.grow_coexist_bytes);
-    try t.expectEqual(@as(u64, 4_407), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+    try t.expect(reserved > 450_048);
+    try t.expectEqual(450_048 *| kv_per_tok, f.grow_coexist_bytes);
+    try t.expectEqual(@as(u64, 11_412), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
 
     // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
     // nothing and bills no window either; a COLD prompt has nothing to credit.
@@ -24302,6 +24313,41 @@ test "mimo_v2 admission credits the hot cache: a gap the cache covers is an evic
         try t.expectEqual(scheduler_mod.admissionPassArmed(c), b.evictionCredit() > 0);
     }
     try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(creditedAdmissionBill(&other, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096)));
+}
+
+test "a warm restore whose decode outgrows its capacity bills the old rows beside the reservation" {
+    // seq <= C < R: the prefill appends inside the restored buffers and the first decode step
+    // past C grows every KV layer to R inside one forward, the C-row buffers still alive.
+    const t = std.testing;
+    const saved_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = saved_disk;
+    prefix_cache_disk_bytes = 0;
+    var q4 = qwen4RequestTestConfig();
+    q4.pinned_context = 1 << 20;
+    const mimo = mimoV2FlashBillConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 130_000;
+    const matched: u64 = 125_000;
+    const capacity: u64 = 131_072;
+    const chunk: u64 = 2048;
+    for ([_]*const model_mod.ModelConfig{ &q4, &mimo }) |cfg| {
+        const kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+        const reserved = @max(reservedCacheTokens(seq, 32_000, chunk, getEffectiveContextLength(cfg)), seq);
+        try t.expect(seq <= capacity and capacity < reserved);
+        for ([_]bool{ true, false }) |donate| {
+            const warm = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = donate };
+            const terms = prefillRequestTerms(cfg, seq, 32_000, kv_bits, chunk, warm);
+            const kv_bill = seq * kv + terms.reserved_kv_bytes + terms.grow_coexist_bytes - terms.shared_resident_bytes;
+            // New bytes at the grow beyond what is already resident: the R-row buffers, plus the
+            // C-row copy a shared restore's first append made.
+            const new_bytes = reserved * kv + (if (donate) 0 else capacity * kv);
+            try t.expect(kv_bill >= new_bytes);
+            try t.expectEqual(capacity * kv, terms.grow_coexist_bytes);
+        }
+        // The decode never outgrows a restore that already holds the reservation.
+        const roomy = prefillRequestTerms(cfg, seq, 32_000, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = reserved, .will_donate = true });
+        try t.expectEqual(@as(u64, 0), roomy.grow_coexist_bytes);
+    }
 }
 
 test "mimo_v2 warm bill credits only the restored global rows, never the ring" {
