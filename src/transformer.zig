@@ -30989,6 +30989,24 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(early_vec);
             try mlx.check(mlx.mlx_async_eval(early_vec));
         }
+        var spec_host: ?[]const i32 = null;
+        var spec_result = mlx.mlx_array{ .ctx = null };
+        defer if (spec_result.ctx != null) {
+            _ = mlx.mlx_array_free(spec_result);
+        };
+        if (expertSpecApplies(self.imatrix != null, mlx.getShape(inds))) if (try engine.specRoute(stream_ctx.layer)) |route| {
+            var gathered = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gathered);
+            try mlx.check(mlx.mlx_take(&gathered, route.slots, ids_contiguous, self.s));
+            const mw_spec = slabMoeWeights(mw, &route.operands);
+            spec_result = try self.moeMLP2WithRouter(expert_x, expert_x, &mw_spec, null, false, null, .{
+                .inds = gathered,
+                .norm_scores = norm_scores,
+                .shared_gated = shared_early,
+            });
+            try handOffStreamedResult(spec_result, streamRows(mlx.getShape(inds)));
+            spec_host = route.host;
+        };
         try mlx.check(mlx.mlx_array_eval(ids_contiguous));
         detail.ids_wait_ns = sync_clock.lap();
         const ids_ptr = mlx.mlx_array_data_int32(ids_contiguous) orelse return error.ExpertIdsUnreadable;
@@ -30999,6 +31017,8 @@ pub const Transformer = struct {
             if (ids_ptr[i] < 0 or ids_ptr[i] >= self.config.num_experts) return error.ExpertOutOfRange;
             expert.* = @intCast(ids_ptr[i]);
         }
+        const routed_ids = if (spec_host != null) try self.allocator.dupe(u16, occurrences) else &[_]u16{};
+        defer if (spec_host != null) self.allocator.free(routed_ids);
         if (swap_logits.ctx != null) try self.swapMissedExperts(engine, stream_ctx.layer, occurrences, swap_logits, swap_tolerance);
         detail.read_ns = sync_clock.lap();
         engine.noteRoute(stream_ctx.layer, self.moe_layers.?[stream_ctx.layer].attn == .full, detail);
@@ -31016,19 +31036,20 @@ pub const Transformer = struct {
         // routing's own global ids.
         const tap = try ImatrixTap.forLayer(self.imatrix, stream_ctx.layer, ids_contiguous, rows, topk, self.s);
         defer if (tap) |t| t.deinit();
+        if (spec_host) |map| {
+            const kept = prepared.quantized and expert_stream_mod.specMatches(map, routed_ids, prepared.remapped, prepared.workspace);
+            noteExpertSpec(kept);
+            if (kept) {
+                const result = spec_result;
+                spec_result = .{ .ctx = null };
+                engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
+                return result;
+            }
+        }
         if (prepared.quantized) {
             const slab_inds = mlx.mlx_array_new_data(remapped_host.ptr, inds_shape.ptr, @intCast(inds_shape.len), .int32);
             defer _ = mlx.mlx_array_free(slab_inds);
-            var mw_slab = mw.*;
-            mw_slab.switch_gate_w = prepared.quantOperand(.gate_w);
-            mw_slab.switch_gate_s = prepared.quantOperand(.gate_s);
-            mw_slab.switch_gate_b = prepared.quantOperand(.gate_b);
-            mw_slab.switch_up_w = prepared.quantOperand(.up_w);
-            mw_slab.switch_up_s = prepared.quantOperand(.up_s);
-            mw_slab.switch_up_b = prepared.quantOperand(.up_b);
-            mw_slab.switch_down_w = prepared.quantOperand(.down_w);
-            mw_slab.switch_down_s = prepared.quantOperand(.down_s);
-            mw_slab.switch_down_b = prepared.quantOperand(.down_b);
+            const mw_slab = slabMoeWeights(mw, &prepared.quant_raw);
             const slab_result = try self.moeMLP2WithRouter(expert_x, expert_x, &mw_slab, null, false, null, .{
                 .inds = slab_inds,
                 .norm_scores = norm_scores,
@@ -35726,6 +35747,37 @@ fn expertSwapApplies(tolerance: f32, biased_router: bool, imatrix_armed: bool, i
     return tolerance > 0 and !biased_router and !imatrix_armed and streamRows(inds_shape) <= STREAM_DECODE_MAX_ROWS;
 }
 
+fn slabMoeWeights(mw: *const MoeMlpWeights, raw: *const [expert_stream_mod.quant.component_count]mlx.mlx_array) MoeMlpWeights {
+    const C = expert_stream_mod.quant.Component;
+    var out = mw.*;
+    out.switch_gate_w = raw[@backingInt(C.gate_w)];
+    out.switch_gate_s = raw[@backingInt(C.gate_s)];
+    out.switch_gate_b = raw[@backingInt(C.gate_b)];
+    out.switch_up_w = raw[@backingInt(C.up_w)];
+    out.switch_up_s = raw[@backingInt(C.up_s)];
+    out.switch_up_b = raw[@backingInt(C.up_b)];
+    out.switch_down_w = raw[@backingInt(C.down_w)];
+    out.switch_down_s = raw[@backingInt(C.down_s)];
+    out.switch_down_b = raw[@backingInt(C.down_b)];
+    return out;
+}
+
+/// A decode-width streamed layer queues its expert compute from the GPU copy
+/// of the cache map before the host reads the router ids; the host keeps it
+/// when every id resolved to the gathered slot, else rebuilds it.
+fn expertSpecApplies(imatrix_armed: bool, inds_shape: []const c_int) bool {
+    return !imatrix_armed and streamRows(inds_shape) <= STREAM_DECODE_MAX_ROWS;
+}
+
+var expert_spec_kept: u64 = 0;
+var expert_spec_total: u64 = 0;
+fn noteExpertSpec(kept: bool) void {
+    if (kept) expert_spec_kept += 1;
+    expert_spec_total += 1;
+    if (expert_spec_total == 1 or expert_spec_total % 20_000 == 0)
+        log.info("[expert-spec] kept {d} of {d} speculated layers\n", .{ expert_spec_kept, expert_spec_total });
+}
+
 fn handOffStreamedResult(result: mlx.mlx_array, rows: c_int) !void {
     if (!streamHandoffApplies(rows)) return;
     const vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{result}, 1);
@@ -35748,6 +35800,13 @@ test "expert swap applies only to unbiased routers at decode widths without a ca
     try testing.expect(!expertSwapApplies(0.3, true, false, &.{ 1, 1, 10 }));
     try testing.expect(!expertSwapApplies(0.3, false, true, &.{ 1, 1, 10 }));
     try testing.expect(!expertSwapApplies(0.3, false, false, &.{ 1, 512, 10 }));
+}
+
+test "speculative expert compute runs at decode widths without an imatrix capture" {
+    try testing.expect(expertSpecApplies(false, &.{ 1, 1, 10 }));
+    try testing.expect(expertSpecApplies(false, &.{ 1, 16, 10 }));
+    try testing.expect(!expertSpecApplies(false, &.{ 1, 17, 10 }));
+    try testing.expect(!expertSpecApplies(true, &.{ 1, 1, 10 }));
 }
 
 pub fn diagEnvOn(name: [*:0]const u8) bool {

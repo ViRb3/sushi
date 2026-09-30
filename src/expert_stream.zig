@@ -1141,7 +1141,35 @@ const LayerState = struct {
     active: bool = false,
     slabs: []SlabOperand = &.{},
     stats: LayerStats = .{},
+    spec_host: []i32 = &.{},
+    spec_slots: mlx.mlx_array = .{ .ctx = null },
 };
+
+/// Writes the slot each expert reads from as the cache stands (-1 = not a ready
+/// hit) into `out`; returns whether any entry changed.
+pub fn refreshSpecMap(expert_to_slot: []const i32, ready: []const bool, out: []i32) bool {
+    var changed = false;
+    for (out, expert_to_slot) |*cached, raw| {
+        const now: i32 = if (raw >= 0 and ready[@intCast(raw)]) raw else -1;
+        if (cached.* != now) {
+            cached.* = now;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+/// A speculative expert result is exact only when the host resolution read
+/// every routed id from the slot the GPU gathered for it.
+pub fn specMatches(map: []const i32, ids: []const u16, remapped: []const u16, workspace: bool) bool {
+    if (workspace or ids.len != remapped.len) return false;
+    for (ids, remapped) |expert, slot| {
+        if (expert >= map.len) return false;
+        const predicted = map[expert];
+        if (predicted < 0 or predicted != slot) return false;
+    }
+    return true;
+}
 
 fn createSlabSet(allocator: std.mem.Allocator, store: *const ExpertStore, count: u32, s: mlx.mlx_stream) ![]SlabOperand {
     return createSlabSetAt(allocator, store, null, count, s);
@@ -1330,6 +1358,10 @@ pub const Engine = struct {
 
     fn releaseSlabs(self: *Engine) void {
         for (self.layers) |*layer| {
+            if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
+            layer.spec_slots = .{ .ctx = null };
+            if (layer.spec_host.len != 0) self.allocator.free(layer.spec_host);
+            layer.spec_host = &.{};
             for (layer.slabs) |*operand| operand.destroy(self.allocator, self.s);
             if (layer.slabs.len != 0) self.allocator.free(layer.slabs);
             layer.slabs = &.{};
@@ -1494,6 +1526,41 @@ pub const Engine = struct {
         errdefer _ = mlx.mlx_array_free(down);
         try mlx.check(mlx.mlx_transpose_axes(&down, down_raw, &axes, 3, self.s));
         return .{ .gate = gate, .up = up, .down = down };
+    }
+
+    pub const SpecRoute = struct {
+        /// int32 [experts]: the slot per expert, 0 where the host map says -1.
+        slots: mlx.mlx_array,
+        host: []const i32,
+        operands: [quant.component_count]mlx.mlx_array,
+    };
+
+    /// The layer's cache map and slab operands, so a decode forward can queue
+    /// the expert compute before the host reads the router ids. Null when the
+    /// store is not quantized.
+    pub fn specRoute(self: *Engine, layer_index: u16) !?SpecRoute {
+        if (self.store.quantized == null or layer_index >= self.layers.len) return null;
+        const layer = &self.layers[layer_index];
+        if (!layer.active or layer.slabs.len != self.store.componentCount()) return null;
+        const experts = layer.cache.expert_to_slot.len;
+        if (layer.spec_host.len != experts) {
+            if (layer.spec_host.len != 0) self.allocator.free(layer.spec_host);
+            layer.spec_host = &.{};
+            layer.spec_host = try self.allocator.alloc(i32, experts);
+            @memset(layer.spec_host, -2);
+        }
+        if (refreshSpecMap(layer.cache.expert_to_slot, layer.cache.ready, layer.spec_host) or layer.spec_slots.ctx == null) {
+            const gpu = try self.allocator.alloc(i32, experts);
+            defer self.allocator.free(gpu);
+            for (gpu, layer.spec_host) |*slot, host| slot.* = @max(host, 0);
+            const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+            if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
+            if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
+            layer.spec_slots = fresh;
+        }
+        var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
+        for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
+        return .{ .slots = layer.spec_slots, .host = layer.spec_host, .operands = operands };
     }
 
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
@@ -3371,4 +3438,24 @@ test "group cache reports only ready residents as cached" {
     cache.markReady(first.bindings[1].slot.?);
     cache.cachedMask(&mask);
     try t.expect(mask[0] and mask[1] and !mask[2] and !mask[3]);
+}
+
+test "spec map follows the ready cache slots and reports changes" {
+    const t = std.testing;
+    const expert_to_slot = [_]i32{ 2, -1, 0, 1 };
+    const ready = [_]bool{ true, false, true };
+    var out = [_]i32{ -2, -2, -2, -2 };
+    try t.expect(refreshSpecMap(&expert_to_slot, &ready, &out));
+    try t.expectEqualSlices(i32, &.{ 2, -1, 0, -1 }, &out);
+    try t.expect(!refreshSpecMap(&expert_to_slot, &ready, &out));
+}
+
+test "spec result is kept only when every id resolved to its gathered slot" {
+    const t = std.testing;
+    const map = [_]i32{ 3, -1, 0, 7 };
+    try t.expect(specMatches(&map, &.{ 0, 2, 3 }, &.{ 3, 0, 7 }, false));
+    try t.expect(!specMatches(&map, &.{ 0, 2, 3 }, &.{ 3, 0, 7 }, true));
+    try t.expect(!specMatches(&map, &.{ 0, 1 }, &.{ 3, 5 }, false));
+    try t.expect(!specMatches(&map, &.{ 0, 2 }, &.{ 3, 1 }, false));
+    try t.expect(!specMatches(&map, &.{9}, &.{0}, false));
 }
