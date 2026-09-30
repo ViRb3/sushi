@@ -11,10 +11,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Sushi packs stream from SSD**: `--ssd-budget-gb N` keeps the trunk resident and streams the routed experts from
   SSD, so a Mac with less memory than the pack can serve it; replies are identical to a resident load. Every Sushi
   Qwen pack and MiMo-V2.6-Flash-Sushi-2.3bpw stream, and Sushi-2bpw serves on a 32 GB M1 Max at a 20 GB budget.
-- **Faster Flash-Next prefill**: oMLX's tensor-unit sparse attention now serves prefill from the first sparse chunk,
-  and GDN prefill runs a software-pipelined recurrence (19% faster on a 10k-token prompt on an M5 Max); batched decode overlaps GPU
-  work with graph building, and `--prefill-decode-share` keeps decoders moving while a long prompt prefills. Thanks
-  @STRML and @cowboycoderhq.
+- **Faster Flash-Next**: on an M5 Max, Sushi-4bpw decodes 8% faster (83 -> 89 tok/s) and prefills a 10k-token prompt
+  19% faster (1,796 -> 2,139 tok/s). oMLX's tensor-unit sparse attention now serves prefill from the first sparse
+  chunk, GDN prefill runs a software-pipelined recurrence, batched decode overlaps GPU work with graph building, and
+  `--prefill-decode-share` keeps decoders moving while a long prompt prefills. Thanks @STRML and @cowboycoderhq.
 - **Better and smaller packs**: new expert weights for Sushi-4bpw (KLD 0.0632 -> 0.0592) and Sushi-3bpw
   (0.1047 -> 0.1036), and Sushi-2bpw for 48 GB Macs.
 - **Live sessions on `/metrics.json`**: every in-flight request and every cached conversation, with its phase,

@@ -45,32 +45,23 @@ The server listens on `127.0.0.1:12345`, the model's own MTP draft head and the 
 GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on, `--mtp-head-kv-quant`,
 `--prefix-cache-mem 1GB`). The n-gram table stays on the SSD and is not counted.
 
-| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-3bpw | Sushi-4bpw |
+| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw |
 |---|---:|---:|---:|---:|
-| weights only | 35.0 | 44.0 | 49.3 | 63.7 |
-| 128k | 41.7 | 50.7 | 56.1 | 70.4 |
-| 256k | 44.6 | 53.6 | 58.9 | 73.3 |
-| 512k | 49.7 | 58.6 | 64.0 | 78.4 |
-| 1M | 59.8 | 68.8 | 74.2 | 88.5 |
+| weights only | 35.0 | 44.0 | 63.7 | 83.6 |
+| 128k | 41.7 | 50.7 | 70.4 | 88.3 |
+| 256k | 44.6 | 53.6 | 73.3 | 90.2 |
+| 512k | 49.7 | 58.6 | 78.4 | 93.9 |
+| 1M | 59.8 | 68.8 | 88.5 | 101.4 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
 the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M:
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-3bpw | Sushi-4bpw |
+| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw |
 |---|---|---|---|---|---|
 | 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — |
-| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | 184k / 288k | — |
-| 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 880k / 1M |
+| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | — | — |
+| 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 880k / 1M | — |
 | 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M |
-
-MiMo-V2.6-Flash-Sushi-2.3bpw (same method; it needs a 128 GB Mac):
-
-| context | weights only | 128k | 256k | 512k | 1M |
-|---|---:|---:|---:|---:|---:|
-| 8-bit KV | 83.6 | 88.3 | 90.2 | 93.9 | 101.4 |
-| 4-bit KV | 83.6 | 87.4 | 88.3 | 90.3 | 94.3 |
-
-At the 120,000 MB limit the full 1M context fits at 8-bit KV.
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD.
@@ -108,7 +99,7 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-2bpw --local-dir ~/.sushi/models/Q
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --prefix-cache-mem 1GB --temp 1
 ```
 
-**64 GB Mac, Sushi-2.6bpw or 3bpw**
+**64 GB Mac, Sushi-2.6bpw**
 
 Set the GPU memory limit first (it resets at reboot). 59,000 MB is the ceiling for this box: above it macOS runs out
 of memory before the model does, and the kernel panics rather than the server refusing.
@@ -134,9 +125,6 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw --local-dir ~/.sushi/models
 ```
 
 At 4-bit KV the quality cost: mean KLD 0.1355 at 8-bit KV to 0.1458, and next-token agreement 89.08% to 88.84%.
-
-Sushi-3bpw also fits a 64 GB Mac, for ~30% better quality (0.1047 against 0.1355) at about half the context: the same commands
-with its model path and `--ctx-size 128000` at 8-bit KV or `--ctx-size 248000` at 4-bit.
 
 **96 GB+ Mac, Sushi-4bpw**
 
