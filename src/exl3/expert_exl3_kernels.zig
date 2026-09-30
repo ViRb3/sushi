@@ -8883,14 +8883,25 @@ fn gemmArmCounts(alloc: std.mem.Allocator, out: *std.ArrayList([256]u32)) !void 
         }
         return;
     }
+    try out.append(alloc, syntheticArmCounts());
+}
+
+/// One synthetic layer of 16200 routed slots, skewed toward low expert ids.
+fn syntheticArmCounts() [256]u32 {
     var c: [256]u32 = @splat(0);
     var total: u32 = 0;
     for (0..256) |e| {
-        c[e] = @intFromFloat(700.0 * @exp(-@as(f64, @floatFromInt(e)) / 40.0));
+        c[e] = @intFromFloat(400.0 * @exp(-@as(f64, @floatFromInt(e)) / 40.0));
         total += c[e];
     }
-    c[0] += 16200 - total;
-    try out.append(alloc, c);
+    c[0] += 16200 -| total;
+    return c;
+}
+
+test "exl3 the GEMM ubench's synthetic layer routes exactly 16200 slots" {
+    var sum: u64 = 0;
+    for (syntheticArmCounts()) |c| sum += c;
+    try std.testing.expectEqual(@as(u64, 16200), sum);
 }
 
 test "exl3 MiMo NAX GEMM served vs reference body at the served geometry, interleaved (SUSHI_EXL3_GEMM_ARMS=1)" {
