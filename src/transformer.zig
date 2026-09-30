@@ -31106,9 +31106,11 @@ pub const Transformer = struct {
         if (spec_route) |route| if (swap_logits.ctx != null and streamRows(mlx.getShape(inds)) == 1) {
             const starved = mlx.mlx_array_new_data(route.starved.ptr, &[_]c_int{@intCast(route.starved.len)}, 1, .uint8);
             defer _ = mlx.mlx_array_free(starved);
-            const pick = try expertPickGpu(ids_contiguous, swap_logits, route.raw, starved, swap_tolerance, self.s);
-            spec_picked = pick.picked;
-            picked_slots = pick.slots;
+            // A shape the kernel does not take just skips speculation for the lossy pick.
+            if (expertPickGpu(ids_contiguous, swap_logits, route.raw, starved, swap_tolerance, self.s)) |pick| {
+                spec_picked = pick.picked;
+                picked_slots = pick.slots;
+            } else |err| if (err != error.UnsupportedShape) return err;
         };
         if (shared_eligible or swap_logits.ctx != null) {
             // The picked ids ride the ids' command buffer, so reading them never
@@ -74267,4 +74269,22 @@ test "streamed rollback owns HC handle after injected MLX failure" {
     try testing.expect(saved.ctx == null);
     try mlx.check(mlx.mlx_array_eval(h));
     try testing.expectEqual(@as(f32, 7), mlx.mlx_array_data_float32(h).?[0]);
+}
+
+test "the GPU expert pick declines a shape its threadgroup cannot hold" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var ids = [_]i32{ 0, 1 };
+    var logits: [2048]f32 = @splat(0);
+    var map: [2048]i32 = @splat(-1);
+    var starved: [2048]u8 = @splat(0);
+    const a_ids = mlx.mlx_array_new_data(&ids, &[_]c_int{2}, 1, .int32);
+    defer _ = mlx.mlx_array_free(a_ids);
+    const a_logits = mlx.mlx_array_new_data(&logits, &[_]c_int{2048}, 1, .float32);
+    defer _ = mlx.mlx_array_free(a_logits);
+    const a_map = mlx.mlx_array_new_data(&map, &[_]c_int{2048}, 1, .int32);
+    defer _ = mlx.mlx_array_free(a_map);
+    const a_starved = mlx.mlx_array_new_data(&starved, &[_]c_int{2048}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(a_starved);
+    try testing.expectError(error.UnsupportedShape, expertPickGpu(a_ids, a_logits, a_map, a_starved, 0.2, s));
 }
