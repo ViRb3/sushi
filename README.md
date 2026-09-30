@@ -10,6 +10,7 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 * [Qwen3.8-Flash-Next-Sushi-2.6bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
+* [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
 
 ## Install
 
@@ -62,6 +63,18 @@ the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at
 | 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 880k / 1M |
 | 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M |
 
+MiMo-V2.6-Flash-Sushi-2.3bpw (same method; it needs a 128 GB Mac):
+
+| context | weights only | 128k | 256k | 512k | 1M |
+|---|---:|---:|---:|---:|---:|
+| 8-bit KV | 83.6 | 88.3 | 90.2 | 93.9 | 101.4 |
+| 4-bit KV | 83.6 | 87.4 | 88.3 | 90.3 | 94.3 |
+
+At the 120,000 MB limit the full 1M context fits at 8-bit KV.
+
+A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
+the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD.
+
 ## Benchmarks
 
 Reported speed using llmprobe `--bench-only`:
@@ -75,6 +88,7 @@ Reported speed using llmprobe `--bench-only`:
 | M5 Pro | 64 GB | 2.6bpw | ~900 | ~50-55 |
 | M5 Max | 128 GB | 3bpw | ~1,900 | ~95 |
 | M5 Max | 128 GB | 4bpw | ~1,750 | ~90 |
+| M5 Max | 128 GB | MiMo 2.3bpw | ~1,130 | ~70 |
 
 ## Recommended launch
 
@@ -140,6 +154,18 @@ sudo sysctl iogpu.wired_limit_mb=88000    # 96 GB Mac
 sudo sysctl iogpu.wired_limit_mb=120000   # 128 GB Mac
 ```
 
+**128 GB Mac, MiMo-V2.6-Flash-Sushi-2.3bpw**
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=120000
+hf download beamster/MiMo-V2.6-Flash-Sushi-2.3bpw --local-dir ~/.sushi/models/MiMo-V2.6-Flash-Sushi-2.3bpw
+
+# images, 8-bit KV, MTP, the full 1M context
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/MiMo-V2.6-Flash-Sushi-2.3bpw --ctx-size 1048576
+```
+
+MTP and the 8-bit KV cache are on by default for MiMo, and thinking is on by default, as in Xiaomi's chat template.
+
 - `--mtp-head-kv-quant` stores the MTP head's own KV at 8 bits too.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt. Agents running long sessions may prefer
   it for the shorter context; each new instruction then re-processes the prompt from the first dropped thought.
@@ -168,6 +194,9 @@ KLD against the bf16 model: 16 prompts x 512 tokens scored to the first EOS, kv8
 with a bf16 KV cache). Each pack is plotted with the n-gram table it ships: bf16 in Sushi-4bpw, 4-bit in Sushi-2bpw,
 Sushi-2.6bpw and Sushi-3bpw; either table works with any pack. Numbers: [docs/quality-kld.md](docs/quality-kld.md).
 
+MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%) against the original MOPD checkpoint, same
+method.
+
 ## Speed
 
 Sushi-3bpw on an M5 Max 128 GB, sushi v1.0.0 release candidate (build 725b76ca): `--ctx-size 1048576 --kv-quant 8 --mtp`, llmprobe `--bench-only`, quiet box.
@@ -178,7 +207,12 @@ Smaller Macs have less memory bandwidth, so expect lower numbers. Chips before M
 a user reported about 400 tok/s prefill at 2-16k tokens and 38.6 tok/s decode on an M2 Max 64 GB running v1.0.4
 ([numbers](docs/perf-baselines.md#m2max-64gb)).
 
+MiMo-V2.6-Flash-Sushi-2.3bpw on the same Mac:
+
+<p align="center"><img src="docs/assets/perf-mimo-2.3bpw.png" alt="MiMo decode and prefill vs context" width="100%"></p>
+
 ## License
 
 MIT, for sushi and the mlx-serve code it forks ([LICENSE](LICENSE)); ported kernels and vendored code are listed in
-[NOTICE](NOTICE). The model packs follow the Qwen Community License, stated on each Hugging Face page.
+[NOTICE](NOTICE). The Qwen packs follow the Qwen Community License and the MiMo pack Xiaomi's MIT license, stated on
+each Hugging Face page.

@@ -4,56 +4,27 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.1.0 — MiMo-V2.6-Flash and SSD streaming
 
-- **MiMo-V2.6-Flash**: a second model, MiMo-V2.6-Flash-Sushi-2.3bpw for 128 GB Macs, reads text and images on every
-  API, thinks by default and runs its own MTP draft heads.
-
-- Sushi packs stream their routed experts from SSD under `--ssd-budget-gb`, so a Mac with less memory than the pack can serve it; output is identical to a resident load.
-
-- Flash-Next GDN prefill uses oMLX's software-pipelined recurrence on NAX GPUs (mlx-serve #641, thanks @STRML).
-
-- Flash-Next prefill attention uses oMLX's occupancy-tuned QSA tensor-unit kernel and takes the sparse gather from
-  the first sparse chunk (mlx-serve #636, thanks @STRML).
-
-- Sushi-3bpw and Sushi-4bpw ship new expert weights on Hugging Face: Sushi-4bpw KLD 0.0632 -> 0.0592, Sushi-3bpw 0.1047 -> 0.1036 (each with the n-gram table it ships).
-
-- `/metrics.json` `sessions` also lists each hot-cache conversation no live request holds as a `cached` row, and `/props` reports `memory.kv_cache_bytes` including live requests (mlx-serve 4e00f2af and eca42620 (#590), thanks @ddalcu; builds on #13, thanks @yoyo930021).
-
-- **Per-request live sessions on `/metrics.json`**: every in-flight request publishes its phase, context tokens
-  against the model's effective limit, cached and generated tokens, its `max_tokens`, a poll-stable `request_id`,
-  its age and the GPU bytes its KV/SSM state holds — refreshed at each decode cull, prefill entry and interleave
-  chunk boundary (mlx-serve sessions publish chain after `4e00f2af` (live KV residency), thanks @ddalcu;
-  mlx-serve #590).
-
-- A prompt-lookup draft is accepted with the exact rule under `--mtp-typical` and `--mtp-tokenv3`, so sampled replies no longer echo their context until the loop guard cuts them (mlx-serve #614, thanks @STRML).
-
-- `--prompt` (also `-p` and `run <model> -p`) honors thinking, sampling and generation flags, then exits after one reply.
-
-- `--prefill-decode-share` reserves a target share of prefill wall time for active decoders and narrows prefill chunks while they run (mlx-serve #568, thanks @STRML).
-
-- Batched Qwen4 decode overlaps GPU execution with graph construction through a PLE-safe async ladder; serial decode stays off by default (mlx-serve #584, thanks @cowboycoderhq).
-
-- Two-row Qwen4 MTP verification folds GDN normalization, gating and rollback history into the recurrence without changing output (mlx-serve #558, thanks @STRML).
-
-- SSD prompt-cache accounting retains existing QSA files across in-place commits (mlx-serve #601, thanks @brandondyal).
-- Rescanning models clears a failed load when its directory is still present, allowing a retry (mlx-serve #550, thanks @brandondyal).
-- JSON-constrained replies return logprobs paired with their emitted tokens (mlx-serve #552, thanks @brandondyal).
-- Quantized KV retains f16 or bf16 activations through cache growth and reconstruction (mlx-serve #553, thanks @jasontitus).
-
-- **sushi updates itself**: `sushi update` installs the newest release after checking its SHA-256, its signature and
-  that it runs, keeping the old install for `sushi update --rollback`; a server checks for a release once a day
-  (`--no-update-check` turns that off), and the chat page and `sushi run`'s `/update` install it and restart.
-- **SSD prompt-cache restores stay at one copy**: a restore no longer copies the whole restored cache at a chunk when
-  the GPU releases finished work late, which could hold up to three copies of it at once.
-- **`--mtp-greedy-tail`**: beside `--mtp-typical`, sampled decoding drafts its later speculative tokens by argmax
-  for faster output at slightly more predictable text; off by default, or per model with `"mtp_greedy_tail": true`
-  in model-settings.json.
-- **Install with Homebrew**: `brew install beamivalice/tap/sushi`; a Homebrew install updates with
-  `brew upgrade sushi`, which `sushi update`, the chat page and `/update` name instead of replacing its files.
-- **`--fast`** turns on the fastest settings in one flag: MTP with typical acceptance and the greedy tail, and 8-bit
-  KV. It trades a little sampling fidelity for speed (greedy requests are unchanged), and any of those flags given
-  beside it wins.
+- **MiMo-V2.6-Flash**: sushi's second model. `MiMo-V2.6-Flash-Sushi-2.3bpw` serves text and image input from one
+  resident pack with native MTP, up to its full 1M-token context on a 128 GB Mac.
+- **Sushi packs stream from SSD**: `--ssd-budget-gb N` keeps the trunk resident and streams the routed experts from
+  SSD, so a Mac with less memory than the pack can serve it; replies are identical to a resident load. Every Sushi
+  Qwen pack and MiMo-V2.6-Flash-Sushi-2.3bpw stream, and Sushi-2bpw serves on a 32 GB M1 Max at a 20 GB budget.
+- **Faster Flash-Next prefill**: oMLX's tensor-unit sparse attention now serves prefill from the first sparse chunk,
+  and GDN prefill runs a software-pipelined recurrence (19% faster on a 10k-token prompt on an M5 Max); batched decode overlaps GPU
+  work with graph building, and `--prefill-decode-share` keeps decoders moving while a long prompt prefills. Thanks
+  @STRML and @cowboycoderhq.
+- **Better and smaller packs**: new expert weights for Sushi-4bpw (KLD 0.0632 -> 0.0592) and Sushi-3bpw
+  (0.1047 -> 0.1036), and Sushi-2bpw for 48 GB Macs.
+- **Live sessions on `/metrics.json`**: every in-flight request and every cached conversation, with its phase,
+  context against the model's limit and the GPU memory its KV holds. Thanks @yoyo930021 and @ddalcu.
+- **Updates itself**: `sushi update` installs the newest release after checking its SHA-256 and signature and keeps
+  the old one for `--rollback`; a daily check, one-click update from the chat page, or `brew install
+  beamivalice/tap/sushi`.
+- **Fixes**: MiMo long-context memory returns to the OS, SSD prompt-cache restores keep one copy, JSON-constrained
+  logprobs pair with their tokens, and a failed model load can be retried after a rescan. Thanks @brandondyal and
+  @jasontitus; the EXL3 engine is now a module mlx-serve builds against, thanks @ddalcu.
 
 ---
 

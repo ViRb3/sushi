@@ -290,6 +290,13 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
   f22a383 + the gate, A B B A twice: 33.9 / 36.6 / 31.4 / 34.8 and 30.7 / 37.0 / 37.4 / 35.1 tok/s, paired 1.08,
   0.90, 1.21, 1.07 (mean 1.06, inside the prompt-to-prompt spread).
 
+### v1.1.0 release gate
+
+`tests/bench.sh --tag v1.1.0 --only sushi-4bpw` (Sushi-4bpw, llmprobe 0.6.12 `--bench-only`, MTP) on the release tree
+(67b794f3 plus the version bump), M5 Max, `taskpolicy -a`, lock `release-110`, fans max, no build or test running:
+decode 89.4 tok/s (87.5-90.2), prefill 2139 tok/s, 5.33 tokens per step, 37/37 requests `mode=mtp`. Against v1.0.5:
+decode +8%, prefill +19%.
+
 ### v1.0.5 release gate
 
 `tests/bench.sh --tag v1.0.5` (Sushi-4bpw, llmprobe 0.6.12 `--bench-only`, MTP) on the release tree (1ea9492a plus the
@@ -456,7 +463,9 @@ run. Each rung is one run.
 | 131k | 52.0 | 715 | 183.3 s | 3.05 |
 
 At `--ctx-size 1048576` the pack loads (preflight 96.7 of 102.9 GB) but admission then has 12.9 GB left, under the
-16.76 GiB bill of a 1M session at kv8; about 768k is the working maximum on a 128 GB Mac.
+16.76 GiB bill of a 1M session at kv8. That boot ran at the default GPU limit; at `iogpu.wired_limit_mb=120000` the
+admission bill of a full 1M prompt (weights, 512-rung bill, 1 GiB hot cache) is 101.4 GiB and fits, 94.3 GiB at kv4
+(probe on `83dc9b6c`, the method of [engine-memory-admission](engine-memory-admission.md)).
 
 <a id="mimo-attn-kernels"></a>
 ### MiMo attention kernels (attention only: no expert pack in these timings)
