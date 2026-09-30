@@ -116,9 +116,11 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill and its first
   grow is billed whole beside it (nothing credited). The restore itself runs unbilled, so it holds the restored KV
   plus one chunk ([engine-prefix-cache](engine-prefix-cache.md#basics)).
-- A warm restore whose buffers hold the prompt but not the reservation (seq <= C < R) bills C rows of every KV layer
-  beside the reservation: the first decode step past C grows every layer inside one forward
-  (`WarmPrefix.decodeOutgrows`). At a 128k entry, kv8: +2040 MiB on qwen4_exp, +1912.5 MiB on mimo_v2.
+- A warm restore whose buffers hold the prompt but not the reservation (seq <= C < R) is grown to R before the
+  prefill's first chunk (`KVCache.growToReservation`), one KV layer per eval, so it bills one window of old rows
+  (`oldBuffersInEvalWindow`) for a donated restore and nothing for a share. At a 128k entry, kv8: +170 MiB on
+  qwen4_exp and +212.5 MiB on mimo_v2 over the bill without the grow; growing at the first decode step instead
+  held every layer's old rows at once.
 - The eviction pass drains the GPU stream before it reads live memory: a command buffer in flight holds its inputs'
   buffers, so an eviction read early frees nothing and trips the shared-entry stop.
 - **Concurrent arrivals are each billed against the SAME free memory** on their connection threads. The gated arch
