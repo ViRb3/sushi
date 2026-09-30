@@ -49,7 +49,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - **A stream and a non-stream answer are the SAME BYTES**; leading whitespace is the one thing a stream may withhold
   (`streamContentLead`). A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
   carries the pre-markup text (`visibleToolPreamble`); a non-stream disconnect reports `client_disconnect`, never
-  `length`; a stop sequence cuts at its INDEX (`stopSequenceCut`); request ints clamp (`parseRequestSeed`,
+  `length`, and is noticed after every decoded token as well as during prefill, so a client's timed-out retry never
+  leaves a ghost decoding to `max_tokens`; a stop sequence cuts at its INDEX (`stopSequenceCut`); request ints clamp (`parseRequestSeed`,
   `clampJsonI32`).
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
@@ -155,6 +156,8 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 - `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
+- Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long
+  prefill plus a long think tripped them, and each fallback re-sent the whole prompt, then timed out and retried.
 - Agent budgets (`launch.budgetForContext` + `compactionReserve`): output share ctx/2, compaction reserve ctx/4
   capped at 20000, carried into pi's `settings.json` and opencode's `compaction` + `limit.output`. A launch below the
   agent's context floor WARNS (claude 64k, opencode 32k, others 16k).
