@@ -10,6 +10,8 @@ earlier history is mlx-serve's, in that project's changelog.
   output is byte-identical.
 - **Greedy MiMo decode reads the vocabulary head through a coarse top-32 shortlist** re-scored on the full head,
   with or without MTP; sampled, logprob, penalty and grammar requests keep the full head.
+- **`--gpu-warm-secs <n>`** (default 60, 0 = off): the server keeps the GPU awake for this long after a request, so
+  the next request no longer starts with a GPU wake-up delay.
 - **With MTP, the first token streams when prefill ends** instead of after the first speculative round (when that
   token is visible: a template-opened thought or thinking off).
 - **Faster SSD streaming**: a streamed layer's expert compute is handed to the GPU as soon as it is built and the

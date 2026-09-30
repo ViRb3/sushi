@@ -4461,6 +4461,50 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.unload_queue.items.len > 0;
 }
 
+/// `--gpu-warm-secs` (0 = off): how long after its last prefill or decode the idle inference
+/// thread keeps the GPU awake. Left idle, the driver drops the resident set's state, and the next
+/// submission then waits before any work runs (docs/server-lifecycle.md#threads).
+pub var gpu_warm_secs: u32 = 60;
+/// Shorter than the idle time after which the state is gone.
+pub const GPU_WARM_TICK_NS: u64 = 500 * std.time.ns_per_ms;
+
+/// PURE: whether an idle thread ticks now. `idle_ns` is null until the thread has run a
+/// prefill or decode; a thread with work never ticks.
+pub fn gpuWarmTickDue(has_work: bool, idle_ns: ?u64, window_ns: u64) bool {
+    const idle = idle_ns orelse return false;
+    return !has_work and idle < window_ns;
+}
+
+/// PURE: how long an idle thread parks before its next tick, or null to park until work arrives.
+pub fn gpuWarmParkNs(idle_ns: ?u64, window_ns: u64) ?u64 {
+    const idle = idle_ns orelse return null;
+    if (idle >= window_ns) return null;
+    return @min(GPU_WARM_TICK_NS, window_ns - idle);
+}
+
+pub const GpuWarmWindow = enum { keep, restart, close };
+
+/// PURE: the window as the thread is about to park. The last pass's prefill or decode restarts it;
+/// an unload closes it, since no model may be left to keep warm.
+pub fn gpuWarmBeforePark(worked: bool, unloaded: bool) GpuWarmWindow {
+    if (unloaded) return .close;
+    return if (worked) .restart else .keep;
+}
+
+/// One synced element-op on the GPU stream. Inference thread only; a failure stays unlatched.
+fn gpuWarmTick() void {
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const one = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(one);
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    if (mlx.mlx_multiply(&out, one, one, s) != 0) return;
+    _ = mlx.mlx_array_eval(out);
+}
+
 /// Poll interval for the idle-eviction sweep, given the configured window.
 ///
 /// A quarter of the window, so a model is evicted within ~1.25x the configured
@@ -4504,6 +4548,11 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
     }
 
+    // The GPU warm window (`--gpu-warm-secs`): open since the last pass that ran a prefill or a
+    // decode tick (`worked`).
+    var warm_since: ?io_util.Stopwatch = null;
+    var warm_ticks: u32 = 0;
+    var worked = false;
     while (!sch.shutdown.load(.acquire)) {
         // 0a. Drain slots queued for cleanup. Conn threads hand finished
         //     slots here in `complete()` — we own the mlx stream binding,
@@ -4581,6 +4630,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        switch (gpuWarmBeforePark(worked, unload_req != null)) {
+            .keep => {},
+            .restart => warm_since = io_util.Stopwatch.init(sch.io),
+            .close => warm_since = null,
+        }
+        if (worked or unload_req != null) warm_ticks = 0;
+        worked = false;
         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
@@ -4590,10 +4646,28 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
+            const warm_ns: u64 = @as(u64, gpu_warm_secs) * std.time.ns_per_s;
             while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(false);
-                sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                if (gpuWarmParkNs(if (warm_since) |sw| sw.read() else null, warm_ns)) |park_ns| {
+                    const timed_out = if (sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{
+                        .raw = .fromNanoseconds(@intCast(park_ns)),
+                        .clock = .awake,
+                    } })) |_| false else |err| err == error.Timeout;
+                    if (timed_out and gpuWarmTickDue(hasWorkPendingLocked(sch), if (warm_since) |sw| sw.read() else null, warm_ns)) {
+                        if (warm_ticks == 0) log.debug("[gpu-warm] keeping the GPU awake for {d} s\n", .{gpu_warm_secs});
+                        warm_ticks += 1;
+                        sch.queue_mu.unlock(sch.io);
+                        gpuWarmTick();
+                        sch.queue_mu.lockUncancelable(sch.io);
+                    }
+                } else {
+                    if (warm_ticks > 0) log.debug("[gpu-warm] idle window over after {d} ticks\n", .{warm_ticks});
+                    warm_since = null;
+                    warm_ticks = 0;
+                    sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                }
             }
             if (sch.shutdown.load(.acquire)) break;
             // Hold until the loop parks again.
@@ -4747,6 +4821,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             const tick_ns = decode_sw.read();
             for (active.items) |s| s.decode_ns +|= tick_ns;
         }
+        worked = n_prefill > 0 or active.items.len > 0;
 
         // 5. Cull finished / errored / cancelled from `decoding`. The slot
         //    still belongs to its connection thread until that thread calls
@@ -7259,6 +7334,25 @@ test "idleEvictTickMs: sweeps well inside the window without spinning" {
     try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
     try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
     try testing.expect(idleEvictTickMs(0) >= 1000);
+}
+
+test "gpu warm: ticks every half second inside the window after work, never past it or with work" {
+    const w: u64 = 60 * std.time.ns_per_s;
+    try testing.expectEqual(@as(?u64, null), gpuWarmParkNs(null, w));
+    try testing.expectEqual(@as(?u64, GPU_WARM_TICK_NS), gpuWarmParkNs(0, w));
+    try testing.expectEqual(@as(?u64, GPU_WARM_TICK_NS), gpuWarmParkNs(30 * std.time.ns_per_s, w));
+    try testing.expectEqual(@as(?u64, 100), gpuWarmParkNs(w - 100, w));
+    try testing.expectEqual(@as(?u64, null), gpuWarmParkNs(w, w));
+    try testing.expectEqual(@as(?u64, null), gpuWarmParkNs(0, 0));
+    try testing.expect(gpuWarmTickDue(false, 0, w));
+    try testing.expect(!gpuWarmTickDue(true, 0, w));
+    try testing.expect(!gpuWarmTickDue(false, null, w));
+    try testing.expect(!gpuWarmTickDue(false, w, w));
+    try testing.expect(!gpuWarmTickDue(false, 0, 0));
+    try testing.expectEqual(GpuWarmWindow.restart, gpuWarmBeforePark(true, false));
+    try testing.expectEqual(GpuWarmWindow.keep, gpuWarmBeforePark(false, false));
+    try testing.expectEqual(GpuWarmWindow.close, gpuWarmBeforePark(false, true));
+    try testing.expectEqual(GpuWarmWindow.close, gpuWarmBeforePark(true, true));
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {

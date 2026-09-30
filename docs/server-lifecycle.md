@@ -150,6 +150,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - Detach every per-connection `std.Thread` immediately; on teardown drain conn threads before `scheduler.deinit`.
 - Sleep inhibition follows the inference-thread wait.
+- **The first GPU submission after about a second of idle waits 0.6-1.0 s before any work runs** (M5 Max, MiMo
+  2.3bpw, ~90 GB resident, measured on e2d5be76; even a one-element op pays it, and a tick every 2 s does not prevent
+  it; [perf-baselines](perf-baselines.md#mimo-ttft-idle)). For `--gpu-warm-secs` (default 60, 0 = off) after its
+  last prefill or decode tick, the parked inference thread runs one synced element-op every 500 ms (`gpuWarmTick`),
+  never while work is queued; an unload closes the window. Output is unchanged.
 - `Slot.deinit` runs on conn threads: it stores marks, the inference thread frees.
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.

@@ -338,6 +338,9 @@ fn printUsage(io: std.Io) void {
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
+        \\  --gpu-warm-secs <n> Keep the GPU awake for this many seconds after
+        \\                        the last request, so the next one starts
+        \\                        without a wake-up delay (default: 60, 0 = off).
         \\  --metrics           Enable Prometheus metrics at GET /metrics (opt-in;
         \\                        zero cost when off). Also GET /metrics.json.
         \\  --no-tool-autocorrect
@@ -898,6 +901,12 @@ pub fn main(init: std.process.Init) !void {
                 };
                 max_resident_mem_explicit = true;
             }
+        } else if (std.mem.eql(u8, args[i], "--gpu-warm-secs") and i + 1 < args.len) {
+            i += 1;
+            scheduler_mod.gpu_warm_secs = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--gpu-warm-secs: expected a whole number of seconds, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Idle eviction window. When set, `server.idleEvictLoop` unloads
             // .ready entries (refcount==0) whose last_used_ms is older than

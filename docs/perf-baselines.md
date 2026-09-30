@@ -645,6 +645,27 @@ boot, A B B A (A = d1408a57, B = this change): decode 69.8 / 70.0 -> 73.8 / 70.5
 192-token decodes 69.9 -> 72.6); prefill 1307 / 1287 -> 1289 / 1305 tok/s (unchanged). 16x512 KLD to first EOS on B:
 0.086034761, unchanged (the KLD tool reads the full head).
 
+<a id="mimo-ttft-idle"></a>
+### MiMo-V2.6-Flash-Sushi-2.3bpw: where the time to first token goes, and the GPU wake after idle (e2d5be76 base)
+
+llmprobe's prefill-cell prompt (2038-2041 tokens, streamed, thinking on, `max_tokens` 8), `--kv-quant 8 --mtp
+--ctx-size 1048576`, prefix cache on, `taskpolicy -a`, GPU lock per boot, fans at max, 2026-10-01.
+
+- Outside the 2k chunk forward: HTTP, template, tokenize and slot ~3 ms; hot-cache lookup 0.03 ms; the one-row
+  final forward 19-25 ms; generator setup and the ring checkpoint 4-5 ms; round 1 28-33 ms (t1 is `<think>`, so the
+  first visible token needs it).
+- The live chunk equals the in-process meter's in the same GPU state. Meter passes alternated in one boot (ms, median
+  of 4): plain 1589, MLX pool cleared before each forward 1572 / 1600, every row's hidden captured 1573 / 1586, both
+  1587 / 1590. Neither the pool clear nor the MTP capture costs anything measurable.
+- The GPU state moves the chunk by up to 1.8x. Back to back, the first ~4 s run at 1255-1276 ms, then 1460-1537.
+  After 20 s idle a forward takes 1976-2285 ms. A one-element op right before it takes 598-999 ms itself, and the
+  forward then runs at 1261. A tick every second keeps it at 1264-1268; ticks every 2, 4 or 5 s do not (2200-2270).
+- `--gpu-warm-secs` (this change on e2d5be76), one boot per arm, 6 requests each after 10 s idle, TTFT ms: off 2284,
+  2305, 1956, 2307, 2344, 1967 (mean 2194); on 1355, 1356, 1355, 1354, 1354, 1354 (mean 1355, -38%).
+- llmprobe 0.6.12 `--bench-only --rungs 4k` A B B A against 9297b93b (quiet box, fans max): decode 71.6 / 69.6 -> 69.1
+  / 69.1, prefill 1313 / 1306 -> 1299 / 1301 tok/s: unchanged, because llmprobe sends its cells back to back and the
+  GPU never idles long enough to pay the wake.
+
 <a id="mimo-attn-kernels"></a>
 ### MiMo attention kernels (attention only: no expert pack in these timings)
 
