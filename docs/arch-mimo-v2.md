@@ -245,7 +245,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   length (one global layer: 0.54 GB at 400k, kv8).
 - **The prefill chunk is chosen per request** (`perRequestPrefillChunk` covers a ringed arch): the widest rung up
   to 4096 whose admission bill fits live memory. The ungated load-time pin subtracts the hot-cache ask first and
-  pinned 2048 (512 before the fused sliding prefill) at every context.
+  pinned 2048 (512 before the fused sliding prefill) at every context; an explicit `--prefill-chunk` caps that ladder.
+- **A MiMo prefill evicts the hot cache to be admitted** (`admissionEvictsHotCache`): the warm credit is the restored
+  global rows only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and its two checkpoint
+  copies are billed whole every turn, and a shared or SSD restore credits nothing. Adaptive width and mid-prefill
+  stepping stay qwen4_exp-only.
 - **A ringed arch RESERVES its cache capacity up front** (`ModelConfig.reservesKvCapacity`, narrower than
   `longCtxGated`) and bills the reservation headroom and the ring: growing +25% at a time duplicated a global layer
   mid-prefill.

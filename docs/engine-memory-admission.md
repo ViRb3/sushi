@@ -61,7 +61,7 @@ architectures need their own measured envelope. These runs do not simulate a 64 
 - **Auto-context is PINNED at load** (`pinAutoContext`, 85% margin on the memory ceiling); ask
   `getEffectiveContextLength`. It bills KV at the CONFIGURED width and activations ONCE.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
-  budget; `--prefill-chunk` wins). `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
+  budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp and the ringed mimo_v2) re-picks the width for every
   request: the widest rung whose admission bill fits live memory (`chooseRequestPrefillChunk`), stepping down per
   chunk under pressure; the load-time pin is only the fallback. `boundedPrefillChunk` still caps the rung per arch
@@ -104,12 +104,21 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 ## Admission
 
 - One `[admission] needed=… available=… reclaimable=… width=… verdict=…` line per decision.
-- A long prefill evicts the hot cache on the INFERENCE thread to be admitted (`evictLruToAdmit`), crediting only
+- An explicit `--prefill-chunk N` caps the per-request ladder, never pins it: N if it fits, else the widest rung
+  below N that fits, down to 512; refused only when that floor does not fit. `requestPrefillPick` is the one rule for
+  the bill and the scheduler, `generate.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed
+  load prove that floor (`perRequestFloorWidth`). `SUSHI_PREFILL_CHUNK_PER_REQUEST=0` restores the pin.
+- A long prefill evicts the hot cache on the INFERENCE thread to be admitted (`evictLruToAdmit`) on every arch where
+  `admissionEvictsHotCache` holds (qwen4_exp and the ringed mimo_v2; the connection thread's `creditedAdmissionBill`
+  and the scheduler's `admissionPassArmed` read that one predicate), crediting only
   provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
 - qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill and its first
   grow is billed whole beside it (nothing credited). The restore itself runs unbilled, so it holds the restored KV
   plus one chunk ([engine-prefix-cache](engine-prefix-cache.md#basics)).
+- A warm restore whose buffers hold the prompt but not the reservation (seq <= C < R) bills C rows of every KV layer
+  beside the reservation: the first decode step past C grows every layer inside one forward
+  (`WarmPrefix.decodeOutgrows`). At a 128k entry, kv8: +2040 MiB on qwen4_exp, +1912.5 MiB on mimo_v2.
 - The eviction pass drains the GPU stream before it reads live memory: a command buffer in flight holds its inputs'
   buffers, so an eviction read early frees nothing and trips the shared-entry stop.
 - **Concurrent arrivals are each billed against the SAME free memory** on their connection threads. The gated arch
