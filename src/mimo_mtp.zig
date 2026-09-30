@@ -26,6 +26,18 @@ const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 
 pub const MAX_HEADS: usize = 3;
+
+/// The coarse draft readout's width. At 2 bits its top-32 shortlist still holds the drafts the
+/// 3-bit copy picks on MiMo.
+pub fn rerankBits() u32 {
+    const p = std.c.getenv("SUSHI_MTP_DRAFT_HEAD_BITS");
+    return rerankBitsFrom(if (p) |v| std.mem.span(v) else null);
+}
+
+fn rerankBitsFrom(raw: ?[]const u8) u32 {
+    return mtp_mod.draftHeadBitsFrom(raw, 2);
+}
+
 /// Committed rows (hiddens and their next tokens) a state keeps: every head's
 /// window plus the rows a lagging head catches up and a round's drafts.
 const RING_ROWS: usize = 256;
@@ -735,7 +747,7 @@ pub const Head = struct {
             self.rerank_tried = true;
             if (self.target) |t| {
                 if (mtp_mod.MtpModel.draftRerankMode() != .off)
-                    self.rerank = mtp_mod.buildRerankCoarse(self.s, t, mtp_mod.rerankCoarseBits());
+                    self.rerank = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());
             }
         }
         return self.rerank != null;
@@ -819,6 +831,12 @@ test "mimo mtp heads warm up every head on a throwaway state (MIMO_V2_MODEL)" {
     head.target = &xfm;
     try testing.expectEqual(head.heads, try head.warmup(&xfm));
     for (xfm.cache.entries) |e| try testing.expect(!e.initialized);
+}
+
+test "mimo mtp drafts through a 2-bit coarse readout unless the env names another width" {
+    try testing.expectEqual(@as(u32, 2), rerankBitsFrom(null));
+    try testing.expectEqual(@as(u32, 3), rerankBitsFrom("3"));
+    try testing.expectEqual(@as(u32, 0), rerankBitsFrom("off"));
 }
 
 test "mimo mtp state keeps its hidden ring, not the prefill chunk it was cut from" {

@@ -45,7 +45,7 @@ fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_arra
     defer _ = mlx.mlx_array_free(slots_u);
     try mlx.check(mlx.mlx_astype(&slots_u, slots, .uint32, s));
     const rows: usize = @intCast(B * S);
-    if (rows >= 2 and rows <= kernels.DECODE_ROWS_MAX) {
+    if (rows >= 2) {
         kernels.dumpUnionHist(slots_u, rows, @intCast(K)) catch {};
     }
     const g = bank.gate;

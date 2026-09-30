@@ -3014,7 +3014,9 @@ pub const Generator = struct {
                     // Materialize this chunk's MTP history entries alongside
                     // the trunk KV so the chunk's activation graph (incl. the
                     // full-hidden capture) can be freed before the next chunk.
-                    if (mtp_cache) |*mc| mc.appendEvalArrays(eval_vec);
+                    // MiMo's last chunk leaves its heads' catch-up to the first draft chain,
+                    // which runs after the scheduler streams t1.
+                    if (mtp_cache) |*mc| if (mc.* != .mimo or end < loop_end) mc.appendEvalArrays(eval_vec);
                     // Same discipline for the DFlash context appended above.
                     if (dflash_ctx) |*dc| dc.appendEvalArrays(eval_vec);
                     // Phase 1: also force SSM state to materialize so any

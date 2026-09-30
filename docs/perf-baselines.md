@@ -477,6 +477,152 @@ At `--ctx-size 1048576` the pack loads (preflight 96.7 of 102.9 GB) but admissio
 admission bill of a full 1M prompt (weights, 512-rung bill, 1 GiB hot cache) is 101.4 GiB and fits, 94.3 GiB at kv4
 (probe on `83dc9b6c`, the method of [engine-memory-admission](engine-memory-admission.md)).
 
+<a id="mimo-verify-2p3"></a>
+### MiMo Sushi-2.3bpw decode forward: attribution and verify-row levers (2f15cc97)
+
+Forward meter (`SUSHI_DECODE_FWD_UBENCH`), kv8, `taskpolicy -a`, GPU lock, 2026-09-30, box busy with other builds
+(absolute numbers read high; compare arms only). Base 2f15cc97: 20.80 ms at 1 row, verify rows 2 / 3 / 4 = 28.54 /
+34.85 / 41.47 ms at 1024 keys.
+
+Where a 1-row forward goes (in-process stand-ins: each family replaced by a view of its input, same boot, 1024 keys):
+routed experts with their router ~8.3 ms, FP8 QKV ~5.3, affine-8 o_proj ~3.3, lm_head ~1.2-1.5, attention ~1.2, the
+rest (norms, layer-0 MLP, embed) ~1.5. The routed experts are ALU-bound (2.7 GB in ~8 ms) and grow ~6.7 ms per extra
+verify row; the trunk GEMVs are flat in rows in isolation (FP8 direct GEMV ~128 us per sliding layer at 1-4 rows;
+the shipped NR 1 / SGS 2 was the best of NR 1-4 x SGS 1-8) and run at ~470-480 GB/s.
+
+Three row levers, each row still its decode tick's bytes: a sliding layer's verify rows in ONE dispatch
+(`mimoSlidingRowsAttn`, a port of MLX's `sdpa_vector` with one threadgroup per head and row), the router's rows in
+one f32 gemv (`mtp_qmv.f32GemvRows`, MLX's M=1 gemv per row), and the affine-8 row kernel at two output rows per
+simdgroup on the unrolled path. Per-forward alternating A/B in one boot (arms interleaved forward by forward, n=60
+per arm, 160 keys = the llmprobe decode cell's context), median ms:
+
+| rows | no lever | all three | sliding rows | router rows | affine-8 two rows |
+|---|---|---|---|---|---|
+| 2 | 29.29 | 28.47 | -0.38 | -0.11 | -0.45 |
+| 3 | 38.86 | 37.35 | -0.72 | -0.23 | -0.61 |
+| 4 | 49.17 | 47.09 | -0.91 | -0.06 | -0.50 |
+
+Per-lever columns: paired mean of all three on minus that lever off (negative = the lever saves). Primitives per
+4-row forward 5704 -> 4978.
+
+The pair GEMV on a once-prepared input (`pairGemvPrepared`, lane-ordered half4 reads), same meter and settings, arms
+prepared / self-preparing: 2 rows 27.72 / 28.14, 3 rows 33.66 / 34.55, 4 rows 40.70 / 41.85 ms (paired -0.43 /
+-0.86 / -1.21). One row keeps the fused prepare: there the extra dispatch lost 0.08-0.10 ms. In the chained kernel
+microbench (47 layers, E=256, ~19 of 32 slots unique at 4 rows) the pair step went 315 -> 296 us at 4 rows without the
+lane order; decode ablations at 1 row: the MCG decode stand-in -12%, no weight loads -16%, constant inputs (no prepare)
+-11%, decode and loads both removed -43%; groups of three or four members spill (1.7-2x slower) and unroll_count(2)
+on the pair GEMV's k loop is 5-7% slower.
+The affine-8 rows kernel at four rows per simdgroup and four simdgroups beat two rows / two simdgroups by 18% on
+lm_head in an isolated 12-copy microbench but lost 0.5-1.1 ms per forward; judge it by the meter.
+Greedy chat, 4 prompts x 320 tokens, kv8: base, the three levers and the prepared pair byte-identical, serial and MTP,
+and MTP == serial on each.
+
+Measured and not taken (same meters): a dependent dispatch costs ~1.7 us in the live graph (`SUSHI_DISPATCH_PROBE`
+0 8 8 0: +376 dispatches, +0.6-0.7 ms at 1 and 4 rows; a forward has ~1150), so a one-dispatch fusion is worth
+~k x 48 x 1.7 us; MLX command-buffer commits cost nothing (`MLX_MAX_MB_PER_BUFFER=1000000`, ops 400: within boot
+noise); a global layer's verify rows in one dispatch below 1024 keys (paired -0.05 / -0.15 / +0.01 ms at 2 / 3 / 4
+rows); the FP8 direct GEMV loading two chunks ahead (+0.2 ms at 4 rows); the pair at one output tile per threadgroup
+(faster only with heavy row sharing, 1% slower at 24 of 32 unique slots); pair K splits 1 / 4 / 8 (2 is best);
+half2 FMA on the decoded weights (lossy; +5% at 1 row, -4% at 4 rows).
+
+Rope + kv8 quantize in one dispatch (`mimoDecodeQkvPrep`, on top of the levers above, same meter, 30 forwards per pass,
+`_QKV_PREP_ARMS` off/on/on/off twice in one boot): 1 row 21.23 -> 20.95 and 21.51 -> 21.26 ms (-0.27 ms, -1.3%);
+4 rows 39.57 -> 39.82 and 42.21 -> 41.35 ms under a 5 ms upward drift across the passes (-0.3 ms mean, not
+resolved). Primitives per forward 3420 -> 3040 at 1 row, 4766 -> 4386 at 4. Two more boots at 16 passes each
+(four off/on/on/off sets): 2 rows -0.45 / -0.20 / -0.38 / -0.40 ms per set (-0.36 ms, -1.3%); 4 rows +0.30 /
+-0.34 / -0.72 / -0.65 ms, the first set inside a 3 ms warm-up rise (-0.35 ms mean, -0.57 without it).
+
+<a id="mimo-prefill-nax-body"></a>
+### MiMo 2.3bpw prefill: where a 2k chunk goes, and the branch-free NAX GEMM body (2f15cc97)
+
+One cold 2025-row chunk (the llmprobe 2k cell minus its cached prefix and final row), in-process prefill meter
+(`SUSHI_PREFILL_UBENCH`), `--kv-quant 8 --mtp --ctx-size 1048576`, `taskpolicy -a`, GPU lock, busy box (other
+workers building), 2026-09-30. Before this change: 1590-1624 ms (1247-1263 tok/s). A Metal System Trace put the GPU
+busy 98.6% of the forward, so host graph build and syncs cost nothing. A per-stage synced pass (+18% sync inflation)
+splits it:
+
+| stage | ms per forward | share |
+|---|---|---|
+| EXL3 GEMMs (gate 409, up 408, down 405) | 1222 | 65% |
+| FP8 QKV (dequant + MLX bf16 GEMMs) | 264 | 14% |
+| affine-8 o_proj (NAX qmm; the dq+GEMM route starts at 2048 rows) | 159 | 8% |
+| router + top-k + argsort, token prepare, SwiGLU mid, sorted finish | 110 | 6% |
+| rope, transposes, kv8 write | 46 | 2% |
+| attention (sliding band 21, global 20) | 41 | 2% |
+
+Real text routes unevenly: per layer the busiest expert takes 583-1400 of 2025 rows and 9-60 experts none, so a
+layer runs ~640 live 32-row windows (25 rows each) and 1136 16-row MMA blocks (12% padding).
+
+The NAX body with clamped x rows, the unswitched k loop and unroll 2 (bytes equal the branch-guarded body's), kernel
+ubench `SUSHI_EXL3_GEMM_ARMS` (E256, n36 MCG w12, 16200 slots on five real layers' routing counts, arms interleaved,
+median of 12), us per GEMM:
+
+| projection | branch-guarded body | this body |
+|---|---|---|
+| gate/up 4096->2048 | 7539-7872 | 5566-5850 (x0.73-0.75) |
+| down 2048->4096 | 7457-8102 | 5542-5983 (x0.73-0.75) |
+
+In-process meter, arms alternated in one boot (0 = branch-guarded body), ms per 2025-row chunk: 2081 / 1726,
+1989 / 1777, 2225 / 2070 (x0.83 / x0.89 / x0.93; the box drifted slower through the run). A 4096-row chunk:
+3512 / 3016, 3561 / 3043 (x0.86 / x0.85). A quieter moment read 1292 ms per 2025-row chunk on this body (1567
+tok/s, the `SUSHI_PREFILL_UBENCH` meter on 2f15cc97 + this change). On the real pack and real text the two bodies'
+final hidden states of a 2025-row chunk are byte-identical (0 of 8,294,400 bf16 differ, four alternated arms).
+
+- On this body a GEMM is MMA-bound (ablations, 5.6 ms: no weight decode 5.04, no x loads 5.39, no MMA 2.70), and 12%
+  of its MMA rows are 16-row padding.
+- The synced profile overstated the trunk: unsynced microbenches put a sliding layer's FP8 QKV at 4.40 ms (MLX's bf16
+  GEMM alone 4.04 ms, 60 TFLOPS) and the affine-8 o_proj at 2.74 ms (MLX `qmm_t_nax`, ~50 TFLOPS).
+
+<a id="mimo-mtp-round"></a>
+### MiMo-V2.6-Flash-Sushi-2.3bpw: where an MTP round goes (2f15cc97)
+
+Setup: `--kv-quant 8 --mtp --ctx-size 1048576`, llmprobe's decode-cell prompt, greedy, `SUSHI_MTP_TRACE=1`, the
+forward meter at 4k keys and a Metal System Trace, `taskpolicy -a`, lock held per boot, contended box, 2026-09-30.
+- The round is GPU work. The GPU is busy 96.3% of a 5 s decode window. Rounds run 43-46 ms at ~3.0 tokens (1.9-2.0
+  accepts of 2.5 drafts). The headline's 3.69 tok/step is llmprobe's predictable cell, not the decode cell.
+- The verify trunk takes 29.2 / 36.6 / 44.1 ms per forward at 2 / 3 / 4 rows, lm_head included (1.0 ms). Its graph
+  builds in 1.3-1.6 ms of CPU, hidden behind the draft chain.
+- The draft chain takes ~1.45 ms of GPU per step: a head forward of 0.94-0.99 ms at 1-4 catch-up rows, plus the
+  coarse readout. The head's GEMVs sum to ~0.61 ms at 550-700 GB/s; the rest is ~35 small dependent dispatches.
+  Fusing two add+norms, the SwiGLU and the value scale saved nothing measurable.
+- Host gaps per single-chunk round were ~1 ms: 0.27 + 0.25 ms around the verify's capture sync and ~0.4 ms after the
+  argmax readback. Keeping the verify captures lazy removes the first two: the GPU goes from 96.3% to 98.3% busy, with
+  one ~0.45 ms gap per round (the lazy capture and the 2-bit readout on 2f15cc97, same flags).
+- Forced depth 3 vs the auto planner on the decode cell: 3.25 vs 2.74-3.10 tokens per round, within ~0-4% on tok/s.
+  Forced 3 loses 11% on prose. The planner is not a lever here.
+- Ruled out: dropping routed experts under 2% of a row's weight removes 2.8% of slots for +0.0029 KLD (16x512 to EOS,
+  kv8); 4% removes 7.4% for about +0.007, over the gate.
+- First token on llmprobe's 2k prefill cell, outside the 2025-row chunk: the final 1-token forward 24-25 ms, the ring
+  checkpoint's copies 2.8 ms of host encode (prefix cache on), request plumbing ~3 ms, and round 1 (30-45 ms), which
+  produces the first visible token when thinking is on (t1 is `<think>`). The final forward stays separate: it keeps
+  a cold request's t1 decode-shaped, as its warm full-prefix replay's is.
+- Not taken: a serial first step instead of round 1 when t1 is invisible. Round 1 runs at depth 1 there, a 2-row
+  verify of ~29 ms against ~21-22 ms serial, so it saves ~7-8 ms of first token (~0.45%) and costs llmprobe's decode
+  window ~0.3-0.5% for the token round 1 no longer commits. The ~0.45 ms gap after each round's argmax is readback
+  wake-up, the commit, a 0.08 ms chain build and the first command buffer's encode; only a pre-dispatched next chain
+  would remove it, at ~4 ms of wasted GPU per partial accept.
+
+<a id="mimo-2p3-quiet-ab"></a>
+### MiMo-V2.6-Flash-Sushi-2.3bpw: the verify-row, prefill-GEMM and round changes together (2f15cc97 base)
+
+llmprobe 0.6.12 `--bench-only --rungs 4k`, `--kv-quant 8 --mtp --ctx-size 1048576`, `taskpolicy -a`, GPU lock per boot,
+quiet box (no other job), fans at max from 44 °C, 2026-10-01, one boot per arm in the order A B C C B A. A = 2f15cc97;
+B = the three sections above plus the one-dispatch rope + kv8 quantize (this change); C = B without the lazy verify
+capture.
+
+| arm | decode tok/s | prefill tok/s (2037-2038 tokens) | tokens per step |
+|---|---|---|---|
+| A | 64.0 / 64.2 | 1136.7 / 1119.2 | 2.82 / 3.69 |
+| B | 72.5 / 71.1 (+12.0%) | 1308.3 / 1290.1 (+15.2%) | 3.62 / 3.10 |
+| C | 71.1 / 68.6 | 1298.3 / 1297.3 | 3.15 / 3.62 |
+
+- The 192-token decode requests in the server logs read 62-73 tok/s on A and 67-77 on B across both boots, so the
+  gain is round time, not acceptance. B over C (+2.8%) is inside boot noise; the lazy capture's effect is the removed
+  idle gaps a Metal trace shows ([#mimo-mtp-round](#mimo-mtp-round)).
+- 16x512 KLD to first EOS on B, kv8: 0.086034761, the v1.1.0 value to the digit. B passes `test_mtp_equivalence.sh`
+  on this pack (19/19) and the full suite.
+- The decode cell's thinking is on, so the prefill handover does not move either cell here.
+
 <a id="mimo-attn-kernels"></a>
 ### MiMo attention kernels (attention only: no expert pack in these timings)
 

@@ -3066,7 +3066,7 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
     var shipped = false;
     for (raw[first..cut]) |byte| {
         try held.append(allocator, byte);
-        if (!consumed and held.items.len >= "<think>".len) {
+        if (!consumed and (held.items.len >= "<think>".len or !chat.thinkOpenerPossible(held.items))) {
             consumed = true;
             const l = chat.thinkOpenTagLenAt(held.items) orelse 0;
             std.mem.copyForwards(u8, held.items[0 .. held.items.len - l], held.items[l..]);

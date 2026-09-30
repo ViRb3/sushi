@@ -59,6 +59,7 @@ const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
+const exl3_kernels = @import("sushi_exl3").kernels;
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -283,6 +284,9 @@ pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usi
 /// The prefill width this request should run at, chosen against live post-eviction memory
 /// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
 pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
+/// The same chooser for the load-time prefill meter, installed before the load (the one above
+/// arrives after it); only the meter reads it.
+pub var prefill_ubench_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
 
 pub const PostEvictionWidth = struct {
     /// The width the prefill runs at. Always the re-ask.
@@ -499,6 +503,9 @@ pub const Slot = struct {
     /// everything from here on is the loop. Non-streaming responses are cut
     /// here so the client cannot round-trip the loop into the next prompt.
     loop_trim_start: ?usize,
+    /// t1 streamed at the MTP prefill handover; the first block still commits it, and its
+    /// echo is not published twice (`takeHandoverEcho`).
+    handover_token: ?u32 = null,
     cancelled: std.atomic.Value(bool),
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
@@ -792,6 +799,15 @@ pub const Slot = struct {
         self.pushTokenWithLogprob(t, null);
     }
 
+    /// True once, for the first token published after the handover when it is t1 again.
+    fn takeHandoverEcho(self: *Slot, t: u32) bool {
+        const h = self.handover_token orelse return false;
+        self.handover_token = null;
+        if (h == t) return true;
+        log.err("[mtp] handover streamed {d} but the first committed token is {d}\n", .{ h, t });
+        return false;
+    }
+
     /// Publish one token and, when the request asked for logprobs, the entry
     /// describing it — in ONE critical section.
     ///
@@ -804,6 +820,7 @@ pub const Slot = struct {
     /// gap survived: it is invisible to output-equality tests AND to llmprobe,
     /// which probes logprobs non-streaming only.
     fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
+        if (self.takeHandoverEcho(t)) return;
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         if (lp) |entry| {
@@ -3476,7 +3493,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on) {
             streaming_resident_bytes.? += try model_mod.mimoMtpResidentBytes(sch.io, sch.allocator, params.model_dir);
             if (mtp_mod.MtpModel.draftRerankMode() != .off)
-                streaming_resident_bytes.? += mtp_mod.rerankCoarseBytes(@intCast(params.config.vocab_size), @intCast(params.config.hidden_size), mtp_mod.rerankCoarseBits());
+                streaming_resident_bytes.? += mtp_mod.rerankCoarseBytes(@intCast(params.config.vocab_size), @intCast(params.config.hidden_size), mimo_mtp.rerankBits());
         }
     }
 
@@ -3632,6 +3649,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
+    if (transformer_mod.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
+
     // DIAGNOSTIC (SUSHI_DECODE_FWD_UBENCH=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
     // cache bookkeeping around them. The server reports `predicted_ms` around
@@ -3697,14 +3716,22 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // pooled-key chain and B the fused kernel; each arm logs its fused launches.
             const pool_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS");
             defer transformer_mod.qsa_pool_rope_fused_override = null;
+            // SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1: MiMo's composed rope + kv8 quantize (off) and
+            // the one-dispatch prep (on) as off, on, on, off passes.
+            const qkv_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS");
+            defer transformer_mod.mimo_qkv_prep_override = null;
             var arm_buf: [8]UbenchArm = undefined;
             for (widths[0..n_widths]) |rows| {
             for (ubenchArms(&arm_buf, rows, xfm_ptr.config.isMimo(), row_arms, pool_arms)) |arm| {
-            for (@as([]const ?bool, if (gdn_arms or fold_arms) &.{ false, true, true, false } else &.{null})) |gdn_arm| {
-            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else gdn_arm;
+            const abba: []const ?bool = &.{ false, true, true, false };
+            const abba2: []const ?bool = &.{ false, true, true, false, false, true, true, false };
+            const no_arms: []const ?bool = &.{null};
+            for (if (qkv_arms) abba2 else if (gdn_arms or fold_arms) abba else no_arms) |gdn_arm| {
+            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else if (qkv_arms) null else gdn_arm;
             transformer_mod.gdn_verify_fold_override = if (fold_arms) gdn_arm else null;
+            transformer_mod.mimo_qkv_prep_override = if (qkv_arms) gdn_arm else null;
             transformer_mod.gdn_verify_fold_calls = 0;
-            if (gdn_arm) |on| log.info("[fwd-ubench] gdn {s} arm: {s}\n", .{ if (fold_arms) "fold" else "recur", if (on) "on" else "off" });
+            if (gdn_arm) |on| log.info("[fwd-ubench] {s} arm: {s}\n", .{ if (qkv_arms) "qkv prep" else if (fold_arms) "gdn fold" else "gdn recur", if (on) "on" else "off" });
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
             defer sch.allocator.free(tok_slice);
             for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
@@ -5559,6 +5586,91 @@ fn deinitSlotsReturningPool(slots: []const *Slot) void {
     if (returns_pool) _ = mlx.mlx_clear_cache();
 }
 
+/// DIAGNOSTIC (SUSHI_PREFILL_UBENCH=N): N cold one-chunk prefills per arm at load, each from an
+/// empty cache, logits never projected (the chunk loop never reads them). `_ROWS` (default 2025)
+/// is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
+/// for real routing; `_ARMS=0,1,1,0` runs a pass per arm, 0 on the reference EXL3 NAX GEMM body.
+fn prefillUbench(alloc: std.mem.Allocator, xfm: *Transformer, cfg: *const ModelConfig, tok: *Tokenizer) void {
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const n = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_PREFILL_UBENCH").?, 0), 10) catch 3);
+    const asked: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ROWS")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 2025 else 2025;
+    const pick = prefill_ubench_chunk orelse {
+        log.warn("[prefill-ubench] skipped: no admission hook to size the chunk\n", .{});
+        return;
+    };
+    // A wider forward than admission would run allocates outside the load's memory bill.
+    const rows = @max(1, @min(asked, pick(cfg, asked + 1, 1, xfm.cache.config, false, 0, 0, false, false)));
+    const ids = alloc.alloc(i32, rows) catch return;
+    defer alloc.free(ids);
+    for (ids, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
+    if (std.c.getenv("SUSHI_PREFILL_UBENCH_TEXT")) |path| blk: {
+        const text = std.Io.Dir.cwd().readFileAlloc(tio, std.mem.sliceTo(path, 0), alloc, .limited(64 << 20)) catch break :blk;
+        defer alloc.free(text);
+        const enc = tok.encode(alloc, text) catch break :blk;
+        defer alloc.free(enc);
+        if (enc.len == 0) break :blk;
+        for (ids, 0..) |*v, i| v.* = @intCast(enc[i % enc.len]);
+    }
+    var arms: [16]?bool = @splat(null);
+    const n_arms = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ARMS")) |r| parseUbenchArms(std.mem.sliceTo(r, 0), &arms) else 1;
+    defer exl3_kernels.nax_reference_override = false;
+    const had_error = mlx.errorPending();
+    defer xfm.resetCache() catch {};
+    const shape = [_]c_int{ 1, @intCast(rows) };
+    const times = alloc.alloc(f64, n) catch return;
+    defer alloc.free(times);
+    for (arms[0..n_arms]) |arm| {
+        exl3_kernels.nax_reference_override = if (arm) |a| !a else false;
+        for (0..n + 1) |iter| {
+            xfm.resetCache() catch return;
+            var ctx = xfm.defaultCtx();
+            ctx.skip_lm_head = true;
+            const ti = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(ti);
+            var sw = io_util.Stopwatch.init(tio);
+            const out = xfm.forwardWith(&ctx, ti) catch |err| {
+                mlx.dropLatchedErrorUnless(had_error);
+                log.warn("[prefill-ubench] forward failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+            defer _ = mlx.mlx_array_free(out);
+            mlx.check(mlx.mlx_array_eval(out)) catch |err| {
+                mlx.dropLatchedErrorUnless(had_error);
+                log.warn("[prefill-ubench] eval failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+            if (iter > 0) times[iter - 1] = @as(f64, @floatFromInt(sw.read())) / 1.0e6;
+        }
+        std.mem.sort(f64, times, {}, std.sort.asc(f64));
+        log.info("[prefill-ubench] arm={s} rows={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s)\n", .{
+            if (arm) |a| (if (a) "1" else "0") else "shipped", rows, n, times[n / 2], times[0], times[n - 1],
+            @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0,
+        });
+    }
+}
+
+/// `_ARMS` list: each comma-separated entry is an arm, `0` the reference, anything else the shipped one.
+fn parseUbenchArms(raw: []const u8, out: *[16]?bool) usize {
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |a| {
+        if (n == out.len) break;
+        out[n] = a[0] != '0';
+        n += 1;
+    }
+    return @max(n, 1);
+}
+
+test "prefill ubench arms parse one entry per comma, 0 the reference and an empty list the shipped arm" {
+    var arms: [16]?bool = @splat(null);
+    try std.testing.expectEqual(@as(usize, 4), parseUbenchArms("0,1,1,0", &arms));
+    try std.testing.expectEqualSlices(?bool, &.{ false, true, true, false }, arms[0..4]);
+    arms = @splat(null);
+    try std.testing.expectEqual(@as(usize, 1), parseUbenchArms("", &arms));
+    try std.testing.expectEqual(@as(?bool, null), arms[0]);
+    try std.testing.expectEqual(@as(usize, 16), parseUbenchArms("1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0", &arms));
+}
+
 /// DiffusionGemma prefill: refresh the slot ctx, build the per-slot
 /// diffusion Runner (which dequantizes the embedding table for
 /// self-conditioning), and run the causal ENCODER pass over the full prompt
@@ -5922,6 +6034,20 @@ fn endPrefillPass(sch: *Scheduler, slot: *Slot) void {
     }
     sch.queue_mu.unlock(sch.io);
     _ = slot.in_pass.fetchSub(1, .acq_rel);
+}
+
+/// t1 is on the host once an MTP prefill ends; the first round would only stream it after its
+/// verify. An EOS t1 stays with the round, which ends the answer the usual way.
+fn handoverToken(mtp: bool, completion_tokens: u32, done: bool, logprobs_n: u32, t1: u32, eos: []const u32) ?u32 {
+    // The swallowed round echo would also drop t1's logprob entry.
+    if (!mtp or completion_tokens != 0 or done or logprobs_n > 0 or generate_mod.isEosId(t1, eos)) return null;
+    return t1;
+}
+
+fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
+    const t1 = handoverToken(gen.mtp != null, gen.completion_tokens, gen.done, slot.logprobs_n, gen.next_token_id, slot.eos_token_ids) orelse return;
+    slot.pushToken(t1);
+    slot.handover_token = t1;
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
@@ -6353,6 +6479,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    publishHandoverToken(slot, &slot.legacy_gen.?);
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
         slot.ring_cps.prompt_end = slot.cache.ringCheckpoint(slot.full_prompt.len, xfm_ptr.s) catch |err| blk: {
@@ -10207,6 +10334,27 @@ test "decode share: cancelled prefill stops its hosted ticks before touching the
     const result = runOwedDecodeTicks(0.9, 1000, 1, &ctx, interleaveDecodeTickOpaque);
     try testing.expectEqual(@as(u32, 1), result.ticks);
     try testing.expectEqual(@as(u64, 1), result.spent_ns);
+}
+
+test "MTP handover: t1 streams at the prefill handover unless it ends the answer or nothing speculates" {
+    const eos = [_]u32{ 2, 7 };
+    try testing.expectEqual(@as(?u32, 42), handoverToken(true, 0, false, 0, 42, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, false, 0, 7, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(false, 0, false, 0, 42, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(true, 1, false, 0, 42, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, true, 0, 42, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, false, 5, 42, &eos));
+}
+
+test "MTP handover: the first block's echo of the streamed t1 is swallowed once, anything else is published" {
+    var slot: Slot = undefined;
+    slot.handover_token = 42;
+    try testing.expect(slot.takeHandoverEcho(42));
+    try testing.expectEqual(@as(?u32, null), slot.handover_token);
+    try testing.expect(!slot.takeHandoverEcho(42));
+    slot.handover_token = 42;
+    try testing.expect(!slot.takeHandoverEcho(43));
+    try testing.expectEqual(@as(?u32, null), slot.handover_token);
 }
 
 test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" {

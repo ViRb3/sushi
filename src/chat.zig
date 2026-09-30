@@ -1691,6 +1691,23 @@ pub fn partialThinkCloseSuffixLen(buf: []const u8) usize {
     return 0;
 }
 
+test "thinkOpenerPossible: a thought no opener can start is delivered without waiting for more bytes" {
+    try std.testing.expect(!thinkOpenerPossible("The"));
+    try std.testing.expect(!thinkOpenerPossible("Okay"));
+    try std.testing.expect(!thinkOpenerPossible("\nWe"));
+    try std.testing.expect(thinkOpenerPossible(""));
+    try std.testing.expect(thinkOpenerPossible(" \n"));
+    try std.testing.expect(thinkOpenerPossible("<"));
+    try std.testing.expect(thinkOpenerPossible("<thi"));
+    try std.testing.expect(thinkOpenerPossible("\n<|chan"));
+    // Muse headers open with bare text: the context word and the recipient.
+    try std.testing.expect(thinkOpenerPossible("assist"));
+    try std.testing.expect(thinkOpenerPossible("assistant to"));
+    try std.testing.expect(thinkOpenerPossible("to"));
+    try std.testing.expect(thinkOpenerPossible("to=self"));
+    try std.testing.expect(!thinkOpenerPossible("too"));
+}
+
 test "partialThinkCloseSuffixLen holds back growing close tags, ignores prose" {
     try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("plain reasoning text"));
     try testing.expectEqual(@as(usize, 7), partialThinkCloseSuffixLen("thinking…</think"));
@@ -2780,6 +2797,19 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 /// leaks tag fragments as visible content (a pi session showed prose ending
 /// in a glued "thought" because `<|channel>` flushed before "thought"
 /// arrived and completed the opener).
+/// Can a thought that begins with `buf` still grow into an opener the streaming gates strip?
+/// Every opener starts with `<` or is a Muse header (`assistant`, `to=`), so any other first
+/// byte is decided at once instead of waiting for the gates' 7 bytes.
+pub fn thinkOpenerPossible(buf: []const u8) bool {
+    const rest = std.mem.trimStart(u8, buf, " \n");
+    if (rest.len == 0 or rest[0] == '<') return true;
+    for ([_][]const u8{ "assistant", "to=" }) |word| {
+        const n = @min(rest.len, word.len);
+        if (std.mem.eql(u8, rest[0..n], word[0..n])) return true;
+    }
+    return false;
+}
+
 pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
     const tags = [_][]const u8{ "<|channel>thought", "<think>" };
     for (tags) |tag| {

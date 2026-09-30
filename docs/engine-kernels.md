@@ -36,7 +36,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   as a scalar input it cost 1-4% per verify forward ([perf-baselines](perf-baselines.md#hc-row-group)).
 - A GEMV that beats MLX's qmv in a chained in-graph ubench can still lose inside the forward: a vectorized affine-8
   reader 10-57% faster in-graph was 2-4% slower per decode forward on an M2 Max
-  ([perf-baselines](perf-baselines.md#m2max-decode)). Judge a decode kernel by the decode meter.
+  ([perf-baselines](perf-baselines.md#m2max-decode)). Judge a decode kernel by the decode meter. The affine-8 verify
+  rows kernel takes two output rows per simdgroup: four rows and four simdgroups won an isolated microbench and lost
+  in the forward ([perf-baselines](perf-baselines.md#mimo-verify-2p3)).
 - A dependent-kernel cut that REDISTRIBUTES a reduction into every threadgroup loses; a routing-independent chain
   the GPU already OVERLAPS is not a dispatch to fuse. Meter: `SUSHI_DECODE_FWD_UBENCH`.
 - A matmul2d decode tile of 16 query rows is latency-bound: its barriers and small matmuls cost more than its
@@ -160,4 +162,6 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   under-samples short kernels and mis-shares the rest ([perf-baselines](perf-baselines.md#m2max-decode)).
 - A Metal System Trace: `xcrun xctrace record --template 'Metal System Trace' --instrument 'Metal GPU Counters'
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
+- Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;
+  `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX reference and served bodies in one boot).
 - Every timing run takes the GPU lock and restores QoS ([CLAUDE.md, Team process](../CLAUDE.md#team-process)).

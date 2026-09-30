@@ -59,20 +59,34 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   row count JITs its own pipelines, and a new binary's first round at each width stalled 450-630 ms.
 - **Verify rows keep decode arithmetic** (`ForwardCtx.verify_rows`, up to `MIMO_VERIFY_ROWS_MAX` = 4 rows, the FP8
   GEMV's direct-row limit): every row's attention runs through `mimoDecodeAttn` on the keys its own decode tick saw
-  (`mimoVerifyRowsAttn`), the rest of the forward is row-identical already (FP8 GEMV <= 4 rows, `mtp_qmv` affine-8,
-  serial router rows, the EXL3 decode chain). A partial accept truncates the cache (attention-only trunk).
+  (`mimoVerifyRowsAttn`; a sliding layer's rows in one dispatch, `mimoSlidingRowsAttn`), the rest of the forward is
+  row-identical already (FP8 GEMV <= 4 rows, `mtp_qmv` affine-8, the router rows' one f32 gemv
+  `mtp_qmv.f32GemvRows`, the EXL3 decode chain). A partial accept truncates the cache (attention-only trunk).
 - Oracle: `tests/dump_mimo_v2_mtp_fixtures.py` renders the heads from the HF reference's own modules on the tiny
   fixture model; `mimo mtp heads track the torch rendering…` replays history, rounds, wrong drafts and rollbacks.
 - **A MiMo verify row reads its own 8 routed experts**, so it costs a large share of a forward and depth pays only
   on predictable text (code, lists, JSON; prose loses). Greedy MTP is byte-identical to serial (18/18 pairs at 256
   tokens, forced and auto).
 - **Real-text verify rows share ~30% of their expert slots**, which the grouped decode GEMVs exploit (one weight
-  decode per pair of slots, [engine-exl3-experts](engine-exl3-experts.md#kernels)). One sdpa for all rows of a sliding layer is open; the
-  global layers' split-K follows each row's own key count, so batching them is not bit-identical.
+  decode per pair of slots, [engine-exl3-experts](engine-exl3-experts.md#kernels)). The global layers' split-K follows
+  each row's own key count, so batching their rows is not bit-identical.
 - **MTP adds to each prefill chunk only the heads' catch-up** (three heads x the 128-row window). Compare prefill arms
   interleaved in one boot, never one reading per arm.
+- **A MiMo verify's hidden captures stay lazy** (`capturePrefillHidden(.., settle = !ctx.verify_rows)`): the trunk,
+  lm_head and accept read go out as one dispatch, where a settled capture made the host wait for the trunk before it
+  built the lm_head ([perf-baselines](perf-baselines.md#mimo-mtp-round)). A prefill chunk's capture still settles.
+- **A MiMo draft step is ~0.95 ms of head forward plus the coarse readout**, and the readout is 2-bit on MiMo
+  (`mimo_mtp.rerankBits`; `SUSHI_MTP_DRAFT_HEAD_BITS` overrides it). At forced depth 3 the 2-bit readout accepted
+  what the 3-bit one did (5 prompts, within 1 accept over ~380 rounds, same bytes out), and a three-draft chain
+  dropped from 4.22 to 3.80 ms (the 2-bit readout on 2f15cc97, kv8, 2.3bpw).
 - The EV planner prices a MiMo EXL3 round with its own surface (`.mimo_exl3`, `MTP_EV_MIMO_EXL3_COSTS`: draft
   .04, verify row .44 of a forward, flat to depth 3); the generic surface prices a row at .20 and over-drafts prose.
+- **t1 streams at the prefill handover** (`scheduler.publishHandoverToken`): an MTP request's first token is on the
+  host when prefill ends, so it goes out before round 1; the round still commits it, and its echo is swallowed once
+  (`Slot.takeHandoverEcho`). An EOS t1 stays with the round. MiMo's last prompt chunk leaves the heads' catch-up to the
+  first draft chain. A first token the stream can show arrives one round earlier. On MiMo with thinking on, t1 is the
+  `<think>` opener, so the first visible token does not move. llmprobe measures decode first frame to last, so where t1
+  shows, its decode rate reads about a round lower for the same token times.
 
 ## Spec verify invariant
 

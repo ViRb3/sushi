@@ -8504,7 +8504,6 @@ pub const KVCache = struct {
     }
 
     fn updateAffine(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
-        const entry = &self.entries[layer];
         const cfg = self.config;
         const group_size: u32 = cfg.group_size;
         const bits: u8 = cfg.bits;
@@ -8522,6 +8521,14 @@ pub const KVCache = struct {
         //    K-derived packed width writes a 16-u32 chunk into a 24-u32 window
         //    (an mlx slice_update mismatch we cannot catch). Identical on every
         //    symmetric arch — the same generalization `updateDense` carries.
+        return self.appendQuantized(layer, new_kq, new_vq, s, max_seq);
+    }
+
+    /// `update` for rows the caller already quantized with this cache's scheme.
+    pub fn appendQuantized(self: *KVCache, layer: u32, new_kq: kv_quant.QuantizedKV, new_vq: kv_quant.QuantizedKV, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        const entry = &self.entries[layer];
+        const group_size: u32 = self.config.group_size;
+        const bits: u8 = self.config.bits;
         const compacted = try self.writeAffineChunk(layer, new_kq, new_vq, s, max_seq);
         var trip = [6]mlx.mlx_array{ entry.key_view, entry.key_scales_view, entry.key_biases_view, entry.value_view, entry.value_scales_view, entry.value_biases_view };
         if (compacted) trip = try handOffRingViews(entry, s, 6);
@@ -13023,20 +13030,22 @@ pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array
     return out;
 }
 
-fn capturePrefillHidden(s: mlx.mlx_stream, dest: *mlx.mlx_array, src: mlx.mlx_array) !void {
+/// `settle` evaluates the copy so it lets go of a prefill chunk; a verify's few rows stay
+/// lazy and ride one dispatch with the lm_head and the accept read.
+fn capturePrefillHidden(s: mlx.mlx_stream, dest: *mlx.mlx_array, src: mlx.mlx_array, settle: bool) !void {
     const owned = try materializedOwnedCopy(s, src);
     defer _ = mlx.mlx_array_free(owned);
-    try mlx.check(mlx.mlx_array_eval(owned));
+    if (settle) try mlx.check(mlx.mlx_array_eval(owned));
     _ = mlx.mlx_array_set(dest, owned);
 }
 
-fn capturePrefillHiddenLast(s: mlx.mlx_stream, dest: *mlx.mlx_array, src: mlx.mlx_array) !void {
+fn capturePrefillHiddenLast(s: mlx.mlx_stream, dest: *mlx.mlx_array, src: mlx.mlx_array, settle: bool) !void {
     const sh = mlx.getShape(src);
     const last = sh[1] - 1;
     var sliced = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sliced);
     try mlx.check(mlx.mlx_slice(&sliced, src, &[_]c_int{ 0, last, 0 }, 3, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-    try capturePrefillHidden(s, dest, sliced);
+    try capturePrefillHidden(s, dest, sliced, settle);
 }
 
 /// Test seams (inference thread only): the copy/eval counters let the retention and cadence tests see what the loop did.
@@ -16063,11 +16072,206 @@ fn mimoDecodeAttn(
     return out;
 }
 
+/// MLX v0.32.2 `sdpa_vector` (float mask, sinks) with one threadgroup per (head, verify row);
+/// row r reads the `W` keys ending at its own key, the window its decode tick saw.
+const MIMO_SWA_ROWS_SOURCE =
+    \\constexpr int BN = 32;
+    \\constexpr int BD = 32;
+    \\constexpr int qk_per_thread = D / BD;
+    \\constexpr int v_per_thread = V / BD;
+    \\typedef float U;
+    \\const uint simd_gid = simdgroup_index_in_threadgroup;
+    \\const uint simd_lid = thread_index_in_simdgroup;
+    \\const int head = int(threadgroup_position_in_grid.x);
+    \\const int row = int(threadgroup_position_in_grid.y);
+    \\const int rows = int(threadgroups_per_grid.y);
+    \\const int kv_head = head / (int(threadgroups_per_grid.x) / int(k_shape[1]));
+    \\const int first = int(k_shape[2]) - rows + 1 - W + row;
+    \\const int inner_k_stride = BN * int(k_strides[2]);
+    \\const int inner_v_stride = BN * int(v_strides[2]);
+    \\thread U qv[qk_per_thread];
+    \\thread U kv[qk_per_thread];
+    \\thread U o[v_per_thread];
+    \\threadgroup U outputs[BN * BD];
+    \\threadgroup U max_scores[BN];
+    \\threadgroup U sum_exp_scores[BN];
+    \\const device T* queries = q + head * q_strides[1] + row * q_strides[2] + simd_lid * qk_per_thread;
+    \\const device T* keys = k + kv_head * k_strides[1] + (first + int(simd_gid)) * k_strides[2] + simd_lid * qk_per_thread;
+    \\const device T* values = v + kv_head * v_strides[1] + (first + int(simd_gid)) * v_strides[2] + simd_lid * v_per_thread;
+    \\const device T* fmask = mask + simd_gid;
+    \\device T* outp = out + (head * rows + row) * V + simd_gid * v_per_thread;
+    \\for (int i = 0; i < qk_per_thread; i++) qv[i] = static_cast<U>(scale[0]) * queries[i];
+    \\for (int i = 0; i < v_per_thread; i++) o[i] = 0;
+    \\U max_score = Limits<U>::finite_min;
+    \\U sum_exp_score = 0;
+    \\if (simd_gid == 0) {
+    \\  max_score = static_cast<U>(sinks[head]);
+    \\  sum_exp_score = 1;
+    \\}
+    \\for (int i = simd_gid; i < W; i += BN) {
+    \\  if (fmask[0] >= Limits<T>::finite_min) {
+    \\    for (int j = 0; j < qk_per_thread; j++) kv[j] = keys[j];
+    \\    U score = 0;
+    \\    for (int j = 0; j < qk_per_thread; j++) score += qv[j] * kv[j];
+    \\    score = simd_sum(score);
+    \\    score += static_cast<U>(fmask[0]);
+    \\    U new_max = max(max_score, score);
+    \\    U factor = fast::exp(max_score - new_max);
+    \\    U exp_score = fast::exp(score - new_max);
+    \\    max_score = new_max;
+    \\    sum_exp_score = sum_exp_score * factor + exp_score;
+    \\    for (int j = 0; j < v_per_thread; j++) o[j] = o[j] * factor + exp_score * values[j];
+    \\  }
+    \\  keys += inner_k_stride;
+    \\  values += inner_v_stride;
+    \\  fmask += BN;
+    \\}
+    \\if (simd_lid == 0) {
+    \\  max_scores[simd_gid] = max_score;
+    \\  sum_exp_scores[simd_gid] = sum_exp_score;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\max_score = max_scores[simd_lid];
+    \\U new_max = simd_max(max_score);
+    \\U factor = fast::exp(max_score - new_max);
+    \\sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+    \\for (int i = 0; i < v_per_thread; i++) {
+    \\  outputs[simd_lid * BD + simd_gid] = o[i];
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+    \\  o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\if (simd_lid == 0) {
+    \\  for (int i = 0; i < v_per_thread; i++) outp[i] = static_cast<T>(o[i]);
+    \\}
+;
+
+var mimo_swa_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var mimo_swa_rows_engaged = false;
+const MimoSwaRowsKey = struct { heads: c_int, dtype: mlx.mlx_dtype, window: c_int };
+var mimo_swa_rows_cfgs: [MIMO_VERIFY_ROWS_MAX + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var mimo_swa_rows_keys: [MIMO_VERIFY_ROWS_MAX + 1]MimoSwaRowsKey = undefined;
+
+/// Every sliding row of a verify in one dispatch, each row that row's decode sdpa bit for bit.
+/// Null while the first row still reads fewer than `window` keys (its tick took no mask).
+fn mimoSlidingRowsAttn(
+    s: mlx.mlx_stream,
+    window: c_int,
+    q: mlx.mlx_array,
+    view: *const DenseKVView,
+    sinks: mlx.mlx_array,
+    offset: c_int,
+    rows: c_int,
+    attn_scale: f32,
+    decode_mask: mlx.mlx_array,
+) !?mlx.mlx_array {
+    // MLX's one-pass vector kernel serves (qk 192, v 128) only below 1024 keys.
+    if (offset + 1 <= window or window >= 1024 or rows < 2 or rows > MIMO_VERIFY_ROWS_MAX) return null;
+    if (sinks.ctx == null or decode_mask.ctx == null or view.k.ctx == null or view.v.ctx == null) return null;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(view.k);
+    const vs = mlx.getShape(view.v);
+    if (qs.len != 4 or ks.len != 4 or vs.len != 4 or qs[0] != 1 or ks[0] != 1 or qs[2] != rows) return null;
+    if (qs[3] != 192 or ks[3] != 192 or vs[3] != 128) return null;
+    const heads = qs[1];
+    const kv_heads = ks[1];
+    if (kv_heads <= 0 or vs[1] != kv_heads or @rem(heads, kv_heads) != 0 or @divExact(heads, kv_heads) > 32) return null;
+    if (ks[2] != vs[2] or ks[2] < window + rows - 1) return null;
+    const dt = mlx.mlx_array_dtype(q);
+    if ((dt != .bfloat16 and dt != .float16 and dt != .float32) or mlx.mlx_array_dtype(view.k) != dt or mlx.mlx_array_dtype(view.v) != dt) return null;
+    if (mlx.mlx_array_strides(q)[3] != 1 or mlx.mlx_array_strides(view.k)[3] != 1 or mlx.mlx_array_strides(view.v)[3] != 1) return null;
+    const ms = mlx.getShape(decode_mask);
+    if (mlx.mlx_array_size(decode_mask) != @as(usize, @intCast(window)) or ms[ms.len - 1] != window) return null;
+    if (mlx.mlx_array_size(sinks) != @as(usize, @intCast(heads))) return null;
+
+    if (mimo_swa_rows_kernel == null) {
+        const input_names = [_][*:0]const u8{ "q", "k", "v", "sinks", "mask", "scale" };
+        const output_names = [_][*:0]const u8{"out"};
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kernel = mlx.mlx_fast_metal_kernel_new("sushi_mimo_swa_rows", in_vec, out_vec, MIMO_SWA_ROWS_SOURCE, "", false, false);
+        if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+        mimo_swa_rows_kernel = kernel;
+    }
+    const slot: usize = @intCast(rows);
+    const key = MimoSwaRowsKey{ .heads = heads, .dtype = dt, .window = window };
+    if (mimo_swa_rows_cfgs[slot] == null or !std.meta.eql(mimo_swa_rows_keys[slot], key)) {
+        if (mimo_swa_rows_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        mimo_swa_rows_cfgs[slot] = null;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ 1, heads, rows, 128 }, 4, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, heads * 1024, rows, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 1024, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "D", 192));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "V", 128));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "W", window));
+        mimo_swa_rows_cfgs[slot] = config;
+        mimo_swa_rows_keys[slot] = key;
+    }
+
+    // MLX's sdpa casts the mask and the sinks to the output type before its kernel reads them. The
+    // kernel reads both unstrided: one `[window]` mask row shared by every head and row (each row here
+    // sees a full window) and one sink per head.
+    var sinks_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sinks_c);
+    try mlx.check(mlx.mlx_astype(&sinks_c, sinks, dt, s));
+    var sinks_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sinks_t);
+    try mlx.check(mlx.mlx_contiguous(&sinks_t, sinks_c, false, s));
+    var mask_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_c);
+    try mlx.check(mlx.mlx_astype(&mask_c, decode_mask, dt, s));
+    var mask_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_t);
+    try mlx.check(mlx.mlx_contiguous(&mask_t, mask_c, false, s));
+    const one = [_]c_int{1};
+    const scale_data = [_]f32{attn_scale};
+    const scale = mlx.mlx_array_new_data(&scale_data, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+    const inputs = [_]mlx.mlx_array{ q, view.k, view.v, sinks_t, mask_t, scale };
+    const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    var out_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(out_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&out_vec, mimo_swa_rows_kernel.?, in_vec, mimo_swa_rows_cfgs[slot].?, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, out_vec, 0));
+    if (!mimo_swa_rows_engaged) {
+        mimo_swa_rows_engaged = true;
+        log.info("[mimo-verify] sliding rows in one dispatch engaged: rows={d} heads={d} kv_heads={d} window={d}\n", .{ rows, heads, kv_heads, window });
+    }
+    return out;
+}
+
 /// A spec verify's rows, or a global prefill too short for the fused kernel, each attending
 /// exactly the keys its own decode tick would have seen through `mimoDecodeAttn`, so an
 /// accepted row is the serial row bit for bit. `kv_view` is the forward's cache update: it
 /// ends at the last row's key.
 fn mimoVerifyRowsAttn(
+    s: mlx.mlx_stream,
+    window: c_int,
+    q_rope: mlx.mlx_array,
+    kv_view: *const DenseKVView,
+    sinks: mlx.mlx_array,
+    is_global: bool,
+    offset: c_int,
+    seq_len: c_int,
+    attn_scale: f32,
+    decode_mask: mlx.mlx_array,
+) !mlx.mlx_array {
+    if (!is_global and seq_len <= MIMO_VERIFY_ROWS_MAX) {
+        if (try mimoSlidingRowsAttn(s, window, q_rope, kv_view, sinks, offset, seq_len, attn_scale, decode_mask)) |out| return out;
+    }
+    return mimoVerifyRowsAttnPerRow(s, window, q_rope, kv_view, sinks, is_global, offset, seq_len, attn_scale, decode_mask);
+}
+
+fn mimoVerifyRowsAttnPerRow(
     s: mlx.mlx_stream,
     window: c_int,
     q_rope: mlx.mlx_array,
@@ -20871,10 +21075,10 @@ pub const Transformer = struct {
         // (which needs the post-final-norm hidden as h_prev seed). Mirrors
         // the identical block in forwardMoe.
         if (ctx.capture_hidden) |target| {
-            try capturePrefillHiddenLast(self.s, target, final_normed);
+            try capturePrefillHiddenLast(self.s, target, final_normed, true);
         }
         if (ctx.capture_hidden_all) |target_all| {
-            try capturePrefillHidden(self.s, target_all, final_normed);
+            try capturePrefillHidden(self.s, target_all, final_normed, true);
         }
 
         if (self.embedding_mode) return final_normed;
@@ -24891,13 +25095,13 @@ pub const Transformer = struct {
         dt.end(h);
         prof.report(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)), ctx.capture_ssm_seq, cfg.num_hidden_layers - cfg.attnCacheLayerCount(), cfg.attnCacheLayerCount());
         Qwen4AttnProf.flush(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)));
-        if (ctx.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h);
+        if (ctx.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h, true);
         // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
         // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
         if (ctx.capture_hidden) |target| {
-            try capturePrefillHiddenLast(self.s, target, h);
+            try capturePrefillHiddenLast(self.s, target, h, true);
         }
-        if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h);
+        if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, true);
 
         const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
         // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
@@ -25275,10 +25479,10 @@ pub const Transformer = struct {
         // Gemma 4 assistant drafter as `h_prev`. Caller frees the captured
         // array.
         if (ctx.capture_hidden) |target| {
-            try capturePrefillHiddenLast(self.s, target, final_normed);
+            try capturePrefillHiddenLast(self.s, target, final_normed, !ctx.verify_rows);
         }
         if (ctx.capture_hidden_all) |target_all| {
-            try capturePrefillHidden(self.s, target_all, final_normed);
+            try capturePrefillHidden(self.s, target_all, final_normed, !ctx.verify_rows);
         }
 
         if (self.embedding_mode) return final_normed;
@@ -27724,6 +27928,39 @@ pub const Transformer = struct {
         return self.attnProjBias(attn_flat, fa.o_w, fa.o_s, fa.o_b, fa.o_bias, decode_shape, layer);
     }
 
+    /// MiMo decode or verify rows whose FP8 QKV left V scaled, on a kv8 g64 cache: Q/K rope and
+    /// the K/V quantize run as one dispatch and K/V append already quantized. Null = composed path.
+    fn mimoDecodePrep(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        proj: [3]mlx.mlx_array,
+        is_global: bool,
+        rope_dims: c_int,
+        rope_base: mlx.mlx_optional_float,
+        offset: c_int,
+        rows: c_int,
+        h_count: c_int,
+        kv_h: c_int,
+        layer: u32,
+        max_kv: u32,
+        q_out: *mlx.mlx_array,
+    ) !?DenseKVView {
+        const kvc = ctx.cache.config;
+        if (kvc.scheme != .affine or kvc.bits != 8 or kvc.group_size != 64) return null;
+        if (mimo_qkv_prep_override == false) return null;
+        const angles = try self.qkAngleRowsFor(if (is_global) 0 else 1, rope_dims, rope_base, .{ .ctx = null }, offset, rows, 1.0);
+        var prep = (try mimoDecodeQkvPrep(self.s, proj[0], proj[1], proj[2], angles, h_count, kv_h, rope_dims, rows)) orelse return null;
+        errdefer _ = mlx.mlx_array_free(prep.q);
+        defer {
+            prep.k.deinit();
+            prep.v.deinit();
+        }
+        const view = try ctx.cache.appendQuantized(layer, prep.k, prep.v, self.s, max_kv);
+        _ = mlx.mlx_array_free(q_out.*);
+        q_out.* = prep.q;
+        return view;
+    }
+
     /// MiMo V2 attention (XiaomiMiMo/MiMo-V2.6-Flash-RL, Apache-2.0):
     /// per-layer GQA geometry, asymmetric K/V widths, and
     /// optional sink columns. Prefill takes `sushi_attn_pd` at qk 192 / v 128 (sliding
@@ -27772,57 +28009,59 @@ pub const Transformer = struct {
             proj[1] = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
             proj[2] = try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
         }
-        const q_proj = proj[0];
-        const k_proj = proj[1];
-        const v_proj = proj[2];
-
-        var q_r = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q_r);
-        try mlx.check(mlx.mlx_reshape(&q_r, q_proj, &q_shape, 4, self.s));
-        var q_t = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q_t);
-        try mlx.check(mlx.mlx_transpose_axes(&q_t, q_r, &perm, 4, self.s));
         var q_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rope);
         const rope_base = mlx.mlx_optional_float{
             .value = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq,
             .has_value = true,
         };
-        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
-
-        var k_r = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_r);
-        try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &k_shape, 4, self.s));
-        var k_t = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_t);
-        try mlx.check(mlx.mlx_transpose_axes(&k_t, k_r, &perm, 4, self.s));
-        var k_rope = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_rope);
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
-
-        var v_r = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(v_r);
-        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &v_shape, 4, self.s));
-        var v_t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
-        var v_scaled = v_t;
-        var v_scale: mlx.mlx_array = .{ .ctx = null };
-        const value_scale: f32 = if (mlx.mlx_array_dtype(fa.q_w) == .uint8) 1.0 else cfg.attention_value_scale;
-        if (value_scale != 1.0) {
-            v_scale = try scalarOf(value_scale, mlx.mlx_array_dtype(v_t), self.s);
-            var scaled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&scaled, v_t, v_scale, self.s));
-            _ = mlx.mlx_array_free(v_t);
-            v_scaled = scaled;
-        }
-        defer {
-            _ = mlx.mlx_array_free(v_scaled);
-            if (v_scale.ctx != null) _ = mlx.mlx_array_free(v_scale);
-        }
-
         const sliding = slidingViewFor(cfg, offset + seq_len, seq_len);
         const max_kv: u32 = if (is_global) 0 else sliding.span;
-        var kv_view = try ctx.cache.update(layer, k_rope, v_scaled, self.s, max_kv);
+        const fp8_qkv = mlx.mlx_array_dtype(fa.q_w) == .uint8;
+        const prepped: ?DenseKVView = if (fp8_qkv and batch == 1 and seq_len <= MIMO_VERIFY_ROWS_MAX and hd == 192 and vhd == 128)
+            try self.mimoDecodePrep(ctx, proj, is_global, rope_dims, rope_base, offset, seq_len, h_count, kv_h, layer, max_kv, &q_rope)
+        else
+            null;
+        var kv_view = prepped orelse blk: {
+            var q_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_r);
+            try mlx.check(mlx.mlx_reshape(&q_r, proj[0], &q_shape, 4, self.s));
+            var q_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_t);
+            try mlx.check(mlx.mlx_transpose_axes(&q_t, q_r, &perm, 4, self.s));
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
+
+            var k_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_r);
+            try mlx.check(mlx.mlx_reshape(&k_r, proj[1], &k_shape, 4, self.s));
+            var k_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_t);
+            try mlx.check(mlx.mlx_transpose_axes(&k_t, k_r, &perm, 4, self.s));
+            var k_rope = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_rope);
+            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, .{ .ctx = null }, self.s));
+
+            var v_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_r);
+            try mlx.check(mlx.mlx_reshape(&v_r, proj[2], &v_shape, 4, self.s));
+            var v_t = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+            var v_scaled = v_t;
+            var v_scale: mlx.mlx_array = .{ .ctx = null };
+            const value_scale: f32 = if (fp8_qkv) 1.0 else cfg.attention_value_scale;
+            if (value_scale != 1.0) {
+                v_scale = try scalarOf(value_scale, mlx.mlx_array_dtype(v_t), self.s);
+                var scaled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&scaled, v_t, v_scale, self.s));
+                _ = mlx.mlx_array_free(v_t);
+                v_scaled = scaled;
+            }
+            defer {
+                _ = mlx.mlx_array_free(v_scaled);
+                if (v_scale.ctx != null) _ = mlx.mlx_array_free(v_scale);
+            }
+            break :blk try ctx.cache.update(layer, k_rope, v_scaled, self.s, max_kv);
+        };
         defer kv_view.deinit();
 
         var attn_out = mlx.mlx_array_new();
@@ -35863,6 +36102,224 @@ pub fn fusedQkNormRope(
         log.info("[attn] fused QK-norm+RoPE engaged: hq={d} hk={d} rd={d} scaled={}\n", .{ hq, hk, rd, ms != null });
     }
     return .{ oq, ok };
+}
+
+// ── MiMo decode QKV prep: partial rope of Q and K + kv8 quantize of K and V, one dispatch ──
+//
+// One dispatch per layer and forward does the work of two partial ropes (each a whole-input copy
+// plus the rotation) and two `affine_quantize` dispatches. The rotation mirrors `rope_single_impl`
+// against the `ropeAngleRow` probe's floats; each 64-wide group is one simdgroup running
+// `affine_quantize<T, 64, 8>` line for line. Bit-identical to the composed ops.
+const MIMO_QKV_PREP_HEADER =
+    \\template <typename T, int RD>
+    \\inline T sushi_rope_elem(const device T* src, uint j, const device float* angles) {
+    \\    constexpr uint half_rd = uint(RD) / 2;
+    \\    if (j < half_rd) {
+    \\        float x1 = float(src[j]);
+    \\        float x2 = float(src[j + half_rd]);
+    \\        return static_cast<T>(x1 * angles[j] - x2 * angles[half_rd + j]);
+    \\    } else if (j < uint(RD)) {
+    \\        uint p = j - half_rd;
+    \\        float x1 = float(src[p]);
+    \\        float x2 = float(src[j]);
+    \\        return static_cast<T>(x1 * angles[j] + x2 * angles[p]);
+    \\    }
+    \\    return src[j];
+    \\}
+    \\template <typename T>
+    \\inline void sushi_q8_group(thread float* w, uint lane, device uint8_t* out, device T* scale_out, device T* bias_out) {
+    \\    constexpr float eps = 1e-7;
+    \\    constexpr float n_bins = 255;
+    \\    float w_min = Limits<T>::max;
+    \\    float w_max = 0;
+    \\    for (int i = 0; i < 2; i++) {
+    \\        w_min = min(w_min, w[i]);
+    \\        w_max = max(w_max, w[i]);
+    \\    }
+    \\    w_min = simd_min(w_min);
+    \\    w_max = simd_max(w_max);
+    \\    float scale = max((w_max - w_min) / n_bins, eps);
+    \\    bool side = abs(w_min) > abs(w_max);
+    \\    scale = side ? scale : -scale;
+    \\    float edge = side ? w_min : w_max;
+    \\    float q0 = round(edge / scale);
+    \\    bool at_zero = q0 == 0.0f;
+    \\    scale = at_zero ? scale : edge / q0;
+    \\    float bias = at_zero ? 0 : edge;
+    \\    if (lane == 0) {
+    \\        *scale_out = static_cast<T>(scale);
+    \\        *bias_out = static_cast<T>(bias);
+    \\    }
+    \\    for (int i = 0; i < 2; i++) {
+    \\        uint8_t val = min(round((w[i] - bias) / scale), n_bins);
+    \\        out[i] = val;
+    \\    }
+    \\}
+;
+
+const MIMO_QKV_PREP_SOURCE =
+    \\constexpr uint HD = 192;
+    \\constexpr uint VD = 128;
+    \\constexpr uint QG = uint(HQ) * (HD / 64);
+    \\constexpr uint KG = uint(HK) * (HD / 64);
+    \\uint g = threadgroup_position_in_grid.x;
+    \\uint r = threadgroup_position_in_grid.y;
+    \\uint lane = thread_position_in_threadgroup.x;
+    \\const device float* row_angles = angles + r * uint(RD);
+    \\if (g < QG) {
+    \\    uint head = g / (HD / 64);
+    \\    uint j = (g % (HD / 64)) * 64 + lane * 2;
+    \\    for (uint i = 0; i < 2; ++i) {
+    \\        oq[(head * NR + r) * HD + j + i] = sushi_rope_elem<T, RD>(q + (r * uint(HQ) + head) * HD, j + i, row_angles);
+    \\    }
+    \\    return;
+    \\}
+    \\float w[2];
+    \\device uint8_t* qout;
+    \\device T* sc;
+    \\device T* bi;
+    \\if (g < QG + KG) {
+    \\    uint kg = g - QG;
+    \\    uint head = kg / (HD / 64);
+    \\    uint j = (kg % (HD / 64)) * 64 + lane * 2;
+    \\    for (uint i = 0; i < 2; ++i) {
+    \\        w[i] = float(sushi_rope_elem<T, RD>(k + (r * uint(HK) + head) * HD, j + i, row_angles));
+    \\    }
+    \\    uint slot = (head * NR + r) * (HD / 64) + kg % (HD / 64);
+    \\    qout = (device uint8_t*)kq + (head * NR + r) * HD + j;
+    \\    sc = ks + slot;
+    \\    bi = kb + slot;
+    \\} else {
+    \\    uint vg = g - QG - KG;
+    \\    uint head = vg / (VD / 64);
+    \\    uint j = (vg % (VD / 64)) * 64 + lane * 2;
+    \\    for (uint i = 0; i < 2; ++i) {
+    \\        w[i] = float(v[(r * uint(HK) + head) * VD + j + i]);
+    \\    }
+    \\    uint slot = (head * NR + r) * (VD / 64) + vg % (VD / 64);
+    \\    qout = (device uint8_t*)vq + (head * NR + r) * VD + j;
+    \\    sc = vs + slot;
+    \\    bi = vb + slot;
+    \\}
+    \\sushi_q8_group<T>(w, lane, qout, sc, bi);
+;
+
+var mimo_qkv_prep_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var mimo_qkv_prep_engaged: bool = false;
+const MimoQkvPrepKey = struct { hq: c_int, hk: c_int, rd: c_int, rows: c_int };
+/// Two layer geometries (global, sliding) at every verify width.
+var mimo_qkv_prep_cfgs: [2 * MIMO_VERIFY_ROWS_MAX]?struct { key: MimoQkvPrepKey, cfg: mlx.mlx_fast_metal_kernel_config } = @splat(null);
+/// Test and fwd-meter seam: false keeps the composed rope + quantize.
+pub var mimo_qkv_prep_override: ?bool = null;
+
+pub const MimoQkvPrep = struct {
+    q: mlx.mlx_array, // [1, HQ, rows, 192], roped
+    k: kv_quant.QuantizedKV, // roped K, affine-8 g64, [1, HK, rows, *]
+    v: kv_quant.QuantizedKV,
+
+    pub fn deinit(self: *MimoQkvPrep) void {
+        _ = mlx.mlx_array_free(self.q);
+        self.k.deinit();
+        self.v.deinit();
+    }
+};
+
+fn mimoQkvPrepConfig(key: MimoQkvPrepKey, dt: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_config {
+    for (&mimo_qkv_prep_cfgs) |*slot| {
+        if (slot.*) |c| {
+            if (std.meta.eql(c.key, key)) return c.cfg;
+        } else {
+            const config = mlx.mlx_fast_metal_kernel_config_new();
+            errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+            const hq = key.hq;
+            const hk = key.hk;
+            const rows = key.rows;
+            const shapes = [_][4]c_int{
+                .{ 1, hq, rows, 192 },
+                .{ 1, hk, rows, 48 },
+                .{ 1, hk, rows, 3 },
+                .{ 1, hk, rows, 3 },
+                .{ 1, hk, rows, 32 },
+                .{ 1, hk, rows, 2 },
+                .{ 1, hk, rows, 2 },
+            };
+            const dtypes = [_]mlx.mlx_dtype{ dt, .uint32, dt, dt, .uint32, dt, dt };
+            for (shapes, dtypes) |sh, odt| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &sh, 4, odt));
+            const groups = hq * 3 + hk * 3 + hk * 2;
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, groups * 32, rows, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HQ", hq));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HK", hk));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RD", key.rd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NR", rows));
+            slot.* = .{ .key = key, .cfg = config };
+            return config;
+        }
+    }
+    return error.MimoQkvPrepConfigsFull;
+}
+
+/// Up to `MIMO_VERIFY_ROWS_MAX` rows of a MiMo layer's Q/K/V on a kv8 (g64) cache: `q_flat`
+/// [1,R,HQ*192], `k_flat` [1,R,HK*192], `v_flat` [1,R,HK*128] (already value-scaled), `angles`
+/// the [R, rd] `ropeAngleRows` from the first row's position. Null = geometry the kernel does
+/// not cover.
+pub fn mimoDecodeQkvPrep(
+    s: mlx.mlx_stream,
+    q_flat: mlx.mlx_array,
+    k_flat: mlx.mlx_array,
+    v_flat: mlx.mlx_array,
+    angles: mlx.mlx_array,
+    hq: c_int,
+    hk: c_int,
+    rd: c_int,
+    rows: c_int,
+) !?MimoQkvPrep {
+    const dt = mlx.mlx_array_dtype(q_flat);
+    if (dt != .bfloat16 or mlx.mlx_array_dtype(k_flat) != .bfloat16 or mlx.mlx_array_dtype(v_flat) != .bfloat16) return null;
+    if (rd != 64 or rows < 1 or rows > MIMO_VERIFY_ROWS_MAX) return null;
+    if (mlx.mlx_array_size(q_flat) != @as(usize, @intCast(rows * hq * 192)) or
+        mlx.mlx_array_size(k_flat) != @as(usize, @intCast(rows * hk * 192)) or
+        mlx.mlx_array_size(v_flat) != @as(usize, @intCast(rows * hk * 128))) return null;
+
+    const config = mimoQkvPrepConfig(.{ .hq = hq, .hk = hk, .rd = rd, .rows = rows }, dt) catch |err| {
+        if (err == error.MimoQkvPrepConfigsFull) return null;
+        return err;
+    };
+    const kernel = mimo_qkv_prep_kernel orelse blk: {
+        const input_names = [_][*:0]const u8{ "q", "k", "v", "angles" };
+        const output_names = [_][*:0]const u8{ "oq", "kq", "ks", "kb", "vq", "vs", "vb" };
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kn = mlx.mlx_fast_metal_kernel_new("sushi_mimo_qkv_prep", in_vec, out_vec, MIMO_QKV_PREP_SOURCE, MIMO_QKV_PREP_HEADER, true, false);
+        if (kn.ctx == null) return error.MetalKernelCompileFailed;
+        mimo_qkv_prep_kernel = kn;
+        break :blk kn;
+    };
+
+    const inputs_arr = [_]mlx.mlx_array{ q_flat, k_flat, v_flat, angles };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 7) return error.MetalKernelBadOutputCount;
+    var outs: [7]mlx.mlx_array = undefined;
+    for (&outs, 0..) |*o, i| {
+        o.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(o, outputs_vec, i));
+    }
+    if (!mimo_qkv_prep_engaged) {
+        mimo_qkv_prep_engaged = true;
+        log.info("[attn] MiMo decode QKV prep engaged: hq={d} hk={d} rd={d} rows={d} (partial rope + kv8 quantize, one dispatch)\n", .{ hq, hk, rd, rows });
+    }
+    return .{
+        .q = outs[0],
+        .k = .{ .q = outs[1], .scales = outs[2], .biases = outs[3] },
+        .v = .{ .q = outs[4], .scales = outs[5], .biases = outs[6] },
+    };
 }
 
 /// Extract the exact cos|sin row the stock RoPE kernel computes at `offset`:
@@ -44793,6 +45250,85 @@ fn qkvSinks(s: mlx.mlx_stream, heads: c_int) !mlx.mlx_array {
     return out;
 }
 
+/// One dispatch for a verify's sliding rows against the per-row sdpa it replaces, on the served
+/// head geometry and a ring cache.
+fn mimoSlidingRowsCase(config: KVQuantConfig, prefix: c_int, width: c_int, gain: f32) !void {
+    const s = mlx.gpuStream();
+    const window: c_int = 128;
+    const hq: c_int = 64;
+    const hkv: c_int = 8;
+    const scale: f32 = 1.0 / @sqrt(192.0);
+    var cache = try KVCache.initWithConfig(testing.allocator, 1, config);
+    defer cache.deinit();
+    cache.setSwaRing(@intCast(window));
+    const g = bf16Scalar(gain, s);
+    defer _ = mlx.mlx_array_free(g);
+    var arrays: [3]mlx.mlx_array = @splat(.{});
+    defer for (arrays) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&arrays, [_]c_int{ hkv, hkv, hq }, [_]c_int{ prefix + width, prefix + width, width }, [_]c_int{ 192, 128, 192 }, [_]f32{ 0.7, 2.1, 1.9 }) |*out, heads, rows, dim, seed| {
+        const raw = try qkvIdentityArray(s, heads, rows, dim, seed, .bfloat16);
+        defer _ = mlx.mlx_array_free(raw);
+        out.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(out, raw, g, s));
+    }
+    const sinks = try qkvSinks(s, hq);
+    defer _ = mlx.mlx_array_free(sinks);
+    const mask = try slidingDecodeMask(s, window, window);
+    defer _ = mlx.mlx_array_free(mask);
+    {
+        const kp = try sliceAttentionSeq(s, arrays[0], 0, prefix);
+        defer _ = mlx.mlx_array_free(kp);
+        const vp = try sliceAttentionSeq(s, arrays[1], 0, prefix);
+        defer _ = mlx.mlx_array_free(vp);
+        var view = try cache.update(0, kp, vp, s, slidingTailSpan(@intCast(window), @intCast(prefix), SLIDING_TRIM_UNBOUNDED));
+        view.deinit();
+    }
+    const kw = try sliceAttentionSeq(s, arrays[0], prefix, prefix + width);
+    defer _ = mlx.mlx_array_free(kw);
+    const vw = try sliceAttentionSeq(s, arrays[1], prefix, prefix + width);
+    defer _ = mlx.mlx_array_free(vw);
+    var view = try cache.update(0, kw, vw, s, slidingTailSpan(@intCast(window), @intCast(width), SLIDING_TRIM_UNBOUNDED));
+    defer view.deinit();
+    const one = (try mimoSlidingRowsAttn(s, window, arrays[2], &view, sinks, prefix, width, scale, mask)) orelse return error.SlidingRowsDeclined;
+    defer _ = mlx.mlx_array_free(one);
+    const per_row = try mimoVerifyRowsAttnPerRow(s, window, arrays[2], &view, sinks, false, prefix, width, scale, mask);
+    defer _ = mlx.mlx_array_free(per_row);
+    qkvExpectBitsEqual(s, one, per_row) catch |err| {
+        std.debug.print("mimo sliding rows: prefix={d} width={d} gain={d} kv={s}\n", .{ prefix, width, gain, @tagName(config.scheme) });
+        return err;
+    };
+}
+
+test "mimo sliding verify rows run in one dispatch, each row bit-identical to its own sdpa" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
+        for ([_]c_int{ 128, 129, 700 }) |prefix| {
+            for ([_]c_int{ 2, 3, 4 }) |width| {
+                for ([_]f32{ 0.05, 1.0, 6.0 }) |gain| try mimoSlidingRowsCase(config, prefix, width, gain);
+            }
+        }
+    }
+}
+
+test "mimo sliding verify rows keep the per-row path while a row still sees the whole history" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const q = try qkvIdentityArray(s, 64, 3, 192, 0.3, .bfloat16);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try qkvIdentityArray(s, 8, 130, 192, 0.5, .bfloat16);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try qkvIdentityArray(s, 8, 130, 128, 0.9, .bfloat16);
+    defer _ = mlx.mlx_array_free(v);
+    const sinks = try qkvSinks(s, 64);
+    defer _ = mlx.mlx_array_free(sinks);
+    const mask = try slidingDecodeMask(s, 128, 128);
+    defer _ = mlx.mlx_array_free(mask);
+    const view: DenseKVView = .{ .k = k, .v = v, .owned = false };
+    try testing.expect((try mimoSlidingRowsAttn(s, 128, q, &view, sinks, 127, 3, 0.07, mask)) == null);
+}
+
 test "mimo verify rows attend with each serial decode tick's arithmetic (dense, kv8, window edge, ring, packed global)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
@@ -45661,7 +46197,7 @@ test "two-chunk prefill capture drops the chunk parent after the boundary eval" 
         try mlx.check(mlx.mlx_array_eval(parent));
         var view = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_slice(&view, parent, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, keep, dim }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-        try capturePrefillHidden(s, kept[chunk], view);
+        try capturePrefillHidden(s, kept[chunk], view, true);
         var dummy = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dummy);
         try mlx.check(mlx.mlx_zeros(&dummy, &[_]c_int{1}, 1, .float16, s));
@@ -71728,6 +72264,109 @@ test "mimo v2 fused qkv split keeps asymmetric value rows" {
     try testing.expectEqualSlices(c_int, &[_]c_int{ @intCast(v_rows), @intCast(in_dim) }, mlx.getShape(parts[2]));
 }
 
+fn testExpectSameBits(want: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
+    const n = mlx.mlx_array_size(want);
+    const a = try testing.allocator.alloc(u32, n);
+    defer testing.allocator.free(a);
+    const b = try testing.allocator.alloc(u32, n);
+    defer testing.allocator.free(b);
+    for ([_]mlx.mlx_array{ want, got }, [_][]u32{ a, b }) |arr, out| {
+        if (mlx.mlx_array_dtype(arr) == .uint32) {
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            _ = mlx.mlx_vector_array_append_value(ev, arr);
+            try mlx.check(mlx.mlx_eval(ev));
+            const data = mlx.mlx_array_data_uint32(arr) orelse return error.TestUnexpectedNullData;
+            @memcpy(out, data[0..n]);
+        } else {
+            // bf16 -> f32 is exact; comparing the f32 bits also tells -0 from +0.
+            try testReadF32(arr, @ptrCast(out), s);
+        }
+    }
+    try testing.expectEqualSlices(u32, a, b);
+}
+
+test "mimo decode qkv prep: bit-identical to partial rope + kv8 quantize at every verify width" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4D69);
+    const rnd = prng.random();
+    const hq: c_int = 64;
+    const rd: c_int = 64;
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    // Global (base 1e7, 4 KV heads) and sliding (base 1e4, 8 KV heads) layers.
+    const layers = [_]struct { hk: c_int, base: f32 }{ .{ .hk = 4, .base = 1.0e7 }, .{ .hk = 8, .base = 1.0e4 } };
+    // Heads span tiny to large activations with outliers; one K group is constant and one
+    // V group is zero, the quantizer's eps and at-zero corners.
+    const head_scales = [_]f32{ 0.02, 0.5, 3.0, 40.0, 300.0 };
+    for (layers) |layer| for (1..@as(usize, MIMO_VERIFY_ROWS_MAX) + 1) |rows_u| {
+        const rows: c_int = @intCast(rows_u);
+        for ([_]c_int{ 0, 1, 4095, 65537, 500000 }) |offset| {
+            var parts: [3]mlx.mlx_array = undefined;
+            const widths = [_]c_int{ hq * 192, layer.hk * 192, layer.hk * 128 };
+            for (&parts, widths, 0..) |*p, w, which| {
+                const buf = try allocator.alloc(f32, @intCast(w * rows));
+                defer allocator.free(buf);
+                const head_w: usize = if (which == 2) 128 else 192;
+                for (buf, 0..) |*v, i| {
+                    const sc = head_scales[(i / head_w) % head_scales.len];
+                    const outlier: f32 = if (rnd.uintLessThan(u32, 97) == 0) 20.0 else 1.0;
+                    v.* = rnd.floatNorm(f32) * sc * outlier;
+                }
+                if (which == 1) @memset(buf[192 + 64 .. 192 + 128], 7.25);
+                if (which == 2) @memset(buf[64..128], 0.0);
+                const raw = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, rows, w }, 3, .float32);
+                defer _ = mlx.mlx_array_free(raw);
+                p.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(p, raw, .bfloat16, s));
+            }
+            defer for (parts) |p| {
+                _ = mlx.mlx_array_free(p);
+            };
+            const base = mlx.mlx_optional_float{ .value = layer.base, .has_value = true };
+
+            var want: [3]mlx.mlx_array = undefined;
+            for (&want, [_]c_int{ hq, layer.hk, layer.hk }, [_]c_int{ 192, 192, 128 }, 0..) |*o, heads, hd, i| {
+                var r = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(r);
+                try mlx.check(mlx.mlx_reshape(&r, parts[i], &[_]c_int{ 1, rows, heads, hd }, 4, s));
+                var t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(t);
+                try mlx.check(mlx.mlx_transpose_axes(&t, r, &perm, 4, s));
+                o.* = mlx.mlx_array_new();
+                if (i == 2) {
+                    try mlx.check(mlx.mlx_array_set(o, t));
+                } else {
+                    try mlx.check(mlx.mlx_fast_rope(o, t, rd, false, base, 1.0, offset, .{ .ctx = null }, s));
+                }
+            }
+            defer for (want) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            var want_k = try kv_quant.quantizeAffine(s, want[1], 64, 8);
+            defer want_k.deinit();
+            var want_v = try kv_quant.quantizeAffine(s, want[2], 64, 8);
+            defer want_v.deinit();
+
+            const angles = try ropeAngleRows(s, rd, base, .{ .ctx = null }, offset, rows, allocator, 1.0);
+            defer _ = mlx.mlx_array_free(angles);
+            var got = (try mimoDecodeQkvPrep(s, parts[0], parts[1], parts[2], angles, hq, layer.hk, rd, rows)) orelse return error.TestExpectedKernel;
+            defer got.deinit();
+
+            try testExpectSameBits(want[0], got.q, s);
+            try testExpectSameBits(want_k.q, got.k.q, s);
+            try testExpectSameBits(want_k.scales, got.k.scales, s);
+            try testExpectSameBits(want_k.biases, got.k.biases, s);
+            try testExpectSameBits(want_v.q, got.v.q, s);
+            try testExpectSameBits(want_v.scales, got.v.scales, s);
+            try testExpectSameBits(want_v.biases, got.v.biases, s);
+        }
+    };
+}
+
 fn mimoFixtureMaxAbs(a: []const f32, b: []const f32) !f32 {
     if (a.len != b.len) return error.FixtureShapeMismatch;
     var max_err: f32 = 0;
@@ -72118,6 +72757,29 @@ test "QSA checkpoint copy failure preserves the destination pooled bank" {
     try testing.expect(mlx.fault.didFire());
     try testing.expectEqual(original, dst.layers[0].qsa_pooled.ctx);
     try testing.expectEqualSlices(c_int, &shape, mlx.getShape(dst.layers[0].qsa_pooled));
+}
+
+test "hidden capture: a verify's stays lazy for its one dispatch, a prefill chunk's is settled" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 1, -2, 3, -4, 5, -6 };
+    const shape = [_]c_int{ 1, 3, 2 };
+    const base = mlx.mlx_array_new_data(&data, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    for ([_]bool{ false, true }) |settle| for ([_]bool{ false, true }) |last| {
+        var src = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(src);
+        try mlx.check(mlx.mlx_add(&src, base, base, s));
+        var dest = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dest);
+        if (last) try capturePrefillHiddenLast(s, &dest, src, settle) else try capturePrefillHidden(s, &dest, src, settle);
+        var available = false;
+        try mlx.check(mlx._mlx_array_is_available(&available, dest));
+        try testing.expectEqual(settle, available);
+        const got = try qwen4ReadF32(testing.allocator, dest, s);
+        defer testing.allocator.free(got);
+        const want: []const f32 = if (last) &.{ 10, -12 } else &.{ 2, -4, 6, -8, 10, -12 };
+        try testing.expectEqualSlices(f32, want, got);
+    };
 }
 
 test "upstream bugfix: KVCache affine quant keeps its dtype through growth" {

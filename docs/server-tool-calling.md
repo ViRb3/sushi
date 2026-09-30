@@ -105,6 +105,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   path (`.hold_thinking` + `unstreamedReasoning`, never a resend); the think gate scans with a CURSOR (`ThinkScan`).
 - Thinking-off is enforced in the PROMPT; generated reasoning is ALWAYS delivered (every site splits via
   `splitThinkBlock(text, true, …)`).
+- **A thought is decided at its first byte when no opener can start it** (`chat.thinkOpenerPossible`: every opener
+  starts with `<` or is a Muse `assistant` / `to=` header); otherwise the three stream sites wait for 7 bytes. On the
+  surface budget path (`armThinkBound` declined) the budget then counts from that earlier consumption.
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
   a close tag still arriving wait (`chat.settledReasoning` on the tools path, `chat.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
