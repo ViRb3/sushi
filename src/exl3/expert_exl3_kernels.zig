@@ -2526,6 +2526,23 @@ const REDUCE_SOURCE: [:0]const u8 =
     \\}
 ;
 
+const REDUCE_SHARED_SOURCE: [:0]const u8 = blk: {
+    const stores =
+        \\  y[yb + lane] = T(a0);
+        \\  y[yb + lane + 32u] = T(a1);
+        \\  y[yb + lane + 64u] = T(a2);
+        \\  y[yb + lane + 96u] = T(a3);
+    ;
+    const at = std.mem.indexOf(u8, REDUCE_SOURCE, stores).?;
+    // Preserve the separate routed store's rounding before the shared addition.
+    break :blk REDUCE_SOURCE[0..at] ++
+        \\  y[yb + lane] = T(float(T(a0)) + float(shared[yb + lane]));
+        \\  y[yb + lane + 32u] = T(float(T(a1)) + float(shared[yb + lane + 32u]));
+        \\  y[yb + lane + 64u] = T(float(T(a2)) + float(shared[yb + lane + 64u]));
+        \\  y[yb + lane + 96u] = T(float(T(a3)) + float(shared[yb + lane + 96u]));
+    ++ REDUCE_SOURCE[at + stores.len ..];
+};
+
 const FunnelArm = enum { pair, fused_mid_down, prepared_down, nax, simdmat };
 var funnel_engaged: [5]bool = @splat(false);
 
@@ -2539,6 +2556,7 @@ var pair_gemv_kernel: KernelSlots = no_kernels;
 var pair_gemv_grouped_kernel: KernelSlots = no_kernels;
 var mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var reduce_shared_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var down_fused_kernel: KernelSlots = no_kernels;
 
 fn getNamedKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -2652,6 +2670,10 @@ fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: 
 pub const REDUCE_MAX_TOPK: c_int = 32;
 
 pub fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    return downFinishReduceWithShared(s, inner, svh, slots, scores, out_dim, rows, topk, out_dtype, null);
+}
+
+fn downFinishReduceWithShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array) !mlx.mlx_array {
     if (topk < 1 or topk > REDUCE_MAX_TOPK) return error.Exl3TopkUnsupported;
     const key = DecodeReduceKey{ .out_dim = out_dim, .rows = rows, .topk = topk, .dtype = out_dtype };
     const cfg = reduce_cfgs.get(key) orelse blk: {
@@ -2671,13 +2693,23 @@ pub fn downFinishReduce(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_ar
     };
     const ins = [_][*:0]const u8{ "inner", "svh", "slots", "sc" };
     const outs = [_][*:0]const u8{"y"};
-    const kernel = try getNamedKernel(&reduce_kernel, "sushi_exl3_down_reduce", &ins, &outs, REDUCE_SOURCE, "");
-    const ov = try applyOuts(s, kernel, &.{ inner, svh, slots, scores }, cfg, 1);
+    const ov = if (shared) |value| blk: {
+        const shared_ins = ins ++ [_][*:0]const u8{"shared"};
+        const kernel = try getNamedKernel(&reduce_shared_kernel, "sushi_exl3_down_reduce_shared", &shared_ins, &outs, REDUCE_SHARED_SOURCE, "");
+        break :blk try applyOuts(s, kernel, &.{ inner, svh, slots, scores, value }, cfg, 1);
+    } else blk: {
+        const kernel = try getNamedKernel(&reduce_kernel, "sushi_exl3_down_reduce", &ins, &outs, REDUCE_SOURCE, "");
+        break :blk try applyOuts(s, kernel, &.{ inner, svh, slots, scores }, cfg, 1);
+    };
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
     return a;
+}
+
+pub fn downFinishReduceShared(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, out_dim: c_int, rows: c_int, topk: c_int, out_dtype: mlx.mlx_dtype, shared: mlx.mlx_array) !mlx.mlx_array {
+    return downFinishReduceWithShared(s, inner, svh, slots, scores, out_dim, rows, topk, out_dtype, shared);
 }
 
 fn prepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suh: mlx.mlx_array, slots: mlx.mlx_array, order: mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !mlx.mlx_array {
@@ -2801,6 +2833,26 @@ pub fn moeSwigluFused(
     scores: mlx.mlx_array,
     out_dtype: mlx.mlx_dtype,
 ) !mlx.mlx_array {
+    return moeSwigluFusedWithShared(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, out_dtype, null);
+}
+
+pub fn moeSwigluFusedWithShared(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    out_dtype: mlx.mlx_dtype,
+    shared: ?mlx.mlx_array,
+) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const ssh = mlx.getShape(slots);
     const tsh = mlx.getShape(gate_t);
@@ -2843,7 +2895,7 @@ pub fn moeSwigluFused(
         try dumpAbsMax(s, down_inner, "down_inner");
         swiglu_maxabs_dumped += 1;
     }
-    const out = try downFinishReduce(s, down_inner, down_svh, slots, scores, hidden, rows, topk, out_dtype);
+    const out = try downFinishReduceWithShared(s, down_inner, down_svh, slots, scores, hidden, rows, topk, out_dtype, shared);
     errdefer _ = mlx.mlx_array_free(out);
     try ubenchEval(out, "reduce");
     if (applyUbenchOn()) {
@@ -9062,5 +9114,52 @@ test "exl3 NAX GEMM body writes the reference body's bytes at MiMo and Flash-Nex
             try naxBodyBytesMatch(rate, dec, 2560, 640, 74 + rate.n);
             try naxBodyBytesMatch(rate, dec, 640, 2560, 75 + rate.n);
         }
+    }
+}
+
+test "exl3 shared reduction preserves the routed output rounding before addition" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(1701);
+    const rnd = prng.random();
+    var ih: [10 * 256]u16 = undefined;
+    var vh: [4 * 256]u16 = undefined;
+    var sh: [256]f32 = undefined;
+    for (&ih) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 3);
+    for (&vh) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 2);
+    for (&sh) |*v| v.* = (rnd.float(f32) * 2 - 1) * 4;
+    const inner = mlx.mlx_array_new_data(&ih, &.{ 10, 256 }, 2, .float16);
+    defer _ = mlx.mlx_array_free(inner);
+    const svh = mlx.mlx_array_new_data(&vh, &.{ 4, 256 }, 2, .float16);
+    defer _ = mlx.mlx_array_free(svh);
+    const slots = mlx.mlx_array_new_data(&[_]u32{ 0, 1, 2, 3, 0, 2, 1, 3, 0, 2 }, &.{10}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(slots);
+    const scores = mlx.mlx_array_new_data(&[_]f32{ 0.03, 0.08, 0.15, 0.2, 0.02, 0.01, 0.09, 0.17, 0.11, 0.14 }, &.{10}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const shared_f32 = mlx.mlx_array_new_data(&sh, &.{256}, 1, .float32);
+    defer _ = mlx.mlx_array_free(shared_f32);
+    inline for ([_]mlx.mlx_dtype{ .bfloat16, .float16, .float32 }) |dtype| {
+        var shared = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(shared);
+        try mlx.check(mlx.mlx_astype(&shared, shared_f32, dtype, s));
+        const routed = try downFinishReduce(s, inner, svh, slots, scores, 256, 1, 10, dtype);
+        defer _ = mlx.mlx_array_free(routed);
+        var expected = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(expected);
+        try mlx.check(mlx.mlx_add(&expected, routed, shared, s));
+        const got = try downFinishReduceShared(s, inner, svh, slots, scores, 256, 1, 10, dtype, shared);
+        defer _ = mlx.mlx_array_free(got);
+        var ef = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ef);
+        var gf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gf);
+        try mlx.check(mlx.mlx_astype(&ef, expected, .float32, s));
+        try mlx.check(mlx.mlx_astype(&gf, got, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(ef));
+        try mlx.check(mlx.mlx_array_eval(gf));
+        const ep = mlx.mlx_array_data_float32(ef).?;
+        const gp = mlx.mlx_array_data_float32(gf).?;
+        try t.expectEqualSlices(u8, std.mem.sliceAsBytes(ep[0..256]), std.mem.sliceAsBytes(gp[0..256]));
     }
 }

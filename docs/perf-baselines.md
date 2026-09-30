@@ -52,6 +52,43 @@ so real ceilings are ~10% lower.
   trims in the MUL1 decode, more split-K, `MLX_MAX_OPS_PER_BUFFER`, `MLX_METAL_FAST_SYNCH`. Decode loads (630 GB/s
   alone) and decode ALU do not overlap.
 
+## M1 Max: Sushi-2bpw streamed decode GPU attribution
+
+2026-09-30, base `677722d`, ReleaseFast, EXL3 MCG n32/window15, 512 experts/top-10, SSD budget 20 GB,
+wired margin 5 GiB, ctx 8192, kv8. M1/G13 uses the SIMD decode kernels, without NAX.
+
+A temporary fixed-expert replay removed host routing reads and SSD fills. Block stand-ins estimated MoE at
+~13 ms, GDN at ~9 ms, HC at ~5 ms and full attention at ~3 ms per token. These are graph ablations, not additive
+kernel timestamps. The per-block forward profiler synchronizes between blocks and distorts the decode chain.
+
+The shared-add finish reduction preserved bf16, f16 and f32 output bits. A same-process replay meter reset KV/SSM
+before every arm and alternated A/B four times, 80 forwards per arm:
+
+| GPU evaluation, ms/forward | A: separate add | B: folded shared add |
+|---|---:|---:|
+| pair 1 | 31.668 | 31.377 |
+| pair 2 | 31.696 | 31.405 |
+| pair 3 | 31.711 | 31.371 |
+| pair 4 | 31.658 | 31.444 |
+| mean | 31.683 | 31.399 |
+
+The cut is 0.284 ms (0.90% of GPU evaluation); graph construction was 2.753 vs 2.776 ms. The meter used the real
+model with replayed expert IDs; it is attribution, not a generation-quality test. A compiler started during the
+last arm, but all four pairs improved. Subsequent measurements require builds to take the box lock too.
+
+Normal greedy boot arms (warm-up plus three 300-token requests per arm, same hash-map/C prompt):
+
+| arm | tok/s, three requests |
+|---|---|
+| A1 | 17.450, 17.417, 17.501 |
+| B1 | 18.019, 18.034, 18.015 |
+| A2 | 17.990, 18.022, 17.393 |
+| B2 | 15.802, 15.805, 15.683 |
+
+All 12 responses were byte-identical. These boots show substantial box drift; they do not establish a live tok/s
+win. The controlled GPU ablation establishes the small kernel gain. One-row GDN verify-fold reuse and narrower
+EXL3 lane funnels were also tried and discarded without a measured win.
+
 ## Flash-Next K3, serial (no MTP)
 
 llmprobe `--bench-only --full`, ctx 65536, KV unquantized, MTP verified off (1.01 tok/step), one server at a time.

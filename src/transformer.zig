@@ -31494,20 +31494,23 @@ pub const Transformer = struct {
     /// MoE MLP with separate router and expert inputs.
     /// router_x: input for routing (raw hidden states).
     /// expert_x: input for expert computation (possibly normalized).
-    fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool) !mlx.mlx_array {
+    fn moeExl3(self: *Transformer, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, inds: mlx.mlx_array, scores: mlx.mlx_array, verify_rows: bool, shared: ?mlx.mlx_array) !mlx.mlx_array {
         if (verify_rows) mtp_verify_expert_rows_calls +%= 1;
         if (mw.exl3_group_count > 0) return sushi_exl3.moeGroups(self.s, expert_x, mw.exl3_groups[0..mw.exl3_group_count], inds, scores, .{
             .codebook = self.config.expert_quant_codebook,
             .window = self.config.expert_quant_window,
         }, verify_rows);
-        return sushi_exl3.moe(self.s, expert_x, .{
+        const bank = sushi_exl3.Bank{
             .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
             .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
             .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
-        }, inds, scores, .{
+        };
+        const dec = sushi_exl3.format.Decode{
             .codebook = self.config.expert_quant_codebook,
             .window = self.config.expert_quant_window,
-        }, verify_rows);
+        };
+        if (shared) |value| return sushi_exl3.moeWithShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value);
+        return sushi_exl3.moe(self.s, expert_x, bank, inds, scores, dec, verify_rows);
     }
 
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x_in: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
@@ -31647,10 +31650,13 @@ pub const Transformer = struct {
             moeDumpTensor(self.s, "w", moe_dump_layer, norm_scores);
         }
         if (cfg.expert_layout == .exl3_k4) {
-            const y = try self.moeExl3(expert_x, mw, inds, norm_scores, skip_shared and router_override != null);
+            const shared = if (routing_override) |given| given.shared_gated else null;
+            const fold_shared = shared != null and mw.exl3_group_count == 0 and moeDumpDir() == null;
+            const y = try self.moeExl3(expert_x, mw, inds, norm_scores, skip_shared and router_override != null, if (fold_shared) shared else null);
             if (moeDumpDir() != null) {
                 moeDumpTensor(self.s, "y", moe_dump_layer, y);
             }
+            if (fold_shared) return y;
             if (routing_override) |given| if (given.shared_gated) |shared_gated| {
                 defer _ = mlx.mlx_array_free(y);
                 var summed = mlx.mlx_array_new();

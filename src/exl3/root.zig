@@ -18,10 +18,24 @@ pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 /// returned in x's shape and dtype. Up to `kernels.DECODE_ROWS_MAX` rows (or any
 /// verify rows) take the decode chain, wider the prefill GEMM.
 pub fn moe(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool) !mlx.mlx_array {
-    return moeOutput(s, x, bank, inds, scores, dec, verify_rows, mlx.mlx_array_dtype(x));
+    return moeOutput(s, x, bank, inds, scores, dec, verify_rows, mlx.mlx_array_dtype(x), null);
 }
 
-fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
+/// Add an already gated shared expert, preserving the routed output's rounding.
+pub fn moeWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, shared: mlx.mlx_array) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    if (xsh[0] * xsh[1] == 1 and mlx.mlx_array_dtype(shared) == mlx.mlx_array_dtype(x) and
+        mlx.mlx_array_size(shared) == mlx.mlx_array_size(x) and mlx.getShape(bank.gate.trellis)[3] == mlx.getShape(bank.up.trellis)[3])
+        return moeOutput(s, x, bank, inds, scores, dec, verify_rows, mlx.mlx_array_dtype(x), shared);
+    const routed = try moe(s, x, bank, inds, scores, dec, verify_rows);
+    defer _ = mlx.mlx_array_free(routed);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_add(&out, routed, shared, s));
+    return out;
+}
+
+fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array) !mlx.mlx_array {
     // Which kernel a dispatch picks is read off ONE process-global codebook,
     // and several EXL3 packs can be resident at once: set it per call.
     kernels.setDecodeParams(dec);
@@ -53,7 +67,7 @@ fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_arra
     const d = bank.down;
     const y = if (rows <= kernels.DECODE_ROWS_MAX or verify_rows)
         if (mlx.getShape(g.trellis)[3] == mlx.getShape(u.trellis)[3])
-            try kernels.moeSwigluFused(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, xd)
+            try kernels.moeSwigluFusedWithShared(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, xd, shared)
         else
             try moeMixedDecode(s, x2, bank, slots_u, sc, K, xd)
     else
@@ -380,7 +394,7 @@ pub fn moeGroups(s: mlx.mlx_stream, x: mlx.mlx_array, banks: []const Bank, inds:
         var weight = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(weight);
         try mlx.check(mlx.mlx_where(&weight, mask, scores, zero, s));
-        const partial = try moeOutput(s, x, bank, local, weight, dec, verify_rows, .float32);
+        const partial = try moeOutput(s, x, bank, local, weight, dec, verify_rows, .float32, null);
         defer _ = mlx.mlx_array_free(partial);
         var wide = mlx.mlx_array_new();
         defer if (wide.ctx != null) {

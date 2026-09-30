@@ -97,6 +97,9 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
   2q+1, 2q+8, 2q+9 at 4q..4q+3), so a lane reads its four as one half4 (`laneQuadReads`). Same values in the same
   order: the pair planes keep the self-preparing kernel's bytes. The same layout for the prepared middle measured no
   gain on the down (mid + down 52.1 vs 51.7 us at 1 row, 145.1 vs 145.9 at 4) and is not taken.
+- **Streamed serial decode** can add its already gated shared expert in the finish reduce, removing a dependent
+  elementwise dispatch. The routed sum is rounded to its output dtype before the shared addition, matching the
+  separate store and add bit for bit. Other widths, mixed gate/up rates and dtype mismatches retain the separate add.
 - **The decode GEMVs are bound by fixed per-tile work, not DRAM** (64-bit index math, two word loads and a 64-bit
   shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: every n below 64) carry two output
   tiles per threadgroup, load both k-tiles of an iteration before decoding, and bump pointers; the per-tile
