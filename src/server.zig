@@ -2918,7 +2918,10 @@ fn expertStreamingPlannedKvBytes(config: *const model_mod.ModelConfig) u64 {
 fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
     const seq: u64 = expertStreamingPlannedSeq(config);
     const explicit = explicitPrefillChunk();
-    const chunk: u64 = if (explicit > 0) explicit else if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else 8192;
+    // A request picks its own rung against free memory, so the load must only prove the ladder's floor fits;
+    // pricing the widest rung refused every streamed load on a small Mac.
+    const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+    const chunk: u64 = if (explicit > 0) explicit else if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else if (perRequestPrefillChunkEnabled(config)) floor else 8192;
     return prefillNeededAtChunk(config, @max(seq, chunk), 2048, defaultKvBits(config), chunk, .{}) -| config.expert_fill_peak_bytes;
 }
 
@@ -3959,6 +3962,48 @@ test "bf16 expert load admission includes 65k KV and QSA serving terms" {
     const fixed: u64 = 10_000_000_000 + 16_000_000_000 + 60_000_000_000 + 536_870_912 + config.expert_fill_peak_bytes;
     try std.testing.expect(expertStreamingLoadFits(fixed + serving, 10_000_000_000, 16_000_000_000, 60_000_000_000, 536_870_912, config.expert_fill_peak_bytes, serving));
     try std.testing.expect(!expertStreamingLoadFits(fixed + serving - 1, 10_000_000_000, 16_000_000_000, 60_000_000_000, 536_870_912, config.expert_fill_peak_bytes, serving));
+}
+
+test "a streamed load bills the narrowest rung the per-request ladder can take" {
+    const fused_guard = qsaScoreFusedOffGuard();
+    defer fused_guard.deinit();
+    var config = qwen4RequestTestConfig();
+    config.expert_streaming = true;
+    // The fit check runs before the post-load sizer pins a chunk.
+    config.pinned_prefill_chunk = 0;
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 32_768;
+    const saved_kv = configured_kv_quant;
+    defer configured_kv_quant = saved_kv;
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const saved_explicit = generate_mod.prefill_chunk_explicit;
+    const saved_chunk = generate_mod.prefill_chunk_override;
+    defer {
+        generate_mod.prefill_chunk_explicit = saved_explicit;
+        generate_mod.prefill_chunk_override = saved_chunk;
+    }
+    const saved_per_request = per_request_chunk_override;
+    defer per_request_chunk_override = saved_per_request;
+    generate_mod.prefill_chunk_explicit = false;
+    per_request_chunk_override = true;
+    const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+    const at = struct {
+        fn bill(c: *const model_mod.ModelConfig, chunk: u64) u64 {
+            return prefillNeededAtChunk(c, @max(32_768, chunk), 2048, 8, chunk, .{}) -| c.expert_fill_peak_bytes;
+        }
+    }.bill;
+    try std.testing.expectEqual(at(&config, floor), expertStreamingServingBytes(&config));
+    try std.testing.expect(at(&config, floor) < at(&config, 8192));
+    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefill_chunk_override = 4096;
+    try std.testing.expectEqual(at(&config, 4096), expertStreamingServingBytes(&config));
+    generate_mod.prefill_chunk_explicit = false;
+    config.pinned_prefill_chunk = 1024;
+    try std.testing.expectEqual(at(&config, 1024), expertStreamingServingBytes(&config));
+    config.pinned_prefill_chunk = 0;
+    per_request_chunk_override = false;
+    try std.testing.expectEqual(at(&config, 8192), expertStreamingServingBytes(&config));
 }
 
 test "bf16 streaming marker is a property of the checkpoint, not of the launch flags" {

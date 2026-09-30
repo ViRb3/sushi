@@ -35,6 +35,8 @@ zero-copy slabs. With no budget a pack loads resident as before.
   per-layer LRU. `--expert-cache-gb` overrides (decimal GB of expert cache).
 - Precedence: `--expert-cache-gb` > `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming all three.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
+- The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
+  rung against free memory; an explicit `--prefill-chunk` or a pinned chunk is priced as given.
 - Admission `budget + planned KV <= wired limit`; the refusal names the `iogpu.wired_limit_mb` that would admit.
   Under `--no-mtp` the head is not loaded at all.
 - An imatrix capture's accumulators live in GPU headroom that admission reads: budgets for capture runs drop
