@@ -13,7 +13,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 - **kv8 is the engine default.** Every load logs `[kv-cache] <scheme> (<source>)`, i.e.
   `[kv-cache] <kv8|kv4|off> (<default|--kv-quant|model-settings.json>)`
   (scheduler adds `; ctx N (source)`); `/props` reports `settings.kv_cache`, `/v1/models` `meta.kv_cache`.
-  `kld capture|compare` teachers stay dense; the MTP head KV is dense unless `--mtp-head-kv-quant`.
+  `kld capture|compare` teachers stay dense; the qwen4 MTP head KV is dense unless `--mtp-head-kv-quant`.
 - `--kv-quant 4|8|off` (`src/kv_quant.zig`, `configuredKvQuantFor(config)`); an explicit flag beats
   `model-settings.json` `kv_quant`, which beats the default. A per-model setting of `kv_quant: off` still wins over
   the default.

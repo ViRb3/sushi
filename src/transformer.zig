@@ -7839,6 +7839,9 @@ pub const DenseKVView = struct {
     /// a pointer to it.
     bits: u8 = 0,
     group_size: u32 = 0,
+    /// The triples slice a ring's pre-compaction buffer and are this view's to free
+    /// (`KVCache.handOffRingViews`); otherwise they are the cache's.
+    owns_triple: bool = false,
 
     pub fn deinit(self: *DenseKVView) void {
         if (self.owned) {
@@ -7848,7 +7851,13 @@ pub const DenseKVView = struct {
             self.v = mlx.mlx_array_new();
             self.owned = false;
         }
-        // Triple fields are non-owning borrows — never free.
+        if (self.owns_triple) {
+            for ([_]*mlx.mlx_array{ &self.k_triple_q, &self.k_triple_scales, &self.k_triple_biases, &self.v_triple_q, &self.v_triple_scales, &self.v_triple_biases }) |a| {
+                _ = mlx.mlx_array_free(a.*);
+                a.* = .{ .ctx = null };
+            }
+            self.owns_triple = false;
+        }
     }
 
     pub fn kTriple(self: DenseKVView) kv_quant.BorrowedTriple {
@@ -8459,7 +8468,7 @@ pub const KVCache = struct {
             row_vq.scales = try sliceStackedRow(s, new_vq.scales, i);
             _ = mlx.mlx_array_free(row_vq.biases);
             row_vq.biases = try sliceStackedRow(s, new_vq.biases, i);
-            try cache.writeAffineChunk(layer, row_kq, row_vq, s, max_seq);
+            _ = try cache.writeAffineChunk(layer, row_kq, row_vq, s, max_seq);
         }
     }
 
@@ -8482,7 +8491,12 @@ pub const KVCache = struct {
         //    K-derived packed width writes a 16-u32 chunk into a 24-u32 window
         //    (an mlx slice_update mismatch we cannot catch). Identical on every
         //    symmetric arch — the same generalization `updateDense` carries.
-        try self.writeAffineChunk(layer, new_kq, new_vq, s, max_seq);
+        const compacted = try self.writeAffineChunk(layer, new_kq, new_vq, s, max_seq);
+        var trip = [6]mlx.mlx_array{ entry.key_view, entry.key_scales_view, entry.key_biases_view, entry.value_view, entry.value_scales_view, entry.value_biases_view };
+        if (compacted) trip = try handOffRingViews(entry, s, 6);
+        errdefer if (compacted) for (trip) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
 
         // 8. Dequantize K/V for SDPA. Owner of these dense arrays is the
         //    DenseKVView returned to the caller. The quant triples ride along
@@ -8491,23 +8505,43 @@ pub const KVCache = struct {
         //    actually reads `.k`/`.v`. (Engagement bug class: the decode
         //    forward calls update(), not denseView() — omitting the triples
         //    here made `--kv-attn-mode fused` a silent no-op.)
-        const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, group_size, bits);
+        const dense_k = try kv_quant.dequantizeAffine(s, trip[0], trip[1], trip[2], group_size, bits);
         errdefer _ = mlx.mlx_array_free(dense_k);
-        const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, group_size, bits);
+        const dense_v = try kv_quant.dequantizeAffine(s, trip[3], trip[4], trip[5], group_size, bits);
         return .{
             .k = dense_k,
             .v = dense_v,
             .owned = true,
-            .k_triple_q = entry.key_view,
-            .k_triple_scales = entry.key_scales_view,
-            .k_triple_biases = entry.key_biases_view,
-            .v_triple_q = entry.value_view,
-            .v_triple_scales = entry.value_scales_view,
-            .v_triple_biases = entry.value_biases_view,
+            .k_triple_q = trip[0],
+            .k_triple_scales = trip[1],
+            .k_triple_biases = trip[2],
+            .v_triple_q = trip[3],
+            .v_triple_scales = trip[4],
+            .v_triple_biases = trip[5],
             .has_quant_triple = true,
             .bits = bits,
             .group_size = group_size,
+            .owns_triple = compacted,
         };
+    }
+
+    /// A compaction leaves the entry's views slicing the pre-compaction buffer, which this
+    /// forward still reads. Hand them to the forward (the caller frees them) and re-point the
+    /// entry at its ring, so only the forward's graph keeps the old buffer alive.
+    fn handOffRingViews(entry: *KVCacheEntry, s: mlx.mlx_stream, comptime n: usize) ![n]mlx.mlx_array {
+        const views = [6]*mlx.mlx_array{ &entry.key_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_view, &entry.value_scales_view, &entry.value_biases_view };
+        const bufs = [6]mlx.mlx_array{ entry.keys, entry.keys_scales, entry.keys_biases, entry.values, entry.values_scales, entry.values_biases };
+        const pick = if (n == 2) [2]usize{ 0, 3 } else [6]usize{ 0, 1, 2, 3, 4, 5 };
+        var out: [n]mlx.mlx_array = undefined;
+        for (pick, 0..) |vi, i| {
+            out[i] = views[vi].*;
+            views[vi].* = mlx.mlx_array_new();
+        }
+        errdefer for (out) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (pick) |vi| try buildSliceView(s, views[vi], bufs[vi], @intCast(entry.offset), 0);
+        return out;
     }
 
     fn writeAffineChunk(
@@ -8517,7 +8551,7 @@ pub const KVCache = struct {
         new_vq: kv_quant.QuantizedKV,
         s: mlx.mlx_stream,
         max_seq: u32,
-    ) !void {
+    ) !bool {
         const entry = &self.entries[layer];
         // A non-zero `max_seq` IS the ring predicate: it says this forward will
         // only ever read the tail of this layer.
@@ -8600,7 +8634,7 @@ pub const KVCache = struct {
         try buildSliceView(s, &entry.key_biases_view, entry.keys_biases, total, view_start);
         try buildSliceView(s, &entry.value_scales_view, entry.values_scales, total, view_start);
         try buildSliceView(s, &entry.value_biases_view, entry.values_biases, total, view_start);
-        try self.ringCompact(entry, s);
+        return self.ringCompact(entry, s);
     }
 
     /// Does a shared restore's first append copy its rows into a buffer sized for THIS request? Yes
@@ -8713,7 +8747,10 @@ pub const KVCache = struct {
         // each buffer's own last dim, so K and V may differ in width.
         try buildSliceView(s, &entry.key_view, entry.keys, total, view_start);
         try buildSliceView(s, &entry.value_view, entry.values, total, view_start);
-        try self.ringCompact(entry, s);
+        if (try self.ringCompact(entry, s)) {
+            const kv = try handOffRingViews(entry, s, 2);
+            return .{ .k = kv[0], .v = kv[1], .owned = true };
+        }
 
         return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
     }
@@ -8860,9 +8897,9 @@ pub const KVCache = struct {
     /// cap. Runs AFTER this forward's view is built: the view slices the
     /// pre-compaction buffer and holds it alive, so the rows it reads are never
     /// the rows this drops.
-    fn ringCompact(self: *KVCache, entry: *KVCacheEntry, s: mlx.mlx_stream) !void {
-        if (self.swa_ring_window == 0 or !entry.ringed) return;
-        if (entry.offset <= ringCap(self.swa_ring_window)) return;
+    fn ringCompact(self: *KVCache, entry: *KVCacheEntry, s: mlx.mlx_stream) !bool {
+        if (self.swa_ring_window == 0 or !entry.ringed) return false;
+        if (entry.offset <= ringCap(self.swa_ring_window)) return false;
         const keep = ringKeep(self.swa_ring_window);
         const drop = entry.offset - keep;
         const cap = ringCap(self.swa_ring_window);
@@ -8876,6 +8913,14 @@ pub const KVCache = struct {
         }
         entry.base += drop;
         entry.offset = keep;
+        // Nothing in this forward's output reads the ring, so left lazy it would hold the
+        // pre-compaction buffer until the next forward. Evaluated now, it lets go of it.
+        const quant = self.config.scheme != .off;
+        const bufs = [6]mlx.mlx_array{ entry.keys, entry.values, entry.keys_scales, entry.keys_biases, entry.values_scales, entry.values_biases };
+        const vec = mlx.mlx_vector_array_new_data(&bufs, if (quant) 6 else 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_async_eval(vec));
+        return true;
     }
 
     /// The capacity a grow takes for THIS entry. A ringed entry never takes the
@@ -15985,9 +16030,10 @@ fn mimoDecodeAttn(
     return out;
 }
 
-/// A spec verify's rows, each attending exactly the keys its own decode tick would have
-/// seen through `mimoDecodeAttn`, so an accepted row is the serial row bit for bit.
-/// `kv_view` is the verify's cache update: it ends at the last row's key.
+/// A spec verify's rows, or a global prefill too short for the fused kernel, each attending
+/// exactly the keys its own decode tick would have seen through `mimoDecodeAttn`, so an
+/// accepted row is the serial row bit for bit. `kv_view` is the forward's cache update: it
+/// ends at the last row's key.
 fn mimoVerifyRowsAttn(
     s: mlx.mlx_stream,
     window: c_int,
@@ -16000,9 +16046,9 @@ fn mimoVerifyRowsAttn(
     attn_scale: f32,
     decode_mask: mlx.mlx_array,
 ) !mlx.mlx_array {
-    if (seq_len > MIMO_VERIFY_ROWS_MAX) return error.MimoVerifyRowsTooWide;
+    var parts: [FUSED256_MIN_Q_LEN - 1]mlx.mlx_array = @splat(.{});
+    if (seq_len > parts.len) return error.MimoVerifyRowsTooWide;
     const view_len = mlx.getShape(kv_view.k)[2];
-    var parts: [MIMO_VERIFY_ROWS_MAX]mlx.mlx_array = @splat(.{});
     defer for (parts) |part| {
         if (part.ctx != null) _ = mlx.mlx_array_free(part);
     };
@@ -16030,7 +16076,8 @@ fn mimoVerifyRowsAttn(
 /// to `fp8_block.gemv_direct_max_rows` rows.
 pub const MIMO_VERIFY_ROWS_MAX: c_int = 4;
 
-const MimoAttnArm = enum { verify_rows, decode, prefill_global, prefill_sliding };
+const MimoAttnArm = enum { verify_rows, decode, prefill_global, prefill_sliding, prefill_rows };
+var mimo_prefill_rows_logged: bool = false; // one-shot log guard
 
 /// The widest verify the trunk still serves row for row: the FP8 GEMV keeps a
 /// single decode row's arithmetic only to `fp8_block.gemv_direct_max_rows` rows,
@@ -16050,7 +16097,10 @@ fn mimoAttnArm(verify_rows: bool, is_prefill: bool, is_global: bool, seq_len: c_
         return if (seq_len > 1) .verify_rows else .decode;
     }
     if (!is_prefill) return .decode;
-    return if (is_global) .prefill_global else .prefill_sliding;
+    if (!is_global) return .prefill_sliding;
+    // Under the fused kernel's floor the composed arm would rebuild the whole packed cache
+    // dense beside a [heads, rows, keys] score sheet; a warm tail reaches it at any context.
+    return if (seq_len < FUSED256_MIN_Q_LEN) .prefill_rows else .prefill_global;
 }
 
 test "mimoAttnArm: the verify budget follows the FP8 GEMV's direct-row arm" {
@@ -16082,6 +16132,16 @@ test "mimoAttnArm: a verify wider than the decode row budget is refused, not re-
     try testing.expectEqual(MimoAttnArm.decode, try mimoAttnArm(false, false, false, 1));
     try testing.expectEqual(MimoAttnArm.prefill_global, try mimoAttnArm(false, true, true, 512));
     try testing.expectEqual(MimoAttnArm.prefill_sliding, try mimoAttnArm(false, true, false, 512));
+}
+
+test "mimoAttnArm: a global prefill under the fused kernel's floor runs row by row" {
+    // Below FUSED256_MIN_Q_LEN the fused kernel declines, and the composed arm would rebuild the
+    // whole packed cache dense beside a [heads, rows, keys] score sheet, neither billed.
+    try testing.expectEqual(MimoAttnArm.prefill_rows, try mimoAttnArm(false, true, true, 2));
+    try testing.expectEqual(MimoAttnArm.prefill_rows, try mimoAttnArm(false, true, true, FUSED256_MIN_Q_LEN - 1));
+    try testing.expectEqual(MimoAttnArm.prefill_global, try mimoAttnArm(false, true, true, FUSED256_MIN_Q_LEN));
+    // A sliding layer reads a window-bounded view at any width.
+    try testing.expectEqual(MimoAttnArm.prefill_sliding, try mimoAttnArm(false, true, false, 2));
 }
 
 var kv_attn_fused_engaged: bool = false; // one-shot log guard
@@ -27734,7 +27794,11 @@ pub const Transformer = struct {
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         switch (try mimoAttnArm(ctx.verify_rows, is_prefill, is_global, seq_len)) {
-            .verify_rows => {
+            .verify_rows, .prefill_rows => {
+                if (!ctx.verify_rows and !mimo_prefill_rows_logged) {
+                    mimo_prefill_rows_logged = true;
+                    log.info("[mimo] short global prefill engaged: {d} rows read row by row over {d} keys\n", .{ seq_len, offset + seq_len });
+                }
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = try mimoVerifyRowsAttn(self.s, @intCast(cfg.sliding_window), q_rope, &kv_view, fa.sinks, is_global, offset, seq_len, attn_scale, local_decode_mask);
             },
@@ -44534,6 +44598,11 @@ test "mimo verify rows attend with each serial decode tick's arithmetic (dense, 
     // The packed global reads (matmul2d / split-K) serve from their key floor; the second block straddles it.
     try mimoVerifyRowsIdentityCase(KVQuantConfig.affine(8), true, QKV_MPP_DECODE_MIN_TK + 3, 4);
     try mimoVerifyRowsIdentityCase(KVQuantConfig.affine(8), true, QKV_MPP_DECODE_MIN_TK - 2, 4);
+    // A short global prefill (a warm tail) takes the same rows, up to the fused kernel's floor.
+    for ([_]c_int{ 5, FUSED256_MIN_Q_LEN - 1 }) |width| {
+        try mimoVerifyRowsIdentityCase(KVQuantConfig.affine(8), true, QKV_MPP_DECODE_MIN_TK + 3, width);
+        try mimoVerifyRowsIdentityCase(KVQuantConfig.dense, true, 700, width);
+    }
 }
 
 test "kvAttnFusedEligible: fused reads are decode-width (t_q == 1) only" {
@@ -51006,6 +51075,72 @@ test "a ringed sliding layer serves the same view under kv-quant" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     try swaRingWalk(.{ .scheme = .affine, .bits = 8, .group_size = 32 });
     try swaRingWalk(.{ .scheme = .affine, .bits = 4, .group_size = 32 });
+}
+
+/// Two prefill chunks through `layers` ringed sliding layers at MiMo's sliding geometry: every
+/// layer's view is read (standing in for its attention) and each chunk's reads are evaluated.
+/// Returns the bytes still active after the second chunk, over what was active before either.
+fn swaRingChunkResidue(kv_cfg: KVQuantConfig, layers: u32, chunk: c_int) !usize {
+    const alloc = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const window: u32 = 128;
+    var cache = try KVCache.initWithConfig(alloc, layers, kv_cfg);
+    defer cache.deinit();
+    cache.setSwaRing(window);
+    var ks: [2]mlx.mlx_array = undefined;
+    var vs: [2]mlx.mlx_array = undefined;
+    for (&ks, &vs, 0..) |*k, *v, i| {
+        k.* = try qkvIdentityArray(s, 8, chunk, 192, 0.3 + @as(f32, @floatFromInt(i)), .bfloat16);
+        v.* = try qkvIdentityArray(s, 8, chunk, 128, 1.1 + @as(f32, @floatFromInt(i)), .bfloat16);
+    }
+    defer for (ks, vs) |k, v| {
+        _ = mlx.mlx_array_free(k);
+        _ = mlx.mlx_array_free(v);
+    };
+    for ([_][2]mlx.mlx_array{ ks, vs }) |pair| {
+        const vec = mlx.mlx_vector_array_new_data(&pair, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+    }
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    for (ks, vs) |k, v| {
+        const reads = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(reads);
+        for (0..layers) |li| {
+            var view = try cache.update(@intCast(li), k, v, s, slidingTailSpan(window, @intCast(chunk), SLIDING_TRIM_UNBOUNDED));
+            defer view.deinit();
+            for ([_]mlx.mlx_array{ view.k, view.v }) |side| {
+                var read = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(read);
+                try mlx.check(mlx.mlx_sum(&read, side, false, s));
+                _ = mlx.mlx_vector_array_append_value(reads, read);
+            }
+        }
+        try mlx.check(mlx.mlx_eval(reads));
+    }
+    try mlx.check(mlx.mlx_synchronize(s));
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    return after -| before;
+}
+
+test "a ringed layer keeps only its ring once the chunk that compacted it is evaluated" {
+    // The ring bill (`ModelConfig.swaRingBytes`) holds `ringCap` rows per sliding layer across
+    // chunks; the pre-compaction buffer is billed only for the width of the forward.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const layers: u32 = 6;
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |cfg| {
+        const residue = try swaRingChunkResidue(cfg, layers, 2048);
+        const row_bytes: usize = if (cfg.scheme == .off) 8 * (192 + 128) * 2 else 8 * (192 + 128) + 8 * (192 + 128) / 64 * 2 * 2;
+        const ring = layers * KVCache.ringCap(128) * row_bytes;
+        std.testing.expect(residue <= ring + ring / 20) catch |err| {
+            std.debug.print("ring residue {d} B over the {d} B ring bill ({s})\n", .{ residue, ring, @tagName(cfg.scheme) });
+            return err;
+        };
+    }
 }
 
 test "a ring rewinds inside its retained window and declines below it" {

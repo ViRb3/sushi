@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **MiMo-V2.6-Flash**: a second model, MiMo-V2.6-Flash-Sushi-2.3bpw for 128 GB Macs, reads text and images on every
+  API, thinks by default and runs its own MTP draft heads.
+
 - Sushi packs stream their routed experts from SSD under `--ssd-budget-gb`, so a Mac with less memory than the pack can serve it; output is identical to a resident load.
 
 - Flash-Next GDN prefill uses oMLX's software-pipelined recurrence on NAX GPUs (mlx-serve #641, thanks @STRML).

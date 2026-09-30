@@ -87,7 +87,7 @@ RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[0;33m'; DIM='\033[2m'; NC='\033[0m
 
 TARGETS=(
   # ── mimo_v2: sliding layers ring, so this is where the trim pays ──
-  "mimo-v2-flash-k2.5|${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw|--no-vision|EXL3 K2.5 experts, resident; sliding layers ring"
+  "mimo-v2-flash-2.3bpw|${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw|--no-vision|EXL3 K2.25 experts (last layer K4), resident; sliding layers ring"
   # ── qwen4_exp: hyper-connections + n-gram PLE + QSA; MTP is opt-in on MoE, forced like bench.sh ──
   "qwen38-flash-next-k3|${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw|--mtp|125B-A6B EXL3 K3, no sliding; in-checkpoint MTP head (opt-in), QSA past 2048"
 )

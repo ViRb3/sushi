@@ -344,6 +344,10 @@ fn readEnvBool(name: [:0]const u8) bool {
     return std.mem.eql(u8, slice, "1");
 }
 
+fn freeArray(a: mlx.mlx_array) void {
+    _ = mlx.mlx_array_free(a);
+}
+
 /// Grammar-constrained sampling state. The caller owns `grammar`, `token_bytes`,
 /// and `mask_buf`; the generator only reads them. `mask_buf.len` must equal
 /// `token_bytes.bytes.len` (the tokenizer's vocab size).
@@ -445,14 +449,20 @@ pub const MtpHeadRef = union(enum) {
             try h.draftStep(target, ref.st, step_i, id_arr, &.{}, null, rope_offset)
         else
             try h.draftStep(target, ref.st, 0, null, host_ids orelse return error.MimoMtpNeedsHostIds, hidden, rope_offset);
-        errdefer _ = mlx.mlx_array_free(last);
         ref.next_step = step_i + 1;
-        var out: mtp_mod.StepOut = .{ .logits = .{ .ctx = null }, .hidden_next = mlx.mlx_array_new_int(@intCast(step_i + 1)) };
-        if (want == .logits) {
-            defer _ = mlx.mlx_array_free(last);
-            out.logits = try target.lmHeadLogits(last);
-        } else out.rerank_x = last;
-        return out;
+        return mimoStepOut(target, freeArray, last, step_i + 1, want);
+    }
+
+    /// Hands a draft step's last row over: through the trunk's lm_head (then freed)
+    /// under `.logits`, else as `rerank_x`. Takes `last`; on error nothing leaks.
+    fn mimoStepOut(target: anytype, comptime free: fn (mlx.mlx_array) void, last: mlx.mlx_array, step_next: usize, want: mtp_mod.StepWant) !mtp_mod.StepOut {
+        errdefer free(last);
+        const hidden_next = mlx.mlx_array_new_int(@intCast(step_next));
+        errdefer free(hidden_next);
+        if (want != .logits) return .{ .logits = .{ .ctx = null }, .hidden_next = hidden_next, .rerank_x = last };
+        const logits = try target.lmHeadLogits(last);
+        free(last);
+        return .{ .logits = logits, .hidden_next = hidden_next };
     }
 
     /// Append committed history without projecting logits.
@@ -21292,4 +21302,62 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
     try std.testing.expectEqual(@as(usize, 8192), env);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
+}
+
+/// Records what `mimoStepOut` frees instead of freeing it, so a double free is a count, not a crash.
+const StepOutFrees = struct {
+    var seen: [8]?*anyopaque = @splat(null);
+    var n: usize = 0;
+    fn record(a: mlx.mlx_array) void {
+        seen[n] = a.ctx;
+        n += 1;
+    }
+    fn count(ctx: ?*anyopaque) usize {
+        var c: usize = 0;
+        for (seen[0..n]) |x| c += @intFromBool(x == ctx);
+        return c;
+    }
+    fn releaseAll() void {
+        for (seen[0..n], 0..) |x, i| {
+            if (std.mem.indexOfScalar(?*anyopaque, seen[0..i], x) == null) _ = mlx.mlx_array_free(.{ .ctx = x });
+        }
+        n = 0;
+    }
+};
+
+test "mimoStepOut: a failed lm_head projection frees the step's arrays once each" {
+    const Failing = struct {
+        fn lmHeadLogits(_: @This(), _: mlx.mlx_array) !mlx.mlx_array {
+            return error.InjectedFault;
+        }
+    };
+    StepOutFrees.n = 0;
+    defer StepOutFrees.releaseAll();
+    const last = mlx.mlx_array_new_int(7);
+    try testing.expectError(error.InjectedFault, MtpHeadRef.mimoStepOut(Failing{}, StepOutFrees.record, last, 1, .logits));
+    try testing.expectEqual(@as(usize, 1), StepOutFrees.count(last.ctx));
+    try testing.expectEqual(@as(usize, 2), StepOutFrees.n);
+}
+
+test "mimoStepOut: logits consume the row once; a rerank step hands it over" {
+    const Ok = struct {
+        fn lmHeadLogits(_: @This(), _: mlx.mlx_array) !mlx.mlx_array {
+            return mlx.mlx_array_new_int(3);
+        }
+    };
+    StepOutFrees.n = 0;
+    defer StepOutFrees.releaseAll();
+    const last = mlx.mlx_array_new_int(7);
+    const out = try MtpHeadRef.mimoStepOut(Ok{}, StepOutFrees.record, last, 2, .logits);
+    defer _ = mlx.mlx_array_free(out.logits);
+    defer _ = mlx.mlx_array_free(out.hidden_next);
+    try testing.expectEqual(@as(usize, 1), StepOutFrees.count(last.ctx));
+    try testing.expect(out.rerank_x.ctx == null);
+
+    const row = mlx.mlx_array_new_int(8);
+    const mixed = try MtpHeadRef.mimoStepOut(Ok{}, StepOutFrees.record, row, 2, .mixed);
+    defer _ = mlx.mlx_array_free(mixed.hidden_next);
+    defer _ = mlx.mlx_array_free(mixed.rerank_x);
+    try testing.expectEqual(@as(usize, 0), StepOutFrees.count(row.ctx));
+    try testing.expect(mixed.rerank_x.ctx == row.ctx and mixed.logits.ctx == null);
 }

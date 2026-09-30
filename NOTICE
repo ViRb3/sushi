@@ -29,6 +29,15 @@ unmodified reference externally to generate independent numerical fixtures.
 The TP-aware FP8 QKV reconstruction in `src/mimo_source.zig` follows
 `conversion/mimo.py`, reimplemented in Zig.
 
+The MiMo-ViT vision tower in `src/mimo_vision.zig` is a port of the
+reference's `MiMoVisionTransformer` (`modeling_mimo_v2.py`), and its image
+preprocessing follows the vendor serving processors (`smart_resize`, bilinear
+resampling, ImageNet normalization). The three MTP heads in `src/mimo_mtp.zig`
+follow the MiMo-V2 MTP layer as XiaomiMiMo's vLLM and SGLang integrations
+compose it (Apache-2.0). Both are reimplemented in Zig against mlx-c;
+tests/dump_mimo_vision_fixtures.py and tests/dump_mimo_v2_mtp_fixtures.py
+render their fixtures from the unmodified reference modules.
+
 `src/fixtures/mimo_v26_chat_template.jinja` is the checkpoint's
 `chat_template` from tokenizer_config.json, unmodified, used as a test
 fixture; the model repository declares it under the MIT License.

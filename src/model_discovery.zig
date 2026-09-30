@@ -58,7 +58,7 @@ const supported_model_types = [_][]const u8{
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
-    "mimo_v2", // Experimental text-only MXFP4 streaming packs.
+    "mimo_v2", // MiMo-V2.6-Flash: resident EXL3 packs (text + image), or the original checkpoint streamed.
 };
 
 fn isSupportedModelType(model_type: []const u8) bool {

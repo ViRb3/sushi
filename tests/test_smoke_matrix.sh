@@ -12,8 +12,8 @@
 #
 # Configs: default (kv8) | off (--kv-quant off) | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
 # where the pack ships a head and does not stream) | nospec (--no-pld --no-mtp
-# --no-drafter). The MiMo EXL3 pack serves resident; MIMO_SSD_BUDGET_GB adds
-# --ssd-budget-gb for a streamed MiMo checkpoint.
+# --no-drafter). The MiMo EXL3 pack serves resident with its vision tower and MTP heads;
+# MIMO_SSD_BUDGET_GB adds --ssd-budget-gb for a streamed MiMo checkpoint, which skips mtp.
 # Per boot: chat non-stream/stream, thinking on/off, tools, json_schema,
 # logprobs, max_tokens cap, prefix-cache hit, 2-way concurrency, /v1/completions,
 # /v1/messages (both modes), /v1/responses (both modes), /v1/models,
@@ -34,7 +34,7 @@ MD="$HOME/.sushi/models"
 # arch|thinking(yes/no)|candidate paths (first that exists wins)
 ARCHES=(
     "qwen4_exp|yes|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw"
-    "mimo_v2|yes|${MIMO_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}"
+    "mimo_v2|yes|${MIMO_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,off,kv4,mtp,nospec}"
 
@@ -241,7 +241,7 @@ for entry in "${ARCHES[@]}"; do
     if [[ "$MAX_GB" -gt 0 && "$gb" -gt "$MAX_GB" ]]; then CELL="$arch"; skip "$arch" "${gb} GB > SMOKE_MAX_GB=$MAX_GB"; continue; fi
 
     arch_flags=()
-    [[ "$arch" == mimo_v2 ]] && arch_flags=(${MIMO_SSD_BUDGET_GB:+--ssd-budget-gb "$MIMO_SSD_BUDGET_GB"} --no-vision)
+    [[ "$arch" == mimo_v2 ]] && arch_flags=(${MIMO_SSD_BUDGET_GB:+--ssd-budget-gb "$MIMO_SSD_BUDGET_GB"})
 
     for cfg in "${WANT_CFG[@]}"; do
         CELL="$arch.$cfg"
@@ -251,7 +251,7 @@ for entry in "${ARCHES[@]}"; do
             off)     flags+=(--kv-quant off) ;;
             kv4)     flags+=(--kv-quant 4) ;;
             kv8)     flags+=(--kv-quant 8) ;;
-            mtp)     [[ "$arch" == mimo_v2 ]] && { skip "$CELL" "streamed experts refuse MTP"; continue; }
+            mtp)     [[ "$arch" == mimo_v2 && -n "${MIMO_SSD_BUDGET_GB:-}" ]] && { skip "$CELL" "streamed experts refuse MTP"; continue; }
                      has_mtp_head "$model" || { skip "$CELL" "no MTP head"; continue; }; flags+=(--mtp) ;;
             nospec)  flags+=(--no-pld --no-mtp --no-drafter) ;;
             *) skip "$CELL" "unknown config"; continue ;;

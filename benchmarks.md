@@ -12,3 +12,4 @@
 |---|---|---|---|---|
 | Qwen3.8-Flash-Next-Sushi-3bpw (MTP) | · | 98 mtp | · | · |
 | Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | · | · | 83 mtp | · |
+| MiMo-V2.6-Flash-Sushi-2.3bpw (MTP) | · | · | · | · |

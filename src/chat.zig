@@ -86,9 +86,9 @@ pub fn canonicalRole(role: []const u8) []const u8 {
 }
 
 /// Fold every `system` message past index 0 into the leading one (created
-/// when absent). Templates we serve raise on a system turn that is not first
-/// and the raise is a silent generic fallback. Returns the joined buffer the
-/// caller owns, null when nothing moved.
+/// when absent). Qwen3.8's template raises on a system turn that is not first
+/// and the raise is a silent generic fallback; MiMo's renders it in place.
+/// Returns the joined buffer the caller owns, null when nothing moved.
 pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !?[]const u8 {
     var extra: usize = 0;
     for (messages.items[@min(messages.items.len, 1)..]) |m| {
@@ -7240,11 +7240,28 @@ test "only a forced tool_choice carries a prompt instruction" {
     try testing.expectEqualStrings("\nYou MUST call the function \"get_time\". Do not respond with text.", one);
 }
 
-test "real mimo_v2 template preserves reasoning and XML tool history" {
+/// src/fixtures/mimo_v26_chat_template.jinja is the `chat_template` of
+/// XiaomiMiMo/MiMo-V2.6-Flash-RL's tokenizer_config.json, verbatim.
+fn mimoTemplateConfig(allocator: std.mem.Allocator) ChatConfig {
+    return .{
+        .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+}
+
+test "real mimo_v2 template is the committed fixture" {
     const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
-    const a = testing.allocator;
-    var config = try loadChatConfig(testing.io, a, std.mem.span(raw));
+    var config = try loadChatConfig(testing.io, testing.allocator, std.mem.span(raw));
     defer config.deinit();
+    try testing.expectEqualStrings(@embedFile("fixtures/mimo_v26_chat_template.jinja"), config.chat_template);
+}
+
+test "mimo_v2 template preserves reasoning and XML tool history" {
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
     const calls = [_]ToolCall{.{ .id = "call_1", .name = "sum", .arguments = "{\"x\":2}" }};
     const messages = [_]Message{
         .{ .role = "user", .content = "Compute." },
@@ -7266,11 +7283,9 @@ test "real mimo_v2 template preserves reasoning and XML tool history" {
     try testing.expectEqualStrings(expected ++ "<think></think>", plain);
 }
 
-test "real mimo_v2 template renders a late system turn in place" {
-    const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
+test "mimo_v2 template renders a late system turn in place" {
     const a = testing.allocator;
-    var config = try loadChatConfig(testing.io, a, std.mem.span(raw));
-    defer config.deinit();
+    var config = mimoTemplateConfig(a);
     const messages = [_]Message{
         .{ .role = "system", .content = "S" },
         .{ .role = "user", .content = "hi" },
@@ -7281,6 +7296,37 @@ test "real mimo_v2 template renders a late system turn in place" {
     defer a.free(rendered);
     try testing.expectEqualStrings("<|im_start|>system\nS<|im_end|><|im_start|>user\nhi<|im_end|>" ++
         "<|im_start|>system\nlate<|im_end|><|im_start|>user\nagain<|im_end|><|im_start|>assistant\n", rendered);
+}
+
+test "mimo_v2 template renders a tools request as the reference does" {
+    // Expected bytes: transformers' apply_chat_template environment (jinja2, its
+    // json.dumps tojson) over the same template and request.
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_weather","description":"Current weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
+    ;
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "S" },
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "Need weather.", .tool_calls = &calls },
+        .{ .role = "tool", .content = "18C", .tool_call_id = "call_1" },
+        .{ .role = "user", .content = "Thanks." },
+    };
+    const expected = "<|im_start|>system\nYou are provided with the following tools:\n\n<tools>\n" ++
+        "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather\", " ++
+        "\"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}" ++
+        "\n</tools><|im_end|><|im_start|>system\nS<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|>" ++
+        "<|im_start|>assistant\n<think>Need weather.</think><tool_call><function=get_weather><parameter=city>Paris</parameter>" ++
+        "</function></tool_call><|im_end|><|im_start|>tool\n18C<|im_end|><|im_start|>user\nThanks.<|im_end|>" ++
+        "<|im_start|>assistant\n";
+    const thinking = try renderChatTemplate(a, &messages, &config, tools_json, null, true, null, false);
+    defer a.free(thinking);
+    try testing.expectEqualStrings(expected, thinking);
+    const plain = try renderChatTemplate(a, &messages, &config, tools_json, null, false, null, false);
+    defer a.free(plain);
+    try testing.expectEqualStrings(expected ++ "<think></think>", plain);
 }
 
 test "collapseDoubledThinkTags collapses 2x → 1x" {

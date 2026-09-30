@@ -1951,16 +1951,12 @@ pub fn serve(
     } else if (scheduler.drafter != null and scheduler.dflash == null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
-    if (config.expert_streaming and server_config.default_force_mtp) {
-        log.info("MTP: enabled for expert streaming by --mtp; replay measured 1.27x expert bytes per committed token\n", .{});
-    } else if (config.expert_streaming) {
-        log.info("MTP: disabled by default for expert streaming\n", .{});
+    if (config.expert_streaming) {
+        log.info("MTP: off under expert streaming (--mtp is refused there)\n", .{});
     } else if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
-    if (transformer_mod.Transformer.mtp_head_kv_quant_flag) {
-        log.info("MTP head KV: following --kv-quant (--mtp-head-kv-quant)\n", .{});
-    }
+    if (mtpHeadKvLine(config, transformer_mod.Transformer.mtp_head_kv_quant_flag)) |line| log.info("{s}\n", .{line});
     if (generate_mod.max_mtp_ctx != 0) {
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
@@ -5336,19 +5332,29 @@ fn attnLayersPerEvalWindow(config: *const model_mod.ModelConfig, window: u32) u3
 /// the size of the cache. A forward narrower than `prefillEvalCadenceApplies` runs one eval for
 /// the whole layer loop and therefore does pay the whole old cache.
 fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, kv_per_tok: u64) u64 {
-    if (!warm.grows(seq)) return 0;
+    if (warm.grows(seq)) return oldBuffersInEvalWindow(config, warm.capacity_tokens, seq -| warm.matched_tokens, kv_per_tok);
+    // An SSD restore installs each layer at exactly its restored rows, so the first append grows
+    // it beside the restored buffer. A ringed arch's admission never sees the restore (it bills a
+    // warm request cold), so with a disk tier it bills that coexistence at the prompt's length.
+    if (prefix_cache_disk_bytes > 0 and config.swaRingTokens() > 0 and !config.longCtxGated())
+        return oldBuffersInEvalWindow(config, seq, seq, kv_per_tok);
+    return 0;
+}
+
+/// Bytes of `tokens`-row old buffers alive beside their grown copies: one eval window of the
+/// caching layers when a `span`-wide forward runs the cadence, every caching layer otherwise.
+fn oldBuffersInEvalWindow(config: *const model_mod.ModelConfig, tokens: u64, span: u64, kv_per_tok: u64) u64 {
     // The layers `kv_per_tok` is the sum over, not every caching layer: on a
     // ringed arch those are nine of forty-eight.
     const attn = config.kvPerTokenLayerCount();
     if (attn == 0) return 0;
-    const span: u64 = seq -| warm.matched_tokens;
     const window: u32 = if (transformer_mod.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
         attnLayersPerEvalWindow(config, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS)
     else
         attn;
     if (window == 0) return 0;
     // The old buffer's own size, spread over the layers that cache.
-    return warm.capacity_tokens *| kv_per_tok / attn *| window;
+    return tokens *| kv_per_tok / attn *| window;
 }
 
 /// Per-request bytes that scale with the prompt rather than the chunk.
@@ -5552,6 +5558,13 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     return n * per_cp;
 }
 
+/// What `--mtp-head-kv-quant` does on this arch, for the boot log; null when unset.
+pub fn mtpHeadKvLine(config: *const model_mod.ModelConfig, flag: bool) ?[]const u8 {
+    if (!flag) return null;
+    if (config.isMimo()) return "MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)";
+    return "MTP head KV: following --kv-quant (--mtp-head-kv-quant)";
+}
+
 /// Per-token bytes of the qwen4 MTP head's own KV at the scheme it was LOADED with,
 /// billed once per request when MTP is on. It was resident and unbilled before.
 pub fn mtpHeadKvBytesPerToken(config: *const model_mod.ModelConfig) u64 {
@@ -5588,7 +5601,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // allocator twin is gated too, so an ungated guard billed memory never reserved). `.{}` is
     // the identity: `prefillMemoryNeeded` then reduces to the previous expression. A ringed arch
     // joins through the narrower `reservesKvCapacity`; every term it does not have stays zero on
-    // its own (no QSA history, no SSM checkpoints, MTP refused while it rings).
+    // its own (no QSA history, no SSM checkpoints); its MTP heads bill `mimo_mtp.State.billedBytes`.
     if (!config.reservesKvCapacity()) return .{};
     // `reservedTokens` returns 0 below its length threshold; floor the reserved length at `seq`.
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
@@ -7947,6 +7960,19 @@ fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
     return out;
 }
 
+/// The client's thinking bool: top-level `enable_thinking`, else `chat_template_kwargs.enable_thinking`.
+fn requestEnableThinking(root: std.json.ObjectMap) ?bool {
+    if (root.get("enable_thinking")) |v| if (v == .bool) return v.bool;
+    return chatTemplateKwargBool(root, "enable_thinking");
+}
+
+/// Responses thinking: a `reasoning` object decides alone; without one the request
+/// bool (`requestEnableThinking`), else the arch default, as on chat.
+fn responsesEnableThinking(root: std.json.ObjectMap, from_reasoning: bool, arch_default: bool) bool {
+    if (root.get("reasoning")) |r| if (r != .null) return from_reasoning;
+    return requestEnableThinking(root) orelse arch_default;
+}
+
 /// Resolve thinking for a chat request. An EXPLICIT client signal always wins —
 /// the vendor `enable_thinking` bool, or an OpenAI `reasoning_effort` string
 /// ("none" being an explicit OFF). Only a request that names NEITHER falls
@@ -7954,10 +7980,7 @@ fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
 ///
 /// The two knobs stay OR'd when both are present, as they always were.
 fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
-    const et: ?bool = if (root.get("enable_thinking")) |v|
-        (if (v == .bool) v.bool else null)
-    else
-        null;
+    const et = requestEnableThinking(root);
     if (et == null and effort_cfg == null) return arch_default;
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
@@ -8340,7 +8363,7 @@ fn handleChatCompletions(
     } else false;
 
     // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
-    // vendor `enable_thinking` bool (Qwen/vLLM chat_template_kwargs family).
+    // vendor `enable_thinking` bool (top-level, or nested in `chat_template_kwargs`).
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
@@ -16881,6 +16904,7 @@ fn handleResponsesInner(
     const active_has_tools = has_tools and !final_answer_mode;
     const active_tools_json: ?[]const u8 = if (active_has_tools) tools_json else null;
     const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice_instruction else null;
+    enable_thinking = responsesEnableThinking(root, enable_thinking, config.defaultEnableThinking(active_has_tools));
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
@@ -20881,12 +20905,39 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
         // A non-bool `enable_thinking` is not a signal; with nothing else in
         // the body the arch default still applies.
         .{ .body = "{\"enable_thinking\":\"yes\"}", .arch = true, .want = true },
+        // vLLM / SGLang clients send the template switch nested; the top-level field wins over it.
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = true, .want = false },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true}}", .arch = false, .want = true },
+        .{ .body = "{\"enable_thinking\":true,\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = false, .want = true },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":\"no\"}}", .arch = true, .want = true },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
         const effort = try parseReasoningEffort(parsed.value.object, -1, false, null);
         try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
+    }
+}
+
+test "responsesEnableThinking: no reasoning object takes the request bool, else the arch default" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, arch: bool, want: bool }{
+        .{ .body = "{}", .arch = true, .want = true },
+        .{ .body = "{}", .arch = false, .want = false },
+        .{ .body = "{\"reasoning\":null}", .arch = true, .want = true },
+        .{ .body = "{\"enable_thinking\":false}", .arch = true, .want = false },
+        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = true, .want = false },
+        // A reasoning object decides alone.
+        .{ .body = "{\"reasoning\":{\"effort\":\"none\"}}", .arch = true, .want = false },
+        .{ .body = "{\"reasoning\":{}}", .arch = false, .want = true },
+        .{ .body = "{\"reasoning\":{\"effort\":\"none\"},\"enable_thinking\":true}", .arch = false, .want = false },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        const from_reasoning = responses_mod.parseReasoning(root.get("reasoning"), -1).enable;
+        try std.testing.expectEqual(case.want, responsesEnableThinking(root, from_reasoning, case.arch));
     }
 }
 
@@ -23471,6 +23522,17 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     try t.expectEqual(@as(u64, 0), other_on.mtp_head_kv_bytes);
 }
 
+test "mtpHeadKvLine: --mtp-head-kv-quant is reported per arch" {
+    const t = std.testing;
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
+    try t.expect(mtpHeadKvLine(&qwen4, false) == null);
+    try t.expect(mtpHeadKvLine(&mimo, false) == null);
+    try t.expectEqualStrings("MTP head KV: following --kv-quant (--mtp-head-kv-quant)", mtpHeadKvLine(&qwen4, true).?);
+    // MiMo's heads keep their own dense window (`mimo_mtp.RowCache`); the flag never reaches them.
+    try t.expectEqualStrings("MTP head KV: --mtp-head-kv-quant has no effect on mimo_v2 (its heads keep a dense sliding window)", mtpHeadKvLine(&mimo, true).?);
+}
+
 test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_quant override" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
@@ -24025,6 +24087,26 @@ fn mimoV2FlashBillConfig() model_mod.ModelConfig {
     cfg.layer_is_global[3] = false;
     for ([_]u32{ 0, 5, 11, 17, 23, 29, 35, 41, 47 }) |li| cfg.layer_is_global[li] = true;
     return cfg;
+}
+
+test "mimo_v2 with an SSD tier bills a restored global layer beside its first grow" {
+    // An SSD restore installs each global layer at exactly the restored rows, and the first
+    // append grows it while the restored buffer is still alive. MiMo's admission never sees
+    // the restore, so with a disk tier it bills one eval window of that coexistence.
+    const t = std.testing;
+    const cfg = mimoV2FlashBillConfig();
+    const saved = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = saved;
+    const seq: u64 = 400_000;
+    const kv_bits: u64 = 8;
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const one_layer = seq * kv_per_tok / cfg.kvPerTokenLayerCount();
+    prefix_cache_disk_bytes = 0;
+    try t.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, seq, 8192, kv_bits, 2048, .{}).grow_coexist_bytes);
+    prefix_cache_disk_bytes = 20 << 30;
+    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    try t.expect(window >= 1);
+    try t.expectEqual(one_layer * window, prefillRequestTerms(&cfg, seq, 8192, kv_bits, 2048, .{}).grow_coexist_bytes);
 }
 
 test "mimo_v2 prefills at the widest width its request bill admits, not at the load-time pin" {

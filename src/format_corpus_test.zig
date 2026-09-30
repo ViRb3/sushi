@@ -316,6 +316,32 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
         .tool_arg_value = "mkdir -p src/app",
     },
+    // ── MiMo-V2.6 (<think> family, the model opens its own block) ───────────
+    // Shaped as the checkpoint's own template renders an assistant turn:
+    // `<think>R</think>` then content, tool calls unframed inside
+    // `<tool_call><function=N><parameter=K>V</parameter></function></tool_call>`.
+    .{
+        .family = "mimo",
+        .name = "model-opened think block, then the answer",
+        .raw = "<think>17*20=340, 17*3=51, so 391.</think>17 × 23 = 391.",
+        .thinking = true,
+        .content_exact = "17 × 23 = 391.",
+        .reasoning_contains = "17*20=340",
+    },
+    .{
+        .family = "mimo",
+        .name = "think block, then an unframed XML tool call",
+        .raw = "<think>Need the weather.</think><tool_call><function=get_weather><parameter=city>Paris</parameter>" ++
+            "<parameter=celsius>true</parameter></function></tool_call>",
+        .thinking = true,
+        .reasoning_contains = "Need the weather.",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .tools_json = weather_tool_schema,
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
     // ── Gemma 4 (<|channel> family, call:name{...} tools) ───────────────────
     .{
         .family = "gemma4",
@@ -2431,6 +2457,15 @@ const dialects = [_]Dialect{
         .value = "a.txt",
     },
     .{
+        // The checkpoint's own template renders parameter values with no newline framing.
+        .family = "mimo-v2.6",
+        .dialect = "tool_call wrapper + unframed <function=> body",
+        .raw = "<tool_call><function=write_file><parameter=path>a.txt</parameter><parameter=content>hi</parameter></function></tool_call>",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
+    },
+    .{
         .family = "lfm2",
         .dialect = "pythonic call expression",
         .raw = "<|tool_call_start|>[write_file(path=\"a.txt\", content=\"hi\")]<|tool_call_end|>",
@@ -2508,6 +2543,7 @@ test "format corpus: a parameter VALUE never decides the call" {
     const shapes = [_]Shape{
         .{ .pre = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>\n</tool_call>" },
         .{ .pre = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>" },
+        .{ .pre = "<tool_call><function=write_file><parameter=path>a.txt</parameter><parameter=content>", .post = "</parameter></function></tool_call>" },
     };
 
     for (shapes) |shape| {
@@ -2737,6 +2773,7 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
     const cases = [_]Case{
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .system_headers = 1 },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .system_headers = 1 },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "role loop", .tpl = chatml, .system_headers = 2 },
     };
     const messages = [_]chat.Message{

@@ -1,6 +1,7 @@
 # Architecture: MiMo-V2.6-Flash (`mimo_v2`)
 
-How the engine serves MiMo-V2.6-Flash-RL: the source checkpoint's layout, the resident trunk, the MXFP4 and EXL3
+How the engine serves MiMo-V2.6-Flash (the served pack is quantized from the MOPD release; the RL release shares its
+layout): the source checkpoint's layout, the resident trunk, the MXFP4 and EXL3
 expert paths, the hybrid global/sliding attention with its ring, the vision tower, and the bills that follow the
 storage. MiMo serves text and image input; the supported product is the MCG EXL3 pack. Read this before touching
 `src/mimo_source.zig`, `src/mimo_vision.zig`, the MiMo arms of `src/transformer.zig`, or anything that bills MiMo's KV.
@@ -12,8 +13,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Product policy
 
-- **MCG EXL3 only.** The served MiMo target is the K2.25 MCG EXL3 pack
-  (`MiMo-V2.6-Flash-Sushi-2.25bpw`).
+- **MCG EXL3 only.** The served MiMo target is the MCG EXL3 pack `MiMo-V2.6-Flash-Sushi-2.3bpw` (K2.25 experts,
+  the last layer K4).
 - **Thinking defaults ON** (the vendor template's default; `generation_config.json` declares none); effort words
   only set the thinking budget (see [server-http-apis](server-http-apis.md)).
 
@@ -70,8 +71,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   presence follows the layer type (sliding layers only).
 - mlx-lm's MiMo support (upstream PR 1219) agrees with this engine on every mechanism except that it computes the
   router matmul in bf16 (changes the top-8 set for 2.8% of tokens per layer; patch it to f32 before using it as a
-  cross-check). `attention_chunk_size` is read by nothing in the engine; whether the reference's chunked attention
-  differs from a plain sliding band is an open question.
+  cross-check). `attention_chunk_size` is read by nothing, in the engine or the reference: `modeling_mimo_v2.py`
+  masks a sliding layer with transformers' `create_sliding_window_causal_mask`, a query and the 127 keys before it,
+  which the `mimo v2 fixture` parity test pins across the window edge.
 
 ## Expert streaming and imatrix
 
@@ -94,6 +96,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   never the context.
   A non-zero `max_seq` into `KVCache.update` IS the ring predicate, so `slidingViewFor` may never decline the trim
   on a ringed arch.
+- **A compaction lets go of the pre-compaction buffer when the forward that read it is evaluated**
+  (`KVCache.handOffRingViews`, `ringCompact`): the forward takes the entry's views, the entry re-points at its ring,
+  and the ring is evaluated at once. Left lazy, the ring and the views pinned every sliding layer's staged chunk until
+  the next forward, 39 layers where `swaStreamBytesPerToken` bills the eval cadence's 5.
 - **A ringed entry's `offset` is LOCAL**; absolute = `base + offset` (`absSeqLen`). A clamp below the retained
   window declines by NAME (`SlidingRingRewindPastWindow`) and the hot-cache restore cold-prefills; a byte-budget trim
   lands only at the entry's end or a ring checkpoint ([engine-prefix-cache](engine-prefix-cache.md#candidate-ranking-and-trimming)).
@@ -123,6 +129,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   coordinates), never rebuilt whole; the sliding ring view is window + chunk rows, dequantized per view.
   Landed 2026-09-23 (668278c): 39-layer band attention 39.5 -> 20.3 ms at chunk 512, 603 -> 95.5 at 2048, 2439 -> 181
   at 4096; 16x512 KLD -0.2%, inside the rounding-flip floor.
+- **A global-layer forward under 16 rows runs row by row** (`MimoAttnArm.prefill_rows`, the verify rows' arm): the
+  fused kernel declines there, and the composed arm would rebuild the whole packed cache dense beside a
+  [heads, rows, keys] score sheet, unbilled. A warm restore's short tail (a follow-up of a few tokens) is the case;
+  each row is its serial decode tick bit for bit.
 - **On M5 both layer kinds prefill on the matrix units** (`sushi_attn_pd_nax`, same carries, bill and slices;
   `SUSHI_ATTN_PD_NAX=0` = the SIMD kernel): global attention ~3x faster per layer
   ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](perf-baselines.md#mimo-attn-kernels)).
@@ -229,6 +239,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `server.kvDequantScratchBytes` bills the kv-quant dense rebuild as ONE layer at the rows that layer stores.
 - `mimo_source.countResidentBytes` bills each MoE router twice: as stored (bf16) and as the f32 copy the
   transformer loader keeps (~0.2 GB on the Flash pack).
+- **With a disk tier, a request bills a restored global layer beside its first grow** (`server.growCoexistBytes`): an
+  SSD restore installs each global layer at exactly the restored rows, and the first append grows it while the
+  restored buffer is alive. The admission never sees the restore, so it bills one eval window of that at the prompt's
+  length (one global layer: 0.54 GB at 400k, kv8).
 - **The prefill chunk is chosen per request** (`perRequestPrefillChunk` covers a ringed arch): the widest rung up
   to 4096 whose admission bill fits live memory. The ungated load-time pin subtracts the hot-cache ask first and
   pinned 2048 (512 before the fused sliding prefill) at every context.

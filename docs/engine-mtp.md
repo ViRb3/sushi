@@ -49,6 +49,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - Each head is a sliding (128) layer with sinks: FP8 qkv (rank-local, tp 4 solved from the 116 scale rows) + bf16
   o_proj, FP8 dense SwiGLU 16384, own `final_layernorm`, the trunk's embedding and lm_head. Its K/V live in a
   per-request `RowCache` holding the window, never a `KVCache`; the prompt appends only its last window per head.
+  The target hiddens ride a 256-row ring (`State.record`), copied out of a prefill chunk's hiddens and evaluated at
+  once: a slice of them held the whole chunk (35 MB at 4096 rows) until the first round.
 - The `.mimo` arm maps the generic stash + merged first step onto head 0 and each later step onto head i
   (`draftStep`); the step index rides `hidden_next` (a scalar), host token ids ride `host_ids`. Depth and the free
   EV cap clamp to the head count and to the verify row budget; rounds stay solo (`mtpRoundsStaySolo`); no
@@ -181,8 +183,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 
 ## Head KV and norms
 
-- **Head KV**: dense by default; `--mtp-head-kv-quant` opts it into `--kv-quant` (billed at its effective width
-  either way, `mtpHeadKvBytesPerToken`); a spec sidecar under another scheme is declined at restore and rewritten
+- **Head KV**: dense by default; `--mtp-head-kv-quant` opts qwen4's into `--kv-quant` (billed at its effective width
+  either way, `mtpHeadKvBytesPerToken`; MiMo's heads keep their dense window and the boot log says the flag does
+  nothing there, `server.mtpHeadKvLine`); a spec sidecar under another scheme is declined at restore and rewritten
   on the next commit. Head persistence with its QSA half: `tests/test_qwen4_mtp_head_persist.sh`.
 - Acceptance modes `exact|typical|tokenv3` (`mtp_acceptance.zig`, per-model `mtp_acceptance`).
   Only sampled decoding reads the mode: temperature < 0.01 (`isGreedyTemperature`, shared with serial sampling) always takes the argmax check (`mtpAcceptRowGreedy`), so

@@ -253,6 +253,16 @@ pub const State = struct {
             errdefer _ = mlx.mlx_array_free(cut);
             const sh = mlx.getShape(self.hid);
             try mlx.check(mlx.mlx_slice(&cut, self.hid, &.{ 0, @intCast(drop), 0 }, 3, &.{ 1, sh[1], sh[2] }, 3, &.{ 1, 1, 1 }, 3, s));
+            // A slice pins the rows it views from: past a prefill chunk, the whole chunk's
+            // hiddens where `billedBytes` holds the ring. Copied and evaluated, it lets go.
+            if (drop > RING_ROWS) {
+                const owned = try transformer_mod.materializedOwnedCopy(s, cut);
+                _ = mlx.mlx_array_free(cut);
+                cut = owned;
+                const vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{cut}, 1);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                try mlx.check(mlx.mlx_async_eval(vec));
+            }
             _ = mlx.mlx_array_free(self.hid);
             self.hid = cut;
             self.hid_base += drop;
@@ -809,6 +819,40 @@ test "mimo mtp heads warm up every head on a throwaway state (MIMO_V2_MODEL)" {
     head.target = &xfm;
     try testing.expectEqual(head.heads, try head.warmup(&xfm));
     for (xfm.cache.entries) |e| try testing.expect(!e.initialized);
+}
+
+test "mimo mtp state keeps its hidden ring, not the prefill chunk it was cut from" {
+    // `State.billedBytes` holds RING_ROWS hiddens (twice); a slice view of a whole chunk's
+    // hiddens held the chunk instead, until the first round replaced it.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const width: c_int = 1024;
+    const rows: usize = 4096;
+    const ids = try testing.allocator.alloc(u32, rows);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast(i);
+    var st = State{ .allocator = testing.allocator };
+    defer st.deinit();
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    {
+        var hidden = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hidden);
+        try mlx.check(mlx.mlx_ones(&hidden, &.{ 1, @intCast(rows), width }, 3, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(hidden));
+        try st.record(s, 0, hidden, ids);
+    }
+    try mlx.check(mlx.mlx_array_eval(st.hid));
+    try mlx.check(mlx.mlx_synchronize(s));
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    const ring: usize = RING_ROWS * @as(usize, @intCast(width)) * 2;
+    std.testing.expect(after -| before <= ring + ring / 4) catch |err| {
+        std.debug.print("mimo mtp hidden ring holds {d} B, ring is {d} B\n", .{ after -| before, ring });
+        return err;
+    };
 }
 
 test "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across rounds, drafts and rollbacks (MIMO_V2_MODEL + MIMO_V2_MTP_FIXTURE)" {

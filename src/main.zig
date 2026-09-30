@@ -178,11 +178,13 @@ fn printUsage(io: std.Io) void {
         \\                        for sampled requests, greedy requests unchanged.
         \\  --no-mtp            Disable the native MTP head. Both served models
         \\                        load it and run it by default.
-        \\  --mtp               Force the MTP head ON, also for an SSD-streamed
-        \\                        pack (off by default there) and other MoE models.
+        \\  --mtp               Force the MTP head ON. Both served models run it
+        \\                        by default; an SSD-streamed pack loads with it
+        \\                        off and refuses --mtp.
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
-        \\                        dense bf16 KV).
+        \\                        dense bf16 KV). No effect on MiMo, whose
+        \\                        heads keep a dense sliding window.
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
@@ -300,9 +302,10 @@ fn printUsage(io: std.Io) void {
         \\                        rendering identical messages on warm reuse.
         \\                        0 disables.
         \\  --expert-cache-gb <n>
-        \\                      Enable bf16 qwen4_exp expert streaming with a
-        \\                        decimal-GB cache (default operating point: 60).
-        \\  --ssd-budget-gb <n> Enable bf16 qwen4_exp expert streaming with a
+        \\                      Stream qwen4_exp routed experts (bf16 checkpoint
+        \\                        or Sushi pack) with a decimal-GB cache.
+        \\  --ssd-budget-gb <n> Stream qwen4_exp routed experts (bf16 checkpoint
+        \\                        or Sushi pack) with a
         \\                        TOTAL resident target of <n> GiB; the expert
         \\                        cache is what is left after the trunk, the
         \\                        prefill union and the fill buffers.
