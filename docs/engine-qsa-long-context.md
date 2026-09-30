@@ -23,7 +23,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   `QSA_PACKED_GATHER_MAX_REUSE` = 4 times (`qsaPackedGatherServes`), else a gather over ONE rebuild.
   `kvDequantScratchBytes` bills the rebuild per forward width (`qsaDenseRebuildRows`); `SUSHI_QSA_ATTN_KERNEL=0`
   restores the old route and its bill.
-- Prefill = `gatherQsa256`; batched slots + kv ≤ 8192 keep the dense mask.
+- Prefill = `gatherQsa256`; batched slots keep the dense mask up to the gather floor: (top-512 + 1) x 4 = 2052 keys
+  where the NAX gather serves (`qsaPrefillGatherMinKv`), 8192 elsewhere; decode and verify floors are unchanged.
 - **Verify gather kv floor is per KV SCHEME** (`qsaVerifyGatherMinKvFor`: dense 32768, quantized 16384).
 
 ## Selection semantics
@@ -40,6 +41,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - The prefill gather rides NAX cooperative tensors on its own predicate (`qsaNaxEligible`: G17 + macOS 26.3 + bf16 +
   hd 256 + gqa 12 + q_len ≥ 16; bar = per-element error vs float64 no worse than stock,
   `tests/qsa_nax_precision.py`, never bytes). The packed NAX variant joins the NAX probe.
+- The dense NAX gather is oMLX's occupancy-tuned kernel (mlx-serve #636): one (query, KV head) per threadgroup, the
+  12 grouped heads as rows of a 16-row tile, no K/V staging, P as fp16 hi+lo; packed kv4/kv8 gathers keep the old
+  kernel. `SUSHI_PROFILE_ATTN=1` logs synced indexer / projection / QSA / tail laps once per forward (`[qwen4-attn]`).
 - One effective YaRN mscale on every indexer arm; the indexer ropes with the SAME M-RoPE table as attention.
 - The pooled block keys are ONE kernel (`sushi_qsa_pool_rope`, from mlx-serve #556): block mean, key norm and
   partial RoPE, bit-identical to the MLX chain. It serves text turns, bf16, 128-wide keys and ratios up to 8; M-RoPE

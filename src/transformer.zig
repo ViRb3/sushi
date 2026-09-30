@@ -2970,12 +2970,26 @@ pub var qsa_gather_min_kv_override: ?c_int = null;
 pub fn qsaGatherMinKv() c_int {
     if (qsa_gather_min_kv_override) |v| return v;
     if (qsa_gather_min_kv_cached) |v| return v;
-    var v: c_int = QSA_GATHER_MIN_KV_DEFAULT;
-    if (std.c.getenv("SUSHI_QSA_GATHER_MIN_KV")) |raw| {
-        v = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
-    }
+    const raw = std.c.getenv("SUSHI_QSA_GATHER_MIN_KV");
+    const v = qsaPrefillGatherMinKvFrom(1, false, if (raw) |r| std.mem.sliceTo(r, 0) else null, null);
     qsa_gather_min_kv_cached = v;
     return v;
+}
+
+pub const QSA_GATHER_MIN_KV_NAX: c_int = 2052;
+
+fn qsaPrefillGatherMinKvFrom(seq_len: c_int, nax_serves: bool, raw: ?[]const u8, override: ?c_int) c_int {
+    if (override) |v| return v;
+    if (raw) |v| return std.fmt.parseInt(c_int, v, 10) catch QSA_GATHER_MIN_KV_DEFAULT;
+    return if (seq_len >= FUSED256_MIN_Q_LEN and nax_serves) QSA_GATHER_MIN_KV_NAX else QSA_GATHER_MIN_KV_DEFAULT;
+}
+
+pub fn qsaPrefillGatherMinKv() c_int {
+    if (qsa_gather_min_kv_override != null) return qsaGatherMinKv();
+    const raw = std.c.getenv("SUSHI_QSA_GATHER_MIN_KV");
+    if (raw != null) return qsaGatherMinKv();
+    const serving = qsaNaxEnabled() and qsaNaxOsOk() and verifyQmmNaxAvailable();
+    return qsaPrefillGatherMinKvFrom(FUSED256_MIN_Q_LEN, serving, null, null);
 }
 
 pub const QSA_GATHER_BK_DEFAULT: c_int = 32;
@@ -3542,11 +3556,12 @@ fn qsaNaxRunProbe() bool {
     defer _ = mlx.mlx_array_free(k);
     const v = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 16, 256 }, 0xC0FFEE3) orelse return false;
     defer _ = mlx.mlx_array_free(v);
-    var blk: [16 * 4]i32 = undefined;
+    var blk: [16 * 512]i32 = undefined;
     for (0..16) |r| {
-        for (0..4) |b| blk[r * 4 + b] = @intCast(b);
+        const complete = (r + 1) / 4;
+        for (0..512) |b| blk[r * 512 + b] = if (b < complete) @intCast(b) else std.math.maxInt(i32);
     }
-    const bshape = [_]c_int{ 1, 16, 4 };
+    const bshape = [_]c_int{ 1, 16, 512 };
     const blocks = mlx.mlx_array_new_data(&blk, &bshape, 3, .int32);
     defer _ = mlx.mlx_array_free(blocks);
     const scale: f32 = 1.0 / 16.0;
@@ -3756,7 +3771,16 @@ fn gatherQsa256Impl(
     if (mlx.mlx_array_dtype(q) != .bfloat16) return null;
 
     qsaNaxArm();
-    var use_nax = qsaNaxEnabled() and qsaNaxEligible(.bfloat16, .bfloat16, .bfloat16, qs[3], gqa, qs[2]);
+    const qst = mlx.mlx_array_strides(q);
+    const kst = mlx.mlx_array_strides(k);
+    const vst = mlx.mlx_array_strides(v);
+    const bst = mlx.mlx_array_strides(blocks);
+    const nax_aligned = qst[3] == 1 and kst[3] == 1 and vst[3] == 1 and bst[2] == 1 and
+        qst[1] % 8 == 0 and qst[2] % 8 == 0 and
+        kst[1] % 8 == 0 and kst[2] % 8 == 0 and
+        vst[1] % 8 == 0 and vst[2] % 8 == 0;
+    const nax_geometry = is_packed or (nax_aligned and ratio == 4 and qs[0] == 1 and qs[1] == 24 and ks[1] == 2 and bs[2] == 512);
+    var use_nax = nax_geometry and qsaNaxEnabled() and qsaNaxEligible(.bfloat16, .bfloat16, .bfloat16, qs[3], gqa, qs[2]);
     const kernel = blk: {
         if (use_nax) {
             break :blk (if (is_packed) getQsaGatherPackedKernel(true) else getQsaNaxKernel()) catch {
@@ -3824,7 +3848,7 @@ fn gatherQsa256Impl(
     const engaged_bit: u5 = qsaEngagedBit(.prefill_gather, qs[2]) + @as(u5, if (use_nax) 16 else 0);
     if (qsa_engaged_bits.take(engaged_bit)) {
         const tgmem: usize = if (use_nax)
-            @as(usize, @intCast(bk)) * 264 * 2 + 2 * 512 * 4
+            2 * 8 * 32 * 4
         else
             @as(usize, @intCast(bk + 8)) * 256 * 2;
         if (use_nax) {
@@ -22904,7 +22928,10 @@ pub const Transformer = struct {
         const quantized = ctx.cache.config.scheme == .affine;
         const row_sparse = qsaAttnKernelEnabled() and
             (qsaSparseAttnServes(quantized, seq_len, qsaAttnMinS()) or (quantized and seq_len >= FUSED256_MIN_Q_LEN));
-        const legacy_blocks = kv > qsaGatherMinKv() and
+        const nax_geometry = seq_len >= FUSED256_MIN_Q_LEN and ratio == 4 and block_topk == 512 and cfg.head_dim == 256 and
+            cfg.num_attention_heads == 24 and cfg.num_key_value_heads == 2 and mlx.mlx_array_dtype(qk) == .bfloat16;
+        const gather_floor = if (nax_geometry) qsaPrefillGatherMinKv() else qsaGatherMinKv();
+        const legacy_blocks = kv > gather_floor and
             (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
                 (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(quantized)));
         const want_blocks = batch == 1 and qsaGatherEnabled() and (row_sparse or legacy_blocks);
@@ -23162,9 +23189,13 @@ pub const Transformer = struct {
                 }
             }
         }
+        const prof = Qwen4AttnProf.begin(x, seq_len);
+        defer Qwen4AttnProf.active = false;
+        errdefer Qwen4AttnProf.reset();
         if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
             ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
         }
+        if (prof) Qwen4AttnProf.lap(if (ctx.qsa_blocks.ctx != null) ctx.qsa_blocks else ctx.qsa_mask, .indexer);
         if (layer == 3) if (qwen4_trace) |tr| {
             if (ctx.qsa_mask.ctx != null) {
                 Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);
@@ -23174,7 +23205,9 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.qsa_mask, m);
             }
         };
-        return self.gatedFullAttnProjected(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
+        const out = try self.gatedFullAttnProjected(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
+        if (prof) Qwen4AttnProf.lap(out, .tail);
+        return out;
     }
 
     /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
@@ -24457,6 +24490,8 @@ pub const Transformer = struct {
     /// through per-stream scalar gates; the n-gram PLE adds to the streams
     /// before its layer; the final mixer replaces model.norm.
     fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        Qwen4AttnProf.reset();
+        errdefer Qwen4AttnProf.reset();
         const dumping = moeDumpBeginForward();
         defer if (dumping) moeDumpForwardDone();
         self.fwd_gen +%= 1; // per-forward QSA scratch key
@@ -24630,6 +24665,7 @@ pub const Transformer = struct {
         ctx.moe_seq_offset.* += @intCast(seq_len);
         dt.end(h);
         prof.report(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)), ctx.capture_ssm_seq, cfg.num_hidden_layers - cfg.attnCacheLayerCount(), cfg.attnCacheLayerCount());
+        Qwen4AttnProf.flush(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)));
         if (ctx.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h);
         // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
         // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
@@ -26787,6 +26823,15 @@ pub const Transformer = struct {
         // Fused-attn opt-in: see standard attention site for design notes
         // (kernel-or-DENSE — a declined kernel falls to the arms below).
         const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
+        if (Qwen4AttnProf.active) {
+            if (kv_view.has_quant_triple) {
+                for ([_]mlx.mlx_array{ kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases, kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases }) |a| Qwen4AttnProf.sync(a);
+            } else {
+                Qwen4AttnProf.sync(full_k);
+                Qwen4AttnProf.sync(full_v);
+            }
+            Qwen4AttnProf.lap(q_rope, .proj);
+        }
         var kv_fused_done = false;
         if (ctx.qsa_blocks.ctx != null or ctx.qsa_mask.ctx != null) {
             // qwen4_exp QSA: the indexer already chose the visible blocks
@@ -26891,6 +26936,8 @@ pub const Transformer = struct {
         } else {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, false, self.s));
         }
+
+        if (Qwen4AttnProf.active) Qwen4AttnProf.lap(attn_out, .qsa);
 
         if (layer == 3) if (qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_pre_tail, attn_out);
         return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer, skip_output);
@@ -34785,6 +34832,52 @@ const ProfClock = struct {
         const d = cum - self.mark_ns;
         self.mark_ns = cum;
         return d;
+    }
+};
+
+const Qwen4AttnProf = struct {
+    const Stage = enum(u2) { indexer, proj, qsa, tail };
+    var on: ?bool = null;
+    var active = false;
+    var clock: ProfClock = undefined;
+    var ns: [4]u64 = @splat(0);
+    var layers: u32 = 0;
+
+    fn sync(arr: mlx.mlx_array) void {
+        if (arr.ctx == null) return;
+        mlx.check(mlx.mlx_array_eval(arr)) catch {};
+    }
+
+    fn begin(x: mlx.mlx_array, seq_len: c_int) bool {
+        if (on == null) on = diagEnvOn("SUSHI_PROFILE_ATTN");
+        if (!on.? or seq_len <= 16) return false;
+        sync(x);
+        clock = ProfClock.init();
+        active = true;
+        layers += 1;
+        return true;
+    }
+
+    fn lap(arr: mlx.mlx_array, stage: Stage) void {
+        sync(arr);
+        ns[@backingInt(stage)] += clock.lap();
+    }
+
+    fn flush(seq_len: c_int, kv: usize) void {
+        if (layers == 0) return;
+        const ms = struct {
+            fn f(n: u64) f64 {
+                return @as(f64, @floatFromInt(n)) / 1e6;
+            }
+        }.f;
+        log.info("[qwen4-attn] S={d} kv={d} layers={d} indexer {d:.3} ms  proj+rope+kv {d:.3} ms  qsa {d:.3} ms  gate+o_proj {d:.3} ms\n", .{ seq_len, kv, layers, ms(ns[0]), ms(ns[1]), ms(ns[2]), ms(ns[3]) });
+        reset();
+    }
+
+    fn reset() void {
+        active = false;
+        ns = @splat(0);
+        layers = 0;
     }
 };
 
@@ -56272,10 +56365,14 @@ fn qsaNaxAssertNoWorseThanStock(
     qsa_nax_override = true;
     const nax = (try gatherQsa256(stream, q, k, v, scale, blocks, ratio)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(nax);
+    try std.testing.expect(qsa_gather_used_nax);
+    try std.testing.expect(qsaProbeAllFinite(stream, nax));
+    try std.testing.expect(qsaProbeAllFinite(stream, stock));
+    try std.testing.expect(qsaProbeAllFinite(stream, ref));
     const max_stock = try attn256MaxDiff(stock, ref, stream);
     const max_nax = try attn256MaxDiff(nax, ref, stream);
-    errdefer std.debug.print("max_stock={e} max_nax={e} floor={e} bar={e}\n", .{ max_stock, max_nax, floor, @max(1.5 * max_stock, floor) });
-    try std.testing.expect(max_nax <= @max(1.5 * max_stock, floor));
+    errdefer std.debug.print("max_stock={e} max_nax={e} floor={e} bar={e}\n", .{ max_stock, max_nax, floor, max_stock });
+    try std.testing.expect(max_nax <= max_stock);
 }
 
 fn qsaBoostLastTileK(
@@ -56347,6 +56444,20 @@ fn qsaBoostLastTileK(
     return out;
 }
 
+test "qsa prefill floor: NAX serving, widths, unavailable hardware and explicit overrides" {
+    const expect = std.testing.expectEqual;
+    try expect(@as(c_int, 2052), qsaPrefillGatherMinKvFrom(16, true, null, null));
+    try expect(@as(c_int, 2052), qsaPrefillGatherMinKvFrom(8192, true, null, null));
+    for ([_]c_int{ 1, 2, 4, 15 }) |width| {
+        try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(width, true, null, null));
+    }
+    try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(16, false, null, null));
+    try expect(@as(c_int, 5000), qsaPrefillGatherMinKvFrom(16, true, "5000", null));
+    try expect(@as(c_int, 0), qsaPrefillGatherMinKvFrom(16, true, "0", null));
+    try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(16, true, "invalid", null));
+    try expect(@as(c_int, 4096), qsaPrefillGatherMinKvFrom(16, true, "5000", 4096));
+}
+
 test "qsaNaxEnabledFrom: on by default, SUSHI_QSA_NAX=0 restores the stock gather" {
     try std.testing.expect(qsaNaxEnabledFrom(null));
     try std.testing.expect(qsaNaxEnabledFrom("1"));
@@ -56415,10 +56526,11 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
         const out = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
         defer _ = mlx.mlx_array_free(out);
         try std.testing.expect(try attn256MaxDiff(out, ref, s) < 0.005);
+        try std.testing.expect(!qsa_gather_used_nax);
     }
 }
 
-test "gatherQsa256 NAX: max error vs f32 gather-softmax is at most 1.5x stock" {
+test "gatherQsa256 NAX: max error vs f32 gather-softmax is no worse than stock" {
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     qsa_nax_override = true;
@@ -56432,7 +56544,7 @@ test "gatherQsa256 NAX: max error vs f32 gather-softmax is at most 1.5x stock" {
     const rnd = prng.random();
     const qL: c_int = 40;
     const kL: c_int = 101;
-    const kb: c_int = 6;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56460,7 +56572,7 @@ test "gatherQsa256 NAX: online softmax rescale across 32-key tiles vs f32 gather
     const rnd = prng.random();
     const qL: c_int = 40;
     const kL: c_int = 203;
-    const kb: c_int = 32;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56475,6 +56587,34 @@ test "gatherQsa256 NAX: online softmax rescale across 32-key tiles vs f32 gather
     defer _ = mlx.mlx_array_free(k);
     const scale: f32 = 1.0 / 16.0;
     try qsaNaxAssertNoWorseThanStock(s, q, k, v, scale, fx.blocks, 4, 4.9e-4);
+}
+
+test "gatherQsa256 NAX: top-512 selection and partial causal tail vs f32 gather-softmax" {
+    if (!verifyQmmNaxAvailable() or !qsaNaxOsOk()) return error.SkipZigTest;
+    const saved_nax = qsa_nax_override;
+    qsa_nax_override = true;
+    defer qsa_nax_override = saved_nax;
+    if (!qsaNaxEnabled()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x4020);
+    const rnd = prng.random();
+    const qL: c_int = 16;
+    const kb: c_int = 512;
+    const qshape = [_]c_int{ 1, 24, qL, 256 };
+    const q = try attn256RandBf16(rnd, &qshape, s);
+    defer _ = mlx.mlx_array_free(q);
+    for ([_]c_int{ 2053, 2153 }) |kL| {
+        const kvshape = [_]c_int{ 1, 2, kL, 256 };
+        const k = try attn256RandBf16(rnd, &kvshape, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &kvshape, s);
+        defer _ = mlx.mlx_array_free(v);
+        var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, 4);
+        defer fx.deinit();
+        try qsaNaxAssertNoWorseThanStock(s, q, k, v, 1.0 / 16.0, fx.blocks, 4, 4.9e-4);
+    }
 }
 
 test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the stock arm" {
@@ -56494,7 +56634,7 @@ test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the 
     const rnd = prng.random();
     const qL: c_int = 16;
     const kL: c_int = 16;
-    const kb: c_int = 4;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56539,7 +56679,7 @@ test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
     const rnd = prng.random();
     const qL: c_int = 16;
     const kL: c_int = 16;
-    const kb: c_int = 4;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56617,7 +56757,7 @@ test "gatherQsa256 NAX: latch is consulted before NAX kernel construction" {
     defer _ = mlx.mlx_array_free(k);
     const v = try attn256RandBf16(rnd, &kv_shape, s);
     defer _ = mlx.mlx_array_free(v);
-    var fx = try QsaBlockFixture.build(rnd, qL, qL, 4, 4);
+    var fx = try QsaBlockFixture.build(rnd, qL, qL, 512, 4);
     defer fx.deinit();
     const out = (try gatherQsa256(s, q, k, v, 1.0 / 16.0, fx.blocks, 4)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(out);
@@ -56669,7 +56809,7 @@ test "gatherQsa256: stock then NAX each fire one engaged line" {
     defer _ = mlx.mlx_array_free(k);
     const v = try attn256RandBf16(rnd, &kv_shape, s);
     defer _ = mlx.mlx_array_free(v);
-    var fx = try QsaBlockFixture.build(rnd, qL, qL, 4, 4);
+    var fx = try QsaBlockFixture.build(rnd, qL, qL, 512, 4);
     defer fx.deinit();
     const scale: f32 = 1.0 / 16.0;
     qsa_nax_override = false;
@@ -57862,7 +58002,7 @@ test "qsa packed gather: prefill widths read the packed cache as precisely as th
             qsa_nax_override = nax;
             const old = (try gatherQsa256(s, q, view.k, view.v, scale, blocks, ratio)) orelse return error.GatherDeclined;
             defer _ = mlx.mlx_array_free(old);
-            try std.testing.expectEqual(nax, qsa_gather_used_nax);
+            try std.testing.expectEqual(nax and c.kb == 512, qsa_gather_used_nax);
             const got = (try gatherQsa256Packed(s, q, &view, scale, blocks, ratio)) orelse return error.PackedGatherDeclined;
             defer _ = mlx.mlx_array_free(got);
             try std.testing.expectEqual(nax, qsa_gather_used_nax);
@@ -71650,4 +71790,26 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
             }
         }
     }
+}
+
+test "qwen4 attention profiler: off and narrow widths stay idle, reset clears forward totals" {
+    const saved_on = Qwen4AttnProf.on;
+    defer Qwen4AttnProf.on = saved_on;
+    defer Qwen4AttnProf.reset();
+    Qwen4AttnProf.reset();
+    Qwen4AttnProf.on = false;
+    try std.testing.expect(!Qwen4AttnProf.begin(.{ .ctx = null }, 8192));
+    Qwen4AttnProf.on = true;
+    for ([_]c_int{ 1, 2, 15, 16 }) |width| {
+        try std.testing.expect(!Qwen4AttnProf.begin(.{ .ctx = null }, width));
+    }
+    try std.testing.expectEqual(@as(u32, 0), Qwen4AttnProf.layers);
+    try std.testing.expect(Qwen4AttnProf.begin(.{ .ctx = null }, 17));
+    try std.testing.expect(Qwen4AttnProf.active);
+    try std.testing.expectEqual(@as(u32, 1), Qwen4AttnProf.layers);
+    Qwen4AttnProf.ns = .{ 1, 2, 3, 4 };
+    Qwen4AttnProf.reset();
+    try std.testing.expect(!Qwen4AttnProf.active);
+    try std.testing.expectEqual(@as(u32, 0), Qwen4AttnProf.layers);
+    try std.testing.expectEqual([_]u64{ 0, 0, 0, 0 }, Qwen4AttnProf.ns);
 }
