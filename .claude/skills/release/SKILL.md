@@ -55,6 +55,9 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
 1. Set `build.zig.zon`'s `.version` to the next version and rename the top `## Unreleased` entry to
    `## v<version> — Headline` (check `gh release list --limit 1` first — never reuse an existing tag)
 2. Dont commit or push
+3. After the owner (or `./release.sh`) cuts it, the Release workflow leaves a DRAFT. Publishing it fires
+   `.github/workflows/homebrew.yml`, which runs the tap's bump and fails unless `Formula/sushi.rb` names the new
+   tag (needs the `HOMEBREW_TAP_TOKEN` secret). Confirm with `brew update && brew info beamivalice/tap/sushi`.
 
 ### CHANGELOG style
 
