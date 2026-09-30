@@ -17109,6 +17109,7 @@ pub const Transformer = struct {
                     .hidden = config.hidden_size,
                     .intermediate = config.moe_intermediate_size,
                     .first_moe_layer = @intCast(config.first_k_dense_replace),
+                    .exl3_n = config.expert_quant_rate.n,
                 },
                 config.expert_cache_bytes,
                 s,

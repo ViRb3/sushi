@@ -103,7 +103,8 @@ pub fn loadWeights(
         const meta = entry.value_ptr.*;
         switch (try classifyKey(key, config)) {
             .skipped, .fp8_scale => {},
-            .resident, .routed_expert => {
+            .resident, .routed_expert => |kind| {
+                if (kind == .routed_expert and config.expert_streaming) continue;
                 const raw = try readTensor(allocator, model_dir, meta);
                 defer allocator.free(raw);
                 var arr = try uploadDense(raw, meta, stream);
@@ -933,7 +934,8 @@ fn countResidentBytes(
         const meta = entry.value_ptr.*;
         switch (try classifyKey(key, config)) {
             .skipped, .fp8_scale => {},
-            .resident, .routed_expert => {
+            .resident, .routed_expert => |kind| {
+                if (kind == .routed_expert and config.expert_streaming) continue;
                 var bytes = try payloadBytes(meta, null);
                 // The transformer loader keeps an f32 copy of each router for f32 routing.
                 if (layerKey(key)) |ref| if (std.mem.eql(u8, ref.rest, "mlp.gate.weight")) {
@@ -2173,4 +2175,71 @@ test "sushi coder legacy uniform billing preserves trunk-only config" {
         bills[i] = try residentBytesWithConfig(t.io, alloc, buf[0..len], &config);
     }
     try t.expectEqual(@as(u64, 3 * (2 * 8 * 8 * 40 * 2 + 2 * 2 * 128 * 2)), bills[1] - bills[0]);
+}
+
+fn checkMimoExl3StreamTrunk(runtime: bool) !void {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTinyExl3Source(t.io, a, tmp.dir, 36);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    const path = buf[0..len];
+    var cfg = try model.parseConfig(t.io, a, path);
+    defer cfg.deinit(a);
+    const resident_bill = try residentBytesWithConfig(t.io, a, path, &cfg);
+    cfg.expert_streaming = true;
+    const streamed_bill = try residentBytesWithConfig(t.io, a, path, &cfg);
+    try t.expectEqual(@as(u64, 3 * (2 * 8 * 8 * 36 * 2 + 2 * 2 * 128 * 2)), resident_bill - streamed_bill);
+    try t.expectEqual(streamed_bill, (try model.streamingResidentSplit(t.io, a, path, .exl3_k4)).trunk);
+    if (!runtime) return;
+    cfg.expert_streaming = false;
+    var resident = try model.loadWeightsForConfig(t.io, a, path, &cfg, false);
+    defer resident.deinit();
+    cfg.expert_streaming = true;
+    var streamed = try model.loadWeightsForConfig(t.io, a, path, &cfg, false);
+    defer streamed.deinit();
+    var it = resident.map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.indexOf(u8, key, ".switch_mlp.") != null) {
+            try t.expect(streamed.get(key) == null);
+            continue;
+        }
+        const actual = streamed.get(key) orelse return error.MissingStreamedTrunk;
+        try t.expectEqual(mlx.mlx_array_dtype(entry.value_ptr.*), mlx.mlx_array_dtype(actual));
+        try t.expectEqualSlices(c_int, mlx.getShape(entry.value_ptr.*), mlx.getShape(actual));
+        try mlx.check(mlx.mlx_array_eval(entry.value_ptr.*));
+        try mlx.check(mlx.mlx_array_eval(actual));
+        const data = struct {
+            fn ptr(arr: mlx.mlx_array) [*]const u8 {
+                return switch (mlx.mlx_array_dtype(arr)) {
+                    .uint8 => mlx.mlx_array_data_uint8(arr).?,
+                    .bfloat16 => @ptrCast(mlx.mlx_array_data_bfloat16(arr).?),
+                    .float32 => @ptrCast(mlx.mlx_array_data_float32(arr).?),
+                    else => unreachable,
+                };
+            }
+        }.ptr;
+        const expected_bytes = data(entry.value_ptr.*);
+        const actual_bytes = data(actual);
+        const bytes = mlx.mlx_array_size(actual) * @as(usize, switch (mlx.mlx_array_dtype(actual)) {
+            .uint8 => 1,
+            .bfloat16 => 2,
+            .float32 => 4,
+            else => unreachable,
+        });
+        try t.expectEqualSlices(u8, expected_bytes[0..bytes], actual_bytes[0..bytes]);
+    }
+}
+
+test "MiMo EXL3 streaming CPU bills the FP8 trunk without routed banks" {
+    try checkMimoExl3StreamTrunk(false);
+}
+
+test "MiMo EXL3 streaming loads the identical FP8 trunk without routed banks" {
+    try checkMimoExl3StreamTrunk(true);
 }

@@ -24,8 +24,9 @@ Any qwen4_exp checkpoint whose routed experts are leading-index banks streams: t
 (`mlp.experts.gate_up_proj` `[512,1280,2560]` + `down_proj` `[512,2560,640]`, 335 GB total, `streaming_required`),
 or the MLX split layout (`switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`), or a uniform Sushi EXL3 pack: its
 nine banks per layer (trellis, suh, svh per projection) stream through the same slabs and the resident EXL3 kernels
-run on slab-local ids, output bit-identical to resident; the ledger bills from the stored headers. Rate-group (`.gN`)
-packs and MiMo EXL3 packs are refused by name and serve resident. MiMo's original MXFP4 checkpoint streams too ([arch-mimo-v2](arch-mimo-v2.md)). Trunk + MTP resident; routed experts come from SSD through
+run on slab-local ids, output bit-identical to resident; the ledger bills from the stored headers, a slot sized to
+the widest layer rate. A MiMo EXL3 pack streams the same way beside its FP8 trunk. Rate-group (`.gN`) and pruned
+packs are refused by name and serve resident until their streaming lands. MiMo's original MXFP4 checkpoint streams too ([arch-mimo-v2](arch-mimo-v2.md)). Trunk + MTP resident; routed experts come from SSD through
 zero-copy slabs. With no budget a pack loads resident as before.
 
 ## Budget

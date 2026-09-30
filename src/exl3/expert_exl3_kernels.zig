@@ -7726,7 +7726,7 @@ var mimo_prefill_force: ?bool = null;
 
 fn mimoPrefillOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int) bool {
     if (mimo_prefill_force) |v| return v;
-    return hidden == 4096 and inter == 2048 and experts == 256 and topk == 8;
+    return hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8;
 }
 
 test "exl3 MiMo prefill metadata and sorted finish preserve BF16 f32-truth bar" {
@@ -8082,7 +8082,7 @@ fn downGemvPreparedMid(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, 
 
 fn preparedMidOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int, rows: c_int, dtype: mlx.mlx_dtype) bool {
     if (prepared_mid_force) |v| return v;
-    return hidden == 4096 and inter == 2048 and experts == 256 and topk == 8 and rows >= 1 and rows <= 8 and dtype == .bfloat16;
+    return hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8 and rows >= 1 and rows <= 8 and dtype == .bfloat16;
 }
 
 test "exl3 prepared mid keys on MiMo geometry, never on the rate, and excludes qwen and unmeasured widths" {
@@ -8451,4 +8451,20 @@ test "exl3 Sushi GPU decode and prefill match scalar truth at K1 K1.5 K3 K5 K8" 
             }
         }
     }
+}
+
+test "MiMo EXL3 streaming CPU slab capacities preserve resident kernel arms" {
+    const t = std.testing;
+    for (1..257) |slots| {
+        try t.expect(mimoPrefillOn(4096, 2048, @intCast(slots), 8));
+        for (1..9) |rows| try t.expect(preparedMidOn(4096, 2048, @intCast(slots), 8, @intCast(rows), .bfloat16));
+    }
+    try t.expect(!mimoPrefillOn(4096, 2048, 0, 8));
+    try t.expect(!mimoPrefillOn(4096, 2048, 257, 8));
+    try t.expect(!preparedMidOn(4096, 2048, 0, 8, 1, .bfloat16));
+    try t.expect(!preparedMidOn(4096, 2048, 257, 8, 1, .bfloat16));
+    try t.expect(!preparedMidOn(4096, 2048, 16, 8, 9, .bfloat16));
+    try t.expect(!preparedMidOn(4096, 2048, 16, 8, 1, .float16));
+    try t.expect(!mimoPrefillOn(2560, 640, 16, 10));
+    try t.expect(!preparedMidOn(2560, 640, 16, 10, 1, .bfloat16));
 }

@@ -147,12 +147,16 @@ pub fn tensorKey(buf: []u8, layer: u16, c: Component) ![]const u8 {
 }
 
 pub fn exl3TensorKey(buf: []u8, layer: u16, c: Component) ![]const u8 {
+    return exl3TensorKeyWithPrefix(buf, AFFINE_PREFIX, layer, c);
+}
+
+fn exl3TensorKeyWithPrefix(buf: []u8, prefix: []const u8, layer: u16, c: Component) ![]const u8 {
     const suffix: []const u8 = switch (partOf(c)) {
         .weight => "trellis",
         .scales => "suh",
         .biases => "svh",
     };
-    return std.fmt.bufPrint(buf, "{s}{d}.mlp.switch_mlp.{s}_proj.{s}", .{ AFFINE_PREFIX, layer, @tagName(projectionOf(c)), suffix });
+    return std.fmt.bufPrint(buf, "{s}{d}.mlp.switch_mlp.{s}_proj.{s}", .{ prefix, layer, @tagName(projectionOf(c)), suffix });
 }
 
 fn rejectExl3RateGroups(map: std.json.ObjectMap) !void {
@@ -770,7 +774,8 @@ pub const QuantStore = struct {
         };
 
         var key_buf: [192]u8 = undefined;
-        const first_layer: u16 = if (isMxfp4Layout(chosen)) geometry.first_moe_layer else 0;
+        const first_layer = geometry.first_moe_layer;
+        const exl3_prefix = if (exl3BankComplete(weight_map, EXL3_PREFIXES[1], first_layer, geometry.layers)) EXL3_PREFIXES[1] else AFFINE_PREFIX;
         if (chosen == .mxfp4_split) {
             // Banks before first_moe_layer must be absent. A dense layer with a
             // stray switch tensor is not safe to reinterpret as a routed bank.
@@ -815,7 +820,7 @@ pub const QuantStore = struct {
                     const key = if (chosen == .mxfp4_split)
                         mxfp4TensorKey(&key_buf, layer, projectionOf(c), partOf(c)) catch return error.InvalidExpertGeometry
                     else if (chosen == .exl3_k4)
-                        exl3TensorKey(&key_buf, layer, c) catch return error.InvalidExpertGeometry
+                        exl3TensorKeyWithPrefix(&key_buf, exl3_prefix, layer, c) catch return error.InvalidExpertGeometry
                     else
                         tensorKey(&key_buf, layer, c) catch return error.InvalidExpertGeometry;
                     const mapped = weight_map.get(key) orelse return error.MissingExpertTensor;
@@ -836,8 +841,7 @@ pub const QuantStore = struct {
                             if (region.rank != 4 or region.dtype != .u16 or region.shape[1] != in_dim / 16 or
                                 region.shape[2] != out_dim / 16 or rate.n > geometry.exl3_n)
                                 return error.Exl3TrellisGeometry;
-                            if (metadata_ready and store.packed_n[ci] != rate.n) return error.Exl3NonuniformStreamingUnsupported;
-                            store.packed_n[ci] = rate.n;
+                            store.packed_n[ci] = @max(store.packed_n[ci], rate.n);
                             region.shape[2] *= rate.n;
                             region.shape[3] = 0;
                         } else {
@@ -868,6 +872,9 @@ pub const QuantStore = struct {
                         store.cols[ci] = @intCast(region.shape[2]);
                         store.dtypes[ci] = region.dtype;
                         store.slot_bytes[ci] = per_expert;
+                    } else if (chosen == .exl3_k4 and partOf(c) == .weight) {
+                        store.cols[ci] = @max(store.cols[ci], @as(u32, @intCast(region.shape[2])));
+                        store.slot_bytes[ci] = @max(store.slot_bytes[ci], per_expert);
                     } else if (store.rows[ci] != region.shape[1] or store.cols[ci] != region.shape[2] or
                         store.dtypes[ci] != region.dtype or store.slot_bytes[ci] != per_expert)
                     {
@@ -930,7 +937,12 @@ pub const QuantStore = struct {
             }
         }
 
-        if (chosen == .exl3_k4 and store.packed_n[0] != store.packed_n[3]) return error.Exl3GateUpRateMismatch;
+        if (chosen == .exl3_k4) {
+            for (first_layer..geometry.layers) |layer| {
+                if (store.span(@intCast(layer), 0, .gate_w).len != store.span(@intCast(layer), 0, .up_w).len)
+                    return error.Exl3GateUpRateMismatch;
+            }
+        }
 
         // Parsed headers are needed only while constructing the source spans.
         for (files_list.items) |*file| {
@@ -956,7 +968,9 @@ pub const QuantStore = struct {
     /// The nine slices of one expert, concatenated in `Component` order.
     pub fn readExpert(self: *const QuantStore, layer: u16, expert: u16, dst: []u8) !void {
         if (layer >= self.geometry.layers or expert >= self.geometry.experts) return error.ExpertOutOfRange;
-        if (dst.len != self.expertBytes()) return error.InvalidExpertRead;
+        var bytes: u64 = 0;
+        for (0..component_count) |ci| bytes += self.span(layer, expert, @fromBackingInt(@intCast(ci))).len;
+        if (dst.len != bytes) return error.InvalidExpertRead;
         var at: usize = 0;
         for (0..component_count) |ci| {
             const c: Component = @fromBackingInt(@intCast(ci));

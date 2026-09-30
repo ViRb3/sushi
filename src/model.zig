@@ -1072,10 +1072,9 @@ pub const ModelConfig = struct {
             self.num_experts_per_tok > 0 and self.hidden_size > 0 and self.moe_intermediate_size > 0;
     }
 
-    /// Can a load of THIS checkpoint stream its experts? A Qwen EXL3 pack can; a MiMo EXL3 pack serves
-    /// resident only, so an SSD budget or expert cache asked of it is ignored.
+    /// Can a load of THIS checkpoint stream its experts?
     pub fn streamsExperts(self: *const ModelConfig) bool {
-        return self.supportsExpertStreaming() and (self.expert_layout != .exl3_k4 or self.isQwen4());
+        return self.supportsExpertStreaming();
     }
 
     /// Dense banks and raw individual experts require the streaming loader.
@@ -4000,6 +3999,19 @@ pub const ResidentSplit = struct { trunk: u64, mtp: u64 };
 pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !ResidentSplit {
     if (layout == .mxfp4_individual)
         return .{ .trunk = try @import("mimo_source.zig").residentBytes(io, allocator, model_dir), .mtp = 0 };
+    if (layout == .exl3_k4) {
+        var config_dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+        defer config_dir.close(io);
+        const raw = try config_dir.readFileAlloc(io, "config.json", allocator, .limited(16 * 1024 * 1024));
+        defer allocator.free(raw);
+        const meta = model_discovery.parseStubMeta(allocator, raw, false);
+        if (std.mem.eql(u8, meta.modelType(), "mimo_v2")) {
+            var config = try parseConfig(io, allocator, model_dir);
+            defer config.deinit(allocator);
+            config.expert_streaming = true;
+            return .{ .trunk = try @import("mimo_source.zig").residentBytesWithConfig(io, allocator, model_dir, &config), .mtp = 0 };
+        }
+    }
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     var referenced = model_discovery.indexShardSet(io, dir) orelse return error.InvalidSafetensorsIndex;
@@ -4155,6 +4167,8 @@ pub fn loadWeightsForConfig(
         return error.ArchitectureUnsupported;
     }
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
+    if (config.expert_streaming and config.usesMimoSourceTrunk())
+        return @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
     if (load_vision) return loadWeightsWithVision(io, allocator, model_dir);
@@ -8642,7 +8656,7 @@ test "mimo_v2 original config selects split QKV and native expert quantization" 
     try testing.expect(c.expertStreamingRequired());
 }
 
-test "mimo_v2 EXL3 routed banks serve resident and take the source trunk loader" {
+test "mimo_v2 EXL3 routed banks stream on request and take the source trunk loader" {
     var c = ModelConfig{
         .model_type = "mimo_v2",
         .num_hidden_layers = 2,
@@ -8655,7 +8669,7 @@ test "mimo_v2 EXL3 routed banks serve resident and take the source trunk loader"
         .expert_layout = .exl3_k4,
     };
     try testing.expect(c.supportsExpertStreaming());
-    try testing.expect(!c.streamsExperts());
+    try testing.expect(c.streamsExperts());
     try testing.expect(!c.expertStreamingRequired());
     try testing.expect(c.usesMimoSourceTrunk());
     c.expert_layout = .mxfp4_individual;
@@ -8759,4 +8773,16 @@ test "parseConfig releases owned paths when an EXL3 pack is refused" {
     var path: [std.fs.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(testing.io, &path);
     try testing.expectError(error.ExpertLayoutUnsupported, parseConfig(testing.io, testing.allocator, path[0..len]));
+}
+
+test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default" {
+    const stream = @import("expert_stream.zig");
+    const c = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 48, .first_k_dense_replace = 1, .num_experts = 256, .num_experts_per_tok = 8, .hidden_size = 4096, .moe_intermediate_size = 2048, .expert_layout = .exl3_k4 };
+    try testing.expect(c.streamsExperts());
+    try testing.expectEqual(@as(u32, 47), c.expertLayerCount());
+    try testing.expect(!stream.expertStreamingEngaged(c.streamsExperts(), c.expertStreamingRequired(), 0, 0));
+    try testing.expect(stream.expertStreamingEngaged(c.streamsExperts(), c.expertStreamingRequired(), 0, 20 << 30));
+    try testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false));
+    try testing.expectEqual(stream.MtpUnderStreaming.drop_settings, stream.mtpUnderStreaming(true, true, false));
+    try testing.expectEqual(stream.MtpUnderStreaming.drop_default, stream.mtpUnderStreaming(true, false, true));
 }

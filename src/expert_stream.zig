@@ -583,6 +583,18 @@ pub const ExpertStore = struct {
         return .{ .rows = rows, .cols = cols, .dtype = .bfloat16, .elem_bytes = 2, .slot_bytes = @as(u64, rows) * cols * 2 };
     }
 
+    pub fn slabSpecAt(self: *const ExpertStore, layer: u16, ci: usize) SlabSpec {
+        var spec = self.slabSpec(ci);
+        if (!spec.exl3) return spec;
+        spec.slot_bytes = self.spanAt(layer, 0, ci).len;
+        if (spec.packed_n != 0) {
+            const tiles = @as(u64, spec.rows) * (spec.cols / spec.packed_n);
+            spec.packed_n = @intCast(spec.slot_bytes / (tiles * spec.elem_bytes));
+            spec.cols = @intCast(spec.slot_bytes / (spec.rows * spec.elem_bytes));
+        }
+        return spec;
+    }
+
     pub fn perExpertBytes(self: *const ExpertStore) u64 {
         if (self.quantized) |*q| return q.expertBytes();
         var total: u64 = 0;
@@ -955,6 +967,24 @@ const SlabOperand = struct {
         return slab.bytes[slot * self.stride ..][0..self.stride];
     }
 
+    fn viewAs(self: *const SlabOperand, template: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, self.array, &.{-1}, 1, s));
+        var prefix = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(prefix);
+        const elements: c_int = @intCast(self.count * self.stride / mlx.mlx_array_itemsize(self.array));
+        try mlx.check(mlx.mlx_slice(&prefix, flat, &.{0}, 1, &.{elements}, 1, &.{1}, 1, s));
+        var shape: [4]c_int = undefined;
+        const dims = mlx.getShape(template);
+        @memcpy(shape[0..dims.len], dims);
+        shape[0] = @intCast(self.count);
+        var view = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_reshape(&view, prefix, &shape, dims.len, s));
+        return view;
+    }
+
     fn borrow(self: *const SlabOperand) !mlx.mlx_array {
         if (!self.present) return error.MissingExpertSlab;
         var handle = mlx.mlx_array_new();
@@ -1037,13 +1067,17 @@ const LayerState = struct {
 };
 
 fn createSlabSet(allocator: std.mem.Allocator, store: *const ExpertStore, count: u32, s: mlx.mlx_stream) ![]SlabOperand {
+    return createSlabSetAt(allocator, store, null, count, s);
+}
+
+fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, layer: ?u16, count: u32, s: mlx.mlx_stream) ![]SlabOperand {
     const n = store.componentCount();
     const slabs = try allocator.alloc(SlabOperand, n);
     errdefer allocator.free(slabs);
     var made: usize = 0;
     errdefer for (slabs[0..made]) |*operand| operand.destroy(allocator, s);
     while (made < n) : (made += 1) {
-        const spec = store.slabSpec(made);
+        const spec = if (layer) |li| store.slabSpecAt(li, made) else store.slabSpec(made);
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
         else if (spec.exl3 and spec.packed_n != 0)
@@ -1074,6 +1108,7 @@ pub const Prepared = struct {
     raw_down: mlx.mlx_array = .{ .ctx = null },
     quant_raw: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null }),
     quantized: bool = false,
+    owns_quant_views: bool = false,
     workspace: bool = false,
     held: [quant.component_count]?HeldLease = @splat(null),
     defer_to: ?*Engine = null,
@@ -1088,6 +1123,9 @@ pub const Prepared = struct {
         if (self.down.ctx != null) _ = mlx.mlx_array_free(self.down);
         if (self.raw_gate_up.ctx != null) _ = mlx.mlx_array_free(self.raw_gate_up);
         if (self.raw_down.ctx != null) _ = mlx.mlx_array_free(self.raw_down);
+        if (self.owns_quant_views) for (self.quant_raw) |arr| {
+            if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+        };
         for (self.held) |entry| {
             const held = entry orelse continue;
             if (self.defer_to) |engine| {
@@ -1197,7 +1235,7 @@ pub const Engine = struct {
             var cache = try GroupCache.init(allocator, plan.slots_per_layer, geometry.experts);
             errdefer cache.deinit();
             layer.* = .{ .cache = cache, .active = true };
-            layer.slabs = try createSlabSet(allocator, &engine.store, plan.slots_per_layer, s);
+            layer.slabs = try createSlabSetAt(allocator, &engine.store, @intCast(layer_index), plan.slots_per_layer, s);
             engine.slab_imports += presentSlabCount(layer.slabs);
         }
         engine.union_slabs = try createSlabSet(allocator, &engine.store, geometry.experts, s);
@@ -1467,6 +1505,10 @@ pub const Engine = struct {
             }
         }
 
+        if (use_union) for (read_set, layer.slabs) |*operand, cached| {
+            operand.stride = cached.stride;
+        };
+
         var spans: std.ArrayList(io_mod.FillSpan) = .empty;
         defer spans.deinit(self.allocator);
         var misses: u64 = 0;
@@ -1549,7 +1591,15 @@ pub const Engine = struct {
         var raws: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         var views: FusedViews = .{ .gate = .{ .ctx = null }, .up = .{ .ctx = null }, .down = .{ .ctx = null } };
         if (quantized) {
-            for (0..n) |ci| raws[ci] = read_set[ci].array;
+            errdefer if (use_union) for (raws) |arr| {
+                if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+            };
+            for (0..n) |ci| {
+                raws[ci] = if (use_union and read_set[ci].present)
+                    try read_set[ci].viewAs(layer.slabs[ci].array, self.s)
+                else
+                    read_set[ci].array;
+            }
         } else {
             raws[0] = try read_set[0].borrow();
             errdefer _ = mlx.mlx_array_free(raws[0]);
@@ -1562,7 +1612,7 @@ pub const Engine = struct {
         layer.stats.union_members += resolution.union_ids.len;
         layer.stats.hits += resolution.hits;
         layer.stats.misses += resolution.misses;
-        layer.stats.fill_bytes += misses * self.plan.expert_bytes;
+        for (spans.items) |span_value| layer.stats.fill_bytes += span_value.len;
         committed = true;
         return .{
             .allocator = self.allocator,
@@ -1574,6 +1624,7 @@ pub const Engine = struct {
             .raw_down = if (quantized) .{ .ctx = null } else raws[1],
             .quant_raw = if (quantized) raws else @splat(.{ .ctx = null }),
             .quantized = quantized,
+            .owns_quant_views = quantized and use_union,
             .workspace = resolution.workspace,
             .held = held,
             .defer_to = self,
@@ -2954,4 +3005,140 @@ test "a uniform EXL3 layout reaches its shards: only grouped or pruned packs ref
         s.deinit();
         return error.TestUnexpectedResult;
     } else |err| try t.expect(err != error.Exl3RaggedStreamingUnsupported and err != error.Exl3RateGroupsStreamingUnsupported);
+}
+
+fn writeMimoExl3StreamFixture(dir: std.Io.Dir) !void {
+    const a = std.testing.allocator;
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(a);
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(a);
+    try header.append(a, '{');
+    try index.appendSlice(a, "{\"weight_map\":{");
+    var offset: usize = 0;
+    for (1..3) |layer| {
+        for (0..9) |ci| {
+            const c: quant.Component = @fromBackingInt(@intCast(ci));
+            const weight = ci % 3 == 0;
+            const n: usize = if (layer == 1) 36 else 64;
+            const bytes: usize = 4 * (if (weight) 8 * 8 * n * 2 else 128 * 2);
+            const key = try std.fmt.allocPrint(a, "model.layers.{d}.mlp.switch_mlp.{s}_proj.{s}", .{ layer, @tagName(quant.projectionOf(c)), if (weight) "trellis" else if (ci % 3 == 1) "suh" else "svh" });
+            defer a.free(key);
+            const shape = if (weight) try std.fmt.allocPrint(a, "4,8,8,{d}", .{n}) else try a.dupe(u8, "4,128");
+            defer a.free(shape);
+            const sep = if (offset == 0) "" else ",";
+            const item = try std.fmt.allocPrint(a, "{s}\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[{s}],\"data_offsets\":[{d},{d}]}}", .{ sep, key, if (weight) "U16" else "F16", shape, offset, offset + bytes });
+            defer a.free(item);
+            try header.appendSlice(a, item);
+            const entry = try std.fmt.allocPrint(a, "{s}\"{s}\":\"experts.safetensors\"", .{ sep, key });
+            defer a.free(entry);
+            try index.appendSlice(a, entry);
+            offset += bytes;
+        }
+    }
+    try header.append(a, '}');
+    try index.appendSlice(a, "}}");
+    const file = try a.alloc(u8, 8 + header.items.len + offset);
+    defer a.free(file);
+    std.mem.writeInt(u64, file[0..8], header.items.len, .little);
+    @memcpy(file[8..][0..header.items.len], header.items);
+    for (file[8 + header.items.len ..], 0..) |*byte, i| byte.* = @truncate(i *% 13 +% i / 251);
+    try dir.writeFile(std.testing.io, .{ .sub_path = "experts.safetensors", .data = file });
+    try dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+}
+
+fn checkMimoExl3Streaming(runtime: bool) !void {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeMimoExl3StreamFixture(tmp.dir);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    const path = buf[0..len];
+    const geometry: Geometry = .{ .layers = 3, .experts = 4, .hidden = 128, .intermediate = 128, .first_moe_layer = 1, .exl3_n = 64 };
+    try t.expectEqual(quant.Layout.exl3_k4, try quant.streamingLayoutOfDir(t.allocator, t.io, "mimo_v2", path, 3, 1));
+    const per = try expertBytesFor(t.allocator, path, geometry, .exl3_k4);
+    try t.expectEqual(try exl3ExpertBytes(geometry), per);
+    const fixed = (1 << 20) + 4 * per + 2 * per + BOUNCE_BYTES;
+    const ledger = try budgetLedger(fixed + 4 * per, 1 << 20, 0, moeLayerCount(geometry), 4, 2, per, BOUNCE_BYTES);
+    try t.expectEqual(@as(u16, 2), ledger.slots_per_layer);
+    try t.expectEqual(fixed + ledger.cache_bytes, ledger.budget_bytes);
+    var store = try ExpertStore.openLayout(t.allocator, path, geometry, .exl3_k4);
+    defer store.deinit();
+    try t.expect(!store.hasExpertLayer(0));
+    const source_file = try tmp.dir.readFileAlloc(t.io, "experts.safetensors", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(source_file);
+    for (1..3) |layer| {
+        var cache = try GroupCache.init(t.allocator, 2, 4);
+        defer cache.deinit();
+        const routes = [_]u16{ 3, 0, 3, 2, 1 };
+        var resolved = try cache.resolve(t.allocator, &routes);
+        defer resolved.deinit(t.allocator);
+        for (routes, resolved.remapped) |expert, slot| try t.expectEqual(expert, resolved.union_ids[slot]);
+        for (0..9) |ci| {
+            const spec = store.slabSpecAt(@intCast(layer), ci);
+            if (ci % 3 == 0) try t.expectEqual(@as(u32, if (layer == 1) 36 else 64), spec.packed_n);
+            for (0..4) |expert| {
+                const span_value = store.spanAt(@intCast(layer), @intCast(expert), ci);
+                try t.expectEqual(spec.slot_bytes, span_value.len);
+                const bytes = try t.allocator.alloc(u8, @intCast(span_value.len));
+                defer t.allocator.free(bytes);
+                try readExact(store.fdAt(span_value.file), bytes, span_value.offset);
+                try t.expectEqualSlices(u8, source_file[@intCast(span_value.offset)..][0..bytes.len], bytes);
+            }
+        }
+    }
+    if (!runtime) return;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var engine = try Engine.initWithOptions(t.allocator, path, geometry, ledger.cache_bytes, s, .{ .layout = .exl3_k4, .bounce_size = 1 << 20 });
+    defer engine.deinit();
+    try t.expect(!engine.layers[0].active);
+    try t.expectEqual(@as(usize, 0), engine.layers[0].slabs.len);
+    try t.expectEqual(@as(u64, 0), engine.fallback_imports);
+    try t.expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
+    try engine.warmCache();
+    for ([_]u16{ 1, 2 }) |layer| {
+        const before = engine.fill_bytes_total;
+        var warm = try engine.prepareHost(layer, &.{0});
+        warm.deinit();
+        try t.expectEqual(before, engine.fill_bytes_total);
+    }
+    for ([_]u16{ 1, 2, 1 }) |layer| {
+        for ([_][]const u16{ &.{ 3, 0, 3 }, &.{ 0, 2, 3, 1, 2 } }) |routes| {
+            var prepared = try engine.prepareHost(layer, routes);
+            defer prepared.deinit();
+            try t.expectEqual(routes.len > 3, prepared.workspace);
+            for (0..9) |ci| {
+                const arr = prepared.quantOperand(@fromBackingInt(@intCast(ci)));
+                const shape = mlx.getShape(arr);
+                if (ci % 3 == 0) try t.expectEqual(@as(c_int, if (layer == 1) 36 else 64), shape[3]);
+                try mlx.check(mlx.mlx_array_eval(arr));
+                const data: [*]const u8 = if (ci % 3 == 0) @ptrCast(mlx.mlx_array_data_uint16(arr).?) else @ptrCast(mlx.mlx_array_data_float16(arr).?);
+                for (routes, prepared.remapped) |expert, slot| {
+                    const source = engine.store.spanAt(layer, expert, ci);
+                    const bytes = try t.allocator.alloc(u8, @intCast(source.len));
+                    defer t.allocator.free(bytes);
+                    try readExact(engine.store.fdAt(source.file), bytes, source.offset);
+                    const actual = if (prepared.workspace) engine.unionSlotBytesAt(slot, ci) else engine.cacheSlotBytesAt(layer, slot, ci);
+                    try t.expectEqualSlices(u8, bytes, actual);
+                    try t.expectEqualSlices(u8, bytes, data[@as(usize, slot) * bytes.len ..][0..bytes.len]);
+                }
+            }
+        }
+    }
+    var allocated: u64 = 0;
+    for (engine.layers) |layer| for (layer.slabs) |slab| {
+        allocated += slab.slab.?.bytes.len;
+    };
+    for (engine.union_slabs) |slab| allocated += slab.slab.?.bytes.len;
+    try t.expect(allocated <= ledger.cache_bytes + ledger.workspace_bytes + ledger.selected_bytes + ledger.bounce_bytes - 4 * (1 << 20));
+}
+
+test "MiMo EXL3 streaming CPU geometry ledger and slab ids cross the dense prefix" {
+    try checkMimoExl3Streaming(false);
+}
+
+test "MiMo EXL3 streaming imported slabs warm and reuse different layer rates" {
+    try checkMimoExl3Streaming(true);
 }

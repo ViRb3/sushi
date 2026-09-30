@@ -541,7 +541,7 @@ test "EXL3 streaming CPU refusals survive the registry and HTTP boundary" {
     }
 }
 
-test "EXL3 streaming CPU rejects malformed and nonuniform banks before allocation" {
+test "EXL3 streaming CPU rejects malformed banks and per-layer gate up rate mismatches" {
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -580,5 +580,5 @@ test "EXL3 streaming CPU rejects malformed and nonuniform banks before allocatio
     specs[9].shape = &narrow;
     specs[9].bytes = 128;
     try writeSafetensors(io, a, tmp.dir, "experts.safetensors", &specs);
-    try std.testing.expectError(error.Exl3NonuniformStreamingUnsupported, stream.ExpertStore.openLayout(a, path, two, .exl3_k4));
+    try std.testing.expectError(error.Exl3GateUpRateMismatch, stream.ExpertStore.openLayout(a, path, two, .exl3_k4));
 }

@@ -73,11 +73,11 @@ for arm in resident streamed; do
         if grep -q '\[expert-stream\] cache ' "$RUN/$arm.log"; then exit 1; fi
     fi
     MODEL=$(curl --connect-timeout 2 --max-time 10 -fsS "http://127.0.0.1:$PORT/v1/models" | jq -er '[.data[] | select(.loaded == true) | .id][0]')
-    jq -nc --arg model "$MODEL" '{model:$model,messages:[{role:"user",content:(("The library keeps books about rivers, forests, mountains, and cities. " * 12) + "Write one short sentence about a library.")}],temperature:0,seed:1234,max_tokens:32,stream:false,logprobs:true,top_logprobs:20}' >"$RUN/request.json"
+    jq -nc --arg model "$MODEL" '{model:$model,messages:[{role:"user",content:(("The library keeps books about rivers, forests, mountains, and cities. " * 12) + "Write one short sentence about a library.")}],temperature:0,seed:1234,enable_thinking:false,max_tokens:32,stream:false,logprobs:true,top_logprobs:20}' >"$RUN/request.json"
     for pass in 1 2; do
         curl --connect-timeout 5 --max-time 1800 -fsS -H 'Content-Type: application/json' \
             -d @"$RUN/request.json" "http://127.0.0.1:$PORT/v1/chat/completions" >"$RUN/$arm-$pass.json"
-        jq -e '.choices | length == 1' "$RUN/$arm-$pass.json" >/dev/null
+        jq -e '(.choices | length == 1) and (.choices[0].logprobs.content | type == "array" and length > 0 and all(.[]; (.top_logprobs | length) == 20))' "$RUN/$arm-$pass.json" >/dev/null
         jq -S -c '{message:.choices[0].message,logprobs:.choices[0].logprobs,finish_reason:.choices[0].finish_reason,completion_tokens:.usage.completion_tokens}' \
             "$RUN/$arm-$pass.json" >"$RUN/$arm-$pass.reply"
     done
