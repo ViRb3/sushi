@@ -11,6 +11,8 @@ earlier history is mlx-serve's, in that project's changelog.
   tok/s with identical output.
 - **`--expert-pick-tolerance <n>`** (0 to 0.6, default off): a streamed pack may serve a cached expert in place of a
   missed one when the router rates it at least `1 - n` as likely; lossy, trading a little accuracy for fewer SSD reads.
+- **A reply cut short while thinking streams the reasoning the non-streamed reply returns**: no lone `<think>` as
+  reasoning (MiMo at `max_tokens: 1`), no empty Anthropic thinking block, and no dropped thought of a few characters.
 
 ---
 

@@ -3038,3 +3038,88 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
         try testing.expectEqualStrings(want, got[1]);
     }
 }
+
+/// Streams `raw` cut by the length limit after `cut` bytes, the way each stream
+/// path does, and returns (tools path, no-tools path) reasoning deltas joined. A
+/// thought the model opens arrives as one `<think>` token, every later byte as a token.
+fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, opened: bool) ![2][]u8 {
+    const first: usize = if (opened) 0 else "<think>".len;
+
+    var tools = std.ArrayList(u8).empty;
+    errdefer tools.deinit(allocator);
+    var streamed: usize = 0;
+    for (@max(first, 1)..cut + 1) |i| {
+        const rc = chat.splitThinkBlock(raw[0..i], true, opened).reasoning_content orelse "";
+        const ready = if (i == cut) rc else chat.settledReasoning(rc);
+        if (chat.unstreamedReasoning(ready, streamed)) |fresh| {
+            try tools.appendSlice(allocator, fresh);
+            streamed = ready.len;
+        }
+    }
+
+    var plain = std.ArrayList(u8).empty;
+    errdefer plain.deinit(allocator);
+    var held = std.ArrayList(u8).empty;
+    defer held.deinit(allocator);
+    if (!opened) try held.appendSlice(allocator, chat.modelThinkOpener(false, raw[0..first]).?);
+    var consumed = false;
+    var shipped = false;
+    for (raw[first..cut]) |byte| {
+        try held.append(allocator, byte);
+        if (!consumed and held.items.len >= "<think>".len) {
+            consumed = true;
+            const l = chat.thinkOpenTagLenAt(held.items) orelse 0;
+            std.mem.copyForwards(u8, held.items[0 .. held.items.len - l], held.items[l..]);
+            held.shrinkRetainingCapacity(held.items.len - l);
+        }
+        if (!consumed) continue;
+        const flush = chat.openThoughtFlush(held.items, shipped);
+        try plain.appendSlice(allocator, held.items[flush.skip..][0..flush.ship]);
+        if (flush.ship > 0) shipped = true;
+        const keep = held.items[flush.skip + flush.ship ..];
+        std.mem.copyForwards(u8, held.items[0..keep.len], keep);
+        held.shrinkRetainingCapacity(keep.len);
+    }
+    try plain.appendSlice(allocator, chat.cutThoughtDelta(held.items, consumed, shipped));
+    return .{ try tools.toOwnedSlice(allocator), try plain.toOwnedSlice(allocator) };
+}
+
+test "format corpus: a thought cut by the length limit streams the non-stream reasoning, on both stream paths" {
+    // `max_tokens: 1` on MiMo streamed its lone `<think>` opener as reasoning while
+    // the non-stream reply carried none. Every cut, the opener's own included, must
+    // stream the split's bytes; a surface that opens its reasoning block or item at
+    // the first delta then opens one exactly when the non-stream reply has reasoning.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, opened: bool };
+    var cases = std.ArrayList(Case).empty;
+    defer cases.deinit(allocator);
+    for (corpus) |e| {
+        if (std.mem.count(u8, e.raw, "</think>") != 1) continue;
+        if (chat.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
+        const opens = std.mem.startsWith(u8, e.raw, "<think>");
+        if (!opens and !e.opened_by_template) continue;
+        try cases.append(allocator, .{ .raw = e.raw, .opened = !opens });
+    }
+    const edges = [_]Case{
+        .{ .raw = "<think>Okay, 17 times 23.</think>391", .opened = false },
+        .{ .raw = "<think>\n\nBlank lines first.\n</think>x", .opened = false },
+        .{ .raw = "<think> </think>", .opened = false },
+        .{ .raw = "\n\nLeading blank lines.\n</think>A", .opened = true },
+        .{ .raw = "Ok</think>", .opened = true },
+        .{ .raw = "Trailing spaces  \n </think>x", .opened = true },
+    };
+    try cases.appendSlice(allocator, &edges);
+    try testing.expect(cases.items.len > edges.len);
+    for (cases.items) |c| {
+        const first: usize = if (c.opened) 1 else "<think>".len;
+        const end = std.mem.indexOf(u8, c.raw, "</think>").? + "</think>".len;
+        for (first..end) |cut| {
+            const want = chat.splitThinkBlock(c.raw[0..cut], true, c.opened).reasoning_content orelse "";
+            const got = try streamCutThought(allocator, c.raw, cut, c.opened);
+            defer for (got) |g| allocator.free(g);
+            errdefer std.debug.print("\nraw: {s}\ncut: {d}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, cut, want, got[0], got[1] });
+            try testing.expectEqualStrings(want, got[0]);
+            try testing.expectEqualStrings(want, got[1]);
+        }
+    }
+}

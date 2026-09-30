@@ -3252,6 +3252,21 @@ pub fn closedThoughtDelta(body: []const u8, shipped: bool) []const u8 {
     return if (shipped) std.mem.trimEnd(u8, body, "\n ") else std.mem.trim(u8, body, "\n ");
 }
 
+/// The last delta of a thought the generation cut while still open, from the
+/// bytes the stream still holds: an opener not yet consumed is structure, and a
+/// thought that shipped nothing drops its leading "\n " as the split does.
+pub fn cutThoughtDelta(held: []const u8, opener_consumed: bool, shipped: bool) []const u8 {
+    var body = held;
+    if (!opener_consumed) {
+        if (thinkOpenTagLenAt(body)) |l| {
+            body = body[l..];
+        } else if (std.mem.startsWith(u8, body, "<|channel>thought")) {
+            body = body["<|channel>thought".len..];
+        }
+    }
+    return if (shipped) body else std.mem.trimStart(u8, body, "\n ");
+}
+
 pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
     if (already >= reasoning.len) return null;
     return reasoning[already..];
@@ -11399,6 +11414,20 @@ test "streamTailIsReasoning: an unopened block was content all along" {
     try testing.expect(streamTailIsReasoning(true, false, true));
     // Already closed and split ⇒ the tail is the visible answer.
     try testing.expect(!streamTailIsReasoning(false, true, true));
+}
+
+test "cutThoughtDelta: a thought cut at its opener delivers nothing, as the split does" {
+    // `max_tokens: 1` on a model that opens its own block: the stream holds only the seeded opener.
+    try testing.expectEqualStrings("", cutThoughtDelta("<think>", false, false));
+    try testing.expectEqualStrings("", cutThoughtDelta("<|channel>thought", false, false));
+    try testing.expectEqualStrings("", splitThinkBlock("<think>", true, false).reasoning_content orelse "");
+    // A prompt-opened thought cut before its first word, and one cut after it.
+    try testing.expectEqualStrings("", cutThoughtDelta("\n", false, false));
+    try testing.expectEqualStrings("Ok", cutThoughtDelta("\nOk", false, false));
+    // Once the opener is consumed, the same bytes are the thought's own text.
+    try testing.expectEqualStrings("<think>", cutThoughtDelta("<think>", true, false));
+    // After a delta shipped, the held run (withheld whitespace, a partial close) goes out as is.
+    try testing.expectEqualStrings(" \n</thi", cutThoughtDelta(" \n</thi", true, true));
 }
 
 test "promptTailOpensThink does not match Gemma's channel opener" {

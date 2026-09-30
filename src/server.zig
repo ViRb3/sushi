@@ -11066,8 +11066,9 @@ fn handleStreamingGeneration(
         // shipped its whole answer as reasoning with EMPTY content, while
         // non-streaming returned it correctly (live 2026-08-04).
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
-            if (!budget_exhausted) {
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
+            const tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
+            if (!budget_exhausted and tail.len > 0) {
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = tail }, null, null, null, .{});
             }
         } else {
             const vis_tail = chat_mod.streamContentLead(think_buf.items, content_started);
@@ -16148,10 +16149,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                    if (!thinking_block_open) {
-                        try openAnthropicThinkingBlock(allocator, stream, block_index);
-                        thinking_block_open = true;
-                    }
                 } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
                     // Inkling thinking message — closes at <|end_message|>.
                     think_close_tag = "<|end_message|>";
@@ -16162,10 +16159,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                    if (!thinking_block_open) {
-                        try openAnthropicThinkingBlock(allocator, stream, block_index);
-                        thinking_block_open = true;
-                    }
                 } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                     think_close_tag = "<channel|>";
                     var skip: usize = 17;
@@ -16175,10 +16168,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                    if (!thinking_block_open) {
-                        try openAnthropicThinkingBlock(allocator, stream, block_index);
-                        thinking_block_open = true;
-                    }
                 } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .analysis) {
                     // gpt_oss: `[<|start|>assistant]<|channel|>analysis<|message|>`
                     // opens a reasoning segment that closes at <|end|>. Consume
@@ -16196,10 +16185,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                    if (!thinking_block_open) {
-                        try openAnthropicThinkingBlock(allocator, stream, block_index);
-                        thinking_block_open = true;
-                    }
                 } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .growing) {
                     // Harmony header still arriving — wait, or `<|channel|>anal`
                     // leaks as reasoning.
@@ -16219,10 +16204,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                     skipped_think_open = true;
-                    if (!thinking_block_open) {
-                        try openAnthropicThinkingBlock(allocator, stream, block_index);
-                        thinking_block_open = true;
-                    }
                 } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .growing) {
                     // Muse header still arriving token by token — wait.
                 } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
@@ -16233,21 +16214,16 @@ fn handleAnthropicStreaming(
                     // No opener in the model's output — template injected one.
                     // Stay in the think block; close tag is detected dynamically.
                     skipped_think_open = true;
-                    if (!thinking_block_open) {
-                        try openAnthropicThinkingBlock(allocator, stream, block_index);
-                        thinking_block_open = true;
-                    }
                 }
             }
 
             // A spent budget closes the DELIVERED thinking block; the tail is withheld, never text.
             if (!budget_exhausted and reasoning_budget >= 0 and think_tokens >= reasoning_budget and skipped_think_open) {
                 budget_exhausted = true;
-                if (thinking_block_open) {
-                    try closeAnthropicThinkingBlock(allocator, stream, block_index);
-                    thinking_block_open = false;
-                    block_index += 1;
-                }
+                if (!thinking_block_open) try openAnthropicThinkingBlock(allocator, stream, block_index);
+                try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                thinking_block_open = false;
+                block_index += 1;
             }
 
             // Check for the close tag — accept whichever appears first
@@ -16305,8 +16281,8 @@ fn handleAnthropicStreaming(
             if (close_match) |m| {
                 const last = chat_mod.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 thought_shipped = false;
-                if (thinking_block_open and last.len > 0) {
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, last);
+                if (!budget_exhausted and last.len > 0) {
+                    try emitAnthropicThinkingOpening(allocator, stream, block_index, &thinking_block_open, last);
                 }
                 if (thinking_block_open) {
                     try closeAnthropicThinkingBlock(allocator, stream, block_index);
@@ -16356,7 +16332,7 @@ fn handleAnthropicStreaming(
                 const flush = chat_mod.openThoughtFlush(think_buf.items, thought_shipped);
                 const safe_len = flush.skip + flush.ship;
                 if (safe_len > 0) {
-                    if (thinking_block_open and flush.ship > 0) try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[flush.skip..safe_len]);
+                    if (!budget_exhausted and flush.ship > 0) try emitAnthropicThinkingOpening(allocator, stream, block_index, &thinking_block_open, think_buf.items[flush.skip..safe_len]);
                     if (flush.ship > 0) thought_shipped = true;
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
@@ -16377,10 +16353,6 @@ fn handleAnthropicStreaming(
                     in_think_block = true;
                     skipped_think_open = true;
                     think_close_tag = "<|eom|>";
-                    if (!thinking_block_open) {
-                        try openAnthropicThinkingBlock(allocator, stream, block_index);
-                        thinking_block_open = true;
-                    }
                 }
                 if (!muse_skip_header) muse_head.clearRetainingCapacity();
                 continue;
@@ -16432,8 +16404,9 @@ fn handleAnthropicStreaming(
     }
 
     // Flush remaining think buffer
-    if (!client_gone and thinking_block_open and think_buf.items.len > 0) {
-        try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items);
+    const think_tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
+    if (!client_gone and !budget_exhausted and think_tail.len > 0) {
+        try emitAnthropicThinkingOpening(allocator, stream, block_index, &thinking_block_open, think_tail);
     }
     if (!client_gone and thinking_block_open) {
         try closeAnthropicThinkingBlock(allocator, stream, block_index);
@@ -16642,6 +16615,14 @@ fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: *Conn, index
     , .{ index, inner });
     defer allocator.free(data);
     try sendAnthropicEvent(stream, "content_block_delta", data);
+}
+
+/// A streamed thinking block opens at its first delta, so a thought that
+/// delivers nothing streams no block, as the non-stream reply carries none.
+fn emitAnthropicThinkingOpening(allocator: std.mem.Allocator, stream: *Conn, index: u32, open: *bool, thinking: []const u8) !void {
+    if (!open.*) try openAnthropicThinkingBlock(allocator, stream, index);
+    open.* = true;
+    try emitAnthropicThinkingDelta(allocator, stream, index, thinking);
 }
 
 /// Close a thinking block with a fake signature and content_block_stop.
@@ -17720,14 +17701,15 @@ fn handleResponsesInner(
         }
 
         // Flush any remaining think buffer (no close tag found) as reasoning.
-        if (!client_gone and in_think_block and think_buf.items.len > 0 and !active_has_tools) {
+        const think_tail = chat_mod.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped);
+        if (!client_gone and in_think_block and think_tail.len > 0 and !active_has_tools) {
             if (!streamed_reasoning_started) {
                 streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                 streamed_reasoning_index = live_output_index;
                 try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                 streamed_reasoning_started = true;
             }
-            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
+            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_tail);
         }
 
         ts.finalize();

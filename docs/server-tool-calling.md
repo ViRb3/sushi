@@ -108,6 +108,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
   a close tag still arriving wait (`chat.settledReasoning` on the tools path, `chat.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
+- **A thought the length limit cuts ends on what its split delivers** (`chat.cutThoughtDelta`): a lone opener is
+  structure, and a thinking block or reasoning item opens at its first delta, so an empty thought streams none.
 
 ## Loop stops
 
