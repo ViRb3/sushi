@@ -74,6 +74,8 @@ stop() {
     [[ -n "$SERVER_PID" ]] || return
     kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
     pkill -f "zig-out/bin/sushi.*--port $PORT" 2>/dev/null || true
+    # macOS hands an exited server's GPU memory back seconds later; the next boot's preflight reads free RAM.
+    sleep "${SMOKE_SETTLE_S:-10}"
 }
 trap stop EXIT
 
