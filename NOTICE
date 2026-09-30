@@ -116,6 +116,11 @@ Used in sushi (`src/transformer.zig`):
 
   * The GatedDeltaNet blocked-sequence prefill kernel, ported from
     `custom_kernels/qwen35_prefill/gdn.py` (`gated_delta_blocked_seq`).
+  * The software-pipelined GatedDeltaNet prefill kernel in
+    `src/kernels/gdn_pipelined.metal`, from `_pipelined_source(12)` in
+    `omlx/custom_kernels/qwen35_prefill/gdn.py` at 730bd6a (oMLX #4006),
+    via Samuel Reed (@STRML), mlx-serve #641. State and output accesses
+    are generic over StT and OutT to retain sushi's bf16 state contract.
   * The per-dispatch key-chunk budget in the head-dim-256 fused causal
     attention path, whose design comes from `qwen35_fa256_attention.py`.
   * The direct-index Qwen4 QSA prefill design (attend to each query's

@@ -451,6 +451,75 @@ fn getGdnKernelBlocked(tb: u32) !mlx.mlx_fast_metal_kernel {
     return error.UnsupportedGdnBlockT;
 }
 
+pub const GdnRoute = enum { stock, blocked, pipelined };
+
+var gdn_pipelined_cached: ?mlx.mlx_fast_metal_kernel = null;
+pub var gdn_pipelined_override: ?bool = null;
+var gdn_pipelined_env: ??[]const u8 = null;
+
+pub fn gdnPipelinedFor(raw: ?[]const u8, model_type: []const u8, nax: bool) bool {
+    if (raw) |v| return !std.mem.eql(u8, v, "0");
+    return nax and std.mem.eql(u8, model_type, "qwen4_exp");
+}
+
+fn gdnPipelinedEnabled(model_type: []const u8) bool {
+    if (gdn_pipelined_override) |v| return v;
+    if (gdn_pipelined_env == null) {
+        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_GDN_PIPELINED")) |r| std.mem.sliceTo(r, 0) else null;
+        gdn_pipelined_env = raw;
+    }
+    return gdnPipelinedFor(gdn_pipelined_env.?, model_type, verifyQmmNaxAvailable());
+}
+
+fn getGdnKernelPipelined() !mlx.mlx_fast_metal_kernel {
+    if (gdn_pipelined_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T" };
+    const output_names = [_][*:0]const u8{ "y", "state_out" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("gated_delta_pipelined_tb12", in_vec, out_vec, @embedFile("kernels/gdn_pipelined.metal"), "", true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gdn_pipelined_cached = kernel;
+    return kernel;
+}
+
+fn gdnRouteKernel(route: GdnRoute, tb: u32, vector_gate: bool) !mlx.mlx_fast_metal_kernel {
+    return switch (route) {
+        .stock => getGdnKernel(vector_gate),
+        .blocked => getGdnKernelBlocked(tb),
+        .pipelined => getGdnKernelPipelined(),
+    };
+}
+
+fn gdnSetGrid(config: mlx.mlx_fast_metal_kernel_config, route: GdnRoute, dv: c_int, hv: c_int, batch: c_int) !void {
+    switch (route) {
+        .stock => {
+            // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * hv));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+        },
+        .blocked => {
+            // Grid: (256*(Dv/32), Hv, B) threads; threadgroup (256,1,1).
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256 * @divExact(dv, 32), hv, batch));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
+        },
+        .pipelined => {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 128 * @divExact(dv, 16), hv, batch));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
+        },
+    }
+}
+
+const GdnPrefillRoute = struct { route: GdnRoute, tb: u32 = 0 };
+
+fn gdnPrefillRoute(model_type: []const u8, seq_len: c_int, dk: c_int, dv: c_int, num_k_heads: c_int, num_v_heads: c_int, vector_gate: bool, in_itemsize: usize) GdnPrefillRoute {
+    if (vector_gate or !gdnBlockedEnabled() or !gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads)) return .{ .route = .stock };
+    const tb = gdnBlockTFor(gdnBlockT(), dk, in_itemsize) orelse return .{ .route = .stock };
+    return .{ .route = if (gdnPipelinedEnabled(model_type)) .pipelined else .blocked, .tb = tb };
+}
+
 // ── Verify-width split-K quantized matmul (spec-decode fast path) ──
 //
 // Stock MLX qmm is tuned for M=1 decode (qmv) and large-M prefill (steel);
@@ -28984,19 +29053,8 @@ pub const Transformer = struct {
             // The blocked kernel reads a PER-HEAD gate; a per-channel (KDA)
             // gate is a different indexing contract, so it declines outright
             // rather than silently reading the wrong element.
-            const blocked_tb: ?u32 = if (!vector_gate and gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads))
-                gdnBlockTFor(gdnBlockT(), dk, gdn_in_itemsize)
-            else
-                null;
-            if (blocked_tb) |_| {
-                // Grid: (256*(Dv/32), Hv, B) threads; threadgroup (256,1,1).
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256 * @divExact(dv, 32), num_v_heads, batch));
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
-            } else {
-                // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
-            }
+            const prefill = gdnPrefillRoute(cfg.model_type, seq_len, dk, dv, num_k_heads, num_v_heads, vector_gate, gdn_in_itemsize);
+            try gdnSetGrid(config, prefill.route, dv, num_v_heads, batch);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", gdn_in_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", gdn_state_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
@@ -29009,7 +29067,7 @@ pub const Transformer = struct {
             const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
             defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-            const gdn_kernel = if (blocked_tb) |tb| try getGdnKernelBlocked(tb) else try getGdnKernel(vector_gate);
+            const gdn_kernel = try gdnRouteKernel(prefill.route, prefill.tb, vector_gate);
             var outputs_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(outputs_vec);
             if (qwen4Standin().gdn_recur) {
@@ -51850,7 +51908,7 @@ const GdnRunOut = struct { y: mlx.mlx_array, state: mlx.mlx_array };
 
 /// Run the GDN recurrence via the stock single-state kernel (blocked=false)
 /// or the blocked-seq prefill kernel (blocked=true) and return BOTH outputs.
-fn gdnRunYState(blocked: bool, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !GdnRunOut {
+fn gdnRunYState(route: GdnRoute, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !GdnRunOut {
     // Mirror the production route exactly: dtypes read off the arrays, block
     // size clamped to what the staging budget allows at that width.
     const in_dtype = mlx.mlx_array_dtype(q);
@@ -51863,14 +51921,8 @@ fn gdnRunYState(blocked: bool, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx_a
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, .bfloat16));
-    if (blocked) {
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256 * @divExact(Dv, 32), Hv, B));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
-    } else {
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, Dv, B * Hv));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
-    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, st_dtype));
+    try gdnSetGrid(config, route, Dv, Hv, B);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", in_dtype));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", st_dtype));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
@@ -51882,7 +51934,7 @@ fn gdnRunYState(blocked: bool, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx_a
     const inputs_arr = [_]mlx.mlx_array{ q, k, v, g, beta, state_in, T_scalar };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
-    const kern = if (blocked) try getGdnKernelBlocked(tb) else try getGdnKernel(false);
+    const kern = try gdnRouteKernel(route, tb, false);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
@@ -51916,7 +51968,7 @@ fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
 /// case; an f16 checkpoint promotes its activations to f32 (f16 ⊕ f32 scalar),
 /// which is a different kernel specialization AND a different threadgroup
 /// budget — both covered by the sweep below.
-const GdnCase = struct { B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dv: c_int, tb: u32, in_dtype: mlx.mlx_dtype = .bfloat16 };
+const GdnCase = struct { B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dv: c_int, tb: u32, in_dtype: mlx.mlx_dtype = .bfloat16, state_dtype: mlx.mlx_dtype = .bfloat16 };
 
 /// Runs one geometry through host ref + stock + blocked and asserts the
 /// blocked kernel is no less accurate than the stock kernel it replaces.
@@ -51997,41 +52049,105 @@ fn gdnBlockedParityCase(case: GdnCase, s: mlx.mlx_stream) !void {
     try mlx.check(mlx.mlx_astype(&v, v32, case.in_dtype, s));
     try mlx.check(mlx.mlx_astype(&g, g32, .bfloat16, s));
     try mlx.check(mlx.mlx_astype(&beta, b32, case.in_dtype, s));
-    try mlx.check(mlx.mlx_astype(&st, st32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&st, st32, case.state_dtype, s));
 
-    const stock = try gdnRunYState(false, 16, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    const stock = try gdnRunYState(.stock, 16, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
     defer _ = mlx.mlx_array_free(stock.y);
     defer _ = mlx.mlx_array_free(stock.state);
-    const blocked = try gdnRunYState(true, case.tb, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
-    defer _ = mlx.mlx_array_free(blocked.y);
-    defer _ = mlx.mlx_array_free(blocked.state);
-
     const stock_y = try evalToF32(al, stock.y, vn, s);
     defer al.free(stock_y);
     const stock_st = try evalToF32(al, stock.state, sn, s);
     defer al.free(stock_st);
-    const blk_y = try evalToF32(al, blocked.y, vn, s);
-    defer al.free(blk_y);
-    const blk_st = try evalToF32(al, blocked.state, sn, s);
-    defer al.free(blk_st);
-
     // No-worse-than-reference: the blocked kernel's error vs the f64 ground
     // truth must not exceed the stock kernel's (both bf16-out; 1.5x headroom
     // covers fp32 summation-order differences, gross bugs blow way past it).
+    for (stock_y) |x| try testing.expect(std.math.isFinite(x));
+    for (stock_st) |x| try testing.expect(std.math.isFinite(x));
+    for (ref.y) |x| try testing.expect(std.math.isFinite(x));
+    for (ref.state) |x| try testing.expect(std.math.isFinite(x));
     const stock_y_err = maxAbsDiff(stock_y, ref.y);
     const stock_st_err = maxAbsDiff(stock_st, ref.state);
-    const blk_y_err = maxAbsDiff(blk_y, ref.y);
-    const blk_st_err = maxAbsDiff(blk_st, ref.state);
-    if (blk_y_err > 1.5 * stock_y_err + 0.02 or blk_st_err > 1.5 * stock_st_err + 0.02) {
-        std.debug.print(
-            "GDN blocked parity FAIL (B={d} T={d} Hk={d} Hv={d} Dv={d} tb={d}): y {d:.5} vs stock {d:.5}, state {d:.5} vs stock {d:.5}\n",
-            .{ case.B, case.T, case.Hk, case.Hv, case.Dv, case.tb, blk_y_err, stock_y_err, blk_st_err, stock_st_err },
-        );
-        return error.GdnBlockedParityFailed;
+    for ([_]GdnRoute{ .blocked, .pipelined }) |route| {
+        const got = try gdnRunYState(route, case.tb, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+        defer _ = mlx.mlx_array_free(got.y);
+        defer _ = mlx.mlx_array_free(got.state);
+        try testing.expectEqual(case.state_dtype, mlx.mlx_array_dtype(got.state));
+        const got_y = try evalToF32(al, got.y, vn, s);
+        defer al.free(got_y);
+        const got_st = try evalToF32(al, got.state, sn, s);
+        defer al.free(got_st);
+        for (got_y) |x| try testing.expect(std.math.isFinite(x));
+        for (got_st) |x| try testing.expect(std.math.isFinite(x));
+        const y_err = maxAbsDiff(got_y, ref.y);
+        const st_err = maxAbsDiff(got_st, ref.state);
+        if (y_err > 1.5 * stock_y_err + 0.02 or st_err > 1.5 * stock_st_err + 0.02) {
+            std.debug.print(
+                "GDN {s} parity FAIL (B={d} T={d} Hk={d} Hv={d} Dv={d} tb={d}): y {d:.5} vs stock {d:.5}, state {d:.5} vs stock {d:.5}\n",
+                .{ @tagName(route), case.B, case.T, case.Hk, case.Hv, case.Dv, case.tb, y_err, stock_y_err, st_err, stock_st_err },
+            );
+            return error.GdnBlockedParityFailed;
+        }
     }
 }
 
-test "GDN blocked-seq kernel: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
+test "GDN pipelined route: defaults, overrides, eligibility and kill switch" {
+    const saved_blocked = gdn_blocked_override;
+    const saved_pipeline = gdn_pipelined_override;
+    const saved_env = gdn_pipelined_env;
+    const saved_nax = vqmm_nax_probe_override;
+    const saved_tb = gdn_block_t_cached;
+    defer {
+        gdn_blocked_override = saved_blocked;
+        gdn_pipelined_override = saved_pipeline;
+        gdn_pipelined_env = saved_env;
+        vqmm_nax_probe_override = saved_nax;
+        gdn_block_t_cached = saved_tb;
+    }
+    gdn_blocked_override = true;
+    gdn_pipelined_override = null;
+    gdn_pipelined_env = @as(?[]const u8, null);
+    vqmm_nax_probe_override = true;
+    gdn_block_t_cached = 32;
+    try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
+    for ([_][]const u8{ "mimo_v2", "qwen3_5", "qwen3_5_moe" }) |model_type| {
+        try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute(model_type, 64, 128, 128, 2, 4, false, 2).route);
+    }
+    try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
+    vqmm_nax_probe_override = false;
+    try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
+    gdn_pipelined_env = @as(?[]const u8, "1");
+    try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("mimo_v2", 64, 128, 128, 2, 4, false, 2).route);
+    vqmm_nax_probe_override = true;
+    gdn_pipelined_env = @as(?[]const u8, "0");
+    try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
+    gdn_pipelined_override = true;
+    try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
+    for ([_]c_int{ 1, 2, 8, 63 }) |seq_len| {
+        try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", seq_len, 128, 128, 2, 4, false, 2).route);
+    }
+    const shapes = [_][4]c_int{
+        .{ 64, 128, 2, 4 },
+        .{ 128, 16, 2, 4 },
+        .{ 128, 48, 2, 4 },
+        .{ 128, 128, 0, 4 },
+        .{ 128, 128, 3, 4 },
+    };
+    for (shapes) |shape| {
+        try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", 64, shape[0], shape[1], shape[2], shape[3], false, 2).route);
+    }
+    try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, true, 2).route);
+    try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 16).route);
+    const fp32 = gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 4);
+    try testing.expectEqual(GdnRoute.pipelined, fp32.route);
+    try testing.expectEqual(@as(u32, 16), fp32.tb);
+    gdn_pipelined_override = false;
+    try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
+    gdn_pipelined_override = true;
+    gdn_blocked_override = false;
+    try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
+}
+
+test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
     const s = mlx.gpuStream();
     // T deliberately hits non-multiples of every supported TB (16/32/48);
     // Hk<Hv exercises GQA head mapping; Dv 32..128 exercises 1..4 DB blocks.
@@ -52049,16 +52165,32 @@ test "GDN blocked-seq kernel: no worse than stock vs f64 ground truth (T/GQA/Dv/
         .{ .B = 2, .T = 64, .Hk = 1, .Hv = 2, .Dv = 64, .tb = 16, .in_dtype = .float32 },
         // f16 activations: same 2-byte staging as bf16, different kernel.
         .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 64, .tb = 32, .in_dtype = .float16 },
+        .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 128, .tb = 32, .state_dtype = .float32 },
+        .{ .B = 1, .T = 65, .Hk = 1, .Hv = 2, .Dv = 64, .tb = 16, .in_dtype = .float32, .state_dtype = .float32 },
+        .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 64, .tb = 32, .in_dtype = .float16, .state_dtype = .float32 },
+        .{ .B = 1, .T = 72, .Hk = 2, .Hv = 4, .Dv = 128, .tb = 48 },
     };
     for (cases) |case| try gdnBlockedParityCase(case, s);
 }
 
 test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full run)" {
+    try gdnChunkContinuity(.blocked, 48, .bfloat16);
+}
+
+test "GDN pipelined kernel: chunk-boundary state continuity (split run == full run)" {
+    for ([_]c_int{ 48, 49 }) |split| {
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |state_dtype| {
+            try gdnChunkContinuity(.pipelined, split, state_dtype);
+        }
+    }
+}
+
+fn gdnChunkContinuity(route: GdnRoute, split: c_int, state_dtype: mlx.mlx_dtype) !void {
     const s = mlx.gpuStream();
     const al = testing.allocator;
     const B: c_int = 1;
     const T: c_int = 100;
-    const T1: c_int = 48; // non-multiple of TB=32: exercises the ragged tail mid-sequence
+    const T1: c_int = split; // non-multiple of TB=32: exercises the ragged tail mid-sequence
     const Hk: c_int = 2;
     const Hv: c_int = 4;
     const Dk: c_int = 128;
@@ -52123,10 +52255,10 @@ test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full
     try mlx.check(mlx.mlx_astype(&v, v32, .bfloat16, s));
     try mlx.check(mlx.mlx_astype(&g, g32, .bfloat16, s));
     try mlx.check(mlx.mlx_astype(&beta, b32, .bfloat16, s));
-    try mlx.check(mlx.mlx_astype(&st, st32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&st, st32, state_dtype, s));
 
     // Full run.
-    const full = try gdnRunYState(true, 32, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    const full = try gdnRunYState(route, 32, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
     defer _ = mlx.mlx_array_free(full.y);
     defer _ = mlx.mlx_array_free(full.state);
 
@@ -52165,10 +52297,10 @@ test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full
     try mlx.check(mlx.mlx_slice(&g2, g, &[_]c_int{ 0, T1, 0 }, 3, &[_]c_int{ B, T, Hv }, 3, &strides3, 3, s));
     try mlx.check(mlx.mlx_slice(&b2, beta, &[_]c_int{ 0, T1, 0 }, 3, &[_]c_int{ B, T, Hv }, 3, &strides3, 3, s));
 
-    const part1 = try gdnRunYState(true, 32, q1, k1, v1, g1, b1, st, B, T1, Hk, Hv, Dk, Dv, s);
+    const part1 = try gdnRunYState(route, 32, q1, k1, v1, g1, b1, st, B, T1, Hk, Hv, Dk, Dv, s);
     defer _ = mlx.mlx_array_free(part1.y);
     defer _ = mlx.mlx_array_free(part1.state);
-    const part2 = try gdnRunYState(true, 32, q2, k2, v2, g2, b2, part1.state, B, T - T1, Hk, Hv, Dk, Dv, s);
+    const part2 = try gdnRunYState(route, 32, q2, k2, v2, g2, b2, part1.state, B, T - T1, Hk, Hv, Dk, Dv, s);
     defer _ = mlx.mlx_array_free(part2.y);
     defer _ = mlx.mlx_array_free(part2.state);
 
@@ -52179,6 +52311,8 @@ test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full
 
     // The only divergence allowed is the one bf16 state rounding injected at
     // the boundary (live chunked prefill injects the identical rounding).
+    for (full_st) |x| try testing.expect(std.math.isFinite(x));
+    for (split_st) |x| try testing.expect(std.math.isFinite(x));
     var max_mag: f32 = 0;
     for (full_st) |x| max_mag = @max(max_mag, @abs(x));
     const tol = 0.02 * max_mag + 0.02;
@@ -52194,6 +52328,8 @@ test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full
     defer al.free(tail_f);
     const part2_y = try evalToF32(al, part2.y, n2, s);
     defer al.free(part2_y);
+    for (tail_f) |x| try testing.expect(std.math.isFinite(x));
+    for (part2_y) |x| try testing.expect(std.math.isFinite(x));
     try testing.expect(maxAbsDiff(tail_f, part2_y) < tol);
 }
 

@@ -96,6 +96,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   for an hd-256 ARRAY mask (`splitMaskedSdpa256`).
 - Qwen4 HC + GDN prefill fusions take the chunk WIDTH as a scalar INPUT (`SUSHI_HC_PREFILL=0` /
   `SUSHI_GDN_PREFILL_FUSED=0`).
+- GDN prefill (S >= 64) takes one of three recurrences (`GdnRoute`): stock, blocked-seq, or oMLX's software-pipelined
+  kernel (mlx-serve #641; 8 lanes per value row, 12-token blocks prefetched), the default for qwen4_exp on NAX GPUs.
+  `SUSHI_GDN_PIPELINED=0` keeps the blocked kernel, `=1` forces it; not bit-identical (dot order).
 
 ## Verify lanes
 

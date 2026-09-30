@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- Flash-Next GDN prefill uses oMLX's software-pipelined recurrence on NAX GPUs (mlx-serve #641, thanks @STRML).
+
 - Flash-Next prefill attention uses oMLX's occupancy-tuned QSA tensor-unit kernel and takes the sparse gather from
   the first sparse chunk (mlx-serve #636, thanks @STRML).
 
