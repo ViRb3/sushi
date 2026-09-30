@@ -4073,16 +4073,20 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     return loadWeightsOpt(io, allocator, model_dir, false);
 }
 
+fn logMimoSourceLoad(config: *const ModelConfig, vision: bool) void {
+    log.info("[mimo-source] loading original shards: {s} experts, FP8 trunk in source bytes{s}\n", .{
+        if (config.expert_streaming) "SSD-streamed" else if (config.expert_layout == .exl3_k4) "resident EXL3" else "native MXFP4",
+        if (vision) ", bf16 vision tower" else "",
+    });
+}
+
 /// MiMo's trunk is FP8 on disk under either routed-expert layout, so both take
 /// the source loader; an EXL3 pack's routed banks come resident beside it.
 pub fn loadWeightsMimoSource(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool) !Weights {
     const mimo_source = @import("mimo_source.zig");
     var config = try parseConfig(io, allocator, model_dir);
     defer config.deinit(allocator);
-    log.info("[mimo-source] loading original shards: {s} experts, FP8 trunk in source bytes{s}\n", .{
-        if (config.expert_layout == .exl3_k4) "resident EXL3" else "native MXFP4",
-        if (vision) ", bf16 vision tower" else "",
-    });
+    logMimoSourceLoad(&config, vision);
     var weights = try mimo_source.loadWeights(io, allocator, model_dir, &config);
     errdefer weights.deinit();
     if (vision) try mimo_source.loadVisionWeightsInto(&weights, io, allocator, model_dir);
@@ -4174,8 +4178,10 @@ pub fn loadWeightsForConfig(
         return error.ArchitectureUnsupported;
     }
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
-    if (config.expert_streaming and config.usesMimoSourceTrunk())
+    if (config.expert_streaming and config.usesMimoSourceTrunk()) {
+        logMimoSourceLoad(config, false);
         return @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
+    }
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
     if (load_vision) return loadWeightsWithVision(io, allocator, model_dir);
