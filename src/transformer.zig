@@ -25037,7 +25037,7 @@ pub const Transformer = struct {
 
         const defer_moe = self.expert_stream != null and self.imatrix == null and batch == 1 and seq_len == 1 and
             !prof.timing and !prof.ops and !dt.on and !dumping and qwen4_trace == null and ctx.capture_layers == null and
-            @as(u16, @bitCast(qwen4Standin())) == 0 and !decodeProfileEnabled() and expert_stream_mod.pick_tolerance == 0 and
+            @as(u16, @bitCast(qwen4Standin())) == 0 and !decodeProfileEnabled() and
             !diagEnvOnCached(&expert_defer_sync_env, "SUSHI_EXPERT_DEFER_SYNC");
         var deferred: ?DeferredQwenMoe = null;
         defer if (deferred) |*d| d.deinit();
@@ -30972,15 +30972,16 @@ pub const Transformer = struct {
         shared: mlx.mlx_array,
         swap_logits: mlx.mlx_array,
         result: mlx.mlx_array,
+        picked: mlx.mlx_array = .{ .ctx = null },
         map: ?[]const i32,
         detail: expert_stream_mod.RouteDetail,
 
         fn retain(self: *const StreamMoe) !StreamMoe {
             var out = self.*;
-            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result" }) |name|
+            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result", "picked" }) |name|
                 @field(out, name) = .{ .ctx = null };
             errdefer out.deinit();
-            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result" }) |name| {
+            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result", "picked" }) |name| {
                 const arr = @field(self, name);
                 if (arr.ctx != null) @field(out, name) = try standinRef(arr);
             }
@@ -30989,7 +30990,7 @@ pub const Transformer = struct {
         }
 
         fn deinit(self: *StreamMoe) void {
-            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result" }) |name| {
+            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result", "picked" }) |name| {
                 const arr = @field(self, name);
                 if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
             }
@@ -31086,9 +31087,33 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_array_eval(expert_x));
             detail.x_wait_ns = sync_clock.lap();
         }
+        const spec_route = if (expertSpecApplies(self.imatrix != null, mlx.getShape(inds))) try engine.specRoute(stream_ctx.layer) else null;
+        var spec_picked = mlx.mlx_array{ .ctx = null };
+        defer if (spec_picked.ctx != null) {
+            _ = mlx.mlx_array_free(spec_picked);
+        };
+        var picked_slots = mlx.mlx_array{ .ctx = null };
+        defer if (picked_slots.ctx != null) {
+            _ = mlx.mlx_array_free(picked_slots);
+        };
+        if (spec_route) |route| if (swap_logits.ctx != null and streamRows(mlx.getShape(inds)) == 1) {
+            const starved = mlx.mlx_array_new_data(route.starved.ptr, &[_]c_int{@intCast(route.starved.len)}, 1, .uint8);
+            defer _ = mlx.mlx_array_free(starved);
+            const pick = try expertPickGpu(ids_contiguous, swap_logits, route.raw, starved, swap_tolerance, self.s);
+            spec_picked = pick.picked;
+            picked_slots = pick.slots;
+        };
         if (shared_eligible or swap_logits.ctx != null) {
-            const with_logits = swap_logits.ctx != null;
-            const ids_vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ ids_contiguous, if (with_logits) swap_logits else ids_contiguous }, if (with_logits) 2 else 1);
+            // The picked ids ride the ids' command buffer, so reading them never
+            // waits on the experts queued behind them.
+            var early: [3]mlx.mlx_array = .{ ids_contiguous, undefined, undefined };
+            var early_n: usize = 1;
+            for ([_]mlx.mlx_array{ swap_logits, spec_picked }) |extra| {
+                if (extra.ctx == null) continue;
+                early[early_n] = extra;
+                early_n += 1;
+            }
+            const ids_vec = mlx.mlx_vector_array_new_data(&early, early_n);
             defer _ = mlx.mlx_vector_array_free(ids_vec);
             try mlx.check(mlx.mlx_async_eval(ids_vec));
         }
@@ -31103,10 +31128,13 @@ pub const Transformer = struct {
         defer if (spec_result.ctx != null) {
             _ = mlx.mlx_array_free(spec_result);
         };
-        if (expertSpecApplies(self.imatrix != null, mlx.getShape(inds))) if (try engine.specRoute(stream_ctx.layer)) |route| {
+        if (spec_route) |route| {
             var gathered = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gathered);
-            try mlx.check(mlx.mlx_take(&gathered, route.slots, ids_contiguous, self.s));
+            if (picked_slots.ctx != null) {
+                const shape = mlx.getShape(inds);
+                try mlx.check(mlx.mlx_reshape(&gathered, picked_slots, shape.ptr, shape.len, self.s));
+            } else try mlx.check(mlx.mlx_take(&gathered, route.slots, ids_contiguous, self.s));
             const mw_spec = slabMoeWeights(mw, &route.operands);
             spec_result = try self.moeMLP2WithRouter(expert_x, expert_x, &mw_spec, null, false, null, .{
                 .inds = gathered,
@@ -31115,7 +31143,7 @@ pub const Transformer = struct {
             });
             try handOffStreamedResult(spec_result, streamRows(mlx.getShape(inds)));
             spec_host = route.host;
-        };
+        }
         const work = StreamMoe{
             .stream_ctx = stream_ctx,
             .expert_x = expert_x,
@@ -31125,10 +31153,12 @@ pub const Transformer = struct {
             .shared = shared_early orelse .{ .ctx = null },
             .swap_logits = swap_logits,
             .result = spec_result,
+            .picked = spec_picked,
             .map = spec_host,
             .detail = detail,
         };
-        if (stream_ctx.deferred) |target| if (spec_host != null and swap_logits.ctx == null) {
+        // A lossy pick defers only when the GPU made it: the host pick then runs at verify.
+        if (stream_ctx.deferred) |target| if (spec_host != null and (swap_logits.ctx == null or spec_picked.ctx != null)) {
             std.debug.assert(target.* == null);
             target.* = try work.retain();
             return standinRef(spec_result);
@@ -31178,7 +31208,20 @@ pub const Transformer = struct {
         const tap = try ImatrixTap.forLayer(self.imatrix, stream_ctx.layer, ids_contiguous, rows, topk, self.s);
         defer if (tap) |t| t.deinit();
         if (spec_host) |map| {
-            const kept = prepared.quantized and expert_stream_mod.specMatches(map, routed_ids, prepared.remapped, prepared.workspace);
+            var kept = false;
+            if (work.picked.ctx != null) {
+                // The GPU made its own lossy pick: keep it only when it is the host's pick.
+                try mlx.check(mlx.mlx_array_eval(work.picked));
+                const picked_ptr = mlx.mlx_array_data_int32(work.picked) orelse return error.ExpertIdsUnreadable;
+                var picked: [32]u16 = undefined;
+                const n = occurrences.len;
+                var agree = n <= picked.len and mlx.mlx_array_size(work.picked) == n;
+                if (agree) for (picked[0..n], picked_ptr[0..n], occurrences) |*dst, gpu, host| {
+                    dst.* = @intCast(@max(gpu, 0));
+                    if (gpu != host) agree = false;
+                };
+                kept = agree and prepared.quantized and expert_stream_mod.specMatches(map, picked[0..n], prepared.remapped, prepared.workspace);
+            } else kept = prepared.quantized and expert_stream_mod.specMatches(map, routed_ids, prepared.remapped, prepared.workspace);
             noteExpertSpec(kept);
             if (kept) {
                 if (kept_out) |flag| flag.* = true;
@@ -35898,6 +35941,129 @@ fn streamSharedEarlyApplies(eligible: bool, inds_shape: []const c_int) bool {
 
 fn expertSwapApplies(tolerance: f32, biased_router: bool, imatrix_armed: bool, inds_shape: []const c_int) bool {
     return tolerance > 0 and !biased_router and !imatrix_armed and streamRows(inds_shape) <= STREAM_DECODE_MAX_ROWS;
+}
+
+/// One-row twin of `expert_stream.substituteMisses` on the GPU, so a lossy pick
+/// needs no host round trip before the layer's experts are queued: misses in
+/// descending logit order, each takes the highest-logit ready expert not yet
+/// selected within `gap` (lowest index on ties) unless it is starved. Writes the
+/// picked ids and their slots. The host still runs its own pick and keeps the
+/// GPU result only when both agree.
+const EXPERT_PICK_SOURCE =
+    \\uint t = thread_position_in_threadgroup.x;
+    \\uint T = threads_per_threadgroup.x;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\threadgroup bool taken[E];
+    \\threadgroup int sel[K];
+    \\threadgroup int order[K];
+    \\threadgroup int nmiss;
+    \\threadgroup float red_v[32];
+    \\threadgroup int red_i[32];
+    \\for (uint e = t; e < uint(E); e += T) taken[e] = false;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (t == 0) {
+    \\  int n = 0;
+    \\  for (int p = 0; p < K; ++p) {
+    \\    int e = ids[p];
+    \\    sel[p] = e;
+    \\    taken[e] = true;
+    \\    if (map[e] >= 0) continue;
+    \\    int at = n;
+    \\    while (at > 0 && logits[ids[order[at - 1]]] < logits[e]) { order[at] = order[at - 1]; at -= 1; }
+    \\    order[at] = p;
+    \\    n += 1;
+    \\  }
+    \\  nmiss = n;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float g = gap[0];
+    \\for (int i = 0; i < nmiss; ++i) {
+    \\  int pos = order[i];
+    \\  int missed = sel[pos];
+    \\  if (int(starved[missed]) >= LIMIT) continue;
+    \\  float lm = logits[missed];
+    \\  float best_v = -INFINITY;
+    \\  int best_i = -1;
+    \\  for (uint e = t; e < uint(E); e += T) {
+    \\    if (taken[e] || map[e] < 0) continue;
+    \\    float v = logits[e];
+    \\    if (!(v - lm >= g) || !(v > best_v)) continue;
+    \\    best_v = v;
+    \\    best_i = int(e);
+    \\  }
+    \\  for (uint off = 16; off > 0; off >>= 1) {
+    \\    float ov = simd_shuffle_down(best_v, off);
+    \\    int oi = simd_shuffle_down(best_i, off);
+    \\    if (lane + off < 32 && oi >= 0 && (best_i < 0 || ov > best_v || (ov == best_v && oi < best_i))) { best_v = ov; best_i = oi; }
+    \\  }
+    \\  if (lane == 0) { red_v[sg] = best_v; red_i[sg] = best_i; }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (t == 0) {
+    \\    float bv = -INFINITY;
+    \\    int bi = -1;
+    \\    for (uint s2 = 0; s2 < (T + 31) / 32; ++s2) {
+    \\      int oi = red_i[s2];
+    \\      float ov = red_v[s2];
+    \\      if (oi >= 0 && (bi < 0 || ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+    \\    }
+    \\    if (bi >= 0) { sel[pos] = bi; taken[bi] = true; }
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\if (t < uint(K)) {
+    \\  int e = sel[t];
+    \\  picked[t] = e;
+    \\  slots[t] = max(map[e], 0);
+    \\}
+;
+
+var expert_pick_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+const ExpertPick = struct { slots: mlx.mlx_array, picked: mlx.mlx_array };
+
+fn expertPickGpu(ids: mlx.mlx_array, logits: mlx.mlx_array, map: mlx.mlx_array, starved: mlx.mlx_array, tolerance: f32, s: mlx.mlx_stream) !ExpertPick {
+    const k: c_int = @intCast(mlx.mlx_array_size(ids));
+    const experts: c_int = @intCast(mlx.mlx_array_size(map));
+    if (k < 1 or k > 32 or experts < 1 or experts > 1024 or mlx.mlx_array_size(logits) != @as(usize, @intCast(experts))) return error.UnsupportedShape;
+    const kernel = expert_pick_kernel orelse blk: {
+        const input_names = [_][*:0]const u8{ "ids", "logits", "map", "starved", "gap" };
+        const output_names = [_][*:0]const u8{ "slots", "picked" };
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const made = mlx.mlx_fast_metal_kernel_new("sushi_expert_pick", in_vec, out_vec, EXPERT_PICK_SOURCE, "", true, false);
+        if (made.ctx == null) return error.MetalKernelCompileFailed;
+        expert_pick_kernel = made;
+        break :blk made;
+    };
+    const gap_value: f32 = @log(1.0 - @min(tolerance, expert_stream_mod.MAX_PICK_TOLERANCE));
+    const gap = mlx.mlx_array_new_data(&gap_value, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(gap);
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const out_shape = [_]c_int{k};
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 1, .int32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 1, .int32));
+    const threads: c_int = @min(1024, @divTrunc(experts + 31, 32) * 32);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, threads, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, threads, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", k));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "E", experts));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "LIMIT", expert_stream_mod.PICK_STARVE_LIMIT));
+    const inputs = [_]mlx.mlx_array{ ids, logits, map, starved, gap };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel, inputs_vec, config, s));
+    var slots = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(slots);
+    try mlx.check(mlx.mlx_vector_array_get(&slots, outputs, 0));
+    var picked = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&picked, outputs, 1));
+    return .{ .slots = slots, .picked = picked };
 }
 
 fn slabMoeWeights(mw: *const MoeMlpWeights, raw: *const [expert_stream_mod.quant.component_count]mlx.mlx_array) MoeMlpWeights {
@@ -74004,5 +74170,63 @@ test "streamed deferred verification preserves outputs states and accounting on 
         if (slots == 4) try testing.expectEqual(rolled_back, expert_deferred_rollbacks);
         if (slots == 1) try testing.expect(expert_deferred_rollbacks > rolled_back);
         x.expert_stream = null;
+    }
+}
+
+test "the GPU expert pick matches the host substitution on one row" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rand = prng.random();
+    const E = 512;
+    const K = 10;
+    for (0..200) |case| {
+        var logits: [E]f32 = undefined;
+        for (&logits) |*v| v.* = rand.floatNorm(f32) * 2;
+        if (case % 7 == 0) logits[rand.uintLessThan(usize, E)] = logits[3];
+        var map: [E]i32 = undefined;
+        var cached: [E]bool = undefined;
+        for (&map, &cached, 0..) |*m, *c, e| {
+            c.* = rand.float(f32) < 0.5;
+            m.* = if (c.*) @intCast(e % 251) else -1;
+        }
+        var starved: [E]u8 = undefined;
+        for (&starved) |*v| v.* = if (rand.float(f32) < 0.1) expert_stream_mod.PICK_STARVE_LIMIT else 0;
+        var ids: [K]u16 = undefined;
+        var picked_n: usize = 0;
+        while (picked_n < K) {
+            const e: u16 = @intCast(rand.uintLessThan(usize, E));
+            if (std.mem.indexOfScalar(u16, ids[0..picked_n], e) != null) continue;
+            ids[picked_n] = e;
+            picked_n += 1;
+        }
+        const tolerance: f32 = if (case % 2 == 0) 0.2 else 0.6;
+        var host_ids = ids;
+        var taken: [E]bool = undefined;
+        var loading: [E]bool = undefined;
+        var host_starved = starved;
+        _ = expert_stream_mod.substituteMisses(&host_ids, &logits, &cached, tolerance, K, &taken, &loading, &host_starved);
+
+        var ids_i32: [K]i32 = undefined;
+        for (&ids_i32, ids) |*d, v| d.* = v;
+        const a_ids = mlx.mlx_array_new_data(&ids_i32, &[_]c_int{ 1, 1, K }, 3, .int32);
+        defer _ = mlx.mlx_array_free(a_ids);
+        const a_logits = mlx.mlx_array_new_data(&logits, &[_]c_int{ 1, 1, E }, 3, .float32);
+        defer _ = mlx.mlx_array_free(a_logits);
+        const a_map = mlx.mlx_array_new_data(&map, &[_]c_int{E}, 1, .int32);
+        defer _ = mlx.mlx_array_free(a_map);
+        const a_starved = mlx.mlx_array_new_data(&starved, &[_]c_int{E}, 1, .uint8);
+        defer _ = mlx.mlx_array_free(a_starved);
+        const pick = try expertPickGpu(a_ids, a_logits, a_map, a_starved, tolerance, s);
+        defer _ = mlx.mlx_array_free(pick.slots);
+        defer _ = mlx.mlx_array_free(pick.picked);
+        try mlx.check(mlx.mlx_array_eval(pick.picked));
+        try mlx.check(mlx.mlx_array_eval(pick.slots));
+        const got = mlx.mlx_array_data_int32(pick.picked).?;
+        const slots = mlx.mlx_array_data_int32(pick.slots).?;
+        for (host_ids, 0..) |want, i| {
+            try testing.expectEqual(@as(i32, want), got[i]);
+            try testing.expectEqual(@max(map[want], 0), slots[i]);
+        }
     }
 }

@@ -1143,6 +1143,7 @@ const LayerState = struct {
     stats: LayerStats = .{},
     spec_host: []i32 = &.{},
     spec_slots: mlx.mlx_array = .{ .ctx = null },
+    spec_raw: mlx.mlx_array = .{ .ctx = null },
 
     /// Brings the host map and its GPU copy up to the cache. The pair only ever
     /// changes together: a failure leaves no GPU map and a host map that forces
@@ -1159,6 +1160,8 @@ const LayerState = struct {
         errdefer {
             if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
             self.spec_slots = .{ .ctx = null };
+            if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
+            self.spec_raw = .{ .ctx = null };
             @memset(self.spec_host, -2);
         }
         const gpu = try allocator.alloc(i32, experts);
@@ -1170,8 +1173,13 @@ const LayerState = struct {
         }
         const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
         if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
+        errdefer _ = mlx.mlx_array_free(fresh);
+        const raw = mlx.mlx_array_new_data(self.spec_host.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        if (raw.ctx == null) return error.ExpertSpecMapAlloc;
         if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
         self.spec_slots = fresh;
+        if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
+        self.spec_raw = raw;
     }
 };
 
@@ -1392,6 +1400,8 @@ pub const Engine = struct {
         for (self.layers) |*layer| {
             if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
             layer.spec_slots = .{ .ctx = null };
+            if (layer.spec_raw.ctx != null) _ = mlx.mlx_array_free(layer.spec_raw);
+            layer.spec_raw = .{ .ctx = null };
             if (layer.spec_host.len != 0) self.allocator.free(layer.spec_host);
             layer.spec_host = &.{};
             for (layer.slabs) |*operand| operand.destroy(self.allocator, self.s);
@@ -1563,6 +1573,10 @@ pub const Engine = struct {
     pub const SpecRoute = struct {
         /// int32 [experts]: the slot per expert, 0 where the host map says -1.
         slots: mlx.mlx_array,
+        /// int32 [experts]: the host map itself, -1 where an expert is not ready.
+        raw: mlx.mlx_array,
+        /// Per-expert swap starvation counts (`substituteMisses` state).
+        starved: []const u8,
         host: []const i32,
         operands: [quant.component_count]mlx.mlx_array,
     };
@@ -1579,7 +1593,7 @@ pub const Engine = struct {
         try layer.refreshSpec(self.allocator);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
-        return .{ .slots = layer.spec_slots, .host = layer.spec_host, .operands = operands };
+        return .{ .slots = layer.spec_slots, .raw = layer.spec_raw, .starved = layer.cache.swap_starved, .host = layer.spec_host, .operands = operands };
     }
 
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
