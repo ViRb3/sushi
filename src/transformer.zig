@@ -17001,6 +17001,7 @@ pub const Transformer = struct {
                         .experts = @intCast(config.num_experts),
                         .hidden = config.hidden_size,
                         .intermediate = config.moe_intermediate_size,
+                        .exl3_n = config.expert_quant_rate.n,
                     },
                     config.expert_cache_bytes,
                     s,
@@ -17009,7 +17010,7 @@ pub const Transformer = struct {
                 expert_stream = engine;
                 imatrix = try imatrix_capture.Collector.forModel(allocator, s, config.model_type, config.num_hidden_layers, @intCast(config.num_experts));
             }
-            log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, {s}), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, if (config.expert_streaming) "sharded pread" else "mmapped", config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
+            log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, {s}), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, if (config.expert_streaming and st.table.bits == 16) "sharded pread" else "mmapped", config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         } else if (std.mem.eql(u8, config.model_type, "mimo_v2") and config.expert_streaming) {
             const engine = try allocator.create(expert_stream_mod.Engine);
             errdefer allocator.destroy(engine);

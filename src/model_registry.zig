@@ -1188,7 +1188,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3RateGroupsStreamingUnsupported, Exl3NonuniformStreamingUnsupported, Exl3GateUpRateMismatch } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
@@ -1204,6 +1204,9 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "ExpertLayoutUnsupported")) return error.ExpertLayoutUnsupported;
             if (std.mem.eql(u8, n, "Exl3TopKExceedsReduceBank")) return error.Exl3TopKExceedsReduceBank;
             if (std.mem.eql(u8, n, "Exl3TrellisGeometry")) return error.Exl3TrellisGeometry;
+            if (std.mem.eql(u8, n, "Exl3RateGroupsStreamingUnsupported")) return error.Exl3RateGroupsStreamingUnsupported;
+            if (std.mem.eql(u8, n, "Exl3NonuniformStreamingUnsupported")) return error.Exl3NonuniformStreamingUnsupported;
+            if (std.mem.eql(u8, n, "Exl3GateUpRateMismatch")) return error.Exl3GateUpRateMismatch;
             if (std.mem.eql(u8, n, "Exl3WindowUnsupported")) return error.Exl3WindowUnsupported;
             if (std.mem.eql(u8, n, "Exl3ShardStampMismatch")) return error.Exl3ShardStampMismatch;
         }

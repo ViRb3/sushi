@@ -10,6 +10,7 @@ pub const Geometry = struct {
     /// Absolute layer at which routed expert banks begin. Qwen4 starts at zero;
     /// sparse MoE packs such as MiMo keep a dense layer zero.
     first_moe_layer: u16 = 0,
+    exl3_n: u32 = 64,
 };
 
 pub const SourceSpan = struct {
@@ -143,6 +144,42 @@ pub fn tensorKey(buf: []u8, layer: u16, c: Component) ![]const u8 {
         @tagName(projectionOf(c)),
         @tagName(partOf(c)),
     });
+}
+
+pub fn exl3TensorKey(buf: []u8, layer: u16, c: Component) ![]const u8 {
+    const suffix: []const u8 = switch (partOf(c)) {
+        .weight => "trellis",
+        .scales => "suh",
+        .biases => "svh",
+    };
+    return std.fmt.bufPrint(buf, "{s}{d}.mlp.switch_mlp.{s}_proj.{s}", .{ AFFINE_PREFIX, layer, @tagName(projectionOf(c)), suffix });
+}
+
+fn rejectExl3RateGroups(map: std.json.ObjectMap) !void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.indexOf(u8, key, ".mlp.switch_mlp.") == null) continue;
+        var parts = std.mem.splitScalar(u8, key, '.');
+        while (parts.next()) |part| {
+            if (part.len > 1 and part[0] == 'g' and decimalU16(part[1..]) != null)
+                return error.Exl3RateGroupsStreamingUnsupported;
+        }
+    }
+}
+
+pub fn streamingLayoutOfDir(allocator: std.mem.Allocator, io: std.Io, model_type: []const u8, model_dir: []const u8, layers: u16, first_moe_layer: u16) !Layout {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+    defer dir.close(io);
+    const raw = try dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(64 * 1024 * 1024));
+    defer allocator.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSafetensorsIndex;
+    const map = parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
+    if (map != .object) return error.InvalidSafetensorsIndex;
+    try rejectExl3RateGroups(map.object);
+    return layoutFromIndexJsonWithFirstMoe(allocator, model_type, raw, layers, first_moe_layer) orelse error.ExpertStreamingUnsupportedLayout;
 }
 
 pub fn fusedTensorKey(buf: []u8, layer: u16, down: bool) ![]const u8 {
@@ -604,6 +641,7 @@ pub const QuantStore = struct {
     cols: [component_count]u32,
     dtypes: [component_count]io_mod.Dtype,
     geoms: [component_count]QuantGeom,
+    packed_n: [component_count]u32 = @splat(0),
 
     fn sourceIndex(self: *const QuantStore, layer: u16, expert: u16, c: Component) usize {
         return ((@as(usize, layer) * self.geometry.experts) + expert) * component_count + @backingInt(c);
@@ -677,6 +715,7 @@ pub const QuantStore = struct {
         const weight_map_value = index_parsed.value.object.get("weight_map") orelse return error.InvalidSafetensorsIndex;
         if (weight_map_value != .object) return error.InvalidSafetensorsIndex;
         const weight_map = weight_map_value.object;
+        if (chosen == .exl3_k4) try rejectExl3RateGroups(weight_map);
 
         var files_list: std.ArrayList(SourceFile) = .empty;
         errdefer {
@@ -747,21 +786,46 @@ pub const QuantStore = struct {
                     }
                     const key = if (chosen == .mxfp4_split)
                         mxfp4TensorKey(&key_buf, layer, projectionOf(c), partOf(c)) catch return error.InvalidExpertGeometry
+                    else if (chosen == .exl3_k4)
+                        exl3TensorKey(&key_buf, layer, c) catch return error.InvalidExpertGeometry
                     else
                         tensorKey(&key_buf, layer, c) catch return error.InvalidExpertGeometry;
                     const mapped = weight_map.get(key) orelse return error.MissingExpertTensor;
                     if (mapped != .string) return error.InvalidSafetensorsIndex;
                     const file = try openSource(allocator, &files_list, model_dir, mapped.string);
-                    const region = io_mod.tensorRegion(allocator, files_list.items[file].fd, key) catch |err| return switch (err) {
+                    var region = io_mod.tensorRegion(allocator, files_list.items[file].fd, key) catch |err| return switch (err) {
                         error.MissingSafetensorsTensor => error.MissingExpertTensor,
                         error.SafetensorsTensorOutOfBounds => error.ExpertTensorOutOfBounds,
                         else => error.InvalidExpertTensor,
                     };
+                    if (chosen == .exl3_k4) {
+                        const in_dim: u64 = if (projectionOf(c) == .down) geometry.intermediate else geometry.hidden;
+                        const out_dim: u64 = if (projectionOf(c) == .down) geometry.hidden else geometry.intermediate;
+                        if (region.shape[0] != geometry.experts or in_dim % 16 != 0 or out_dim % 16 != 0)
+                            return error.Exl3TrellisGeometry;
+                        if (partOf(c) == .weight) {
+                            const rate = kFromPackedDim(region.shape[3]) orelse return error.Exl3TrellisGeometry;
+                            if (region.rank != 4 or region.dtype != .u16 or region.shape[1] != in_dim / 16 or
+                                region.shape[2] != out_dim / 16 or rate.n > geometry.exl3_n)
+                                return error.Exl3TrellisGeometry;
+                            if (metadata_ready and store.packed_n[ci] != rate.n) return error.Exl3NonuniformStreamingUnsupported;
+                            store.packed_n[ci] = rate.n;
+                            region.shape[2] *= rate.n;
+                            region.shape[3] = 0;
+                        } else {
+                            const width = if (partOf(c) == .scales) in_dim else out_dim;
+                            if (region.rank != 2 or region.dtype != .f16 or region.shape[1] != width)
+                                return error.Exl3TrellisGeometry;
+                            region.shape[1] = 1;
+                            region.shape[2] = width;
+                        }
+                        region.rank = 3;
+                    }
                     if (region.rank != 3 or region.shape[0] != geometry.experts) return error.InvalidExpertTensor;
                     if (region.shape[1] == 0 or region.shape[1] > std.math.maxInt(u32)) return error.InvalidExpertTensor;
                     if (region.shape[2] == 0 or region.shape[2] > std.math.maxInt(u32)) return error.InvalidExpertTensor;
                     const elem: u64 = switch (region.dtype) {
-                        .bf16 => 2,
+                        .bf16, .f16, .u16 => 2,
                         .u8 => 1,
                         .u32 => 4,
                         .other => return error.InvalidExpertTensor,
@@ -799,6 +863,7 @@ pub const QuantStore = struct {
             if (!metadata_ready) return error.MissingExpertTensor;
         }
         for ([_]Projection{ .gate, .up, .down }) |p| {
+            if (chosen == .exl3_k4) continue;
             const in_dim: u64 = if (p == .down) geometry.intermediate else geometry.hidden;
             const out_rows: u64 = if (p == .down) geometry.hidden else geometry.intermediate;
             const w = weightOf(p);
@@ -836,6 +901,8 @@ pub const QuantStore = struct {
                     store.rows[@backingInt(b)] != out_rows) return error.InvalidExpertTensor;
             }
         }
+
+        if (chosen == .exl3_k4 and store.packed_n[0] != store.packed_n[3]) return error.Exl3GateUpRateMismatch;
 
         // Parsed headers are needed only while constructing the source spans.
         for (files_list.items) |*file| {
@@ -928,9 +995,9 @@ fn cachedTensorRegion(file: *const SourceFile, key: []const u8) !io_mod.TensorRe
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;
-    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 3)
+    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 4)
         return error.InvalidSafetensorsTensor;
-    var dimensions: [3]u64 = .{ 0, 0, 0 };
+    var dimensions: [4]u64 = .{ 0, 0, 0, 0 };
     var elements: u64 = 1;
     for (shape.array.items, 0..) |dim, i| {
         if (dim != .integer or dim.integer <= 0) return error.InvalidSafetensorsTensor;

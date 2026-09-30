@@ -1752,8 +1752,7 @@ pub const Scheduler = struct {
         )) blk: {
             if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
             const geometry = streamingGeometryOf(owned.config);
-            const layout = expert_stream_mod.quant.layoutOfDirWithFirstMoe(self.allocator, self.io, owned.config.model_type, entry.path, geometry.layers, geometry.first_moe_layer) orelse
-                return error.ExpertStreamingUnsupportedLayout;
+            const layout = try expert_stream_mod.quant.streamingLayoutOfDir(self.allocator, self.io, owned.config.model_type, entry.path, geometry.layers, geometry.first_moe_layer);
             const split = try model_mod.streamingResidentSplit(self.io, self.allocator, entry.path, layout);
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
             switch (mtpStreamingVerdict(mtp)) {
@@ -3122,7 +3121,7 @@ test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the p
     ));
 }
 
-test "an EXL3 pack ignores an SSD budget like any non-streaming model" {
+test "EXL3 streaming CPU settings budget engages the EXL3 loader" {
     // The streamed load refuses an EXL3 layout by name; the budget used to engage it anyway, so a
     // settings-file budget made the pack unloadable with a "re-convert the pack" 503.
     const t = std.testing;
@@ -3136,10 +3135,11 @@ test "an EXL3 pack ignores an SSD budget like any non-streaming model" {
         .expert_layout = .exl3_k4,
     };
     q4.ssd_budget_gb_override = 60;
-    try t.expect(q4.supportsExpertStreaming() and !q4.streamsExperts());
+    try t.expect(q4.supportsExpertStreaming() and q4.streamsExperts());
     const budget = resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.streamsExperts());
-    try t.expect(budget.setting_ignored);
-    try t.expect(!expert_stream_mod.expertStreamingEngaged(q4.streamsExperts(), q4.expertStreamingRequired(), 0, budget.bytes));
+    try t.expect(!budget.setting_ignored);
+    try t.expectEqual(@as(u64, 60 << 30), budget.bytes);
+    try t.expect(expert_stream_mod.expertStreamingEngaged(q4.streamsExperts(), q4.expertStreamingRequired(), 0, budget.bytes));
 }
 
 test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
@@ -3378,9 +3378,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const budget = streaming_budget;
         if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
         const geometry = streamingGeometryOf(params.config);
-        const layout = expert_stream_mod.quant.layoutOfDirWithFirstMoe(sch.allocator, sch.io, params.config.model_type, params.model_dir, geometry.layers, geometry.first_moe_layer) orelse
-            return error.ExpertStreamingUnsupportedLayout;
-        if (layout == .exl3_k4) return error.ExpertLayoutUnsupported;
+        const layout = try expert_stream_mod.quant.streamingLayoutOfDir(sch.allocator, sch.io, params.config.model_type, params.model_dir, geometry.layers, geometry.first_moe_layer);
         params.config.expert_layout = layout;
         const split = try model_mod.streamingResidentSplit(sch.io, sch.allocator, params.model_dir, layout);
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);

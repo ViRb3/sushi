@@ -1072,10 +1072,10 @@ pub const ModelConfig = struct {
             self.num_experts_per_tok > 0 and self.hidden_size > 0 and self.moe_intermediate_size > 0;
     }
 
-    /// Can a load of THIS checkpoint stream its experts? An EXL3 pack serves resident only, so an
-    /// SSD budget or expert cache asked of it is ignored like any non-streaming model's.
+    /// Can a load of THIS checkpoint stream its experts? A Qwen EXL3 pack can; a MiMo EXL3 pack serves
+    /// resident only, so an SSD budget or expert cache asked of it is ignored.
     pub fn streamsExperts(self: *const ModelConfig) bool {
-        return self.supportsExpertStreaming() and self.expert_layout != .exl3_k4;
+        return self.supportsExpertStreaming() and (self.expert_layout != .exl3_k4 or self.isQwen4());
     }
 
     /// Dense banks and raw individual experts require the streaming loader.

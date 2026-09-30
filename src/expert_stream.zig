@@ -82,18 +82,18 @@ pub fn mxfp4ExpertBytes(hidden: u32, intermediate: u32) !u64 {
 pub fn expertBytesFor(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: quant.Layout) !u64 {
     switch (layout) {
         .bf16_fused => return expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate),
-        .quantized_split, .mxfp4_split, .mxfp4_individual => {
+        .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
             var store = try quant.QuantStore.openForLayout(allocator, model_dir, .{
                 .layers = geometry.layers,
                 .experts = geometry.experts,
                 .hidden = geometry.hidden,
                 .intermediate = geometry.intermediate,
                 .first_moe_layer = geometry.first_moe_layer,
+                .exl3_n = geometry.exl3_n,
             }, layout);
             defer store.deinit();
             return store.expertBytes();
         },
-        .exl3_k4 => return exl3ExpertBytes(geometry),
     }
 }
 
@@ -506,7 +506,7 @@ fn tensorLayout(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u8, s
         error.SafetensorsTensorOutOfBounds => error.ExpertTensorOutOfBounds,
         else => error.InvalidExpertTensor,
     };
-    if (region.dtype != .bf16 or region.rank != 3 or !std.mem.eql(u64, &region.shape, &shape_expected)) return error.InvalidExpertTensor;
+    if (region.dtype != .bf16 or region.rank != 3 or !std.mem.eql(u64, region.shape[0..3], &shape_expected)) return error.InvalidExpertTensor;
     if (region.tensor_bytes != 2 * shape_expected[0] * shape_expected[1] * shape_expected[2]) return error.InvalidExpertTensor;
     return .{ .data_offset = region.data_offset, .tensor_offset = region.tensor_offset, .tensor_bytes = region.tensor_bytes, .experts = @intCast(shape_expected[0]) };
 }
@@ -517,6 +517,8 @@ pub const SlabSpec = struct {
     dtype: mlx.mlx_dtype,
     elem_bytes: u8,
     slot_bytes: u64,
+    exl3: bool = false,
+    packed_n: u32 = 0,
 };
 
 pub const ExpertStore = struct {
@@ -562,6 +564,8 @@ pub const ExpertStore = struct {
             const c: quant.Component = @fromBackingInt(@intCast(ci));
             const dtype: mlx.mlx_dtype = switch (q.dtypeOf(c)) {
                 .bf16 => .bfloat16,
+                .f16 => .float16,
+                .u16 => .uint16,
                 .u8 => .uint8,
                 .u32 => .uint32,
                 .other => .bfloat16,
@@ -569,10 +573,10 @@ pub const ExpertStore = struct {
             const elem: u8 = switch (q.dtypeOf(c)) {
                 .u8 => 1,
                 .u32 => 4,
-                .bf16 => 2,
+                .bf16, .f16, .u16 => 2,
                 .other => 0,
             };
-            return .{ .rows = q.rowsOf(c), .cols = q.colsOf(c), .dtype = dtype, .elem_bytes = elem, .slot_bytes = q.slotBytes(c) };
+            return .{ .rows = q.rowsOf(c), .cols = q.colsOf(c), .dtype = dtype, .elem_bytes = elem, .slot_bytes = q.slotBytes(c), .exl3 = q.layout == .exl3_k4, .packed_n = q.packed_n[ci] };
         }
         const rows: u32 = if (ci == 0) 2 * self.geometry.intermediate else self.geometry.hidden;
         const cols: u32 = if (ci == 0) self.geometry.hidden else self.geometry.intermediate;
@@ -604,6 +608,7 @@ pub const ExpertStore = struct {
             .hidden = geometry.hidden,
             .intermediate = geometry.intermediate,
             .first_moe_layer = geometry.first_moe_layer,
+            .exl3_n = geometry.exl3_n,
         }, chosen);
         return .{ .allocator = allocator, .geometry = geometry, .files = &.{}, .spans = &.{}, .quantized = q };
     }
@@ -896,15 +901,25 @@ const SlabOperand = struct {
     }
 
     fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
-        if (count == 0 or d0 == 0 or d1 == 0 or elem_bytes == 0) return error.InvalidExpertGeometry;
-        const stride = @as(usize, d0) * @as(usize, d1) * @as(usize, elem_bytes);
+        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
+    }
+
+    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+        if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
+        var stride: usize = elem_bytes;
+        var shape: [4]c_int = undefined;
+        shape[0] = @intCast(count);
+        for (inner, 0..) |d, j| {
+            if (d <= 0) return error.InvalidExpertGeometry;
+            stride = try std.math.mul(usize, stride, @intCast(d));
+            shape[j + 1] = d;
+        }
         const slab = try io_mod.PageSlab.create(allocator, stride * count);
         errdefer slab.destroy();
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
         payload.* = .{};
-        const shape = [_]c_int{ @intCast(count), @intCast(d0), @intCast(d1) };
-        const operand = try io_mod.importSlab(slab, &shape, dtype, payload, .{});
+        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{});
         if (!operand.aliased) {
             _ = mlx.mlx_array_free(operand.array);
             return error.ExpertSlabImportCopied;
@@ -1031,6 +1046,10 @@ fn createSlabSet(allocator: std.mem.Allocator, store: *const ExpertStore, count:
         const spec = store.slabSpec(made);
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
+        else if (spec.exl3 and spec.packed_n != 0)
+            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes)
+        else if (spec.exl3)
+            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes)
         else
             try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes);
     }
