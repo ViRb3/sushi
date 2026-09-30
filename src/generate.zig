@@ -314,6 +314,13 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
+/// The width a request forwards at, and the width its admission bills: `effectivePrefillChunk`,
+/// never wider than the width handed in (0 = none). An explicit width outranks only the load-time pin.
+pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_prefill_chunk: usize) usize {
+    const width = effectivePrefillChunk(head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated, pinned_prefill_chunk);
+    return if (pinned_prefill_chunk == 0) width else @min(width, pinned_prefill_chunk);
+}
+
 /// Read an unsigned integer from an environment variable, falling back to
 /// `default` when unset, empty, or unparseable. Uses libc getenv to stay
 /// allocator-free at call sites.
@@ -2643,7 +2650,7 @@ pub const Generator = struct {
         // start at ssm_checkpoint_pos_offset, so the final KV length is that
         // offset plus everything we're about to forward.
         const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-        const PREFILL_CHUNK: usize = decodeShareCapped(effectivePrefillChunk(
+        const PREFILL_CHUNK: usize = decodeShareCapped(requestPrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,

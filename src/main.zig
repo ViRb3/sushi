@@ -248,11 +248,13 @@ fn printUsage(io: std.Io) void {
         \\                        per-request `kv_attn_mode` field overrides.
         \\                        MiMo's global layers read packed from 4096
         \\                        cached keys in every mode.
-        \\  --prefill-chunk <n> Max tokens forwarded per prefill chunk
+        \\  --prefill-chunk <n> Maximum tokens forwarded per prefill chunk
         \\                        (default: 8192). Auto-capped further per model
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
-        \\                        Lower it if a long prompt spikes memory.
+        \\                        When a request does not fit at <n>, it runs
+        \\                        at the widest narrower width that fits (down
+        \\                        to 512) instead of being refused.
         \\  --prefill-decode-share <s>
         \\                      Target decode wall-time share during another
         \\                        request's prefill (0..0.9); narrows chunks too.
