@@ -118,6 +118,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   company waits in `pending` (`[admission] held`); alone it proceeds.
 - The hot-cache budget is clamped at load and follows residency ([engine-prefix-cache](engine-prefix-cache.md#budget)).
 - Context-overflow 400s name BOTH counts.
+- **A freed reserved-KV slot goes back to the OS, not MLX's pool** (`deinitSlotsReturningPool`, and the prefill-end
+  clear, both on `reservesKvCapacity`): the request-end clear runs before the slot is freed, so its KV parked there
+  (MiMo: 1.6 GiB after a 128k request, 3.2 after 256k) and the next admission read it as spent.
 - MiMo MTP adds a constant per-request and load-time reserve (`mimo_mtp.State.billedBytes`) for all three sliding head KVs, retained hiddens, and catch-up/concatenation buffers; it is zero with MTP off and never scales with context.
 - **A vision encode is billed before it runs** (`towerFitFault`, `server.visionEncodeBill`): the largest block's tower
   scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels

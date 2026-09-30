@@ -53,6 +53,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   (`draftStep`); the step index rides `hidden_next` (a scalar), host token ids ride `host_ids`. Depth and the free
   EV cap clamp to the head count and to the verify row budget; rounds stay solo (`mtpRoundsStaySolo`); no
   prefix-cache persistence (the head rebuilds from the prompt's last window).
+- **The load warms every verify row count and head** (`warmupMimoVerify`, `Head.warmup`, `[spec-warmup] MiMo …`): each
+  row count JITs its own pipelines, and a new binary's first round at each width stalled 450-630 ms.
 - **Verify rows keep decode arithmetic** (`ForwardCtx.verify_rows`, up to `MIMO_VERIFY_ROWS_MAX` = 4 rows, the FP8
   GEMV's direct-row limit): every row's attention runs through `mimoDecodeAttn` on the keys its own decode tick saw
   (`mimoVerifyRowsAttn`), the rest of the forward is row-identical already (FP8 GEMV <= 4 rows, `mtp_qmv` affine-8,
@@ -141,6 +143,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - **Round cost is MEASURED** per model/width/KV bucket from live single-chunk rounds (`round_cost.zig`;
   `SUSHI_MTP_COST_TABLE=0` = prior only); width trials m_lo then m_lo+1 never m_lo−1; the silicon depth row is a
   COLD-START cap.
+- **The KV grid is per arch** (`round_cost.layoutFor`): qwen4 edges to 256k; MiMo on to 512k and 768k, since its global
+  layers read every key. On one `32k+` cell MiMo dropped nearly every 64k-256k round as implausible against 32k cells.
+- **`[spec-stats] … stalls=N/max_ms`** counts this request's rounds slower than twice the median round at their width
+  (`round_cost.RoundLog`), so an info-level log shows a hiccup the table dropped quietly; smooth reads `stalls=0/0`.
 - **The regime gate** compares the two round SHAPES at one base depth: two-chunk (draft m_lo, sync on the chain's
   confidence, maybe extend to m_hi) against single-chunk at m_lo, each as round wall over tokens. A round emits 1..m+1
   tokens, so each shape is judged on the running mean of `MTP_REGIME_MIN_SAMPLES` rounds or more; a verdict on one

@@ -15697,6 +15697,40 @@ fn qkvMppRunProbe(kernel: mlx.mlx_fast_metal_kernel, key: QkvMppKey) bool {
     return !mlx.errorPending();
 }
 
+fn qkvMppKernel() ?mlx.mlx_fast_metal_kernel {
+    if (qkv_mpp_kernel_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk" };
+    const output_names = [_][*:0]const u8{ "m_out", "l_out", "o_out" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kk = mlx.mlx_fast_metal_kernel_new("sushi_qkv_mpp", in_vec, out_vec, QKV_MPP_KERNEL_SOURCE, QSA_SCORE_KERNEL_HEADER, false, false);
+    if (kk.ctx == null) return null;
+    qkv_mpp_kernel_cached = kk;
+    return kk;
+}
+
+/// Build the template set a MiMo global decode row dispatches past the packed floor, before a
+/// request needs it (its probe is the JIT).
+fn mimoWarmPackedDecode(config: *const ModelConfig, kv_config: KVQuantConfig) void {
+    const kernel = qkvMppKernel() orelse return;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers and !config.isGlobalLayer(li)) : (li += 1) {}
+    if (li == config.num_hidden_layers) return;
+    const h_kv: c_int = @intCast(config.layerKVHeads(li));
+    if (h_kv == 0) return;
+    _ = qkvMppProbe(kernel, .{
+        .dk = @intCast(config.layerHeadDim(li)),
+        .dv = @intCast(config.layerVHeadDim(li)),
+        .bits = kv_config.bits,
+        .gs = kv_config.group_size,
+        .gqa = @divTrunc(@as(c_int, @intCast(config.num_attention_heads)), h_kv),
+        .tq = 1,
+        .dtype = .bfloat16,
+    });
+}
+
 /// Packed-KV attention through matmul2d, t_q 1..8, no mask or end-aligned causal. Null = declined.
 pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8) !?mlx.mlx_array {
     if (!verifyQmmNaxAvailable()) return null;
@@ -15734,19 +15768,9 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     const t_k: c_int = ks[2];
     if (t_k < t_q) return null;
 
-    if (qkv_mpp_kernel_cached == null) {
-        const input_names = [_][*:0]const u8{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk" };
-        const output_names = [_][*:0]const u8{ "m_out", "l_out", "o_out" };
-        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
-        defer _ = mlx.mlx_vector_string_free(in_vec);
-        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
-        defer _ = mlx.mlx_vector_string_free(out_vec);
-        const kk = mlx.mlx_fast_metal_kernel_new("sushi_qkv_mpp", in_vec, out_vec, QKV_MPP_KERNEL_SOURCE, QSA_SCORE_KERNEL_HEADER, false, false);
-        if (kk.ctx == null) return null;
-        qkv_mpp_kernel_cached = kk;
-    }
+    const kernel = qkvMppKernel() orelse return null;
     const tkey = QkvMppKey{ .dk = dk, .dv = dv, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .dtype = qdt };
-    if (!qkvMppProbe(qkv_mpp_kernel_cached.?, tkey)) return null;
+    if (!qkvMppProbe(kernel, tkey)) return null;
     const nsplit = qkvMppSplits(t_k);
     const real_rows: c_int = gqa * t_q;
     const m_rows = qkvMppMRows(tkey);
@@ -19789,6 +19813,43 @@ pub const Transformer = struct {
         }
         if (head_in.ctx != null) try self.specWarmHead(head_in);
         log.info("[spec-warmup] verify widths 1..{d} solo, group rows 2..{d} at up to {d} tokens each, head width 1 ({d} ms).\n", .{ width_cap, n_slots, group_seq_max, lap.read() / std.time.ns_per_ms });
+    }
+
+    /// Bit `r` set = a MiMo verify of `r` rows ran.
+    pub const MimoWarmRows = u32;
+
+    // A MiMo verify row keeps its decode tick's arithmetic, so each row count JITs its own FP8,
+    // EXL3 and qmv pipelines, and the packed global attention its matmul2d set past the key
+    // floor; left to the first request, each compile stalled a round 450-630 ms on a new binary.
+    pub fn warmupMimoVerify(self: *Transformer, kv_config: KVQuantConfig) !MimoWarmRows {
+        moe_dump_warmup_depth += 1;
+        defer moe_dump_warmup_depth -= 1;
+        if (!self.config.isMimo()) return 0;
+        const sl = try SpecWarmSlot.init(self, kv_config);
+        defer {
+            sl.deinit(self.allocator);
+            _ = mlx.mlx_clear_cache();
+        }
+        if (self.config.swaRingTokens() > 0) sl.cache.setSwaRing(self.config.sliding_window);
+        var prompt_ids: [8]i32 = undefined;
+        const prompt = specWarmIds(&prompt_ids);
+        defer _ = mlx.mlx_array_free(prompt);
+        specWarmEvalFree(&[_]mlx.mlx_array{try self.forwardWith(&sl.ctx, prompt)});
+        var warmed: MimoWarmRows = 0;
+        sl.ctx.verify_rows = true;
+        var rows: usize = 2;
+        while (rows <= MIMO_VERIFY_ROWS_MAX) : (rows += 1) {
+            var ids: [@intCast(MIMO_VERIFY_ROWS_MAX)]i32 = undefined;
+            const block = specWarmIds(ids[0..rows]);
+            defer _ = mlx.mlx_array_free(block);
+            var last = mlx.mlx_array_new();
+            var all = mlx.mlx_array_new();
+            const logits = try self.forwardWithCaptureAll(&sl.ctx, block, &last, &all);
+            specWarmEvalFree(&[_]mlx.mlx_array{ logits, last, all });
+            warmed |= @as(MimoWarmRows, 1) << @intCast(rows);
+        }
+        if (kv_config.isQuant() and mimoDecodeUsesNax()) mimoWarmPackedDecode(&self.config, kv_config);
+        return warmed;
     }
 
     // Mirror of `scheduler.mtpSubGroupSize`: the slots one row-axis tick can carry at this row
@@ -71213,6 +71274,8 @@ fn mimoExpectClose(label: []const u8, actual: []const f32, expected: []const f32
 
 /// The HF oracle keeps separate experts; the serving contract uses leading-index banks.
 pub fn stackMimoFixtureExperts(weights: *Weights, config: ModelConfig, s: mlx.mlx_stream) !void {
+    // A served pack's experts are EXL3 banks the loader already serves; only the fixture's per-expert rows stack.
+    if (config.expert_layout == .exl3_k4) return;
     const a = weights.allocator;
     for (config.first_k_dense_replace..config.num_hidden_layers) |li| {
         for ([_][]const u8{ "gate", "up", "down" }) |projection| {
@@ -71450,23 +71513,52 @@ test "mimo v2 verify rows equal serial decode ticks bit for bit across the slidi
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    var ids: [140]i32 = undefined;
-    for (&ids, 0..) |*v, i| v.* = @intCast(2 + (i * 37) % (config.vocab_size - 2));
-    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |kv| {
-        for ([_]usize{ 20, 126, 136 }) |prefix| {
-            for ([_]usize{ 2, 4 }) |rows| {
-                const ticks = try mimoVerifyOrTicks(a, &xfm, &ids, prefix, rows, false, kv);
-                defer a.free(ticks);
-                const verify = try mimoVerifyOrTicks(a, &xfm, &ids, prefix, rows, true, kv);
-                defer a.free(verify);
-                for (ticks, verify, 0..) |x, y, i| {
-                    if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) {
-                        std.debug.print("mimo verify row differs: kv={s} prefix={d} rows={d} at {d}: {d} vs {d}\n", .{ @tagName(kv.scheme), prefix, rows, i, x, y });
-                        return error.RowNotBitIdentical;
+    // Past the packed floor the global rows read the kv8 cache through matmul2d; a repeated
+    // token makes the verify rows share experts, which takes the grouped expert GEMVs.
+    const long_prefix: usize = @as(usize, @intCast(QKV_MPP_DECODE_MIN_TK)) + 3;
+    var ids: [long_prefix + MIMO_VERIFY_ROWS_MAX]i32 = undefined;
+    for ([_]bool{ false, true }) |repeat| {
+        for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |kv| {
+            for ([_]usize{ 20, 126, 136, long_prefix }) |prefix| {
+                for (&ids, 0..) |*v, i| v.* = @intCast(2 + (i * 37) % (config.vocab_size - 2));
+                if (repeat) @memset(ids[prefix..], ids[prefix]);
+                for ([_]usize{ 2, 3, 4 }) |rows| {
+                    const ticks = try mimoVerifyOrTicks(a, &xfm, &ids, prefix, rows, false, kv);
+                    defer a.free(ticks);
+                    const verify = try mimoVerifyOrTicks(a, &xfm, &ids, prefix, rows, true, kv);
+                    defer a.free(verify);
+                    for (ticks, verify, 0..) |x, y, i| {
+                        if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) {
+                            std.debug.print("mimo verify row differs: kv={s} prefix={d} rows={d} repeat={} at {d}: {d} vs {d}\n", .{ @tagName(kv.scheme), prefix, rows, repeat, i, x, y });
+                            return error.RowNotBitIdentical;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+test "mimo spec warm-up runs every verify row count on its own slot (MIMO_V2_MODEL)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| a.free(p);
+    var weights = try model_mod.loadWeightsForConfig(io, a, std.mem.span(model_dir), &config, false);
+    defer weights.deinit();
+    try stackMimoFixtureExperts(&weights, config, s);
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var want: Transformer.MimoWarmRows = 0;
+    var rows: usize = 2;
+    while (rows <= MIMO_VERIFY_ROWS_MAX) : (rows += 1) want |= @as(Transformer.MimoWarmRows, 1) << @intCast(rows);
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |kv| {
+        try testing.expectEqual(want, try xfm.warmupMimoVerify(kv));
+        for (xfm.cache.entries) |e| try testing.expect(!e.initialized);
     }
 }
 

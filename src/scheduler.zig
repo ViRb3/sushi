@@ -1320,6 +1320,9 @@ pub const Scheduler = struct {
     /// inference thread drains this queue between ticks where it owns the
     /// stream binding, so all mlx ops stay on one thread.
     cleanup_queue: std.ArrayList(*Slot),
+    /// Slots out of `pending` whose prefill pass is running: neither pending nor decoding, so
+    /// a shutdown reaches them only here (queue_mu).
+    prefilling: std.ArrayList(*Slot),
     /// Metrics sink. Null when --metrics is off. Populated from LoadParams.
     /// Read once per REQUEST in `finishSlot` — never on the per-token path.
     metrics: ?*metrics_mod.Metrics,
@@ -1438,6 +1441,7 @@ pub const Scheduler = struct {
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
+            .prefilling = std.ArrayList(*Slot).empty,
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
@@ -1503,6 +1507,7 @@ pub const Scheduler = struct {
         self.decoding.deinit(self.allocator);
         for (self.cleanup_queue.items) |slot| slot.deinit();
         self.cleanup_queue.deinit(self.allocator);
+        self.prefilling.deinit(self.allocator);
         // Vision/embed queues should be empty (encodeVision/computeEmbedding
         // block until done) but guard against shutdown-mid-encode by signaling
         // done with an error.
@@ -1606,6 +1611,7 @@ pub const Scheduler = struct {
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
         try self.cleanup_queue.ensureUnusedCapacity(self.allocator, self.in_flight + 1);
+        try self.prefilling.ensureUnusedCapacity(self.allocator, self.in_flight + 1);
         // Stamp the stable id the `/metrics.json` session rows carry before the
         // slot becomes visible to the inference thread; immutable from here.
         slot.request_id = self.req_seq;
@@ -1683,6 +1689,7 @@ pub const Scheduler = struct {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
+        for (self.prefilling.items) |slot| slot.cancel();
         for (self.decoding.items) |slot| slot.cancel();
     }
 
@@ -2475,6 +2482,20 @@ fn ubenchArms(buf: *[8]UbenchArm, rows: usize, is_mimo: bool, row_arms: bool, po
         n += 1;
     };
     return buf[0..n];
+}
+
+fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: *mimo_mtp.Head, kv_config: transformer_mod.KVQuantConfig) void {
+    const start = std.Io.Timestamp.now(io, .awake);
+    const rows = xfm.warmupMimoVerify(kv_config) catch |err| {
+        log.warn("[spec-warmup] MiMo verify failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
+        return;
+    };
+    const steps = head.warmup(xfm) catch |err| {
+        log.warn("[spec-warmup] MiMo heads failed ({s}); the first round pays their kernel compile inside the round.\n", .{@errorName(err)});
+        return;
+    };
+    const ms: u64 = @as(u64, @intCast(start.untilNow(io, .awake).nanoseconds)) / std.time.ns_per_ms;
+    log.info("[spec-warmup] MiMo verify rows 0x{x}, {d} head steps ({d} ms).\n", .{ rows, steps, ms });
 }
 
 /// MiMo's MTP heads from the checkpoint's own shard, bound to the trunk they share.
@@ -4086,6 +4107,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
         }
+        if (mimo_head) |head| mimoSpecWarmup(sch.io, xfm_ptr, head, params.kv_quant_config);
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -4487,8 +4509,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
-            s.deinit();
         }
+        deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
         if (vision_n > 0 or embed_n > 0) {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
@@ -4543,8 +4565,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             var admit_idx: [to_prefill.len]usize = undefined;
             const n_admit = memoryAdmitCount(sch, admit_idx[0..admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)]);
             for (admit_idx[0..n_admit]) |idx| {
-                to_prefill[n_prefill] = sch.pending.items[idx];
-                _ = to_prefill[n_prefill].in_pass.fetchAdd(1, .acq_rel);
+                to_prefill[n_prefill] = admitForPrefillLocked(sch, idx);
                 n_prefill += 1;
             }
             // Remove admitted entries in DESCENDING index order so the
@@ -4566,7 +4587,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         //    no per-tick stream rebind / mutex coexistence is needed.
         if (n_prefill > 0) {
             for (to_prefill[0..n_prefill], 0..) |slot, pi| {
-                defer _ = slot.in_pass.fetchSub(1, .acq_rel);
+                defer endPrefillPass(sch, slot);
                 // Between the slots of one admitted batch, tick the streams
                 // that just started decoding — a single-chunk prefill exposes
                 // no chunk-boundary yield, so without this every slot's first
@@ -5509,6 +5530,18 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     _ = mlx.mlx_clear_cache();
 }
 
+/// Free finished slots on the inference thread. The request-end clear ran before this, so a
+/// slot that reserved its whole KV up front parked it in MLX's pool, sized to its own prompt
+/// (reused by no later request, and the admission bill never counts it back): return it.
+fn deinitSlotsReturningPool(slots: []const *Slot) void {
+    var returns_pool = false;
+    for (slots) |s| {
+        if (s.model.config) |c| returns_pool = returns_pool or c.reservesKvCapacity();
+        s.deinit();
+    }
+    if (returns_pool) _ = mlx.mlx_clear_cache();
+}
+
 /// DiffusionGemma prefill: refresh the slot ctx, build the per-slot
 /// diffusion Runner (which dequantizes the embedding table for
 /// self-conditioning), and run the causal ENCODER pass over the full prompt
@@ -5850,6 +5883,28 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     const tick_ns = sw.read();
     for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
     return tick_ns;
+}
+
+/// Take `pending[idx]` into this tick's prefill pass (queue_mu held; the caller removes it
+/// from `pending`).
+fn admitForPrefillLocked(sch: *Scheduler, idx: usize) *Slot {
+    const slot = sch.pending.items[idx];
+    _ = slot.in_pass.fetchAdd(1, .acq_rel);
+    // `submit` reserved room for every in-flight slot.
+    sch.prefilling.appendAssumeCapacity(slot);
+    return slot;
+}
+
+/// The prefill pass over `slot` is over, however it ended.
+fn endPrefillPass(sch: *Scheduler, slot: *Slot) void {
+    sch.queue_mu.lockUncancelable(sch.io);
+    for (sch.prefilling.items, 0..) |s, i| {
+        if (s != slot) continue;
+        _ = sch.prefilling.swapRemove(i);
+        break;
+    }
+    sch.queue_mu.unlock(sch.io);
+    _ = slot.in_pass.fetchSub(1, .acq_rel);
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
@@ -9801,9 +9856,11 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     sch.pending = .empty;
     sch.decoding = .empty;
     sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
     defer sch.pending.deinit(allocator);
     defer sch.decoding.deinit(allocator);
     defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
     defer for (sch.cleanup_queue.items) |slot| slot.deinit();
     for (0..12) |_| {
         failing.fail_index = std.math.maxInt(usize);
@@ -9829,6 +9886,102 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
     try testing.expectEqual(@as(usize, 24), Probe.frees);
     try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
+}
+
+test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    defer sch.pending.deinit(allocator);
+    defer sch.decoding.deinit(allocator);
+    defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
+    const s = mlx.gpuStream();
+    const kv_bytes: usize = 64 << 20;
+    var mimo = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 1, .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
+    var plain = ModelConfig{ .model_type = "qwen3", .num_hidden_layers = 1 };
+    try testing.expect(mimo.reservesKvCapacity() and !plain.reservesKvCapacity());
+    for ([_]*ModelConfig{ &mimo, &plain }) |cfg| {
+        var model: LoadedModel = undefined;
+        model.config = cfg;
+        model.transformer = null;
+        model.prefix_cache = null;
+        _ = mlx.mlx_clear_cache();
+        const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
+        sch.complete(slot);
+        const done = sch.cleanup_queue.orderedRemove(0);
+        // The reservation a long request made, as the slot's own KV buffer.
+        var kv = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_arange(&kv, 0, @floatFromInt(kv_bytes / 4), 1, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(kv));
+        _ = mlx.mlx_synchronize(s);
+        _ = mlx.mlx_array_free(done.cache.entries[0].keys);
+        done.cache.entries[0].keys = kv;
+        deinitSlotsReturningPool(&.{done});
+        var pooled: usize = 0;
+        _ = mlx.mlx_get_cache_memory(&pooled);
+        if (cfg == &mimo) {
+            try testing.expectEqual(@as(usize, 0), pooled);
+        } else {
+            try testing.expect(pooled >= kv_bytes);
+        }
+    }
+    _ = mlx.mlx_clear_cache();
+}
+
+test "shutdown cancels a slot whose prefill is running, so the prefill stops at its next chunk" {
+    const allocator = testing.allocator;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    model.prefix_cache = null;
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    defer sch.pending.deinit(allocator);
+    defer sch.decoding.deinit(allocator);
+    defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
+    const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
+    // The inference thread's admission step, as `inferenceLoop` runs it.
+    sch.queue_mu.lockUncancelable(sch.io);
+    const taken = admitForPrefillLocked(&sch, 0);
+    _ = sch.pending.orderedRemove(0);
+    sch.queue_mu.unlock(sch.io);
+    try testing.expectEqual(slot, taken);
+    sch.cancelAllInFlight();
+    const cancelled = slot.cancelled.load(.acquire);
+    endPrefillPass(&sch, slot);
+    sch.complete(slot);
+    while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
+    try testing.expect(cancelled);
 }
 
 test "admission combines Qwen and MiMo reservations in either order" {

@@ -410,6 +410,32 @@ and 4-8% of a depth-3 verify; a matmul2d QSA prototype (branch `qsa-mpp-proto`) 
 Its n36 experts reached the fast decode arms only with the rate-generic readers:
 [exl3-rate-generic](#exl3-rate-generic) (live decode 35 -> 61 tok/s with MTP).
 
+<a id="mimo-longctx"></a>
+### MiMo Sushi-2.25bpw long-context ladder, MTP (3d11b0f7)
+
+One boot, one request per rung (the source-tree prompt ladder, "explain the code"), 256 tokens, T=0,
+`--ctx-size 1048576 --kv-quant 8 --mtp`, info log, `taskpolicy -a`, GPU lock, fans max, 2026-09-28. Decode / prefill in
+tok/s; tok/step = 1 + accepted drafts per round; stalls = rounds over twice the median at their width.
+
+| rung | decode | prefill | TTFT | tok/step | stalls |
+|---|---|---|---|---|---|
+| 4k | 55.7 | 839 | 4.9 s | 2.44 | 5 (214 ms) |
+| 8k | 58.9 | 1119 | 7.4 s | 2.61 | 1 |
+| 16k | 56.4 | 1086 | 15.2 s | 2.42 | 0 |
+| 32k | 57.0 | 949 | 34.6 s | 2.39 | 2 |
+| 64k | 44.4 | 816 | 80.4 s | 2.17 | 1 |
+| 128k | 43.2 | 661 | 198.5 s | 1.92 | 0 |
+| 256k | 31.8 | 449 | 584.6 s | 2.17 | 0 |
+
+- Baseline, main 1ea9492a on the same prompts: 57.2 / 55.5 / 54.8 / 57.4 decode at 4k-32k; its 64k and 256k
+  cells were contended (18.0 and 22.6). The slope past 32k is the global layers' attention per verify row.
+- The stalls came with other agents' builds and fan changes on the box: a quiet box read 0 on every rung, both
+  before the pool fix (typical-sampling boots below) and after it (64d9c341: 63.8 / 60.8 / 55.8 / 48.9 / 39.9 at
+  4k / 8k / 32k / 64k / 128k, 0 stalls, 07:38).
+- Typical 0.2 at T=1.0, top_p 0.95, seed 7, two boots back to back after 3 min idle: `--mtp-greedy-tail` (90f8bf7f)
+  vs without (3d11b0f7) decodes +15.1 / +12.6 / +13.2% at 16k / 32k / 64k (tok/step 3.51 / 3.51 / 3.12 vs
+  2.78 / 2.72 / 2.69), with GPU clocks within 1-5% and prefill within 1-8%; at 4k / 8k the clocks differed 14-19%.
+
 <a id="mimo-ladder"></a>
 ### MiMo-V2.6-Flash-Sushi-2.3bpw, 4k-128k context ladder (1a7f92d1)
 

@@ -1456,10 +1456,10 @@ pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool
 ///
 /// The per-chunk clear runs before the last chunks' transient is freed, so that
 /// transient parks in the pool up to the cap and the first decode tick allocates
-/// on top of it (8.1 GB parked at the first tick of a 393k prefill). Gated on
-/// `longCtxGated`: every other arch keeps its previous call pattern exactly.
+/// on top of it (8.1 GB parked at the first tick of a 393k prefill). Gated on an
+/// arch that reserves its KV up front: every other arch keeps its call pattern exactly.
 pub fn clearsPoolAtPrefillEnd(config: *const model_mod.ModelConfig) bool {
-    return config.longCtxGated();
+    return config.reservesKvCapacity();
 }
 
 /// Number of accepted draft tokens that may accompany the always-committed
@@ -1725,6 +1725,8 @@ pub const Generator = struct {
     mtp_lookup_streak: bool = false,
     /// Rounds where the confidence gate extended into chunk B.
     mtp_ext_rounds: u64 = 0,
+    /// This request's round walls, for the `stalls=` field.
+    mtp_round_log: round_cost.RoundLog = .{},
     /// Speculative rounds that rolled recurrent state back on a partial accept.
     partial_rounds: u64 = 0,
     /// Extension dry-spell gate: consecutive extension-CONSIDERED rounds
@@ -2093,8 +2095,12 @@ pub const Generator = struct {
                     @as(f64, @floatFromInt(drafts_proposed))
             else
                 0.0;
+            const stalls = self.mtp_round_log.stalls();
+            // The line is at the formatter's 32-argument limit.
+            var stalls_buf: [32]u8 = undefined;
+            const stalls_txt = std.fmt.bufPrint(&stalls_buf, "{d}/{d:.0}", .{ stalls.count, stalls.max_ms }) catch "?";
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} serial_drops=t{d}/c{d}/b{d} lookup={d}/{d}/{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} serial_drops=t{d}/c{d}/b{d} lookup={d}/{d}/{d} stalls={s}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -2127,6 +2133,7 @@ pub const Generator = struct {
                     self.mtp_lookup_rounds,
                     self.mtp_lookup_drafted,
                     self.mtp_lookup_accepted,
+                    stalls_txt,
                 },
             );
             if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] lookup_table={s}:{s}\n", .{
@@ -8978,6 +8985,7 @@ pub const Generator = struct {
         // anchored the table at 2 on the M4 base 9B).
         const ev_planned = self.mtp_ev_rounds > MTP_EV_WARMUP_ROUNDS;
         const wall = if (post_warmup) self.mtpRegimeWallMs(round_ms) else round_ms;
+        self.mtp_round_log.add(m, wall);
         const tok: f32 = @floatFromInt(tokens);
         if (post_warmup and self.spec_cost_solo and !width_trial) mtpRegimeObserve(&self.mtp_regime, two_chunk, m_lo, wall, tok);
         // A trial round was a single-chunk shape at another depth: not a
@@ -17985,7 +17993,7 @@ test "clear cadence survives variable spec strides" {
     }
 }
 
-test "the allocator pool is returned at the prefill/decode handover, long-context gate only" {
+test "the allocator pool is returned at the prefill/decode handover, on archs that reserve their KV" {
     // The per-chunk clear runs BEFORE the last chunks' transient is freed, so it
     // parks in MLX's pool up to the cap and the first decode tick allocates on top
     // of it (measured 8.1 GB parked at the first tick of a 393k prefill; a cold
@@ -17994,6 +18002,9 @@ test "the allocator pool is returned at the prefill/decode handover, long-contex
     const t = testing;
     var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
     try t.expect(clearsPoolAtPrefillEnd(&qwen4));
+    // MiMo reserves its KV up front too: a 256k request parked 3.2 GiB there, and the next admission read it as spent.
+    var mimo = model_mod.ModelConfig{ .model_type = "mimo_v2", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
+    try t.expect(clearsPoolAtPrefillEnd(&mimo));
     for ([_][]const u8{
         "qwen3_5",
         "qwen3_5_moe",

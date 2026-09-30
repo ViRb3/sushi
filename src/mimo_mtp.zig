@@ -676,6 +676,49 @@ pub const Head = struct {
         return self.lastRow(try self.forwardRows(target, st, li, st.round_q, @min(st.n_drafts, li)));
     }
 
+    /// One history append and one round of every head on a throwaway state, so their pipelines
+    /// JIT at load instead of inside a request's first rounds. Returns the head steps it ran.
+    pub fn warmup(self: *Head, target: *Transformer) !usize {
+        const hist: usize = 8;
+        var ids: [hist + 2]u32 = undefined;
+        for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
+        const st = try self.newState(self.allocator);
+        defer {
+            st.deinit();
+            self.allocator.destroy(st);
+        }
+        var hid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hid);
+        try mlx.check(mlx.mlx_zeros(&hid, &[_]c_int{ 1, @intCast(hist + 1), self.hidden }, 3, .bfloat16, self.s));
+        var hist_hid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hist_hid);
+        try mlx.check(mlx.mlx_slice(&hist_hid, hid, &.{ 0, 0, 0 }, 3, &.{ 1, @intCast(hist), self.hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
+        try self.appendHistory(target, st, ids[1 .. hist + 1], hist_hid, 0);
+        var row_hid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row_hid);
+        try mlx.check(mlx.mlx_slice(&row_hid, hid, &.{ 0, @intCast(hist), 0 }, 3, &.{ 1, @intCast(hist + 1), self.hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
+        var out = try self.draftStep(target, st, 0, null, ids[hist + 1 .. hist + 2], row_hid, hist);
+        var steps: usize = 1;
+        while (steps < self.heads) : (steps += 1) {
+            const d = try self.draftSelect(target, out, null);
+            defer _ = mlx.mlx_array_free(d);
+            const next = try self.draftStep(target, st, steps, d, &.{}, null, 0);
+            _ = mlx.mlx_array_free(out);
+            out = next;
+        }
+        defer _ = mlx.mlx_array_free(out);
+        const last = try self.draftSelect(target, out, null);
+        defer _ = mlx.mlx_array_free(last);
+        try mlx.check(mlx.mlx_array_eval(last));
+        // A sampled request drafts from the re-scored shortlist instead of the argmax.
+        if (try self.draftShortlist(target, out, null)) |sl| {
+            var list = sl;
+            defer list.deinit();
+            try mlx.check(mlx.mlx_array_eval(list.exact));
+        }
+        return steps;
+    }
+
     /// Built once, at the first ask: the coarse copy of the target's lm_head.
     pub fn canRerankDrafts(self: *Head) bool {
         if (!self.rerank_tried) {
@@ -742,6 +785,30 @@ fn expectRowClose(label: []const u8, k: usize, q: usize, ours: mlx.mlx_array, re
         std.debug.print("mimo mtp {s}: head {d} row {d} max |d| {d} > {d}\n", .{ label, k, q, worst, bar });
         return error.TestExpectedEqual;
     }
+}
+
+test "mimo mtp heads warm up every head on a throwaway state (MIMO_V2_MODEL)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = std.mem.span(model_dir);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer if (config.ngram_table_path) |p| a.free(p);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    try transformer_mod.stackMimoFixtureExperts(&weights, config, s);
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var mtp_weights = try @import("mimo_source.zig").loadMtpWeights(io, a, dir);
+    defer mtp_weights.deinit();
+    var head = (try Head.load(a, s, &config, &mtp_weights)) orelse return error.NoMtpHeads;
+    defer head.deinit();
+    head.target = &xfm;
+    try testing.expectEqual(head.heads, try head.warmup(&xfm));
+    for (xfm.cache.entries) |e| try testing.expect(!e.initialized);
 }
 
 test "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across rounds, drafts and rollbacks (MIMO_V2_MODEL + MIMO_V2_MTP_FIXTURE)" {

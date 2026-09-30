@@ -237,6 +237,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   mid-prefill.
 - Admission bills at kv8: 64k 2.75 GiB, 128k 3.69, 512k 9.29 at chunk 512 (10.34 at 1024), 1M 16.76; 1M at kv8
   needs 12.83 GB of KV alone. An explicit `--ctx-size` outranks auto-context.
+- **Whether 1M admits is the box's free memory, not the bill**: resident MiMo takes no wired-limit floor, so the
+  ceiling is footprint + free RAM. With 88.4 GiB loaded, a quiet M5 Max 128 GB left ~27 GiB (full 1M at chunk 4096,
+  21.3 GiB); with ~14 GiB held by other processes it left 11.6-12.6 GiB, and the largest prompt was ~660-740k.
 
 ## Evidence
 
