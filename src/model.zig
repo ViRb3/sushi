@@ -1104,6 +1104,13 @@ pub const ModelConfig = struct {
         return self.isQwen4();
     }
 
+    /// Does admission credit the hot cache and evict it to admit a prefill? One predicate for the
+    /// connection thread's credits and the inference thread's eviction pass. A ringed arch joins:
+    /// its warm credit is the global layers' rows alone, the ring is billed whole.
+    pub fn admissionEvictsHotCache(self: *const ModelConfig) bool {
+        return self.longCtxGated() or self.swaRingTokens() > 0;
+    }
+
     /// Does a request reserve its whole cache capacity up front instead of
     /// growing +25% at a time? Narrower than `longCtxGated`: a ringed arch
     /// joins because its per-token KV is nine layers of a 48-layer trunk, so a

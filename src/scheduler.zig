@@ -303,6 +303,13 @@ pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) PostEvictionWidth {
     };
 }
 
+/// Does the inference thread run the evict-to-admit pass for this model? The connection
+/// thread's credits (`server.creditedAdmissionBill`) read the same predicate.
+pub fn admissionPassArmed(cfg: ?*const ModelConfig) bool {
+    const c = cfg orelse return false;
+    return c.admissionEvictsHotCache();
+}
+
 /// Asked by the prefill loop: the width of the next chunk, re-priced at every chunk boundary
 /// (`server.adaptivePrefillWidthNow`). Null keeps the admitted width.
 pub var prefill_chunk_adapt: ?*const fn (
@@ -2393,6 +2400,16 @@ test "admitsWithinMemory: siblings are billed together, a lone request always pr
     try testing.expectEqual(@as(usize, 1), admitsWithinMemory(&.{big}, false));
     // A gated admit carries no bill here and never blocks the queue.
     try testing.expectEqual(@as(usize, 3), admitsWithinMemory(&.{ null, b, b }, false));
+}
+
+test "admissionPassArmed: the evict-to-admit pass runs for qwen4_exp and mimo_v2, never an unserved arch" {
+    const mimo = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 1, .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
+    const qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
+    const llama = ModelConfig{ .model_type = "llama", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
+    try testing.expect(admissionPassArmed(&mimo));
+    try testing.expect(admissionPassArmed(&qwen4));
+    try testing.expect(!admissionPassArmed(&llama));
+    try testing.expect(!admissionPassArmed(null));
 }
 
 const ThreadCtx = struct {
@@ -6122,10 +6139,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // re-asked after the pass against the live delta.
     var admitted_prefill_chunk: u32 = 0;
     var evicted_live_bytes: u64 = 0;
-    // Arch gate for the whole pass; the connection-thread half is gated in
-    // `server.prefillAdmissionBill`. `publishHotCacheResidency` is not gated.
-    const admission_pass_armed = if (slot.model.config) |c| c.longCtxGated() else false;
-    if (admission_pass_armed) if (prefill_admission_fits) |fits_fn| {
+    // `publishHotCacheResidency` is not gated.
+    if (admissionPassArmed(slot.model.config)) if (prefill_admission_fits) |fits_fn| {
         if (slot.model.config) |cfg| {
             // Bills the request's own kv-quant scheme and vision chunking, not the process defaults.
             const Probe = struct {

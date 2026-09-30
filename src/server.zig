@@ -5688,8 +5688,8 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
 const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
 
 /// The body of the pre-flight memory 400. Two arms: with the credits present the message
-/// quotes them; with them structurally zero (every arch outside `longCtxGated`) the previous
-/// sentence, which named no cache. The discriminator is the arch gate, not `bill.evictable`,
+/// quotes them; with them structurally zero (every arch outside `admissionEvictsHotCache`)
+/// the previous sentence, which named no cache. The discriminator is the arch gate, not `bill.evictable`,
 /// so the qwen4_exp bytes stay exactly as they were. Caller owns the returned bytes.
 fn memoryRefusalMessage(
     allocator: std.mem.Allocator,
@@ -6229,11 +6229,14 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
             sch.reclaimable_hot_cache_bytes.load(.monotonic)
     else
         0;
-    // Arch gate for the whole evict-to-admit half: both admit arms are driven entirely by the
-    // two credits, so zeroing them restores the previous single `needed > available` refusal.
-    // Off the gated arch an admit that then dies mid-prefill is worse than a clean 400. The
-    // publishers stay on every arch (the guard used to dereference `hot_prefix_cache`).
-    if (!config.longCtxGated()) {
+    return creditedAdmissionBill(config, needed, available, evictable, reclaimable, chunk);
+}
+
+/// PURE: the bill with the hot-cache credits on an arch that evicts to admit
+/// (`admissionEvictsHotCache`). Elsewhere both credits are zero, so both admit arms go dead and
+/// the single `needed > available` refusal stands. The publishers stay on every arch.
+pub fn creditedAdmissionBill(config: *const model_mod.ModelConfig, needed: u64, available: u64, evictable: u64, reclaimable: u64, chunk: u64) AdmissionBill {
+    if (!config.admissionEvictsHotCache()) {
         return .{ .needed = needed, .available = available, .chunk = chunk };
     }
     return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
@@ -6382,7 +6385,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm). The cache
         // clause is only true where the bill carries the cache; `memoryRefusalMessage` is the one formatter.
-        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.longCtxGated());
+        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.admissionEvictsHotCache());
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -23655,7 +23658,7 @@ test "ctxSizingCacheReserve: the advertised context is unchanged on every other 
     try t.expect(big < small);
 }
 
-test "prefillAdmissionBill: the evict-to-admit credits are qwen4_exp-only" {
+test "prefillAdmissionBill: the evict-to-admit arms are driven by the two credits alone" {
     // Both admit arms are driven entirely by the two credits, so zeroing them restores the
     // previous single `needed > available` refusal.
     const t = std.testing;
@@ -23670,7 +23673,7 @@ test "prefillAdmissionBill: the evict-to-admit credits are qwen4_exp-only" {
     try t.expect(!deferral.fitsAfterEviction());
     try t.expect(pinnedResidentBytes(deferral) > 0); // warm deferral
 
-    // Ungated the bill carries neither credit, and both arms go dead.
+    // Where the arch does not evict, the bill carries neither credit, and both arms go dead.
     const ungated = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB };
     try t.expectEqual(ungated.fits(), ungated.fitsAfterEviction());
     try t.expectEqual(@as(u64, 0), pinnedResidentBytes(ungated));
@@ -24197,6 +24200,52 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
     // the per-chunk estimator is calibrated on qwen4_exp and stepped a 64k MiMo prompt down to 512.
     try t.expectEqual(@as(usize, 4096), generate_mod.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 0));
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+}
+
+test "mimo_v2 admission credits the hot cache: a gap the cache covers is an evict, not a refusal" {
+    const t = std.testing;
+    const MB: u64 = 1024 * 1024;
+    const cfg = mimoV2FlashBillConfig();
+    // The live refusal: 8924 MB needed, 8027 MB available, 1995 MB of hot cache this prompt does not pin.
+    const bill = creditedAdmissionBill(&cfg, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096);
+    try t.expectEqual(1995 * MB, bill.evictionCredit());
+    try t.expectEqual(AdmissionVerdict.evict, admissionVerdict(bill));
+    // A credit short of the gap is still a refusal.
+    const short = creditedAdmissionBill(&cfg, 8924 * MB, 8027 * MB, 1995 * MB, 800 * MB, 4096);
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(short));
+
+    // Both halves read one predicate: the credits ride exactly where the inference thread evicts.
+    var other = cfg;
+    other.model_type = "llama";
+    const q4 = qwen4RequestTestConfig();
+    for ([_]*const model_mod.ModelConfig{ &cfg, &other, &q4 }) |c| {
+        const b = creditedAdmissionBill(c, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096);
+        try t.expectEqual(scheduler_mod.admissionPassArmed(c), b.evictionCredit() > 0);
+    }
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(creditedAdmissionBill(&other, 8924 * MB, 8027 * MB, 1995 * MB, 1995 * MB, 4096)));
+}
+
+test "mimo_v2 warm bill credits only the restored global rows, never the ring" {
+    const t = std.testing;
+    const cfg = mimoV2FlashBillConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 140_000;
+    const matched: u64 = 120_000;
+    const chunk: u64 = 4096;
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    // `kvBytesPerToken` is the nine global layers; `residentCapacityTokens` skips the ringed ones.
+    try t.expectEqual(@as(u32, 9), cfg.kvPerTokenLayerCount());
+
+    const cold = prefillRequestTerms(&cfg, seq, 32_000, kv_bits, chunk, .{});
+    const donated = prefillRequestTerms(&cfg, seq, 32_000, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = true });
+    try t.expectEqual(matched * kv_per_tok, donated.shared_resident_bytes);
+    // The restored ring holds only its retained rows; the first append regrows it, so the ring
+    // and both checkpoint copies are billed whole on a warm turn too.
+    try t.expect(donated.qsa_ring_bytes > 0);
+    try t.expectEqual(cold.qsa_ring_bytes, donated.qsa_ring_bytes);
+    // A share is copied by its first append: nothing credited.
+    const shared = prefillRequestTerms(&cfg, seq, 32_000, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = false });
+    try t.expectEqual(@as(u64, 0), shared.shared_resident_bytes);
 }
 
 test "mimo_v2 at 500k, kv8, chunk 2048: the fused sliding arm drops exactly the band sheet" {
