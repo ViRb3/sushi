@@ -63,6 +63,16 @@ zero-copy slabs. With no budget a pack loads resident as before.
   submitted between the ids and the blocking read, so the GPU runs it during the host round trip. Same ops, same
   order; output is bit-identical.
 
+- Qwen4 single-token decode keeps at most one unresolved layer while submitting the next GDN MoE layer's router
+  and cache-map expert compute. A cache miss discards that successor, restores its recurrent handles, and rebuilds
+  from the preceding MLP's exact output; PLE and full-attention successors verify first. Cache resolution and its
+  accounting occur only after the predecessor passes, so discarded routes never fill or touch LRU state.
+- Deferred HC writes belong to the speculative stream: rollback restores the preceding MLP's stream and injection
+  gate, then replaces the pending write with its exact result. Profiling, dtype tracing, layer captures, stand-ins,
+  imatrix collection, batched/wide forwards and lossy expert picking keep synchronous verification.
+- `SUSHI_EXPERT_DEFER_SYNC=1` selects synchronous verification for an exact schedule comparison: deferred
+  verification overlaps host work on hits but spends an extra GDN build and speculative compute on misses.
+
 ## Lossy expert pick (`--expert-pick-tolerance <n>`, 0..0.6, default 0 = exact)
 
 - On a cache miss at decode widths, a routed expert may be replaced by the best cached expert outside the row's top-k

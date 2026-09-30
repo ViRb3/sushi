@@ -25035,11 +25035,25 @@ pub const Transformer = struct {
         const ladder = if (ctx.batch_slots != null) self.decode_async_ladder_qwen4 else self.decode_async_ladder;
         var ladder_blocked = false;
 
-        for (0..layerCap(cfg.num_hidden_layers)) |layer_idx| {
+        const defer_moe = self.expert_stream != null and self.imatrix == null and batch == 1 and seq_len == 1 and
+            !prof.timing and !prof.ops and !dt.on and !dumping and qwen4_trace == null and ctx.capture_layers == null and
+            @as(u16, @bitCast(qwen4Standin())) == 0 and !decodeProfileEnabled() and expert_stream_mod.pick_tolerance == 0 and
+            !diagEnvOnCached(&expert_defer_sync_env, "SUSHI_EXPERT_DEFER_SYNC");
+        var deferred: ?DeferredQwenMoe = null;
+        defer if (deferred) |*d| d.deinit();
+        var layer_idx: usize = 0;
+        while (layer_idx < layerCap(cfg.num_hidden_layers)) {
             const li: u32 = @intCast(layer_idx);
             if (dumping) moe_dump_layer = li;
             const lw = &ml[layer_idx];
             const entry = &entries[layer_idx];
+            const next_safe = defer_moe and layer_idx + 1 < layerCap(cfg.num_hidden_layers) and streamedSuccessorSafe(&ml[layer_idx + 1]);
+            if (deferred != null and !streamedSuccessorSafe(lw))
+                _ = try self.verifyQwenMoe(&deferred, &h, &pending, batch, seq_len);
+            var undo: ?StreamGdnUndo = if (deferred != null) try StreamGdnUndo.init(entry) else null;
+            defer if (undo) |*u| u.deinit();
+            var submitted: ?StreamMoe = null;
+            defer if (submitted) |*work| work.deinit();
 
             if (lw.ple) |*pw| {
                 try self.hcFlush(&h, batch, seq_len, &pending);
@@ -25079,14 +25093,37 @@ pub const Transformer = struct {
             var pre2: HcRead = if (si.hc) try self.hcReadStandin(h, batch, seq_len) else try self.hcReadPending(&h, &lw.hc_mlp.?, batch, seq_len, &pending);
             defer pre2.deinit();
             try prof.lap(pre2.mixed, .hc_read);
-            const mlp_out = if (si.mlp) try standinRef(pre2.mixed) else switch (lw.mlp) {
+            var mlp_out = if (si.mlp) try standinRef(pre2.mixed) else switch (lw.mlp) {
                 .moe => |*mw| if (self.expert_stream != null)
-                    try self.moeMLPStreamed(ctx, pre2.mixed, mw, @intCast(layer_idx))
+                    try self.moeMLP2WithRouter(pre2.mixed, pre2.mixed, mw, null, false, .{
+                        .ctx = ctx,
+                        .layer = @intCast(layer_idx),
+                        .deferred = if (next_safe or deferred != null) &submitted else null,
+                    }, null)
                 else
                     try self.moeMLP(pre2.mixed, mw),
                 .dense => |*dw| try self.denseMLP(pre2.mixed, dw),
             };
             defer _ = mlx.mlx_array_free(mlp_out);
+            if (deferred != null) {
+                if (!try self.verifyQwenMoe(&deferred, &h, &pending, batch, seq_len)) {
+                    undo.?.restore(entry);
+                    continue;
+                }
+            }
+            if (submitted) |*work| {
+                if (next_safe) {
+                    const saved_h = try standinRef(h);
+                    errdefer _ = mlx.mlx_array_free(saved_h);
+                    const saved_inj = try standinRef(pre2.inj);
+                    deferred = .{ .moe = work.*, .h = saved_h, .inj = saved_inj };
+                    submitted = null;
+                } else {
+                    const exact = try self.finishStreamedMoe(work, &lw.mlp.moe, null);
+                    _ = mlx.mlx_array_free(mlp_out);
+                    mlp_out = exact;
+                }
+            }
             try prof.lap(mlp_out, .mlp);
             if (layer_idx == 0) if (qwen4_trace) |tr| {
                 Qwen4Trace.set(&tr.mixed_mlp, pre2.mixed);
@@ -25132,7 +25169,9 @@ pub const Transformer = struct {
                 try evalCadencePoint(h, ctx.ssm_entries);
             }
             dt.layer(h, layer_idx);
+            layer_idx += 1;
         }
+        std.debug.assert(deferred == null);
 
         if (ctx.capture_stream_all != null or ctx.capture_hidden != null or ctx.capture_hidden_all != null) {
             try self.hcFlush(&h, batch, seq_len, &pending);
@@ -30910,6 +30949,7 @@ pub const Transformer = struct {
     const MoeStreamCtx = struct {
         ctx: *ForwardCtx,
         layer: u16,
+        deferred: ?*?StreamMoe = null,
     };
 
     const MoeRoutingOverride = struct {
@@ -30921,6 +30961,75 @@ pub const Transformer = struct {
 
     fn moeMLPStreamed(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, mw: *const MoeMlpWeights, layer: u16) !mlx.mlx_array {
         return self.moeMLP2WithRouter(x, x, mw, null, false, .{ .ctx = ctx, .layer = layer }, null);
+    }
+
+    const StreamMoe = struct {
+        stream_ctx: MoeStreamCtx,
+        expert_x: mlx.mlx_array,
+        inds: mlx.mlx_array,
+        norm_scores: mlx.mlx_array,
+        ids: mlx.mlx_array,
+        shared: mlx.mlx_array,
+        swap_logits: mlx.mlx_array,
+        result: mlx.mlx_array,
+        map: ?[]const i32,
+        detail: expert_stream_mod.RouteDetail,
+
+        fn retain(self: *const StreamMoe) !StreamMoe {
+            var out = self.*;
+            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result" }) |name|
+                @field(out, name) = .{ .ctx = null };
+            errdefer out.deinit();
+            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result" }) |name| {
+                const arr = @field(self, name);
+                if (arr.ctx != null) @field(out, name) = try standinRef(arr);
+            }
+            out.stream_ctx.deferred = null;
+            return out;
+        }
+
+        fn deinit(self: *StreamMoe) void {
+            inline for (.{ "expert_x", "inds", "norm_scores", "ids", "shared", "swap_logits", "result" }) |name| {
+                const arr = @field(self, name);
+                if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+            }
+        }
+    };
+
+    const DeferredQwenMoe = struct {
+        moe: StreamMoe,
+        h: mlx.mlx_array,
+        inj: mlx.mlx_array,
+
+        fn deinit(self: *DeferredQwenMoe) void {
+            self.moe.deinit();
+            _ = mlx.mlx_array_free(self.h);
+            _ = mlx.mlx_array_free(self.inj);
+        }
+    };
+
+    fn verifyQwenMoe(self: *Transformer, deferred: *?DeferredQwenMoe, h: *mlx.mlx_array, pending: *?HcPending, batch: c_int, seq: c_int) !bool {
+        const d = &(deferred.* orelse return true);
+        // The successor owns different slabs; no cache state from its wrong route
+        // is committed until this layer has been verified.
+        var kept = false;
+        const mw = &self.moe_layers.?[d.moe.stream_ctx.layer].mlp.moe;
+        const exact = try self.finishStreamedMoe(&d.moe, mw, &kept);
+        defer _ = mlx.mlx_array_free(exact);
+        defer {
+            d.deinit();
+            deferred.* = null;
+        }
+        noteExpertDeferred(kept);
+        if (!kept) {
+            if (pending.*) |*pd| pd.deinit();
+            pending.* = null;
+            _ = mlx.mlx_array_free(h.*);
+            h.* = try standinRef(d.h);
+            const next = @as(usize, d.moe.stream_ctx.layer) + 1;
+            try self.hcWriteOrDefer(h, exact, d.inj, batch, seq, self.moe_layers.?[next].hc_attn.?.inject_flat, pending);
+        }
+        return kept;
     }
 
     fn swapMissedExperts(self: *Transformer, engine: *expert_stream_mod.Engine, layer: u16, occurrences: []u16, logits: mlx.mlx_array, tolerance: f32) !void {
@@ -31007,6 +31116,38 @@ pub const Transformer = struct {
             try handOffStreamedResult(spec_result, streamRows(mlx.getShape(inds)));
             spec_host = route.host;
         };
+        const work = StreamMoe{
+            .stream_ctx = stream_ctx,
+            .expert_x = expert_x,
+            .inds = inds,
+            .norm_scores = norm_scores,
+            .ids = ids_contiguous,
+            .shared = shared_early orelse .{ .ctx = null },
+            .swap_logits = swap_logits,
+            .result = spec_result,
+            .map = spec_host,
+            .detail = detail,
+        };
+        if (stream_ctx.deferred) |target| if (spec_host != null and swap_logits.ctx == null) {
+            std.debug.assert(target.* == null);
+            target.* = try work.retain();
+            return standinRef(spec_result);
+        };
+        return self.finishStreamedMoe(&work, mw, null);
+    }
+
+    fn finishStreamedMoe(self: *Transformer, work: *const StreamMoe, mw: *const MoeMlpWeights, kept_out: ?*bool) anyerror!mlx.mlx_array {
+        const stream_ctx = work.stream_ctx;
+        const engine = self.expert_stream orelse return error.MissingExpertStream;
+        const expert_x = work.expert_x;
+        const inds = work.inds;
+        const norm_scores = work.norm_scores;
+        const ids_contiguous = work.ids;
+        const shared_early: ?mlx.mlx_array = if (work.shared.ctx != null) work.shared else null;
+        const swap_logits = work.swap_logits;
+        const spec_host = work.map;
+        var detail = work.detail;
+        var sync_clock = ProfClock.init();
         try mlx.check(mlx.mlx_array_eval(ids_contiguous));
         detail.ids_wait_ns = sync_clock.lap();
         const ids_ptr = mlx.mlx_array_data_int32(ids_contiguous) orelse return error.ExpertIdsUnreadable;
@@ -31019,7 +31160,7 @@ pub const Transformer = struct {
         }
         const routed_ids = if (spec_host != null) try self.allocator.dupe(u16, occurrences) else &[_]u16{};
         defer if (spec_host != null) self.allocator.free(routed_ids);
-        if (swap_logits.ctx != null) try self.swapMissedExperts(engine, stream_ctx.layer, occurrences, swap_logits, swap_tolerance);
+        if (swap_logits.ctx != null) try self.swapMissedExperts(engine, stream_ctx.layer, occurrences, swap_logits, expert_stream_mod.pick_tolerance);
         detail.read_ns = sync_clock.lap();
         engine.noteRoute(stream_ctx.layer, self.moe_layers.?[stream_ctx.layer].attn == .full, detail);
         var prepared = try engine.prepareHost(stream_ctx.layer, occurrences);
@@ -31040,10 +31181,9 @@ pub const Transformer = struct {
             const kept = prepared.quantized and expert_stream_mod.specMatches(map, routed_ids, prepared.remapped, prepared.workspace);
             noteExpertSpec(kept);
             if (kept) {
-                const result = spec_result;
-                spec_result = .{ .ctx = null };
+                if (kept_out) |flag| flag.* = true;
                 engine.noteExpertCompute(stream_ctx.layer, compute_clock.lap());
-                return result;
+                return standinRef(work.result);
             }
         }
         if (prepared.quantized) {
@@ -73620,5 +73760,236 @@ test "a MiMo argmax-only readout holds the full head's bit-exact logits at its t
             }
             try std.testing.expectEqual(@as(usize, 32), kept);
         }
+    }
+}
+
+var expert_defer_sync_env: ?bool = null;
+var expert_deferred_layers: u64 = 0;
+var expert_deferred_rollbacks: u64 = 0;
+fn noteExpertDeferred(kept: bool) void {
+    expert_deferred_layers += 1;
+    if (!kept) expert_deferred_rollbacks += 1;
+    if (expert_deferred_layers == 1 or expert_deferred_layers % 20_000 == 0)
+        log.info("[expert-defer] verified {d} layers, rolled back {d} GDN successors\n", .{ expert_deferred_layers, expert_deferred_rollbacks });
+}
+
+const StreamGdnUndo = struct {
+    conv: mlx.mlx_array,
+    state: mlx.mlx_array,
+    initialized: bool,
+
+    fn init(entry: *const SSMCacheEntry) !StreamGdnUndo {
+        const conv = if (entry.conv_state.ctx != null) try standinRef(entry.conv_state) else entry.conv_state;
+        errdefer if (conv.ctx != null) { _ = mlx.mlx_array_free(conv); };
+        const state = if (entry.ssm_state.ctx != null) try standinRef(entry.ssm_state) else entry.ssm_state;
+        return .{ .conv = conv, .state = state, .initialized = entry.initialized };
+    }
+
+    fn restore(self: *StreamGdnUndo, entry: *SSMCacheEntry) void {
+        if (entry.conv_state.ctx != null) _ = mlx.mlx_array_free(entry.conv_state);
+        if (entry.ssm_state.ctx != null) _ = mlx.mlx_array_free(entry.ssm_state);
+        entry.conv_state = self.conv;
+        entry.ssm_state = self.state;
+        entry.initialized = self.initialized;
+        self.conv = .{ .ctx = null };
+        self.state = .{ .ctx = null };
+    }
+
+    fn deinit(self: *StreamGdnUndo) void {
+        if (self.conv.ctx != null) _ = mlx.mlx_array_free(self.conv);
+        if (self.state.ctx != null) _ = mlx.mlx_array_free(self.state);
+    }
+};
+
+fn streamedSuccessorSafe(layer: *const MoeLayerWeights) bool {
+    return layer.attn == .linear and layer.ple == null and layer.mlp == .moe;
+}
+
+test "streamed deferred verification crosses only GDN MoE layers without PLE" {
+    var layer: MoeLayerWeights = undefined;
+    layer.attn = .{ .linear = std.mem.zeroes(LinearAttnWeights) };
+    layer.mlp = .{ .moe = std.mem.zeroes(MoeMlpWeights) };
+    layer.ple = null;
+    try testing.expect(streamedSuccessorSafe(&layer));
+    layer.ple = std.mem.zeroes(PleWeights);
+    try testing.expect(!streamedSuccessorSafe(&layer));
+    layer.ple = null;
+    layer.attn = .{ .full = std.mem.zeroes(FullAttnWeights) };
+    try testing.expect(!streamedSuccessorSafe(&layer));
+    layer.attn = .{ .linear = std.mem.zeroes(LinearAttnWeights) };
+    layer.mlp = .{ .dense = std.mem.zeroes(DenseMlpWeights) };
+    try testing.expect(!streamedSuccessorSafe(&layer));
+}
+
+const StreamDeferredRig = struct {
+    fx: Qwen4LadderHostFixture,
+    layers: [4]MoeLayerWeights,
+    arrays: [96]mlx.mlx_array = undefined,
+    count: usize = 0,
+
+    fn weight(self: *StreamDeferredRig, r: std.Random, shape: []const c_int) !mlx.mlx_array {
+        const a = try attn256RandBf16(r, shape, self.fx.xfm().s);
+        self.arrays[self.count] = a;
+        self.count += 1;
+        return a;
+    }
+
+    fn init(self: *StreamDeferredRig, pack: *const expert_stream_mod.TinyQuantPack) !void {
+        try self.fx.init();
+        const x = self.fx.xfm();
+        x.config = .{
+            .model_type = "qwen4_exp", .hidden_size = 64, .hc_count = 4, .num_hidden_layers = 4, .vocab_size = 16,
+            .num_experts = 4, .num_experts_per_tok = 2, .moe_intermediate_size = 64, .hidden_act = .silu,
+            .linear_num_key_heads = 1, .linear_num_value_heads = 1, .linear_key_head_dim = 32, .linear_value_head_dim = 32,
+            .linear_conv_kernel_dim = 4, .quant_group_size = 32, .quant_bits = 4,
+        };
+        var prng = std.Random.DefaultPrng.init(183);
+        const r = prng.random();
+        const none: mlx.mlx_array = .{ .ctx = null };
+        x.emb_w = try self.weight(r, &.{ 16, 64 });
+        x.lm_head_w = try self.weight(r, &.{ 16, 64 });
+        x.one = mlx.mlx_array_new_float(1);
+        x.ones_hidden = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_ones(&x.ones_hidden.?, &[_]c_int{64}, 1, .bfloat16, x.s));
+        const hc_weights = HcWeights{
+            .norm_w = try self.weight(r, &.{ 4, 64 }),
+            .down_w = try self.weight(r, &.{ 256, 8 }), .down_s = none, .down_b = none,
+            .up_w = try self.weight(r, &.{ 8, 256 }), .up_s = none, .up_b = none,
+            .inject_w = try self.weight(r, &.{ 256, 4 }), .inject_s = none, .inject_b = none,
+        };
+        x.qwen4_mixer = hc_weights;
+        var mw: MoeMlpWeights = std.mem.zeroes(MoeMlpWeights);
+        mw.router_w = try self.weight(r, &.{ 64, 4 });
+        mw.switch_gate_w = pack.residentBank(4, 0);
+        mw.switch_gate_s = pack.residentBank(4, 1);
+        mw.switch_gate_b = pack.residentBank(4, 2);
+        mw.switch_up_w = pack.residentBank(4, 3);
+        mw.switch_up_s = pack.residentBank(4, 4);
+        mw.switch_up_b = pack.residentBank(4, 5);
+        mw.switch_down_w = pack.residentBank(4, 6);
+        mw.switch_down_s = pack.residentBank(4, 7);
+        mw.switch_down_b = pack.residentBank(4, 8);
+        for ([_]mlx.mlx_array{ mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b }) |a| {
+            self.arrays[self.count] = a;
+            self.count += 1;
+        }
+        const la = LinearAttnWeights{
+            .qkv_w = try self.weight(r, &.{ 64, 96 }), .qkv_s = none, .qkv_b = none,
+            .z_w = try self.weight(r, &.{ 64, 32 }), .z_s = none, .z_b = none,
+            .a_w = try self.weight(r, &.{ 64, 1 }), .a_s = none, .a_b = none,
+            .b_w = try self.weight(r, &.{ 64, 1 }), .b_s = none, .b_b = none,
+            .out_w = try self.weight(r, &.{ 32, 64 }), .out_s = none, .out_b = none,
+            .conv1d_w = try self.weight(r, &.{ 96, 4, 1 }),
+            .norm_w = try self.weight(r, &.{32}),
+            .A_log = try self.weight(r, &.{1}), .dt_bias = try self.weight(r, &.{1}),
+            .combined_proj = false,
+        };
+        for (&self.layers) |*layer| layer.* = .{
+            .input_norm = none, .post_attn_norm = none, .is_linear = true,
+            .attn = .{ .linear = la }, .mlp = .{ .moe = mw },
+            .hc_attn = hc_weights, .hc_mlp = hc_weights,
+        };
+        x.moe_layers = &self.layers;
+    }
+
+    fn deinit(self: *StreamDeferredRig) void {
+        const x = self.fx.xfm();
+        for (self.arrays[0..self.count]) |a| _ = mlx.mlx_array_free(a);
+        inline for (.{ "gdn_q_scale", "gdn_k_scale", "gdn_eps", "gdn_ones_w", "ones_hidden" }) |name|
+            if (@field(x, name)) |a| { _ = mlx.mlx_array_free(a); };
+        _ = mlx.mlx_array_free(x.one);
+        self.fx.deinit();
+    }
+};
+
+fn streamDeferredCheckpoint(dir: std.Io.Dir, pack: *const expert_stream_mod.TinyQuantPack) !void {
+    const a = testing.allocator;
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(a);
+    try index.appendSlice(a, "{\"weight_map\":{");
+    const header_len: usize = @intCast(std.mem.readInt(u64, pack.file[0..8], .little));
+    for (0..4) |layer| {
+        const copy = try a.dupe(u8, pack.file);
+        defer a.free(copy);
+        var pos: usize = 8;
+        while (std.mem.indexOfPos(u8, copy[0 .. 8 + header_len], pos, "layers.0")) |found| {
+            copy[found + 7] = @intCast('0' + layer);
+            pos = found + 8;
+        }
+        var buf: [32]u8 = undefined;
+        const file = try std.fmt.bufPrint(&buf, "layer-{d}.safetensors", .{layer});
+        try dir.writeFile(testing.io, .{ .sub_path = file, .data = copy });
+        for (0..expert_quant_mod.component_count) |ci| {
+            var key_buf: [192]u8 = undefined;
+            const key = try expert_quant_mod.tensorKey(&key_buf, @intCast(layer), @fromBackingInt(@intCast(ci)));
+            const item = try std.fmt.allocPrint(a, "{s}\"{s}\":\"{s}\"", .{ if (layer == 0 and ci == 0) "" else ",", key, file });
+            defer a.free(item);
+            try index.appendSlice(a, item);
+        }
+    }
+    try index.appendSlice(a, "}}");
+    try dir.writeFile(testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+}
+
+test "streamed deferred verification preserves outputs states and accounting on hits misses and workspace" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pack = try expert_stream_mod.writeTinyQuantCheckpoint(a, tmp.dir, 32, 4, 64, 64, 32, .{ 4, 4, 4 });
+    defer pack.deinit();
+    try streamDeferredCheckpoint(tmp.dir, &pack);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const path = path_buf[0..path_len];
+    var rig: StreamDeferredRig = .{ .fx = undefined, .layers = undefined };
+    try rig.init(&pack);
+    defer rig.deinit();
+    const x = rig.fx.xfm();
+    const geom = expert_stream_mod.Geometry{ .layers = 4, .experts = 4, .hidden = 64, .intermediate = 64 };
+    const per = try expert_stream_mod.expertBytesFor(a, path, geom, .quantized_split);
+    const old_sync = expert_defer_sync_env;
+    defer expert_defer_sync_env = old_sync;
+    const warm = [_]u16{ 0, 1, 2, 3 };
+    for ([_]u16{ 4, 2, 1 }) |slots| {
+        var baseline = try expert_stream_mod.Engine.initWithOptions(a, path, geom, per * 4 * slots, x.s, .{ .layout = .quantized_split, .bounce_size = 1 << 20 });
+        defer baseline.deinit();
+        var candidate = try expert_stream_mod.Engine.initWithOptions(a, path, geom, per * 4 * slots, x.s, .{ .layout = .quantized_split, .bounce_size = 1 << 20 });
+        defer candidate.deinit();
+        if (slots == 4) for (0..4) |layer| {
+            var b = try baseline.prepareHost(@intCast(layer), &warm);
+            b.deinit();
+            var c = try candidate.prepareHost(@intCast(layer), &warm);
+            c.deinit();
+        };
+        const bs = try Qwen4TestSlot.init(a, 4);
+        defer bs.deinit(a);
+        const cs = try Qwen4TestSlot.init(a, 4);
+        defer cs.deinit(a);
+        const verified = expert_deferred_layers;
+        const rolled_back = expert_deferred_rollbacks;
+        for ([_]i32{ 1, 2, 3, 6, 9, 12, 4, 1 }) |token| {
+            x.expert_stream = &baseline;
+            expert_defer_sync_env = true;
+            const expected = try bs.forward(x, &.{token});
+            defer _ = mlx.mlx_array_free(expected);
+            const ev = try qwen4ReadF32(a, expected, x.s);
+            defer a.free(ev);
+            x.expert_stream = &candidate;
+            expert_defer_sync_env = false;
+            const got = try cs.forward(x, &.{token});
+            defer _ = mlx.mlx_array_free(got);
+            const gv = try qwen4ReadF32(a, got, x.s);
+            defer a.free(gv);
+            try testing.expectEqualSlices(f32, ev, gv);
+            try expectSlotStateEqual(a, x.s, bs, cs, 0);
+            try testing.expectEqual(baseline.fill_experts_total, candidate.fill_experts_total);
+            try testing.expectEqual(baseline.breakdown().hits, candidate.breakdown().hits);
+            try testing.expectEqual(baseline.breakdown().union_members, candidate.breakdown().union_members);
+        }
+        try testing.expect(expert_deferred_layers > verified);
+        if (slots == 4) try testing.expectEqual(rolled_back, expert_deferred_rollbacks);
+        if (slots == 1) try testing.expect(expert_deferred_rollbacks > rolled_back);
+        x.expert_stream = null;
     }
 }
