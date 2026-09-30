@@ -157,7 +157,8 @@ MTP and the 8-bit KV cache are on by default for MiMo, and thinking is on by def
 - `--mtp-head-kv-quant` stores the MTP head's own KV at 8 bits too.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt. Agents running long sessions may prefer
   it for the shorter context; each new instruction then re-processes the prompt from the first dropped thought.
-- `--prefill-chunk 2048` caps the prompt tokens forwarded per step; 4096 prefills faster but needs more memory.
+- `--prefill-chunk 2048` is the widest prompt step per forward; a wider one costs memory without prefilling faster,
+  and a request that does not fit steps down to a narrower chunk.
 - `--prefix-cache-mem 1GB` keeps seen prompt prefixes hot in RAM, faster than the SSD.
 - `--prefix-cache-disk 20GB` keeps seen prompt prefixes on the SSD, so a repeated prompt skips its prefill.
 - `--prefix-cache-entries 1` keeps one conversation's prefix; raise it to 4-8 when several agents share the server.

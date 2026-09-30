@@ -4,6 +4,21 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## v1.1.1 — Long MiMo prompts and agent sessions
+
+- **MiMo long prompts are admitted again**: a resident MiMo server now sizes requests against the GPU limit you set
+  (`iogpu.wired_limit_mb`), not against what other apps happen to leave free, so a long agent session no longer gets
+  "requires ~N MB GPU memory" on a 768k server; the prompt cache gives its memory back to a request that needs it.
+- **`--prefill-chunk` is a maximum**: a request that does not fit at your chunk steps down to a narrower one instead
+  of being refused. 2048 is the recommended value; wider chunks cost memory without prefilling faster.
+- **Warm agent turns stop spiking memory**: a turn that reuses the cached conversation grows its KV buffers during the
+  prefill, one layer at a time, instead of all at once on the first reply token, so long agent sessions stay admitted.
+- **Claude Code on a local model**: `sushi launch claude` keeps each turn on one streamed request, and a request whose
+  client disconnects now stops generating instead of running on for nobody.
+- **Homebrew gets each release right away**: `brew upgrade sushi` sees a new version as soon as it is published.
+
+---
+
 ## v1.1.0 — MiMo-V2.6-Flash and SSD streaming
 
 - **MiMo-V2.6-Flash**: sushi's second model. `MiMo-V2.6-Flash-Sushi-2.3bpw` serves text and image input from one
