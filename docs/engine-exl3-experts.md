@@ -35,7 +35,7 @@ kernel on supported hardware.
   (plus `window`); per-tensor rate read from the trellis shape. Every other module stays the affine pack's.
 - **A rate is K = n/16**, n the packed halfwords per 256-weight tile (36 = K2.25, 48 = K3, 64 = K4): weight t's
   codeword is the 16-bit window ending at `((t+1)*n)>>4`, so its fresh bits follow from n and the pattern is never
-  stored. Even n in [32, 64] admits; `expert_quant.k` may be fractional JSON.
+  stored. Even n in [16, 128] admits (K1 to K8); `expert_quant.k` may be fractional JSON.
 - **Every reader keys on n, never on an integer K** (`exl3.Rate`, kernel template `NHW`, cache keys,
   `exl3ExpertBytes`); a K printed anywhere reads 2.25, not 36.
 - **Every fast path serves every admitted n; a guard test enumerates them** (`every admitted rate takes the fast
