@@ -329,8 +329,6 @@ pub const Head = struct {
     value_scale: f32,
     eps: f32,
     window: usize,
-    /// Coarse lm_head copy the drafts shortlist on (`mtp.buildRerankCoarse`).
-    rerank: ?mtp_mod.RerankCoarse = null,
     rerank_tried: bool = false,
     rerank_logged: bool = false,
     ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32 = null,
@@ -430,8 +428,6 @@ pub const Head = struct {
     }
 
     pub fn deinit(self: *Head) void {
-        if (self.rerank) |*rc| rc.deinit();
-        self.rerank = null;
         for (self.owned.items) |a| _ = mlx.mlx_array_free(a);
         self.owned.deinit(self.allocator);
     }
@@ -741,25 +737,28 @@ pub const Head = struct {
         return steps;
     }
 
-    /// Built once, at the first ask: the coarse copy of the target's lm_head.
+    /// Drafts shortlist on the trunk's coarse lm_head copy (`Transformer.lm_head_coarse`), built at
+    /// the first ask when the trunk has none yet.
     pub fn canRerankDrafts(self: *Head) bool {
+        const t = self.target orelse return false;
+        if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
         if (!self.rerank_tried) {
             self.rerank_tried = true;
-            if (self.target) |t| {
-                if (mtp_mod.MtpModel.draftRerankMode() != .off)
-                    self.rerank = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());
-            }
+            if (t.lm_head_coarse == null) t.lm_head_coarse = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());
         }
-        return self.rerank != null;
+        return t.lm_head_coarse != null;
     }
 
     pub fn draftSelect(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
-        if (try mtp_mod.rerankSelect(self.s, target, &self.rerank, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+        if (self.canRerankDrafts()) {
+            if (try mtp_mod.rerankSelect(self.s, target, &target.lm_head_coarse, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+        }
         return mtp_mod.fullReadoutArgmax(self.s, target, x, suppress_mask);
     }
 
     pub fn draftShortlist(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
-        return mtp_mod.rerankShortlist(self.s, target, &self.rerank, &self.rerank_logged, x, suppress_mask);
+        if (!self.canRerankDrafts()) return null;
+        return mtp_mod.rerankShortlist(self.s, target, &target.lm_head_coarse, &self.rerank_logged, x, suppress_mask);
     }
 };
 

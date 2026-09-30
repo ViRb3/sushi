@@ -117,6 +117,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   `SUSHI_MTP_BATCHED_QWEN4` opts in; `mergedVerifyDeclineReason` names the decline). Four MTP streams on MCG K3
   aggregate ~85 tok/s; a linear model of the measured verify-row cost predicts ~95-125 with merged verify at depth
   2-3. Measure before any code.
+- <a id="greedy-shortlist"></a>**A greedy MiMo forward reads the trunk head through the drafts' shortlist**
+  (`lmHeadShortlistFor`, up to 16 argmax-only rows, serial ticks and verify rows alike): the coarse top-32 per row,
+  re-scored through the full head (the same qmv, so each value is the full readout's), every other id -inf. The copy
+  exists with MTP or without, so MTP == serial holds by construction. Gate `generate.argmaxOnlyRequest` (greedy or
+  top-1; no penalty, logprobs, grammar, forced call or PLD); `kld` reads the full head. Not certified: a full argmax
+  outside the top-32 changes the token; `SUSHI_LMHEAD_SHORTLIST_AUDIT=1` counts such rows, `SUSHI_LMHEAD_FULL=1`
+  reads the full head ([perf-baselines](perf-baselines.md#mimo-lmhead-shortlist)).
 - **Drafts shortlist on a coarse lm_head copy and re-score exactly** from the MIXER output
   (`buildRerankCoarse`/`rerankShortlist`/`fullReadoutArgmax`, `StepWant.mixed`; `SUSHI_MTP_DRAFT_RERANK=0`
   restores the full readout). A greedy target drafts the argmax (byte-identity contract); a sampled target draws

@@ -1014,6 +1014,19 @@ pub const SamplingParams = struct {
     suppress_mask: ?mlx.mlx_array = null,
 };
 
+/// Whether a request consumes only each position's argmax: greedy (or top-1), no logit-moving
+/// penalty, no logprobs, no grammar or forced call choosing among ids, no PLD. Only then may a
+/// forward serve pruned or shortlisted logits.
+pub fn argmaxOnlyRequest(sampling: SamplingParams, logprobs_n: u32, pld_enabled: bool) bool {
+    return (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
+        sampling.repeat_penalty == 1.0 and
+        sampling.presence_penalty == 0.0 and
+        sampling.constraint == null and
+        sampling.call_force == null and
+        !pld_enabled and
+        logprobs_n == 0;
+}
+
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
 /// host, once per model load. Caller owns the returned array.
 ///
@@ -2604,17 +2617,10 @@ pub const Generator = struct {
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
 
-        // Certified lm_head prune gate: the pruned projection proves the
-        // ARGMAX, not the tail distribution, so it may engage only when this
-        // request consumes nothing else — greedy (or top-1) sampling with no
-        // logit-modifying penalties, no per-token logprobs and no grammar
-        // mask. Mirrors the `logprobs>0 + grammar disable spec` precedent:
-        // no request gets slower, some get faster.
-        ctx.argmax_only = (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
-            sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
-            sampling.constraint == null and
-            options.logprobs_n == 0;
+        // lm_head gate: the certified prune and MiMo's coarse shortlist serve
+        // the ARGMAX, not the tail distribution, so they engage only when this
+        // request consumes nothing else (`argmaxOnlyRequest`).
+        ctx.argmax_only = argmaxOnlyRequest(sampling, options.logprobs_n, options.pld_enabled);
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -21437,4 +21443,19 @@ test "mimoStepOut: logits consume the row once; a rerank step hands it over" {
     defer _ = mlx.mlx_array_free(mixed.rerank_x);
     try testing.expectEqual(@as(usize, 0), StepOutFrees.count(row.ctx));
     try testing.expect(mixed.rerank_x.ctx == row.ctx and mixed.logits.ctx == null);
+}
+
+test "argmax-only requests: greedy with nothing that reads past the argmax" {
+    const greedy: SamplingParams = .{ .temperature = 0.0 };
+    try std.testing.expect(argmaxOnlyRequest(greedy, 0, false));
+    try std.testing.expect(argmaxOnlyRequest(.{ .temperature = 0.8, .top_k = 1 }, 0, false));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.7 }, 0, false));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0, false));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .presence_penalty = 0.5 }, 0, false));
+    try std.testing.expect(!argmaxOnlyRequest(greedy, 5, false));
+    try std.testing.expect(!argmaxOnlyRequest(greedy, 0, true));
+    var cf: CallForce = undefined;
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .call_force = &cf }, 0, false));
+    var c: Constraint = undefined;
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .constraint = &c }, 0, false));
 }

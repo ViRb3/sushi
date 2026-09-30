@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **Faster MiMo 2.3bpw**: the prefill's expert GEMMs, the MTP verify rows and the draft heads do less work per token;
   output is byte-identical.
+- **Greedy MiMo decode reads the vocabulary head through a coarse top-32 shortlist** re-scored on the full head,
+  with or without MTP; sampled, logprob, penalty and grammar requests keep the full head.
 - **With MTP, the first token streams when prefill ends** instead of after the first speculative round (when that
   token is visible: a template-opened thought or thinking off).
 - **Faster SSD streaming**: a streamed layer's expert compute is handed to the GPU as soon as it is built and the

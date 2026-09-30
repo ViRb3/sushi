@@ -3490,11 +3490,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // A resident MiMo load is billed by what the source loader serves: the
         // FP8 trunk as stored plus its scale grids, and the vision tower it loads.
         streaming_resident_bytes = try model_mod.mimoSourceResidentBytes(sch.io, sch.allocator, params.model_dir, params.load_vision and params.config.mimo_vision);
-        if (mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on) {
+        if (mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on)
             streaming_resident_bytes.? += try model_mod.mimoMtpResidentBytes(sch.io, sch.allocator, params.model_dir);
-            if (mtp_mod.MtpModel.draftRerankMode() != .off)
-                streaming_resident_bytes.? += mtp_mod.rerankCoarseBytes(@intCast(params.config.vocab_size), @intCast(params.config.hidden_size), mimo_mtp.rerankBits());
-        }
+        // One coarse lm_head copy: the heads' drafts and the trunk's greedy readout share it.
+        if (mimo_mtp.rerankBits() != 0)
+            streaming_resident_bytes.? += mtp_mod.rerankCoarseBytes(@intCast(params.config.vocab_size), @intCast(params.config.hidden_size), mimo_mtp.rerankBits());
     }
 
     // Resolve the sidecar before preflight so billing and loading see the same dependency.
@@ -3720,18 +3720,32 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // the one-dispatch prep (on) as off, on, on, off passes.
             const qkv_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS");
             defer transformer_mod.mimo_qkv_prep_override = null;
+            // SUSHI_DECODE_FWD_UBENCH_LMHEAD_ARMS=1: argmax-only forwards on the full lm_head (off) and
+            // the coarse shortlist (on) as off, on, on, off passes; the heads load later, so it builds
+            // its own coarse copy for the meter.
+            const lm_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_LMHEAD_ARMS");
+            const lm_built = lm_arms and xfm_ptr.lm_head_coarse == null;
+            if (lm_built) xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
+            defer if (lm_arms) {
+                if (lm_built) if (xfm_ptr.lm_head_coarse) |*c| {
+                    c.deinit();
+                    xfm_ptr.lm_head_coarse = null;
+                };
+                transformer_mod.lmhead_shortlist_override = null;
+            };
             var arm_buf: [8]UbenchArm = undefined;
             for (widths[0..n_widths]) |rows| {
             for (ubenchArms(&arm_buf, rows, xfm_ptr.config.isMimo(), row_arms, pool_arms)) |arm| {
             const abba: []const ?bool = &.{ false, true, true, false };
             const abba2: []const ?bool = &.{ false, true, true, false, false, true, true, false };
             const no_arms: []const ?bool = &.{null};
-            for (if (qkv_arms) abba2 else if (gdn_arms or fold_arms) abba else no_arms) |gdn_arm| {
-            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else if (qkv_arms) null else gdn_arm;
+            for (if (qkv_arms) abba2 else if (gdn_arms or fold_arms or lm_arms) abba else no_arms) |gdn_arm| {
+            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else if (qkv_arms or lm_arms) null else gdn_arm;
+            if (lm_arms) transformer_mod.lmhead_shortlist_override = gdn_arm;
             transformer_mod.gdn_verify_fold_override = if (fold_arms) gdn_arm else null;
             transformer_mod.mimo_qkv_prep_override = if (qkv_arms) gdn_arm else null;
             transformer_mod.gdn_verify_fold_calls = 0;
-            if (gdn_arm) |on| log.info("[fwd-ubench] {s} arm: {s}\n", .{ if (qkv_arms) "qkv prep" else if (fold_arms) "gdn fold" else "gdn recur", if (on) "on" else "off" });
+            if (gdn_arm) |on| log.info("[fwd-ubench] {s} arm: {s}\n", .{ if (lm_arms) "lm_head shortlist" else if (qkv_arms) "qkv prep" else if (fold_arms) "gdn fold" else "gdn recur", if (on) "on" else "off" });
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
             defer sch.allocator.free(tok_slice);
             for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
@@ -3739,6 +3753,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
             ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
             arm.apply(&ctx);
+            if (lm_arms) ctx.argmax_only = true;
             log.info("[fwd-ubench] rows={d} capture={} verify_rows={} qsa_pool={s}\n", .{ tok_slice.len, ctx.capture_ssm_seq, arm.verify_rows, arm.poolName() });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
@@ -4024,6 +4039,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         h.deinit();
         sch.allocator.destroy(h);
     };
+    // The heads built the coarse copy for their drafts; without them the trunk's greedy readout still takes one.
+    // Same predicate as the resident bill that prices this copy.
+    if (params.config.usesMimoSourceTrunk() and !params.config.expert_streaming and xfm_ptr.lm_head_coarse == null)
+        xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
     if (mtp_enabled and !params.config.isMimo() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {

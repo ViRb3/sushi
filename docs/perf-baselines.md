@@ -623,6 +623,28 @@ capture.
   on this pack (19/19) and the full suite.
 - The decode cell's thinking is on, so the prefill handover does not move either cell here.
 
+<a id="mimo-lmhead-shortlist"></a>
+### MiMo 2.3bpw: greedy lm_head through the coarse top-32 (on d1408a57, 2026-10-01)
+
+Decode meter (`SUSHI_DECODE_FWD_UBENCH=40`, 4096 keys, `_LMHEAD_ARMS` alternating the full head and the shortlist in
+one boot, `--kv-quant 8 --mtp`, `taskpolicy -a`, GPU lock), ms per forward: 1 row 20.89 / 20.10 / 20.07 / 21.27
+(full / shortlist / shortlist / full, about -1.0 ms); 4 verify rows 43.65 / 42.83 / 42.97 / 48.28 (at least -0.8 ms).
+The full affine-8 head reads 0.64 GB; the 2-bit copy ~0.19 GB plus the 32-row re-score.
+
+Greedy identity, 9 prompts x up to 512 tokens (story, code, prose, JSON, math, a tool call, code and prose with
+thinking off, an explanation with thinking on), MTP and serial each, full-head boot vs shortlist boot: every answer
+byte-identical (tool-call ids carry a timestamp), and MTP == serial in both boots. A `--no-mtp` boot on the trunk's
+own copy returned the same bytes. The audit (`SUSHI_LMHEAD_SHORTLIST_AUDIT=1`) also covered the 16 KLD wikitext
+prompts, raw, at 512 tokens. Over ~32,500 audited rows (serial ticks and verify rows) the full argmax was never
+outside the coarse top-32, and the served argmax never differed. In the final boot (17,664 rows), every shortlist logit
+was also bit-equal to the full head's. `tests/test_mtp_equivalence.sh` on this pack: 19 passed, 0 failed, with the
+`--no-mtp` base on the shortlist.
+
+llmprobe 0.6.12 `--bench-only --rungs 4k`, `--kv-quant 8 --mtp --ctx-size 1048576`, quiet box, fans at max, lock per
+boot, A B B A (A = d1408a57, B = this change): decode 69.8 / 70.0 -> 73.8 / 70.5 tok/s (per-request medians of the
+192-token decodes 69.9 -> 72.6); prefill 1307 / 1287 -> 1289 / 1305 tok/s (unchanged). 16x512 KLD to first EOS on B:
+0.086034761, unchanged (the KLD tool reads the full head).
+
 <a id="mimo-attn-kernels"></a>
 ### MiMo attention kernels (attention only: no expert pack in these timings)
 
