@@ -169,6 +169,7 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\    api: openai-completions
         \\    apiKey: sushi
         \\    compat:
+        \\      streamIdleTimeoutMs: 0
         \\      supportsDeveloperRole: false
         \\      supportsReasoningEffort: true
         \\      maxTokensField: max_tokens
@@ -857,6 +858,16 @@ test "omp models.yml: static per-model entries, no discovery, pi-compat vocabula
     try t.expect(std.mem.indexOf(u8, yml, "contextWindow: 262144") != null);
     try t.expect(std.mem.indexOf(u8, yml, "input: [text, image]") != null);
     try t.expect(std.mem.indexOf(u8, yml, "thinkingFormat: qwen") != null);
+}
+
+test "omp models.yml: buffered tool calls have no provider progress deadline" {
+    const entries = [_]Entry{.{ .id = "local", .budget = .{ .context = 131072, .output = 32768 }, .vision = false, .loaded = true }};
+    const yml = try ompModelsYml(t.allocator, "http://127.0.0.1:12345", &entries);
+    defer t.allocator.free(yml);
+    try t.expect(std.mem.indexOf(u8, yml, "    compat:\n      streamIdleTimeoutMs: 0\n") != null);
+    const script = try scriptFor(t.allocator, .omp, "http://127.0.0.1:12345", "local", entries[0].budget, null, &.{});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "STREAM_IDLE_TIMEOUT") == null);
 }
 
 test "codex config: responses wire API, keyless, context at the root" {

@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`sushi launch omp` lets local buffered tool calls finish without the default five-minute retry**; the generated
+  Sushi provider disables its model-progress deadline while preserving explicit user timeout overrides.
+
 - **Long-context MiMo requests switch to serial decode when their MTP rounds lose on measured cost**, while
   workloads that benefit from speculation keep it.
 - **Experimental token logit biases**: load scoped penalties and rewards from JSON/CSV with `--logit-bias-file`,

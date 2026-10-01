@@ -58,7 +58,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
-  byte-silence. `--timeout` is a STALL timeout (`StallClock`).
+  byte-silence. SSE comments keep the transport alive but do not count as model progress for every client.
+  `sushi launch omp` sets the Sushi provider's `compat.streamIdleTimeoutMs: 0` so buffered calls can finish;
+  explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
+  omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's
+  `providers.streamFirstEventTimeoutSeconds` controls it, with zero allowing unlimited initial buffering.
+  `--timeout` remains a token-progress STALL timeout (`StallClock`).
 - **NO string built from model bytes is guaranteed UTF-8**: sanitizing lives INSIDE the escaper (`chat.utf8Next`
   under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
   escaped at the SINK.
