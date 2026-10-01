@@ -202,7 +202,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   as its tick reads it (the shortlist under `argmax_only`). Byte-identical to the solo ticks (`mimo batched decode
   rows` on the real pack; `tests/test_mimo_batched_equivalence.sh`).
 - A group holds at most four slots (`batchGroupCap`, independently of the MTP verify width); the rest decode serial by name
-  (`row_cap`). Nothing pads: rows never share a key tensor. MTP slots keep their solo rounds.
+  (`row_cap`). Nothing pads: rows never share a key tensor. Groups of three or four eligible MTP slots take
+  plain batched ticks and retain each row's hidden state so solo rounds can resume; smaller groups keep solo MTP.
+  `SUSHI_MTP_BATCHED=0` disables this MTP crowd policy.
 - Measured against interleaved MTP streams: [perf-baselines](perf-baselines.md#mimo-batched-decode).
 
 ## Prompt lookup decoding

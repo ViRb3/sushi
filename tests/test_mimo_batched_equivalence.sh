@@ -5,9 +5,11 @@
 # thinking off, MTP and prompt lookup off since a speculating slot decodes serial, prefix cache
 # off). Prompts sit below the 128 window, past it, past the 640-row ring cap and past the packed
 # global arm's 4096 keys; groups of 2, 3 and 4 batch, and a group of 5 sends one slot serial by
-# name (`row_cap`). The engagement line must appear.
+# name (`row_cap`). The engagement line must appear. A second boot with MTP on (the default) answers
+# each prompt alone and in crowded groups of 3 and 4 (MTP streams that decode as batched rows): every
+# answer must be the serial bytes of the first boot.
 #
-# Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), MIMO_MODEL, PORT (default 19089), BINARY.
+# Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), MIMO_MODEL, PORT (default 19089), BINARY, MIMO_BATCH_OUTPUT_DIR.
 
 set -uo pipefail
 
@@ -79,6 +81,18 @@ group() { # label prompt indices...
         pids+=($!)
         k=$((k + 1))
     done
+    if [[ "$label" == m3 || "$label" == m4 ]]; then
+        local running
+        : > "$WORK/$label-widths.txt"
+        while true; do
+            running=0
+            for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && running=1; done
+            [ "$running" = 1 ] || break
+            curl -sf --max-time 2 "$BASE/metrics.json" | jq -r '.gauges.batched_group_size' >> "$WORK/$label-widths.txt"
+            sleep 0.05
+        done
+        grep -qx "${#pids[@]}" "$WORK/$label-widths.txt" || fail "$label: expected batch width never engaged"
+    fi
     for pid in "${pids[@]}"; do wait "$pid" || fail "$label: request failed"; done
     k=0
     for i in "$@"; do
@@ -108,6 +122,30 @@ for line in (p / "stream.sse").read_text().splitlines():
             chunks.append(choices[0].get("delta", {}).get("content") or "")
 assert "".join(chunks).encode() == (p / "solo1.txt").read_bytes()
 PYCODE
+# MTP on (the default): a crowded group of 3 or 4 MTP streams decodes as plain batched rows and its heads
+# resume afterwards; every answer is still the serial answer above.
+kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null
+LOG="$WORK/server-mtp.log"
+"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 --mtp --no-pld --metrics \
+    --max-concurrent 5 --prefix-cache-entries 0 --log-level info > "$LOG" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 900); do
+    curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && break
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: MTP server died:"; tail -20 "$LOG"; exit 1; }
+    sleep 1
+done
+for i in 0 1 2 3; do
+    ask "$WORK/p$i.json" > "$WORK/mtp-solo$i.txt" || { echo "fail: MTP solo $i"; tail -20 "$LOG"; exit 1; }
+    cmp -s "$WORK/solo$i.txt" "$WORK/mtp-solo$i.txt" || fail "MTP solo: prompt $i differs from its serial answer"
+done
+group m3 1 1 1
+group m4 1 1 1 1
+group mixed-m3 0 1 2
+group mixed-m4 0 1 2 3
+grep -q '\[spec-stats\] mode=mtp' "$LOG" || fail "no MTP rounds ran"
+grep -q '\[batched\] mimo batched decode engaged' "$LOG" || fail "crowded MTP streams did not decode as batched rows"
+grep '\[batched\]' "$LOG" | sort | uniq -c
 
 [ $EC = 0 ] && echo "PASS"
 exit $EC

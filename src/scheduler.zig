@@ -6800,7 +6800,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
             batchable_n += 1;
-        } else if (why == .spec_active and slotMtpGroupable(s) and mtp_n < mtp_buf.len) {
+        } else if (why == .spec_active and (slotMtpGroupable(s) or slotMimoMtpCrowdable(s)) and mtp_n < mtp_buf.len) {
             mtp_buf[mtp_n] = s;
             mtp_n += 1;
         } else {
@@ -7648,6 +7648,19 @@ fn batchedTickAction(cancelled: bool) BatchedTickAction {
 /// Can this MTP slot's verify ride one batched trunk forward with its neighbours?
 /// Per-request head (never qwen4's module-owned one), a GDN trunk with per-slot state
 /// the batched path merges, and a round that is actually speculating this tick.
+/// A MiMo MTP slot that may drop to plain batched ticks when crowded (`mtpCrowdThresholdFor`);
+/// its rounds otherwise stay solo, and no grouped verify ever takes it.
+fn slotMimoMtpCrowdable(slot: *const Slot) bool {
+    if (!mtpGroupEnabled()) return false;
+    const gen = if (slot.legacy_gen) |*g| g else return false;
+    if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
+    if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
+    const t = slot.model.transformer orelse return false;
+    if (!t.supportsBatchedMimoDecode()) return false;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
+}
+
 fn slotMtpGroupable(slot: *const Slot) bool {
     if (!mtpGroupEnabled()) return false;
     const gen = if (slot.legacy_gen) |*g| g else return false;
@@ -8670,7 +8683,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const logits_arr = if (use_gdn)
         try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else if (use_mimo)
-        try xfm_ptr.forwardMimoBatchedDecode(next_tokens, ctxs, rope_offsets)
+        try xfm_ptr.forwardMimoBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else
         try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
     defer {
@@ -9964,6 +9977,40 @@ test "retained position: a padded row can never take the full-accept arm" {
     try testing.expect(!generate_mod.Generator.mtpFullAccept(1, 2, 3));
     try testing.expect(!generate_mod.Generator.mtpFullAccept(0, 2, 3));
     try testing.expectEqual(@as(u32, 1), generate_mod.Generator.mtpRetained(0));
+}
+
+test "MiMo crowded MTP respects the batching kill switch" {
+    const saved = mtp_group_env;
+    defer mtp_group_env = saved;
+    var xfm: Transformer = undefined;
+    xfm.config = .{ .model_type = "mimo_v2" };
+    xfm.moe_layers = &.{};
+    xfm.expert_stream = null;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = &xfm;
+    var gen: Generator = undefined;
+    gen.mtp = .{ .mimo = undefined };
+    gen.mtp_cache = .{ .mimo = undefined };
+    gen.has_last_hidden = true;
+    gen.spec_disabled_runtime = false;
+    gen.mtp_serial_left = 0;
+    gen.mtp_serial_exit = .none;
+    gen.drafter = null;
+    gen.dflash = null;
+    gen.pld_enabled = false;
+    gen.dspark_enabled = false;
+    var slot: Slot = undefined;
+    slot.model = &model;
+    slot.legacy_gen = gen;
+    slot.enable_mtp = true;
+    slot.enable_drafter = false;
+    slot.enable_pld = false;
+    slot.sampling = .{};
+    slot.logprobs_n = 0;
+    mtp_group_env = true;
+    try testing.expect(slotMimoMtpCrowdable(&slot));
+    mtp_group_env = false;
+    try testing.expect(!slotMimoMtpCrowdable(&slot));
 }
 
 test "single MTP slot reaches the round entry through runDecodeTick" {

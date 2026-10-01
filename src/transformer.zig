@@ -21954,12 +21954,14 @@ pub const Transformer = struct {
     /// arithmetic, whose every op but attention already computes a row as its decode tick does;
     /// row i attends and appends on slot i's own cache (`ForwardCtx.batch_rows`). Each row is
     /// read out as its slot's tick reads it (the shortlist under `argmax_only`). Returns N
-    /// logits `[1, 1, V]`; caller owns each and the slice.
+    /// logits `[1, 1, V]`; caller owns each and the slice. `hidden_rows`, when given, receives
+    /// every row's final-normed hidden `[1, 1, H]` (what a solo tick captures for the MTP heads).
     pub fn forwardMimoBatchedDecode(
         self: *Transformer,
         next_tokens: []const u32,
         ctxs: []const *ForwardCtx,
         rope_offsets: []const u32,
+        hidden_rows: ?*?[]mlx.mlx_array,
     ) ![]mlx.mlx_array {
         const n = next_tokens.len;
         std.debug.assert(n == ctxs.len and n == rope_offsets.len and n >= 1 and n <= MIMO_VERIFY_ROWS_MAX);
@@ -22000,6 +22002,12 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_slice(&row, normed, &[_]c_int{ 0, @intCast(i), 0 }, 3, &[_]c_int{ 1, @as(c_int, @intCast(i)) + 1, hidden }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
             out[i] = try self.lmHeadProject(row, c.argmax_only);
             filled += 1;
+        }
+        if (hidden_rows) |dst| {
+            var as_rows = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(as_rows);
+            try mlx.check(mlx.mlx_reshape(&as_rows, normed, &[_]c_int{ @intCast(n), 1, hidden }, 3, self.s));
+            dst.* = try sliceBatchRows(self.allocator, self.s, as_rows, n);
         }
         return out;
     }
@@ -74557,10 +74565,13 @@ test "mimo batched decode rows equal each slot's own decode tick bit for bit (MI
                     batch_ctx[i] = batch[i].ctx(i % 2 == 0);
                     batch_ptrs[i] = &batch_ctx[i];
                 }
-                const rows = try xfm.forwardMimoBatchedDecode(tokens[0..n], batch_ptrs[0..n], offsets[0..n]);
+                var hiddens: ?[]mlx.mlx_array = null;
+                const rows = try xfm.forwardMimoBatchedDecode(tokens[0..n], batch_ptrs[0..n], offsets[0..n], &hiddens);
                 defer {
                     for (rows) |r| _ = mlx.mlx_array_free(r);
                     a.free(rows);
+                    for (hiddens.?) |h| _ = mlx.mlx_array_free(h);
+                    a.free(hiddens.?);
                 }
                 for (0..n) |i| {
                     batch[i].offset += 1;
@@ -74568,8 +74579,17 @@ test "mimo batched decode rows equal each slot's own decode tick bit for bit (MI
                     const tok: i32 = @intCast(tokens[i]);
                     const one = mlx.mlx_array_new_data(&tok, &[_]c_int{ 1, 1 }, 2, .int32);
                     defer _ = mlx.mlx_array_free(one);
-                    const want = try xfm.forwardWith(&c, one);
+                    // The solo tick's capture is what an MTP head resuming after plain ticks reads.
+                    var want_hidden = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(want_hidden);
+                    const want = try xfm.forwardWithCapture(&c, one, &want_hidden);
                     defer _ = mlx.mlx_array_free(want);
+                    const hw = try qwen4ReadF32(a, want_hidden, s);
+                    defer a.free(hw);
+                    const hg = try qwen4ReadF32(a, hiddens.?[i], s);
+                    defer a.free(hg);
+                    try testing.expectEqual(hw.len, hg.len);
+                    for (hw, hg) |x, y| try testing.expectEqual(@as(u32, @bitCast(x)), @as(u32, @bitCast(y)));
                     const want_host = try qwen4ReadF32(a, want, s);
                     defer a.free(want_host);
                     const got_host = try qwen4ReadF32(a, rows[i], s);

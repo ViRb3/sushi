@@ -641,6 +641,25 @@ Interleaved MTP streams share the GPU round by round, so their aggregate stays w
 code). Batched rows read most of a forward's weights once for the group: past 2 streams on prose and 3 on code
 they beat it.
 
+<a id="mimo-crowded-mtp"></a>
+**Crowded MTP (7bc8e280, 2026-10-01).** Two consecutive boots of the same ReleaseFast binary, with
+`SUSHI_MTP_BATCHED=0` then `1`, `SUSHI_ROUND_COST_PERSIST=0`, `--mtp --no-pld --kv-quant 8 --prefill-chunk 2048
+--ctx-size 8192 --prefix-cache-entries 0 --max-concurrent 4 --metrics`. Greedy, thinking off, 256 output tokens,
+identical prompts and warmup, `taskpolicy -a`, exclusive GPU lock per arm, fans max. The arm-boundary maximum sensor
+reading was 75.6 C. Warm serial rates were 46.8 and 46.7 tok/s. All 14 response pairs were byte-identical; metrics
+reported batch width zero with the policy off and widths three/four with it on.
+
+| workload | streams | interleaved MTP | crowded batching |
+|---|---|---|---|
+| prose | 3 | 48.1 | 65.0 |
+| prose | 4 | 48.7 | 70.9 |
+| code | 3 | 57.4 | 64.3 |
+| code | 4 | 59.0 | 69.3 |
+
+Aggregate output tokens / request-group wall time, tok/s. Separate boots include run variation. The earlier
+cache-enabled calibration had a different priming sequence (nine restored tokens versus three), so its byte strings
+were not used as this comparison's oracle. The strict live gate also matched solo, crowded and streamed output.
+
 <a id="mimo-mtp-vs-serial"></a>
 ### MiMo 2.3bpw: MTP against serial per KV bucket (63476cd1; the 256k boot on 0f5e7a95)
 
