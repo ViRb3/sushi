@@ -201,5 +201,6 @@ composite.
   hard-linked file, never modifies it in place.
 - **A tensor two shards carry loads from the shard the index names** (`ShardOwners`): the MiMo 2.3bpw pack's
   source shard still holds bf16 `o_proj`, `embed_tokens` and `lm_head` beside the affine ones, and the generic loader
-  kept whichever file the directory listed last and leaked the other's name. Without an index the later file
-  stands and the earlier is released. The served MiMo path reads through `mimo_source`, which refuses a duplicate.
+  kept whichever file the directory listed last and leaked the other's name. An owner shard that is not on disk
+  claims nothing (a partly stale index); without an owner the later file stands and the earlier is released. The
+  served MiMo path reads through `mimo_source`, which refuses a duplicate.

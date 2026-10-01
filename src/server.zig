@@ -1631,19 +1631,38 @@ fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
     return remaining < max_tokens / 4;
 }
 
+fn ignoreEosRequested(root: std.json.ObjectMap) bool {
+    const v = root.get("ignore_eos") orelse return false;
+    return v == .bool and v.bool;
+}
+
 /// vLLM's `ignore_eos`: an EOS id does not end the reply, so it runs to `max_tokens`. Stop
 /// sequences and the loop stops still end it.
 fn requestEosSlice(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) []const u32 {
-    if (root.get("ignore_eos")) |v| if (v == .bool and v.bool) return &.{};
-    return config.eosTokenSlice();
+    return if (ignoreEosRequested(root)) &.{} else config.eosTokenSlice();
 }
 
 /// Chat refuses `ignore_eos`: past its end of turn the model writes another turn, whose think
 /// block the non-stream reply merges into the reasoning and the live stream cannot.
 fn chatIgnoreEosRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    const v = root.get("ignore_eos") orelse return null;
-    if (v != .bool or !v.bool) return null;
+    if (!ignoreEosRequested(root)) return null;
     return "'ignore_eos' is supported on /v1/completions only: a chat reply ends at its end of turn";
+}
+
+/// vLLM's default `skip_special_tokens` for a completion that decodes past EOS: the
+/// `special: true` turn markers it writes there stay out of its text, on both paths.
+fn completionShowsToken(tok: *const Tokenizer, id: u32, skip_special: bool) bool {
+    if (!skip_special) return true;
+    for (tok.flagged_specials) |sp| if (sp.id == id) return false;
+    return true;
+}
+
+fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: []const u32, skip_special: bool) ![]u8 {
+    if (!skip_special) return tok.decode(allocator, ids, false);
+    var shown = std.ArrayList(u32).empty;
+    defer shown.deinit(allocator);
+    for (ids) |id| if (completionShowsToken(tok, id, true)) try shown.append(allocator, id);
+    return tok.decode(allocator, shown.items, false);
 }
 
 /// The auto budget's own tightness question: under a quarter of the window left.
@@ -9135,12 +9154,12 @@ fn handleCompletions(
     };
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9156,6 +9175,7 @@ fn handleNonStreamingCompletion(
     max_tokens: u32,
     sampling: generate_mod.SamplingParams,
     eos_token_ids: []const u32,
+    skip_special: bool,
     stop_sequences: []const []const u8,
     model_name: []const u8,
     enable_pld: bool,
@@ -9186,7 +9206,7 @@ fn handleNonStreamingCompletion(
     // applies — FIM clients rely on exact indentation, and the streaming
     // handler never stripped it, so this also restores stream/non-stream
     // parity (tests/test_completions_spec.sh).
-    const raw_text = try tok.decode(allocator, result.token_ids, false);
+    const raw_text = try completionText(allocator, tok, result.token_ids, skip_special);
     defer allocator.free(raw_text);
 
     var final_text: []const u8 = raw_text;
@@ -9247,6 +9267,7 @@ fn handleStreamingCompletion(
     max_tokens: u32,
     sampling: generate_mod.SamplingParams,
     eos_token_ids: []const u32,
+    skip_special: bool,
     stop_sequences: []const []const u8,
     model_name: []const u8,
     include_usage: bool,
@@ -9353,6 +9374,7 @@ fn handleStreamingCompletion(
             break;
         }
         try lps.note(token_id);
+        if (!completionShowsToken(tok, token_id, skip_special)) continue;
         const strip = tok.tok_type == .sentencepiece_bpe;
         const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
 
@@ -25105,6 +25127,35 @@ test "sushi coder load refusals retain named group errors" {
     for ([_]anyerror{ error.Exl3GroupMissing, error.Exl3GroupNameInvalid, error.Exl3MixedGroupLayout, error.Exl3GroupGeometry, error.Exl3GroupDtype, error.Exl3RouterWidthMismatch, error.Exl3TopKExceedsExperts, error.Exl3RaggedStreamingUnsupported, error.Exl3RouterGroupsUnsupported }) |err| {
         try std.testing.expect(loadRefusalFor(err) != null);
     }
+}
+
+test "ignore_eos: a completion's text past EOS drops the special turn markers, the same on both paths" {
+    const t = std.testing;
+    const a = t.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "<|im_end|>", "<|endoftext|>" });
+    defer deinitTestTokenizer(&tok);
+    // `<think>` is an added token but not `special: true`, as in the Qwen vocabulary.
+    tok.flagged_specials = &.{ .{ .id = 257, .content = "<|im_end|>" }, .{ .id = 258, .content = "<|endoftext|>" } };
+    const ids = [_]u32{ 'P', 'a', 'r', 'i', 's', 257, '\n', 258, 256, 'x' };
+
+    const kept = try completionText(a, &tok, &ids, false);
+    defer a.free(kept);
+    try t.expectEqualStrings("Paris<|im_end|>\n<|endoftext|><think>x", kept);
+    const skipped = try completionText(a, &tok, &ids, true);
+    defer a.free(skipped);
+    try t.expectEqualStrings("Paris\n<think>x", skipped);
+    // The stream decodes token by token and drops what `completionShowsToken` hides.
+    var streamed = std.ArrayList(u8).empty;
+    defer streamed.deinit(a);
+    for (ids) |id| {
+        if (!completionShowsToken(&tok, id, true)) continue;
+        const piece = try tok.decode(a, &.{id}, false);
+        defer a.free(piece);
+        try streamed.appendSlice(a, piece);
+    }
+    try t.expectEqualStrings(skipped, streamed.items);
 }
 
 test "ignore_eos: a completion that sets it decodes past EOS; a chat request that sets it is refused by name" {

@@ -4288,6 +4288,16 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
     // assigns elsewhere (a MiMo pack's source shard keeps the bf16 o_proj beside the affine one).
     const owners: ?std.json.Parsed(std.json.Value) = if (referenced != null) indexWeightMap(io, allocator, dir) else null;
     defer if (owners) |o| o.deinit();
+    // Only an owner that will load can claim its tensor: a partly stale index names shards that are gone.
+    var present: std.StringHashMapUnmanaged(void) = .empty;
+    defer present.deinit(allocator);
+    if (owners != null) {
+        var names = referenced.?.keyIterator();
+        while (names.next()) |n| {
+            _ = dir.statFile(io, n.*, .{}) catch continue;
+            try present.put(allocator, n.*, {});
+        }
+    }
 
     var file_count: u32 = 0;
     var it = dir.iterate();
@@ -4308,7 +4318,7 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .file = entry.name } else null;
+        const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .present = &present, .file = entry.name } else null;
         try loadSafetensorsFileMode(allocator, &weights, path, s, load_vision, streaming, shard);
         file_count += 1;
     }
@@ -4490,8 +4500,8 @@ fn putLoadedWeight(allocator: std.mem.Allocator, weights: *Weights, key: []const
     gop.value_ptr.* = value;
 }
 
-/// The shard being read and the index's tensor-to-shard map.
-const ShardOwners = struct { map: std.json.ObjectMap, file: []const u8 };
+/// The shard being read, the index's tensor-to-shard map and the indexed shards on disk.
+const ShardOwners = struct { map: std.json.ObjectMap, present: *const std.StringHashMapUnmanaged(void), file: []const u8 };
 
 /// `model.safetensors.index.json` parsed with its own copies of every string, or null when it
 /// has no `weight_map` object.
@@ -4540,7 +4550,7 @@ fn loadSafetensorsFileMode(
 
         const key_str_raw = std.mem.span(key.?);
         if (shard) |sh| if (sh.map.get(key_str_raw)) |owner| {
-            if (owner == .string and !std.mem.eql(u8, owner.string, sh.file)) {
+            if (owner == .string and !std.mem.eql(u8, owner.string, sh.file) and sh.present.contains(owner.string)) {
                 _ = mlx.mlx_array_free(value);
                 continue;
             }
@@ -4810,6 +4820,29 @@ test "loadWeights takes a tensor two shards carry from the shard the index names
     defer w.deinit();
     try std.testing.expectEqual(@as(u32, 2), w.count());
     try std.testing.expectEqualSlices(c_int, &.{2}, mlx.getShape(w.get("w").?));
+}
+
+test "loadWeights keeps a tensor whose index owner is not on disk (a partly stale index)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[4,8]}}";
+    var st: [8 + hdr.len + 8]u8 = undefined;
+    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+    @memcpy(st[8 .. 8 + hdr.len], hdr);
+    @memset(st[8 + hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a.safetensors", .data = &st });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-gone.safetensors\",\"x\":\"model-a.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 2), w.count());
 }
 
 test "loadWeights ignores an index that names no shard on disk (re-sharded upload, stale index)" {
@@ -8957,6 +8990,8 @@ test "parseConfigFromJson: an optional field set to null keeps its default; slid
 }
 
 test "the shipped packs' configs parse to the geometry they serve (src/fixtures/model-configs)" {
+    // Cut from Qwen3.8-Flash-Next-Sushi-3bpw and MiMo-V2.6-Flash-Sushi-2.3bpw. MiMo's `expert_quant.k` 4 is the
+    // widest rate a layer packs, the one the engine bills: its last MoE layer is K4, the rest K2.25.
     const t = testing;
     const q = try parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
     try t.expectEqualStrings("qwen4_exp", q.model_type);
@@ -9014,9 +9049,13 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
     try t.expectEqual(@as(?u32, null), m.bos_token_id);
     try t.expectEqualSlices(u32, &.{151645}, m.eosTokenSlice());
 
-    for ([_][]const u8{ @embedFile("fixtures/model-configs/qwen4_exp.json"), @embedFile("fixtures/model-configs/mimo_v2.json") }) |doc| {
-        const meta = model_discovery.parseStubMeta(t.allocator, doc, true);
-        try t.expect(meta.found and meta.quantized_experts and meta.expert_quant_rate != null);
+    for ([_]struct { doc: []const u8, rate_n: u32 }{
+        .{ .doc = @embedFile("fixtures/model-configs/qwen4_exp.json"), .rate_n = 3 * 16 },
+        .{ .doc = @embedFile("fixtures/model-configs/mimo_v2.json"), .rate_n = 4 * 16 },
+    }) |c| {
+        const meta = model_discovery.parseStubMeta(t.allocator, c.doc, true);
+        try t.expect(meta.found and meta.quantized_experts);
+        try t.expectEqual(c.rate_n, meta.expert_quant_rate.?.n);
         try t.expectEqual(@as(u32, 48), meta.num_hidden_layers);
     }
 }

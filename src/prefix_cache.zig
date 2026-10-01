@@ -4767,6 +4767,8 @@ test "a ringed entry persists to the SSD tier and restores only at a ring checkp
     a.setSwaRing(window);
     const hit = try hc2.lookupAndRestore(&a, &moe_off, null, s, &next, false, 0, null, null);
     try testing.expectEqual(@as(usize, prompt), hit.matched);
+    // A ring restore's bill was never measured, so admission credits none of its rows.
+    try testing.expect(!hit.ownsRestoredRows());
     try expectRingContinuesCold(&a, s, n_layers, window, prompt, next.len);
 
     // A verbatim re-send restores at its last token off the ring the entry ended with.
@@ -4776,6 +4778,7 @@ test "a ringed entry persists to the SSD tier and restores only at a ring checkp
     const full = try hc2.lookupAndRestore(&b, &moe_off, null, s, &toks, false, 0, null, null);
     try testing.expect(full.full_match);
     try testing.expectEqual(@as(usize, toks.len - 1), full.matched);
+    try testing.expect(!full.ownsRestoredRows());
     try expectRingContinuesCold(&b, s, n_layers, window, toks.len - 1, toks.len);
 
     // A divergence no ring checkpoint reaches cold-prefills.

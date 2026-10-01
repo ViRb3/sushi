@@ -77,7 +77,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `top_p` 0 is GREEDY (`applyTopP` floors at `floatMin(f32)`).
 - A sampler never draws a RESERVED special or PADDING row (`installSuppressMask`; logprobs stay RAW).
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
-  (`requestEosSlice`); stop sequences and the loop stops still end it. Chat refuses it with a named 400
+  (`requestEosSlice`); stop sequences and the loop stops still end it, and its text skips `special: true` tokens
+  (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
 
