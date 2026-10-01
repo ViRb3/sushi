@@ -680,8 +680,22 @@ tok/s, MTP / serial (accepted drafts per round):
 | 211,087 | 26.7 / 26.8 (0.89) | 32.7 / 32.4 | 0.82 | 39.7 / 37.1 (1.90) | 30.5 / 30.8 | 1.25 |
 
 Prose stops paying past ~100k keys (each verify row reads every global key); code pays at every context. The
-adaptive serial switch stays qwen4_exp-only: on MiMo it could win only on prose past ~100k, and a per-request
-`enable_mtp:false` already gives a long prose request the serial rate.
+adaptive serial switch takes MiMo from 64k ([engine-mtp](engine-mtp.md#adaptive-serial)).
+
+<a id="mimo-adaptive-serial"></a>
+**Adaptive serial at 211k keys (0cfb70f2, 2026-10-01).** The frozen 256k-bucket requests above were replayed with
+`SUSHI_MTP_ADAPTIVE_SERIAL=1 SUSHI_ROUND_COST_PERSIST=0`, `--mtp --kv-quant 8 --prefill-chunk 4096 --ctx-size 581632
+--prefix-cache-entries 32 --prefix-cache-mem 5840MB --max-concurrent 1`; PLD on, greedy, thinking off, 256 output
+tokens. Actual admission width was 4096. One boot, `taskpolicy -a`, exclusive GPU lock, fans max. All eight responses
+matched the recorded baseline's bytes, prompt lengths, restored-prefix lengths and output-token counts.
+
+| workload | recorded MTP, switch unavailable | adaptive MTP request | serial in this boot | switches |
+|---|---|---|---|---|
+| prose, 211,087 tokens | 26.7 / 26.8 | 32.1 / 31.4 | 30.9 / 30.8 | one per request |
+| code, 211,088 tokens | 39.7 / 37.1 | 45.7 / 41.1 | 29.5 / 30.4 | none |
+
+Decode tok/s, two requests per cell. Prose reached serial speed; code retained speculation. The historical arm is
+the recorded 0f5e7a95 boot above, so its speed differences include intervening engine changes and run variation.
 
 <a id="mimo-mtp-round"></a>
 ### MiMo-V2.6-Flash-Sushi-2.3bpw: where an MTP round goes (2f15cc97)

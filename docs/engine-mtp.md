@@ -205,10 +205,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   MCG K3 round costs (31.2 / 36.0 / 42.4 ms at depth 1 / 2 / 3, ~5 ms per row after) and a ~20 ms serial token,
   depth 2 breaks even at ~0.53 per-draft acceptance, depth 3 at ~0.60, depth 4 at ~0.63; depth 4-6 wins only above
   ~0.85, where the model says cap 2 leaves 25-35% (computed from the recorded costs, not yet measured live).
-- **Adaptive serial** (qwen4, kv >= 32k): the plan's base width is voted against the bucket's measured serial token
+- <a id="adaptive-serial"></a>**Adaptive serial** (qwen4 at kv >= 32k, MiMo at kv >= 64k,
+  `MTP_ADAPTIVE_MIN_KV_MIMO`: below it MiMo's rounds beat serial even on prose,
+  [perf-baselines](perf-baselines.md#mimo-mtp-vs-serial)): the plan's base width is voted against the bucket's measured serial token
   (table AND this request's 16-round window must both lose by 5%, three rounds running). A serial request re-enters
   MTP when its OWN KV bucket changes: the read bucket maps a never-measured bucket back onto the switch's, so a
   request that went serial at 33k stayed serial to 91.8k (main 36ae6d0, Sushi-3bpw, kv8, temp 1 thinking).
+  At 211k keys MiMo prose reaches serial speed while code keeps MTP; all eight replayed responses preserve bytes
+  and cache counts ([measurement](perf-baselines.md#mimo-adaptive-serial)).
 
 ## Reproducibility
 

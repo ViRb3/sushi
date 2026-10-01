@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Long-context MiMo requests switch to serial decode when their MTP rounds lose on measured cost**, while
+  workloads that benefit from speculation keep it.
+
 - **Faster MiMo 2.3bpw**: the prefill's expert GEMMs, the MTP verify rows (whose global layers share one walk of a
   long cache), the draft heads and long-prompt attention do less work per token; output is byte-identical.
 - **Faster Qwen3.8-Flash-Next prefill**: the expert routing table is built on the GPU and the expert outputs are

@@ -7170,14 +7170,14 @@ pub const Generator = struct {
         return null;
     }
 
-    /// Model-level twin of `mtpAdaptiveArchEligible`: only the in-checkpoint qwen4 head was
+    /// Model-level twin of `mtpAdaptiveArchEligible`: only the in-checkpoint heads were
     /// calibrated. `model_has_mtp` alone let every sidecar pack fold a cell nothing reads.
-    pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, module_head_loaded: bool) bool {
-        return model_has_mtp and module_head_loaded;
+    pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, checkpoint_head: bool) bool {
+        return model_has_mtp and checkpoint_head;
     }
 
     fn mtpAdaptiveModelOk(self: *const Generator) bool {
-        return mtpAdaptiveModelEligible(self.model_has_mtp, self.xfm.qwen4_mtp != null);
+        return mtpAdaptiveModelEligible(self.model_has_mtp, self.xfm.qwen4_mtp != null or self.xfm.config.isMimo());
     }
 
     /// Will anyone read a serial cell for this model? Gated on the model, not the request: a
@@ -7187,7 +7187,7 @@ pub const Generator = struct {
         if (!self.mtpAdaptiveModelOk()) return false;
         // Not `xfm.qwen4_mtp != null`: the weights load with the trunk even under `--no-mtp`.
         if (!self.model_has_mtp) return false;
-        return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKv());
+        return mtpAdaptiveKvEligible(self.mtpKvLen(), self.mtpAdaptiveMinKv());
     }
 
     /// Drop the serial cell's pending interval: something ran between two decode ticks that
@@ -10200,6 +10200,14 @@ pub const Generator = struct {
     /// KV below which the switch does not exist: no vote, no probe. Rounds lose to serial from
     /// the 32-64k bucket up; below that the probes cost more than a switch could buy.
     pub const MTP_ADAPTIVE_MIN_KV: u32 = 32768;
+    /// MiMo's verify rows stay cheap until its global layers read many keys, so below this its
+    /// rounds beat serial even on prose and a probe could only cost.
+    pub const MTP_ADAPTIVE_MIN_KV_MIMO: u32 = 65536;
+
+    /// The switch's floor for this arch; `SUSHI_MTP_ADAPTIVE_MIN_KV` names both.
+    pub fn mtpAdaptiveMinKvFor(is_mimo: bool, env: ?u32) u32 {
+        return env orelse if (is_mimo) MTP_ADAPTIVE_MIN_KV_MIMO else MTP_ADAPTIVE_MIN_KV;
+    }
 
     /// May the adaptive switch run at this context at all? Read before the vote and the probe.
     pub fn mtpAdaptiveKvEligible(kv_len: u32, min_kv: u32) bool {
@@ -10484,13 +10492,17 @@ pub const Generator = struct {
         return v;
     }
 
-    var mtp_adaptive_min_kv_cache: ?u32 = null;
-    fn mtpAdaptiveMinKv() u32 {
-        if (mtp_adaptive_min_kv_cache) |v| return v;
-        const n = readEnvUsize("SUSHI_MTP_ADAPTIVE_MIN_KV", MTP_ADAPTIVE_MIN_KV);
-        const v: u32 = @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
-        mtp_adaptive_min_kv_cache = v;
-        return v;
+    var mtp_adaptive_min_kv_env: ?u32 = null;
+    var mtp_adaptive_min_kv_read = false;
+    fn mtpAdaptiveMinKv(self: *const Generator) u32 {
+        if (!mtp_adaptive_min_kv_read) {
+            mtp_adaptive_min_kv_read = true;
+            if (std.c.getenv("SUSHI_MTP_ADAPTIVE_MIN_KV") != null) {
+                const n = readEnvUsize("SUSHI_MTP_ADAPTIVE_MIN_KV", MTP_ADAPTIVE_MIN_KV);
+                mtp_adaptive_min_kv_env = @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
+            }
+        }
+        return mtpAdaptiveMinKvFor(self.xfm.config.isMimo(), mtp_adaptive_min_kv_env);
     }
 
     var mtp_adaptive_confirm_cache: ?u32 = null;
@@ -10567,18 +10579,22 @@ pub const Generator = struct {
         );
     }
 
-    /// Only the in-checkpoint qwen4 head was calibrated for the adaptive serial switch; a
+    /// The heads the adaptive serial switch was calibrated for: qwen4_exp's and MiMo's; a
     /// sidecar pack has a different verify surface. Not `moduleOwned()`: different question.
+    pub fn mtpAdaptiveHeadEligible(tag: std.meta.Tag(MtpHeadRef)) bool {
+        return tag == .qwen4 or tag == .mimo;
+    }
+
     fn mtpAdaptiveArchEligible(self: *const Generator) bool {
         const head = self.mtp orelse return false;
-        return head == .qwen4;
+        return mtpAdaptiveHeadEligible(std.meta.activeTag(head));
     }
 
     fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         // Read after the plan (m_lo is the width it prices) and before the width trial.
         if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
             self.mtpAdaptiveArchEligible() and
-            mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
+            mtpAdaptiveKvEligible(kv_len, self.mtpAdaptiveMinKv()))
         {
             const t = &self.xfm.round_cost;
             const b = self.mtpAdaptiveBucket(kv_len);
@@ -19829,6 +19845,21 @@ test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its perio
     }.f;
     try testing.expectEqual(@as(?u32, 136), run(false)); // the arm-once schedule
     try testing.expectEqual(@as(?u32, 20), run(true)); // shipped: every layout
+}
+
+test "mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, a sidecar head does not" {
+    const G = Generator;
+    try testing.expect(G.mtpAdaptiveHeadEligible(.qwen4));
+    try testing.expect(G.mtpAdaptiveHeadEligible(.mimo));
+    try testing.expect(!G.mtpAdaptiveHeadEligible(.qwen));
+}
+
+test "mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k, and the env names both" {
+    const G = Generator;
+    try testing.expectEqual(@as(u32, 65536), G.mtpAdaptiveMinKvFor(true, null));
+    try testing.expectEqual(G.MTP_ADAPTIVE_MIN_KV, G.mtpAdaptiveMinKvFor(false, null));
+    try testing.expectEqual(@as(u32, 8192), G.mtpAdaptiveMinKvFor(true, 8192));
+    try testing.expectEqual(@as(u32, 8192), G.mtpAdaptiveMinKvFor(false, 8192));
 }
 
 test "mtpAdaptiveModelEligible: the serial row and its price window are the module head's, not every MTP model's" {
