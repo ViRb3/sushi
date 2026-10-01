@@ -124,10 +124,11 @@ bin_for()   { [[ "$1" == "dev" ]] && echo "$DEV_BIN" || echo "$SHIPPED_BIN"; }
 bin_stamp() { stat -f "%Sm" -t "%Y-%m-%dT%H:%M" "$1" 2>/dev/null; }
 
 # ── Engine lifecycle ──
-# The kill list and the wait list must name the SAME port, or every stop burns
-# the full timeout (11 min/run when this was last broken).
+ENGINE_PID=""
 stop_engine() {
-    pkill -f "sushi --serve" 2>/dev/null
+    [[ -n "$ENGINE_PID" ]] || return 0
+    kill "$ENGINE_PID" 2>/dev/null; wait "$ENGINE_PID" 2>/dev/null
+    ENGINE_PID=""
     for _ in $(seq 1 40); do
         lsof -ti tcp:"$PORT" >/dev/null 2>&1 || return 0
         sleep 1
@@ -166,6 +167,7 @@ run_unit() {
     [[ -n "$spec" ]] && eval "spec_arr=($spec)"
     "$bin" --serve --model "$path" --port "$PORT" "${spec_arr[@]+"${spec_arr[@]}"}" >"$slog" 2>&1 &
     local pid=$!
+    ENGINE_PID=$pid
 
     local up=0
     for _ in $(seq 1 900); do
@@ -234,6 +236,11 @@ echo "  run dir: $RUN_DIR"
 echo "  depth:   $([[ $FULL -eq 1 ]] && echo '--full (median of 3/rung, to 64k)' || ([[ $QUICK -eq 1 ]] && echo '--quick (8k rung, one run)' || echo 'one run/rung, to 16k'))"
 echo "  pause:   touch $RUN_DIR/PAUSE"
 echo
+
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass --port" >&2
+    exit 1
+fi
 
 idx=0
 for t in "${TARGETS[@]}"; do

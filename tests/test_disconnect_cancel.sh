@@ -49,8 +49,10 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 # Cancellation takes effect at a chunk boundary; auto-sized chunks can exceed
 # the entire 12s bound under GPU contention. Pin the workload, not a looser deadline.
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 32768 --prefill-chunk 512 --no-pld --metrics --log-level debug > "$LOG" 2>&1 &

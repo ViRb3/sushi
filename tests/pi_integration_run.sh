@@ -47,13 +47,13 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 QWEN4="${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
 MIMO="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 
+SUSHI_PID=""
 kill_sushi() {
-    # Match by --port, not by binary path — MLX_BIN may point at the app
-    # bundle OR a dev build; a path-based pattern silently leaves the other
-    # one running and the next case reuses the wrong model.
-    pkill -f "sushi.*--serve.*--port $PORT" 2>/dev/null || true
+    [ -n "$SUSHI_PID" ] || return 0
+    kill "$SUSHI_PID" 2>/dev/null
     for _ in $(seq 1 10); do
-        if ! pgrep -f "sushi.*--serve.*--port $PORT" >/dev/null; then
+        if ! kill -0 "$SUSHI_PID" 2>/dev/null; then
+            SUSHI_PID=""
             return 0
         fi
         sleep 0.5
@@ -61,10 +61,18 @@ kill_sushi() {
     return 1
 }
 
+# A server still on the port would answer the next case with the wrong model.
+require_free_port() {
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+        echo "port $PORT is already in use; stop that server or set PORT" >&2
+        return 1
+    fi
+}
+
 start_sushi() {
     local path="$1"
     local logfile="$2"
-    kill_sushi
+    require_free_port || return 1
     "$MLX_BIN" --model "$path" --serve --port "$PORT" \
         --log-level info --ctx-size 32768 > "$logfile" 2>&1 &
     local pid=$!
@@ -345,6 +353,7 @@ run_one_case() {
             printf "%s\t%s\t%s\t%s\t%s\n" "$(date +%Y-%m-%dT%H:%M:%S)" "$label" "server-start-fail" "0" "" >> "$SUMMARY"
             return 1
         fi
+        SUSHI_PID=$pid
         load_end=$(date +%s)
         echo "sushi PID=$pid (loaded in $((load_end-load_start))s)" | tee -a "$agent_log"
     else
@@ -436,6 +445,10 @@ fi
 
 if [ ! -f "$SUMMARY" ]; then
     printf "timestamp\tlabel\tscore\telapsed_s\tnotes\n" > "$SUMMARY"
+fi
+
+if [ -z "${SKIP_SERVER_START:-}" ]; then
+    require_free_port || exit 1
 fi
 
 for case in "${CASES[@]}"; do

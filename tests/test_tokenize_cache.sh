@@ -26,14 +26,15 @@ BASE="http://127.0.0.1:$PORT"
 [ -x "$BIN" ]   || { echo "fail: build sushi first ($BIN)"; exit 1; }
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
 
-pkill -9 -f "sushi.*port $PORT" 2>/dev/null
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or set PORT" >&2
+    exit 1
+fi
 
 LOG="$(mktemp)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    pkill -9 -f "sushi.*port $PORT" 2>/dev/null
     rm -f "$LOG"
 }
 trap cleanup EXIT INT TERM

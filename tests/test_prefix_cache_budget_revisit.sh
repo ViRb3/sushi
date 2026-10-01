@@ -22,8 +22,11 @@ for m in "$MODEL_A" "$MODEL_B"; do
 done
 [ -x "$BIN" ] || { echo -e "${RED}FAIL${NC} $BIN missing"; exit 1; }
 
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOG=$(mktemp)
-pkill -f "sushi.*--port $PORT" 2>/dev/null; sleep 0.5
 "$BIN" --serve --model "$MODEL_A" --model-dir "$HOME/.sushi/models" --host 127.0.0.1 --port "$PORT" \
     --ctx-size 8192 --prefix-cache-mem 0 --prefix-cache-disk off --log-level info >"$LOG" 2>&1 &
 SRV=$!
