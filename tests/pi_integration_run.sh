@@ -10,7 +10,7 @@
 # Usage: tests/pi_integration_run.sh [matrix]
 #   matrix=all (default): qwen4_exp thinking off + on, express-todo scenario
 #   matrix=quick       : qwen4_exp thinking on only, express-todo scenario
-#   matrix=html        : qwen4_exp, 2-turn html scenario —
+#   matrix=html        : qwen4_exp and mimo_v2, 2-turn html scenario —
 #                        turn 1 creates mlx.html, turn 2 adds JS; scored on
 #                        file existence/structure/content/JS plus the
 #                        audit_format markers (junk filenames, tag leaks,
@@ -18,6 +18,7 @@
 #   matrix=html-quick  : same as html
 #   PI_CASES=csv       : filter cases by label (e.g. PI_CASES=html-qwen4)
 #   QWEN4_EXP_MODEL    : pack path override
+#   MIMO_MODEL         : MiMo pack path override (served resident)
 #   MLX_BIN=path       : server binary override (default: zig-out/bin/sushi)
 #
 # Writes per-run logs into tests/pi-results/ and appends a
@@ -44,6 +45,7 @@ mkdir -p "$RESULTS" "$WORKSPACE_ROOT"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
 QWEN4="${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
+MIMO="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 
 kill_sushi() {
     # Match by --port, not by binary path — MLX_BIN may point at the app
@@ -425,11 +427,11 @@ if [ "$MATRIX" = "all" ]; then
     CASES+=("qwen4-no-think|$QWEN4|qwen4_exp|--thinking off|qwen|true")
 fi
 
-# MiMo streams its experts and needs --ssd-budget-gb, which this driver's
-# server boot does not pass, so the html scenario covers qwen4_exp only.
+# MiMo serves resident; its template reads enable_thinking as Qwen's does.
 if [ "$SCENARIO" = "html" ]; then
     CASES=()
     CASES+=("html-qwen4|$QWEN4|qwen4_exp|--thinking medium|qwen|true")
+    CASES+=("html-mimo|$MIMO|mimo_v2|--thinking medium|qwen|true")
 fi
 
 if [ ! -f "$SUMMARY" ]; then
