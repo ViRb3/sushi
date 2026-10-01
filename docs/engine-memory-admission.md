@@ -117,9 +117,16 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   and the scheduler's `admissionPassArmed` read that one predicate), crediting only
   provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
-- qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill and its first
-  grow is billed whole beside it (nothing credited). The restore itself runs unbilled, so it holds the restored KV
-  plus one chunk ([engine-prefix-cache](engine-prefix-cache.md#basics)).
+- qwen4_exp bills a warm request AFTER its restore, so a disk-restored buffer is live memory at the bill. The SSD
+  tier fills buffers the slot owns (`LookupResult.slot_owned`), so its rows are credited like a checkout's: the
+  first append grows each layer and its old rows are freed at that layer's eval window, which is all the bill keeps
+  (`grow_coexist_bytes`). MiMo's ring restore is not credited. The restore itself runs unbilled, so it holds the
+  restored KV plus one chunk ([engine-prefix-cache](engine-prefix-cache.md#basics)).
+- Measured (Sushi-3bpw, kv8, `--ctx-size 262144 --prefix-cache-disk 20GB --prefix-cache-entries 1`, MTP on, a
+  140,565-token SSD restore, one boot, `taskpolicy -a`, lock held, 2026-10-01): the peak over live memory at the bill
+  is 1,534 MiB with a 2,328-token tail and 3,072 MiB with 9,144, against a credited bill of 9,425 / 9,641 MiB (11,430
+  / 11,647 MiB uncredited). The grown buffers alone exceed the restored rows' 1,750 MiB, so those rows were freed
+  before the peak.
 - A warm restore whose buffers hold the prompt but not the reservation (seq <= C < R) is grown to R before the
   prefill's first chunk (`KVCache.growToReservation`), one KV layer per eval, so it bills one window of old rows
   (`oldBuffersInEvalWindow`) for a donated restore and nothing for a share. At a 128k entry, kv8: +170 MiB on

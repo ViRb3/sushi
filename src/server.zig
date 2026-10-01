@@ -3987,10 +3987,10 @@ test "oneSessionFor: a full MiMo cache leaves a cold full-context prompt its bil
     try t.expect(oneSessionFor(&cfg, 8, ceiling, weights, 0, ctx, chunk).bill > prefillNeededAtChunk(&cfg, ctx, 0, 8, chunk, .{}));
 }
 
-test "a qwen4_exp SSD restore's first grow is billed: rows it did not check out are never credited" {
-    // The inference thread bills a warm request after its restore, so the restored buffer is live
-    // memory; with nothing credited the grown copy is billed whole beside it, more than a donated
-    // restore that models the same grow's coexistence.
+test "a qwen4_exp SSD restore is credited: its first grow bills one eval window of the restored rows" {
+    // The SSD tier fills buffers the slot owns at exactly the restored length (`LookupResult.slot_owned`),
+    // so the first append grows every layer beside its old buffer and frees that buffer at the layer's
+    // eval window. A share is billed the whole copy instead.
     const t = std.testing;
     const guard = qsaScoreFusedOffGuard();
     defer guard.deinit();
@@ -3998,14 +3998,16 @@ test "a qwen4_exp SSD restore's first grow is billed: rows it did not check out 
     cfg.pinned_context = 1 << 20;
     const seq: u64 = 400_000;
     const restored: u64 = seq - 2000;
-    const disk = WarmPrefix{ .matched_tokens = restored, .capacity_tokens = restored };
-    const donated = WarmPrefix{ .matched_tokens = restored, .capacity_tokens = restored, .will_donate = true };
-    try t.expectEqual(@as(u64, 0), prefillRequestTerms(&cfg, seq, 2048, 8, 1024, disk).shared_resident_bytes);
-    // Over the donated bill by at least the restored KV less the old buffers the grow keeps alive.
-    const d = prefillRequestTerms(&cfg, seq, 2048, 8, 1024, donated);
-    try t.expect(d.grow_coexist_bytes > 0 and d.shared_resident_bytes > d.grow_coexist_bytes);
-    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, 8, 1024, disk) - prefillNeededAtChunk(&cfg, seq, 2048, 8, 1024, donated) >=
-        d.shared_resident_bytes - d.grow_coexist_bytes);
+    const disk = WarmPrefix{ .matched_tokens = restored, .capacity_tokens = restored, .will_donate = true };
+    const shared = WarmPrefix{ .matched_tokens = restored, .capacity_tokens = restored };
+    const d = prefillRequestTerms(&cfg, seq, 2048, 8, 1024, disk);
+    try t.expectEqual(restored * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8), d.shared_resident_bytes);
+    // Twelve caching layers, one inside each four-layer eval window.
+    try t.expectEqual(d.shared_resident_bytes / 12, d.grow_coexist_bytes);
+    try t.expectEqual(
+        prefillNeededAtChunk(&cfg, seq, 2048, 8, 1024, shared) - (d.shared_resident_bytes - d.grow_coexist_bytes) * 5 / 4,
+        prefillNeededAtChunk(&cfg, seq, 2048, 8, 1024, disk),
+    );
 }
 
 test "clampedPrefixCacheMem: the budget never exceeds what the weights leave under the ceiling" {

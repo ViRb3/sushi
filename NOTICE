@@ -262,6 +262,11 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
   * `ignore_eos` (`requestEosSlice` in `src/server.zig`), from mlx-serve
     eca42620 (#590) by David Dalcu. Modifications: `/v1/completions` only;
     a chat request that sets it is refused by name.
+  * The SSD restore's rows credited at admission (`LookupResult.slot_owned`
+    in `src/prefix_cache.zig`, its read in `src/scheduler.zig`), from
+    mlx-serve #621 by Josh Bellis (@jdbellis). Modifications: the hybrid
+    restore only (MiMo's ring restore stays uncredited), proved by a live
+    peak-against-bill read before landing.
   * Checked `config.json` reads (`cfgField`, `cfgInt`, `cfgF32`, `cfgObject`
     and `cfgString` in `src/model.zig`, the root and size checks in
     `src/model_discovery.zig`), from mlx-serve #608 by @alinselea.

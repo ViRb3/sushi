@@ -153,8 +153,15 @@ pub const LookupResult = struct {
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
+    /// Did an SSD restore fill buffers the slot owns outright (`restoreKvInto`)?
+    slot_owned: bool = false,
     /// `Entry.id` of the RAM entry restored from; 0 = none.
     entry_id: u64 = 0,
+
+    /// Are the restored rows the slot's own? Only those the admission bill credits (`WarmPrefix.will_donate`).
+    pub fn ownsRestoredRows(self: LookupResult) bool {
+        return self.checked_out or self.slot_owned;
+    }
 };
 
 /// A ringed slot's restore points (`KVCache.ringCheckpoint`), handed to the commit that owns
@@ -1411,6 +1418,7 @@ pub const HotPrefixCache = struct {
                     // length, `hm` by restorable checkpoint, so they routinely differ.
                     .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
                     .mtp_base = disk_mtp,
+                    .slot_owned = true,
                 };
             }
 
@@ -5971,6 +5979,57 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expectEqual(@as(usize, 512), cache2.step);
     }
+}
+
+test "HotPrefixCache: a hybrid SSD restore hands the slot rows it owns, a RAM share does not" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var entry_tokens: [520]u32 = undefined;
+    for (&entry_tokens, 0..) |*t, i| t.* = if (i < 512) @intCast(i + 7) else @intCast(i + 900);
+    var src = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&src);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-own", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 520);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        _ = try hc.commitWithSsm(&cache, &entry_tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+
+        var slot = try KVCache.init(testing.allocator, 3);
+        defer slot.deinit();
+        var ssm = pcEmptySsm();
+        defer pcFreeHybrid(&ssm);
+        var moe_off: usize = 0;
+        const ram = try hc.lookupAndRestore(&slot, &moe_off, &ssm, s, &tokens, false, 0, null, null);
+        try testing.expectEqual(@as(usize, 512), ram.matched);
+        // The entry keeps the buffers: the first append copies them, so nothing is credited.
+        try testing.expect(!ram.ownsRestoredRows());
+    }
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-own", 0, 128);
+    defer hc2.deinit();
+    var slot2 = try KVCache.init(testing.allocator, 3);
+    defer slot2.deinit();
+    var ssm2 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm2);
+    var moe_off2: usize = 0;
+    const disk = try hc2.lookupAndRestore(&slot2, &moe_off2, &ssm2, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 512), disk.matched);
+    try testing.expect(disk.ownsRestoredRows());
 }
 
 test "HotPrefixCache: a hybrid disk restore adopts the spec sidecar of the entry it restored" {
