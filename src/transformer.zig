@@ -74496,9 +74496,10 @@ const MimoBatchTestSlot = struct {
 };
 
 fn mimoBatchTestPrefill(xfm: *Transformer, slot: *MimoBatchTestSlot, ids: []const i32, kv: KVQuantConfig) !void {
-    slot.cache = try KVCache.initWithConfig(testing.allocator, xfm.config.num_hidden_layers, kv);
+    const cache = try KVCache.initWithConfig(testing.allocator, xfm.config.num_hidden_layers, kv);
+    slot.* = .{ .cache = cache };
+    errdefer slot.cache.deinit();
     slot.cache.setSwaRing(xfm.config.sliding_window);
-    slot.offset = 0;
     var c = slot.ctx(false);
     const pre = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, 2, .int32);
     defer _ = mlx.mlx_array_free(pre);
