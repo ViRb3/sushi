@@ -1586,9 +1586,9 @@ pub const HotPrefixCache = struct {
             try target_cache.truncate(0, s);
             // A 0-token outcome is not a restore: the marker was set above the restore (the hybrid
             // clamp needs the entry live) and would otherwise shield a fully reclaimable entry from
-            // the admission pass. The LRU hand-back takes the same `ssd_first` gate as the lien decline.
+            // the admission pass. Promoted, the entry would make a usable one the next eviction victim.
             self.last_restored_used = null;
-            if (self.ssd_first) e.last_used = used_before_restore;
+            e.last_used = used_before_restore;
             log.info("  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d}); cold prefill\n", .{ m.shared, prompt_ids.len });
             return .{ .matched = 0, .full_match = false };
         }
@@ -8729,6 +8729,54 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
     try t.expect(rep.admitted);
     try t.expectEqual(@as(usize, 2), rep.entries);
+}
+
+test "off SSD-first too, a 0-token hybrid outcome keeps its entry's recency: the count cap takes it, not another session" {
+    const t = testing;
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+    try t.expect(!hc.ssd_first);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*x, i| x.* = @intCast(i + 7);
+    // The entry the lookup lands on, committed first: a checkpoint but no QSA history, so on a
+    // QSA arch it matches and then restores nothing.
+    var src = try KVCache.init(testing.allocator, 3);
+    defer src.deinit();
+    try testFillCache(&src, s, 3, 600);
+    var src512 = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&src512);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    _ = try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
+    // Another session's entry, committed after it.
+    var other_ids: [600]u32 = undefined;
+    for (&other_ids, 0..) |*x, i| x.* = @intCast(i + 900_007);
+    var other = try KVCache.init(testing.allocator, 3);
+    defer other.deinit();
+    try testFillCache(&other, s, 3, 600);
+    _ = try hc.commit(&other, &other_ids, false);
+    hc.qsa_history_required = true;
+    const used_before = hc.entries.items[0].last_used;
+
+    var slot_cache = try KVCache.init(testing.allocator, 3);
+    defer slot_cache.deinit();
+    var ssm = pcEmptySsm();
+    defer pcFreeHybrid(&ssm);
+    var moe_off: usize = 0;
+    const miss = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, &.{}, null, null, 0xF5, false);
+    try t.expectEqual(@as(usize, 0), miss.matched);
+    try t.expectEqual(used_before, hc.entries.items[0].last_used);
+
+    var third_ids: [600]u32 = undefined;
+    for (&third_ids, 0..) |*x, i| x.* = @intCast(i + 500_007);
+    var third = try KVCache.init(testing.allocator, 3);
+    defer third.deinit();
+    try testFillCache(&third, s, 3, 600);
+    _ = try hc.commit(&third, &third_ids, false);
+    try t.expectEqual(@as(usize, 2), hc.entryCount());
+    for (hc.entries.items) |e| try t.expect(e.tokens[0] != tokens[0]);
 }
 
 test "the lien weighs the share a restore DELIVERS, not the one it matched" {
