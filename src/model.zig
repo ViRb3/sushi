@@ -4284,6 +4284,10 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
     // or a foreign file whose parse failure would be an uncatchable MLX abort.
     var referenced = model_discovery.indexShardSet(io, dir);
     defer if (referenced) |*r| model_discovery.freeShardSet(r);
+    // A live index also names each tensor's shard: a shard may still carry a tensor the index
+    // assigns elsewhere (a MiMo pack's source shard keeps the bf16 o_proj beside the affine one).
+    const owners: ?std.json.Parsed(std.json.Value) = if (referenced != null) indexWeightMap(io, allocator, dir) else null;
+    defer if (owners) |o| o.deinit();
 
     var file_count: u32 = 0;
     var it = dir.iterate();
@@ -4304,7 +4308,8 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFileMode(allocator, &weights, path, s, load_vision, streaming);
+        const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .file = entry.name } else null;
+        try loadSafetensorsFileMode(allocator, &weights, path, s, load_vision, streaming, shard);
         file_count += 1;
     }
 
@@ -4392,7 +4397,7 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     load_vision: bool,
 ) !void {
-    return loadSafetensorsFileMode(allocator, weights, path, s, load_vision, null);
+    return loadSafetensorsFileMode(allocator, weights, path, s, load_vision, null, null);
 }
 
 fn qwen4NormFold(key: []const u8) bool {
@@ -4471,9 +4476,32 @@ fn qwen4SplitGateUp(value: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
 }
 
 fn putLoadedWeight(allocator: std.mem.Allocator, weights: *Weights, key: []const u8, value: mlx.mlx_array) !void {
-    const owned_key = try allocator.dupe(u8, key);
-    errdefer allocator.free(owned_key);
-    try weights.map.put(owned_key, value);
+    const gop = try weights.map.getOrPut(key);
+    if (gop.found_existing) {
+        // A tensor two unindexed files carry: the later one stands, the earlier is released.
+        _ = mlx.mlx_array_free(gop.value_ptr.*);
+        gop.value_ptr.* = value;
+        return;
+    }
+    gop.key_ptr.* = allocator.dupe(u8, key) catch |err| {
+        weights.map.removeByPtr(gop.key_ptr);
+        return err;
+    };
+    gop.value_ptr.* = value;
+}
+
+/// The shard being read and the index's tensor-to-shard map.
+const ShardOwners = struct { map: std.json.ObjectMap, file: []const u8 };
+
+/// `model.safetensors.index.json` parsed with its own copies of every string, or null when it
+/// has no `weight_map` object.
+fn indexWeightMap(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?std.json.Parsed(std.json.Value) {
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(16 * 1024 * 1024)) catch return null;
+    defer allocator.free(raw);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .allocate = .alloc_always }) catch return null;
+    if (parsed.value == .object) if (parsed.value.object.get("weight_map")) |wm| if (wm == .object) return parsed;
+    parsed.deinit();
+    return null;
 }
 
 fn loadSafetensorsFileMode(
@@ -4483,6 +4511,7 @@ fn loadSafetensorsFileMode(
     s: mlx.mlx_stream,
     load_vision: bool,
     streaming: ?expert_quant.Layout,
+    shard: ?ShardOwners,
 ) !void {
     // Only the dense HF layout needs the converter's work at load time: the
     // fused bank split, the delta norms and the conv transpose. An MLX pack
@@ -4510,6 +4539,12 @@ fn loadSafetensorsFileMode(
         }
 
         const key_str_raw = std.mem.span(key.?);
+        if (shard) |sh| if (sh.map.get(key_str_raw)) |owner| {
+            if (owner == .string and !std.mem.eql(u8, owner.string, sh.file)) {
+                _ = mlx.mlx_array_free(value);
+                continue;
+            }
+        };
         var key_buf: [512]u8 = undefined;
         const key_str = if (streaming) |layout|
             qwen4StreamingWeightKey(layout, &key_buf, key_str_raw) orelse {
@@ -4745,6 +4780,36 @@ test "loadWeights reads only the shards the index names (issue #274)" {
     var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
     defer w.deinit();
     try std.testing.expectEqual(@as(u32, 1), w.count());
+}
+
+test "loadWeights takes a tensor two shards carry from the shard the index names, and frees the other" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // A MiMo pack's source shard keeps its bf16 o_proj beside the affine one the index names.
+    for ([_]struct { name: []const u8, hdr: []const u8 }{
+        .{ .name = "model-a.safetensors", .hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[4,8]}}" },
+        .{ .name = "model-b.safetensors", .hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}" },
+    }) |f| {
+        const st = try allocator.alloc(u8, 8 + f.hdr.len + 8);
+        defer allocator.free(st);
+        std.mem.writeInt(u64, st[0..8], f.hdr.len, .little);
+        @memcpy(st[8 .. 8 + f.hdr.len], f.hdr);
+        @memset(st[8 + f.hdr.len ..], 0);
+        try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = st });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-b.safetensors\",\"x\":\"model-a.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 2), w.count());
+    try std.testing.expectEqualSlices(c_int, &.{2}, mlx.getShape(w.get("w").?));
 }
 
 test "loadWeights ignores an index that names no shard on disk (re-sharded upload, stale index)" {
