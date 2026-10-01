@@ -113,6 +113,7 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .missing_or_unparseable;
     defer parsed.deinit();
+    if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
     // The DFlash contract outranks model_type: v1 assistants at least carry a
     // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
@@ -944,7 +945,7 @@ pub const StubMeta = struct {
 
 fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
     if (obj.get(key)) |v| {
-        if (v == .integer and v.integer > 0) return @intCast(v.integer);
+        if (v == .integer and v.integer > 0) return std.math.cast(u32, v.integer) orelse 0;
     }
     return 0;
 }
@@ -1955,4 +1956,16 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
         \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
     });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+}
+
+test "discovery skips a config.json whose root is not an object and drops a size past u32" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(u32, 0), parseStubMeta(allocator, "{\"hidden_size\":4294967297}", false).hidden_size);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "[]", "null", "false", "17", "\"qwen4_exp\"", "[{}]" }) |content| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = content });
+        try std.testing.expect(peekConfig(io, allocator, tmp.dir, ".") == .missing_or_unparseable);
+    }
 }

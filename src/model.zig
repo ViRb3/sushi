@@ -1777,6 +1777,13 @@ fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
 /// Range-check every qwen4_exp bound the forward indexes a fixed array with or divides by.
 /// Names travel to the client as "Model load failed: <name>".
 fn validateQwen4Config(config: *const ModelConfig) !void {
+    if (config.hidden_size == 0 or config.head_dim == 0 or config.full_attention_interval == 0 or
+        config.num_attention_heads == 0 or config.num_key_value_heads == 0 or
+        config.num_attention_heads % config.num_key_value_heads != 0 or
+        config.num_experts_per_tok == 0 or config.num_experts_per_tok > config.num_experts)
+    {
+        return error.InvalidQwen4Geometry;
+    }
     // `NgramHash.multipliers` is [MAX_NGRAM_SIZE]i64; `ple_prev` is written ngram_size-1 deep.
     if (config.ngram_size < 2 or config.ngram_size > qwen4_exp.MAX_NGRAM_SIZE) {
         return error.InvalidQwen4NgramSize;
@@ -1816,37 +1823,37 @@ pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
 /// qwen4_exp arms (same `vision_config` keys, `rope_parameters.mrope_*`,
 /// vision token ids). The generic vision_config block already set
 /// `has_vision`; this reads Qwen's own keys into `qv_*`.
-fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) void {
+fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) !void {
     if (root.get("vision_config")) |vc_val| {
         if (vc_val == .object) {
             const vc = vc_val.object;
             config.qwen_vision = true;
             if (vc.get("depth")) |v| {
-                if (v == .integer) config.qv_depth = @intCast(v.integer);
+                if (v == .integer) config.qv_depth = try cfgInt(u32, v);
             }
             if (vc.get("hidden_size")) |v| {
-                if (v == .integer) config.qv_hidden = @intCast(v.integer);
+                if (v == .integer) config.qv_hidden = try cfgInt(u32, v);
             }
             if (vc.get("num_heads")) |v| {
-                if (v == .integer) config.qv_heads = @intCast(v.integer);
+                if (v == .integer) config.qv_heads = try cfgInt(u32, v);
             }
             if (vc.get("intermediate_size")) |v| {
-                if (v == .integer) config.qv_intermediate = @intCast(v.integer);
+                if (v == .integer) config.qv_intermediate = try cfgInt(u32, v);
             }
             if (vc.get("patch_size")) |v| {
-                if (v == .integer) config.qv_patch = @intCast(v.integer);
+                if (v == .integer) config.qv_patch = try cfgInt(u32, v);
             }
             if (vc.get("temporal_patch_size")) |v| {
-                if (v == .integer) config.qv_temporal_patch = @intCast(v.integer);
+                if (v == .integer) config.qv_temporal_patch = try cfgInt(u32, v);
             }
             if (vc.get("spatial_merge_size")) |v| {
-                if (v == .integer) config.qv_merge = @intCast(v.integer);
+                if (v == .integer) config.qv_merge = try cfgInt(u32, v);
             }
             if (vc.get("num_position_embeddings")) |v| {
-                if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer);
+                if (v == .integer) config.qv_num_pos_emb = try cfgInt(u32, v);
             }
             if (vc.get("out_hidden_size")) |v| {
-                if (v == .integer) config.qv_out_hidden = @intCast(v.integer);
+                if (v == .integer) config.qv_out_hidden = try cfgInt(u32, v);
             }
             if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
             if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
@@ -1863,7 +1870,7 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
                 if (v == .array) {
                     for (v.array.items, 0..) |item, i| {
                         if (i >= 3) break;
-                        if (item == .integer) config.mrope_section[i] = @intCast(item.integer);
+                        if (item == .integer) config.mrope_section[i] = try cfgInt(u32, item);
                     }
                 }
             }
@@ -1871,13 +1878,13 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
     }
     // Qwen vision token ids (top-level).
     if (root.get("video_token_id")) |v| {
-        if (v == .integer) config.video_token_id = @intCast(v.integer);
+        if (v == .integer) config.video_token_id = try cfgInt(u32, v);
     }
     if (root.get("vision_start_token_id")) |v| {
-        if (v == .integer) config.vision_start_token_id = @intCast(v.integer);
+        if (v == .integer) config.vision_start_token_id = try cfgInt(u32, v);
     }
     if (root.get("vision_end_token_id")) |v| {
-        if (v == .integer) config.vision_end_token_id = @intCast(v.integer);
+        if (v == .integer) config.vision_end_token_id = try cfgInt(u32, v);
     }
 }
 
@@ -1906,31 +1913,31 @@ fn parseYarnRopeParameters(config: *ModelConfig, cfg_obj: std.json.ObjectMap) !v
     if (!(rt == .string and std.mem.eql(u8, rt.string, "yarn"))) return;
 
     if (rp.get("original_max_position_embeddings")) |v| {
-        if (v == .integer) config.yarn_orig_max_pos = @intCast(v.integer);
+        if (v == .integer) config.yarn_orig_max_pos = try cfgInt(u32, v);
     }
     // A YaRN block with no window to scale FROM is not a scaling we can
     // reproduce: the ramp bounds (and so every mid-band frequency) come from
     // it. Refuse the load rather than serve a silently-wrong rotation.
     if (config.yarn_orig_max_pos == 0) return error.YarnRopeNeedsOriginalMaxPos;
-    if (rp.get("factor")) |v| config.yarn_factor = jsonFloat(v);
-    if (rp.get("beta_fast")) |v| config.yarn_beta_fast = jsonFloat(v);
-    if (rp.get("beta_slow")) |v| config.yarn_beta_slow = jsonFloat(v);
+    if (cfgField(rp, "factor")) |v| config.yarn_factor = try cfgF32(v);
+    if (cfgField(rp, "beta_fast")) |v| config.yarn_beta_fast = try cfgF32(v);
+    if (cfgField(rp, "beta_slow")) |v| config.yarn_beta_slow = try cfgF32(v);
     if (rp.get("truncate")) |v| {
         if (v == .bool) config.yarn_truncate = v.bool;
     }
     if (config.yarn_factor <= 0.0) return error.InvalidRopeScalingFactor;
     // HF: `factor = max_position_embeddings / original_max_position_embeddings`
     // when the block leaves it out (the config then only states the window).
-    if (rp.get("factor") == null and config.max_position_embeddings > config.yarn_orig_max_pos) {
+    if (cfgField(rp, "factor") == null and config.max_position_embeddings > config.yarn_orig_max_pos) {
         config.yarn_factor = @as(f32, @floatFromInt(config.max_position_embeddings)) /
             @as(f32, @floatFromInt(config.yarn_orig_max_pos));
     }
     // HF `attention_factor` replaces; vLLM `attn_factor` multiplies the
     // computed 0.1·ln(factor)+1. Both present → HF wins.
-    if (rp.get("attention_factor")) |v| {
-        config.yarn_attention_factor = jsonFloat(v);
-    } else if (rp.get("attn_factor")) |v| {
-        config.yarn_attention_factor = yarnMscale(config.yarn_factor) * jsonFloat(v);
+    if (cfgField(rp, "attention_factor")) |v| {
+        config.yarn_attention_factor = try cfgF32(v);
+    } else if (cfgField(rp, "attn_factor")) |v| {
+        config.yarn_attention_factor = yarnMscale(config.yarn_factor) * try cfgF32(v);
     } else {
         config.yarn_attention_factor = yarnMscale(config.yarn_factor);
     }
@@ -2010,57 +2017,57 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged orelse content, .{});
     defer parsed.deinit();
 
-    const root = parsed.value.object;
+    const root = try cfgObject(parsed.value);
     var config = ModelConfig{};
 
     // Detect model_type from top-level (always present)
-    const model_type = if (root.get("model_type")) |v| v.string else "gemma3";
+    const model_type = if (cfgField(root, "model_type")) |v| try cfgString(v) else "gemma3";
 
     // Determine which object to read config from: text_config (nested) or root (flat)
-    const cfg_obj = if (root.get("text_config")) |tc_val| tc_val.object else root;
+    const cfg_obj = if (cfgField(root, "text_config")) |tc_val| try cfgObject(tc_val) else root;
 
     // Parse common fields
-    if (cfg_obj.get("vocab_size")) |v| config.vocab_size = @intCast(v.integer);
-    if (cfg_obj.get("hidden_size")) |v| config.hidden_size = @intCast(v.integer);
-    if (cfg_obj.get("intermediate_size")) |v| {
-        config.intermediate_size = @intCast(v.integer);
+    if (cfgField(cfg_obj, "vocab_size")) |v| config.vocab_size = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "hidden_size")) |v| config.hidden_size = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "intermediate_size")) |v| {
+        config.intermediate_size = try cfgInt(u32, v);
         config.intermediate_size_declared = true;
     }
-    if (cfg_obj.get("num_hidden_layers")) |v| config.num_hidden_layers = @intCast(v.integer);
-    if (cfg_obj.get("num_attention_heads")) |v| config.num_attention_heads = @intCast(v.integer);
-    if (cfg_obj.get("num_key_value_heads")) |v| config.num_key_value_heads = @intCast(v.integer);
-    if (cfg_obj.get("head_dim")) |v| config.head_dim = @intCast(v.integer);
-    if (cfg_obj.get("max_position_embeddings")) |v| config.max_position_embeddings = @intCast(v.integer);
-    if (cfg_obj.get("rms_norm_eps")) |v| config.rms_norm_eps = jsonFloat(v);
-    if (cfg_obj.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
-    if (cfg_obj.get("query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = @intCast(v.integer);
+    if (cfgField(cfg_obj, "num_hidden_layers")) |v| config.num_hidden_layers = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "num_attention_heads")) |v| config.num_attention_heads = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "num_key_value_heads")) |v| config.num_key_value_heads = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "head_dim")) |v| config.head_dim = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "max_position_embeddings")) |v| config.max_position_embeddings = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "rms_norm_eps")) |v| config.rms_norm_eps = try cfgF32(v);
+    if (cfgField(cfg_obj, "rope_theta")) |v| config.rope_theta = try cfgF32(v);
+    if (cfgField(cfg_obj, "query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = try cfgInt(u32, v);
 
     // MoE fields (guard against JSON null values)
     if (cfg_obj.get("num_experts")) |v| {
-        if (v == .integer) config.num_experts = @intCast(v.integer);
+        if (v == .integer) config.num_experts = try cfgInt(u32, v);
     }
     if (cfg_obj.get("num_experts_per_tok")) |v| {
-        if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+        if (v == .integer) config.num_experts_per_tok = try cfgInt(u32, v);
     }
     if (cfg_obj.get("top_k_experts")) |v| {
-        if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+        if (v == .integer) config.num_experts_per_tok = try cfgInt(u32, v);
     }
     if (cfg_obj.get("moe_intermediate_size")) |v| {
-        if (v == .integer) config.moe_intermediate_size = @intCast(v.integer);
+        if (v == .integer) config.moe_intermediate_size = try cfgInt(u32, v);
     }
     if (cfg_obj.get("shared_expert_intermediate_size")) |v| {
-        if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer);
+        if (v == .integer) config.shared_expert_intermediate_size = try cfgInt(u32, v);
     }
 
     // Linear attention (GatedDeltaNet) fields
-    if (cfg_obj.get("linear_num_key_heads")) |v| config.linear_num_key_heads = @intCast(v.integer);
-    if (cfg_obj.get("linear_num_value_heads")) |v| config.linear_num_value_heads = @intCast(v.integer);
-    if (cfg_obj.get("linear_key_head_dim")) |v| config.linear_key_head_dim = @intCast(v.integer);
-    if (cfg_obj.get("linear_value_head_dim")) |v| config.linear_value_head_dim = @intCast(v.integer);
-    if (cfg_obj.get("linear_conv_kernel_dim")) |v| config.linear_conv_kernel_dim = @intCast(v.integer);
+    if (cfgField(cfg_obj, "linear_num_key_heads")) |v| config.linear_num_key_heads = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "linear_num_value_heads")) |v| config.linear_num_value_heads = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "linear_key_head_dim")) |v| config.linear_key_head_dim = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "linear_value_head_dim")) |v| config.linear_value_head_dim = try cfgInt(u32, v);
+    if (cfgField(cfg_obj, "linear_conv_kernel_dim")) |v| config.linear_conv_kernel_dim = try cfgInt(u32, v);
 
     // Hybrid attention
-    if (cfg_obj.get("full_attention_interval")) |v| config.full_attention_interval = @intCast(v.integer);
+    if (cfgField(cfg_obj, "full_attention_interval")) |v| config.full_attention_interval = try cfgInt(u32, v);
     if (cfg_obj.get("attn_output_gate")) |v| {
         if (v == .bool) config.attn_output_gate = v.bool;
     }
@@ -2085,14 +2092,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
     }
     if (cfg_obj.get("bos_token_id")) |v| {
-        if (v == .integer and v.integer >= 0) config.bos_token_id = @intCast(v.integer);
+        if (v == .integer and v.integer >= 0) config.bos_token_id = try cfgInt(u32, v);
     }
 
     // Rope parameters (nested for Qwen3.5)
     if (cfg_obj.get("rope_parameters")) |rp_val| {
         if (rp_val == .object) {
-            if (rp_val.object.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
-            if (rp_val.object.get("partial_rotary_factor")) |v| config.partial_rotary_factor = jsonFloat(v);
+            if (cfgField(rp_val.object, "rope_theta")) |v| config.rope_theta = try cfgF32(v);
+            if (cfgField(rp_val.object, "partial_rotary_factor")) |v| config.partial_rotary_factor = try cfgF32(v);
         }
     }
 
@@ -2101,11 +2108,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (v == .null) {
             config.has_sliding_window = false;
         } else {
-            config.sliding_window = @intCast(v.integer);
+            config.sliding_window = try cfgInt(u32, v);
             config.has_sliding_window = true;
         }
     }
-    if (cfg_obj.get("sliding_window_pattern")) |v| config.sliding_window_pattern = @intCast(v.integer);
+    if (cfgField(cfg_obj, "sliding_window_pattern")) |v| config.sliding_window_pattern = try cfgInt(u32, v);
 
     // Gemma-specific: dual RoPE bases
     if (cfg_obj.get("rope_local_base_freq")) |v| config.rope_local_base_freq = jsonFloat(v);
@@ -2130,13 +2137,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
     // Gemma 4: dual head dimensions and KV sharing
     if (cfg_obj.get("global_head_dim")) |v| {
-        if (v == .integer) config.global_head_dim = @intCast(v.integer);
+        if (v == .integer) config.global_head_dim = try cfgInt(u32, v);
     }
     if (cfg_obj.get("num_global_key_value_heads")) |v| {
-        if (v == .integer) config.num_global_key_value_heads = @intCast(v.integer);
+        if (v == .integer) config.num_global_key_value_heads = try cfgInt(u32, v);
     }
     if (cfg_obj.get("num_kv_shared_layers")) |v| {
-        if (v == .integer) config.num_kv_shared_layers = @intCast(v.integer);
+        if (v == .integer) config.num_kv_shared_layers = try cfgInt(u32, v);
     }
     if (cfg_obj.get("attention_k_eq_v")) |v| {
         if (v == .bool) config.attention_k_eq_v = v.bool;
@@ -2145,7 +2152,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.final_logit_softcapping = jsonFloat(v);
     }
     if (cfg_obj.get("hidden_size_per_layer_input")) |v| {
-        if (v == .integer) config.hidden_size_per_layer_input = @intCast(v.integer);
+        if (v == .integer) config.hidden_size_per_layer_input = try cfgInt(u32, v);
     }
 
     // Gemma 4: nested rope_parameters with per-attention-type config
@@ -2170,8 +2177,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 }
             }
             // Qwen3.5 style: { "rope_theta": ..., "partial_rotary_factor": ... }
-            if (rp_val.object.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
-            if (rp_val.object.get("partial_rotary_factor")) |v| config.partial_rotary_factor = jsonFloat(v);
+            if (cfgField(rp_val.object, "rope_theta")) |v| config.rope_theta = try cfgF32(v);
+            if (cfgField(rp_val.object, "partial_rotary_factor")) |v| config.partial_rotary_factor = try cfgF32(v);
         }
     }
 
@@ -2186,15 +2193,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     // Check root level for max_position_embeddings (may not be in text_config)
     if (config.max_position_embeddings == 0) {
         if (root.get("max_position_embeddings")) |v| {
-            if (v == .integer) config.max_position_embeddings = @intCast(v.integer);
+            if (v == .integer) config.max_position_embeddings = try cfgInt(u32, v);
         }
     }
 
     // Parse quantization from top level
-    if (root.get("quantization")) |q_val| {
-        const q = q_val.object;
-        if (q.get("bits")) |v| config.quant_bits = @intCast(v.integer);
-        if (q.get("group_size")) |v| config.quant_group_size = @intCast(v.integer);
+    if (cfgField(root, "quantization")) |q_val| {
+        const q = try cfgObject(q_val);
+        if (cfgField(q, "bits")) |v| config.quant_bits = try cfgInt(u32, v);
+        if (cfgField(q, "group_size")) |v| config.quant_group_size = try cfgInt(u32, v);
         if (q.get("mode")) |v| {
             if (v == .string) {
                 config.quant_mode = QuantMode.fromString(v.string) orelse {
@@ -2221,10 +2228,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     // EOS tokens
     if (root.get("eos_token_id")) |v| {
         switch (v) {
-            .integer => |i| config.addEosToken(@intCast(i)),
+            .integer => config.addEosToken(try cfgInt(u32, v)),
             .array => |arr| {
                 for (arr.items) |item| {
-                    if (item == .integer) config.addEosToken(@intCast(item.integer));
+                    if (item == .integer) config.addEosToken(try cfgInt(u32, item));
                 }
             },
             else => {},
@@ -2237,34 +2244,34 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.has_vision = true;
             const vc = vc_val.object;
             if (vc.get("hidden_size")) |v| {
-                if (v == .integer) config.vision_hidden_size = @intCast(v.integer);
+                if (v == .integer) config.vision_hidden_size = try cfgInt(u32, v);
             }
             if (vc.get("num_hidden_layers")) |v| {
-                if (v == .integer) config.vision_num_layers = @intCast(v.integer);
+                if (v == .integer) config.vision_num_layers = try cfgInt(u32, v);
             }
             if (vc.get("num_attention_heads")) |v| {
-                if (v == .integer) config.vision_num_heads = @intCast(v.integer);
+                if (v == .integer) config.vision_num_heads = try cfgInt(u32, v);
             }
             if (vc.get("head_dim")) |v| {
-                if (v == .integer) config.vision_head_dim = @intCast(v.integer);
+                if (v == .integer) config.vision_head_dim = try cfgInt(u32, v);
             }
             if (vc.get("global_head_dim")) |v| {
-                if (v == .integer) config.vision_head_dim = @intCast(v.integer);
+                if (v == .integer) config.vision_head_dim = try cfgInt(u32, v);
             }
             if (vc.get("intermediate_size")) |v| {
-                if (v == .integer) config.vision_intermediate_size = @intCast(v.integer);
+                if (v == .integer) config.vision_intermediate_size = try cfgInt(u32, v);
             }
             if (vc.get("patch_size")) |v| {
-                if (v == .integer) config.vision_patch_size = @intCast(v.integer);
+                if (v == .integer) config.vision_patch_size = try cfgInt(u32, v);
             }
             if (vc.get("pooling_kernel_size")) |v| {
-                if (v == .integer) config.vision_pooling_kernel = @intCast(v.integer);
+                if (v == .integer) config.vision_pooling_kernel = try cfgInt(u32, v);
             }
             if (vc.get("default_output_length")) |v| {
-                if (v == .integer) config.vision_soft_tokens = @intCast(v.integer);
+                if (v == .integer) config.vision_soft_tokens = try cfgInt(u32, v);
             }
             if (vc.get("position_embedding_size")) |v| {
-                if (v == .integer) config.vision_position_embedding_size = @intCast(v.integer);
+                if (v == .integer) config.vision_position_embedding_size = try cfgInt(u32, v);
             }
             if (vc.get("rope_parameters")) |rp| {
                 if (rp == .object) {
@@ -2283,16 +2290,16 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             // model_patch_size (48px merged patch vs 16px teacher patch_size),
             // num_soft_tokens (vs default_output_length), mm_posemb_size.
             if (vc.get("mm_embed_dim")) |v| {
-                if (v == .integer) config.vision_mm_embed_dim = @intCast(v.integer);
+                if (v == .integer) config.vision_mm_embed_dim = try cfgInt(u32, v);
             }
             if (vc.get("model_patch_size")) |v| {
-                if (v == .integer) config.vision_model_patch_size = @intCast(v.integer);
+                if (v == .integer) config.vision_model_patch_size = try cfgInt(u32, v);
             }
             if (vc.get("num_soft_tokens")) |v| {
-                if (v == .integer) config.vision_soft_tokens = @intCast(v.integer);
+                if (v == .integer) config.vision_soft_tokens = try cfgInt(u32, v);
             }
             if (vc.get("mm_posemb_size")) |v| {
-                if (v == .integer) config.vision_mm_posemb_size = @intCast(v.integer);
+                if (v == .integer) config.vision_mm_posemb_size = try cfgInt(u32, v);
             }
         }
     }
@@ -2301,40 +2308,40 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (ac_val == .object) {
             const ac = ac_val.object;
             if (ac.get("audio_embed_dim")) |v| {
-                if (v == .integer) config.audio_embed_dim = @intCast(v.integer);
+                if (v == .integer) config.audio_embed_dim = try cfgInt(u32, v);
             }
             // audio_samples_per_token lives in processor_config, not config.json;
             // default 640 (40ms @ 16kHz) matches the only shipped unified checkpoint.
             if (ac.get("audio_samples_per_token")) |v| {
-                if (v == .integer) config.audio_samples_per_token = @intCast(v.integer);
+                if (v == .integer) config.audio_samples_per_token = try cfgInt(u32, v);
             }
         }
     }
     if (root.get("audio_token_id")) |v| {
-        if (v == .integer) config.audio_token_id = @intCast(v.integer);
+        if (v == .integer) config.audio_token_id = try cfgInt(u32, v);
     }
     if (root.get("boa_token_id")) |v| {
-        if (v == .integer) config.boa_token_id = @intCast(v.integer);
+        if (v == .integer) config.boa_token_id = try cfgInt(u32, v);
     }
     // eoa lives under `eoa_token_index` in the unified config.json.
     if (root.get("eoa_token_index")) |v| {
-        if (v == .integer) config.eoa_token_id = @intCast(v.integer);
+        if (v == .integer) config.eoa_token_id = try cfgInt(u32, v);
     }
     if (root.get("eoa_token_id")) |v| {
-        if (v == .integer and config.eoa_token_id == 0) config.eoa_token_id = @intCast(v.integer);
+        if (v == .integer and config.eoa_token_id == 0) config.eoa_token_id = try cfgInt(u32, v);
     }
     // Image token ID (top-level or in mm_tokens_per_image config)
     if (root.get("image_token_id")) |v| {
-        if (v == .integer) config.image_token_id = @intCast(v.integer);
+        if (v == .integer) config.image_token_id = try cfgInt(u32, v);
     }
     if (root.get("image_token_index")) |v| {
-        if (v == .integer and config.image_token_id == 0) config.image_token_id = @intCast(v.integer);
+        if (v == .integer and config.image_token_id == 0) config.image_token_id = try cfgInt(u32, v);
     }
     if (root.get("boi_token_id")) |v| {
-        if (v == .integer) config.boi_token_id = @intCast(v.integer);
+        if (v == .integer) config.boi_token_id = try cfgInt(u32, v);
     }
     if (root.get("eoi_token_id")) |v| {
-        if (v == .integer) config.eoi_token_id = @intCast(v.integer);
+        if (v == .integer) config.eoi_token_id = try cfgInt(u32, v);
     }
 
     // Set model-family defaults based on model_type
@@ -2618,7 +2625,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
-        parseQwenVisionFields(&config, root, cfg_obj);
+        try parseQwenVisionFields(&config, root, cfg_obj);
     } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
     {
@@ -2641,7 +2648,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.hc_count = 4;
         config.hc_lowrank = 320;
         config.ple_embed_dim = config.hidden_size;
-        parseQwenVisionFields(&config, root, cfg_obj);
+        try parseQwenVisionFields(&config, root, cfg_obj);
         // YaRN (262144 → e.g. 1048576) rides ONE rotary table for the whole
         // trunk: attention, the QSA indexer and the MTP head all read it, so
         // a scaled rotation cannot desync the block selector from attention.
@@ -2671,9 +2678,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (try qwen4ConfigU32(cfg_obj, "indexer_compress_ratio")) |v| config.indexer_compress_ratio = v;
         if (cfg_obj.get("eos_token_id")) |v| {
             switch (v) {
-                .integer => |i| config.ngram_eos = @intCast(i),
+                .integer => config.ngram_eos = try cfgInt(u32, v),
                 .array => |arr| if (arr.items.len > 0 and arr.items[0] == .integer) {
-                    config.ngram_eos = @intCast(arr.items[0].integer);
+                    config.ngram_eos = try cfgInt(u32, arr.items[0]);
                 },
                 else => {},
             }
@@ -3896,6 +3903,36 @@ fn jsonFloat(v: std.json.Value) f32 {
         .float => |f| @floatCast(f),
         else => 0.0,
     };
+}
+
+// Config JSON is untrusted: a field of the wrong JSON type or out of its range is
+// `error.InvalidConfigField`, never a bare union read or `@intCast` (illegal in ReleaseFast).
+
+/// A field, with JSON null read as absent: an optional left at its default.
+fn cfgField(obj: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    const v = obj.get(key) orelse return null;
+    return if (v == .null) null else v;
+}
+
+fn cfgInt(comptime T: type, v: std.json.Value) !T {
+    if (v != .integer) return error.InvalidConfigField;
+    return std.math.cast(T, v.integer) orelse error.InvalidConfigField;
+}
+
+fn cfgF32(v: std.json.Value) !f32 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| @floatCast(f),
+        else => error.InvalidConfigField,
+    };
+}
+
+fn cfgObject(v: std.json.Value) !std.json.ObjectMap {
+    return if (v == .object) v.object else error.InvalidConfigField;
+}
+
+fn cfgString(v: std.json.Value) ![]const u8 {
+    return if (v == .string) v.string else error.InvalidConfigField;
 }
 
 /// Holds all loaded weights as mlx arrays, keyed by name.
@@ -8798,4 +8835,123 @@ test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default
     try testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_settings, stream.mtpUnderStreaming(true, true, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_default, stream.mtpUnderStreaming(true, false, true));
+}
+
+test "parseConfigFromJson: a wrong-typed or out-of-range field is a named error, never a bare read" {
+    const t = testing;
+    for ([_][]const u8{
+        "[]",
+        "17",
+        "\"qwen4_exp\"",
+        "null",
+        "{\"model_type\":5}",
+        "{\"model_type\":\"qwen4_exp\",\"text_config\":7}",
+        "{\"model_type\":\"llama\",\"hidden_size\":\"4096\"}",
+        "{\"model_type\":\"llama\",\"vocab_size\":-1}",
+        "{\"model_type\":\"llama\",\"num_hidden_layers\":4294967296}",
+        "{\"model_type\":\"llama\",\"rms_norm_eps\":\"1e-6\"}",
+        "{\"model_type\":\"llama\",\"quantization\":[]}",
+        "{\"model_type\":\"llama\",\"quantization\":{\"bits\":\"4\"}}",
+        "{\"model_type\":\"llama\",\"eos_token_id\":-2}",
+        "{\"model_type\":\"llama\",\"eos_token_id\":[1,-2]}",
+        "{\"model_type\":\"llama\",\"num_experts\":-1}",
+        "{\"model_type\":\"llama\",\"bos_token_id\":4294967296}",
+        "{\"model_type\":\"llama\",\"image_token_id\":-7}",
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"vision_config\":{\"depth\":-1}"),
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":-1}"),
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":262144,\"factor\":\"4\"}"),
+    }) |doc| {
+        try t.expectError(error.InvalidConfigField, parseConfigFromJson(t.allocator, doc));
+    }
+}
+
+test "qwen4_exp config: a geometry the forward divides by or indexes with is a named error" {
+    const t = testing;
+    const base = "\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48,\"head_dim\":256," ++
+        "\"hc_count\":4,\"hc_lowrank\":320,\"ple_embed_dim\":2560,\"moe_intermediate_size\":640," ++
+        "\"vocab_size\":248320," ++ QWEN4_GOOD_FIELDS;
+    for ([_][]const u8{
+        "{" ++ base ++ ",\"full_attention_interval\":0,\"num_attention_heads\":24,\"num_key_value_heads\":2,\"num_experts\":512,\"num_experts_per_tok\":10}",
+        "{" ++ base ++ ",\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":0,\"num_experts\":512,\"num_experts_per_tok\":10}",
+        "{" ++ base ++ ",\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":5,\"num_experts\":512,\"num_experts_per_tok\":10}",
+        "{" ++ base ++ ",\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":2,\"num_experts\":8,\"num_experts_per_tok\":10}",
+    }) |doc| {
+        try t.expectError(error.InvalidQwen4Geometry, parseConfigFromJson(t.allocator, doc));
+    }
+}
+
+test "parseConfigFromJson: an optional field set to null keeps its default; sliding_window null still disables" {
+    const t = testing;
+    const c = try parseConfigFromJson(t.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++
+        ",\"max_position_embeddings\":null,\"bos_token_id\":null,\"sliding_window\":null,\"image_token_id\":null"));
+    const d = ModelConfig{};
+    try t.expectEqual(d.max_position_embeddings, c.max_position_embeddings);
+    try t.expectEqual(@as(?u32, null), c.bos_token_id);
+    try t.expect(!c.has_sliding_window);
+    try t.expectEqual(@as(u32, 0), c.image_token_id);
+}
+
+test "the shipped packs' configs parse to the geometry they serve (src/fixtures/model-configs)" {
+    const t = testing;
+    const q = try parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    try t.expectEqualStrings("qwen4_exp", q.model_type);
+    try t.expectEqual(@as(u32, 248320), q.vocab_size);
+    try t.expectEqual(@as(u32, 2560), q.hidden_size);
+    try t.expectEqual(@as(u32, 48), q.num_hidden_layers);
+    try t.expectEqual(@as(u32, 24), q.num_attention_heads);
+    try t.expectEqual(@as(u32, 2), q.num_key_value_heads);
+    try t.expectEqual(@as(u32, 256), q.head_dim);
+    try t.expectEqual(@as(u32, 1048576), q.max_position_embeddings);
+    try t.expectEqual(@as(f32, 1e-6), q.rms_norm_eps);
+    try t.expectEqual(@as(f32, 10_000_000), q.rope_theta);
+    try t.expectEqual(@as(f32, 0.25), q.partial_rotary_factor);
+    try t.expectEqual(@as(u32, 512), q.num_experts);
+    try t.expectEqual(@as(u32, 10), q.num_experts_per_tok);
+    try t.expectEqual(@as(u32, 640), q.moe_intermediate_size);
+    try t.expectEqual(@as(u32, 640), q.shared_expert_intermediate_size);
+    try t.expectEqual(@as(u32, 16), q.linear_num_key_heads);
+    try t.expectEqual(@as(u32, 48), q.linear_num_value_heads);
+    try t.expectEqual(@as(u32, 4), q.full_attention_interval);
+    try t.expectEqual(@as(u32, 8), q.quant_bits);
+    try t.expectEqual(@as(u32, 64), q.quant_group_size);
+    try t.expectEqualSlices(u32, &.{248044}, q.eosTokenSlice());
+    try t.expectEqual(@as(?u32, 248044), q.bos_token_id);
+    try t.expectEqual(@as(u32, 248056), q.image_token_id);
+    try t.expectEqual(@as(u32, 248057), q.video_token_id);
+    try t.expectEqual(@as(u32, 27), q.qv_depth);
+    try t.expectEqual(@as(u32, 1152), q.qv_hidden);
+    try t.expectEqual([3]u32{ 11, 11, 10 }, q.mrope_section);
+    try t.expect(q.rope_yarn);
+    try t.expectEqual(@as(f32, 4), q.yarn_factor);
+    try t.expectEqual(@as(u32, 262144), q.yarn_orig_max_pos);
+    try t.expectEqual(@as(u32, 3), q.ngram_size);
+    try t.expectEqual(@as(u32, 8), q.heads_per_ngram);
+    try t.expectEqual(@as(u64, 20_000_000), q.ngram_vocab_base);
+    try t.expectEqual(@as(u32, 2048), q.indexer_budget);
+    try t.expectEqual(@as(i32, 1), q.ple_layer_idx);
+    try t.expectEqual(@as(u32, 248044), q.ngram_eos);
+
+    const m = try parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/mimo_v2.json"));
+    try t.expectEqualStrings("mimo_v2", m.model_type);
+    try t.expectEqual(@as(u32, 152576), m.vocab_size);
+    try t.expectEqual(@as(u32, 4096), m.hidden_size);
+    try t.expectEqual(@as(u32, 48), m.num_hidden_layers);
+    try t.expectEqual(@as(u32, 64), m.num_attention_heads);
+    try t.expectEqual(@as(u32, 192), m.head_dim);
+    try t.expectEqual(@as(u32, 128), m.v_head_dim);
+    try t.expectEqual(@as(u32, 1048576), m.max_position_embeddings);
+    try t.expectEqual(@as(u32, 128), m.sliding_window);
+    try t.expectEqual(@as(u32, 256), m.num_experts);
+    try t.expectEqual(@as(u32, 8), m.num_experts_per_tok);
+    try t.expectEqual(@as(u32, 2048), m.moe_intermediate_size);
+    try t.expectEqual(@as(u32, 1), m.first_k_dense_replace);
+    try t.expectEqual(@as(f32, 0.334), m.partial_rotary_factor);
+    try t.expectEqual(@as(?u32, null), m.bos_token_id);
+    try t.expectEqualSlices(u32, &.{151645}, m.eosTokenSlice());
+
+    for ([_][]const u8{ @embedFile("fixtures/model-configs/qwen4_exp.json"), @embedFile("fixtures/model-configs/mimo_v2.json") }) |doc| {
+        const meta = model_discovery.parseStubMeta(t.allocator, doc, true);
+        try t.expect(meta.found and meta.quantized_experts and meta.expert_quant_rate != null);
+        try t.expectEqual(@as(u32, 48), meta.num_hidden_layers);
+    }
 }

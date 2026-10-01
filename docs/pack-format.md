@@ -97,6 +97,11 @@ stacked bank per projection with its own rate, read from its own trellis shape.
 `num_experts_per_tok` must be ≤ 32 (the decode reduce bank,
 `Exl3TopKExceedsReduceBank`).
 
+The parser trusts no field: a wrong JSON type or a value outside its field's range is `InvalidConfigField`
+(`cfgField`/`cfgInt`/`cfgF32`), a JSON `null` leaves the default (`sliding_window: null` still disables), and a
+qwen4_exp geometry the forward divides by or indexes with is `InvalidQwen4Geometry`. The served packs' configs, cut
+to what the engine reads, are committed in `src/fixtures/model-configs/` and pinned by a parse test.
+
 ### Stored-affine trunk linears (`mimo_v2`)
 
 A MiMo pack may STORE `o_proj` (every layer's `model.layers.{L}.self_attn.o_proj`),

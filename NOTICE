@@ -262,6 +262,12 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
   * `ignore_eos` (`requestEosSlice` in `src/server.zig`), from mlx-serve
     eca42620 (#590) by David Dalcu. Modifications: `/v1/completions` only;
     a chat request that sets it is refused by name.
+  * Checked `config.json` reads (`cfgField`, `cfgInt`, `cfgF32`, `cfgObject`
+    and `cfgString` in `src/model.zig`, the root and size checks in
+    `src/model_discovery.zig`), from mlx-serve #608 by @alinselea.
+    Modifications: scoped to the common prelude, the qwen4_exp branch and
+    discovery; qwen4_exp adds a geometry refusal, and the fixtures are the
+    served packs' configs.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)
