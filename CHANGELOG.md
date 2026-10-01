@@ -47,6 +47,8 @@ earlier history is mlx-serve's, in that project's changelog.
   so a long session after a restart is admitted where that bill refused it.
 - **A malformed `config.json` is refused by name** (a wrong field type, a negative or oversized number) instead of
   loading undefined values; model discovery skips one whose top level is not an object.
+- **Concurrent MiMo requests without MTP decode together** in one forward of up to four streams, with the same
+  output as each alone.
 
 ---
 

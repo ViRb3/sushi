@@ -2172,7 +2172,7 @@ pub const Scheduler = struct {
         // a hybrid), but has its own batched kernel. Ask the transformer, never
         // name the arch here — same rule as `modelExclusiveDecode`.
         const t = slot.model.transformer orelse return .arch;
-        return if (t.supportsBatchedGdnDecode()) .ok else .arch;
+        return if (t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode()) .ok else .arch;
     }
 };
 
@@ -2189,12 +2189,18 @@ pub const BatchVerdict = enum {
     penalty,
     arch,
     pad_waste,
+    row_cap,
 };
 
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
 pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
-    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode();
+    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode() or cfg.supportsBatchedMimoDecode();
+}
+
+/// MiMo batching is certified for up to four independent slots.
+pub fn batchGroupCap(cfg: *const model_mod.ModelConfig) usize {
+    return if (cfg.supportsBatchedMimoDecode()) 4 else MAX_BATCH_GROUP;
 }
 
 /// One line per slot the first time it decodes serial beside live company;
@@ -6858,14 +6864,24 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
         var group = batchable_buf[start..end];
+        const row_cap = if (group[0].model.config) |c| batchGroupCap(c) else MAX_BATCH_GROUP;
+        if (group.len > row_cap) {
+            for (group[row_cap..]) |s| {
+                noteSerial(sch, s, .row_cap);
+                try runSingleDecodeTick(sch, s);
+            }
+            group = group[0..row_cap];
+        }
         // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
         const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
+        // Per-row attention reads each slot's own cache: nothing pads.
+        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() else true;
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
         // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
         // how many still fit; the tail decodes serially this tick.
-        if (group.len >= 2) {
+        if (pads and group.len >= 2) {
             var kv_lens: [32]u32 = undefined;
             // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
             // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
@@ -8622,11 +8638,12 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // the gate — a slot that has not prefilled yet carries no recurrent state
     // to merge, so that tick stays serial rather than merging a wrong width.
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
+    const use_mimo = xfm_ptr.supportsBatchedMimoDecode();
     // Position source is per PATH: a GDN trunk positions from the slot's
     // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
     // linear layer there, so it reads 0 forever and every batched token was
     // roped at position 0 (qwen3_5 batched diverged from serial at token 14).
-    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn) slot.moe_seq_offset else slot.cache.step);
+    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn or use_mimo) slot.moe_seq_offset else slot.cache.step);
     if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
         // A slot with no recurrent state yet cannot join the merge. Decode the
         // group serially this tick instead of skipping it — skipping advances
@@ -8652,6 +8669,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     };
     const logits_arr = if (use_gdn)
         try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
+    else if (use_mimo)
+        try xfm_ptr.forwardMimoBatchedDecode(next_tokens, ctxs, rope_offsets)
     else
         try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
     defer {
@@ -8795,6 +8814,18 @@ test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
         cfg.num_experts = 8;
         try testing.expect(!modelBatchable(&cfg));
     }
+}
+
+test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial" {
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "mimo_v2";
+    cfg.num_experts = 256;
+    try testing.expect(!modelBatchable(&cfg));
+    try testing.expect(configBatchesDecode(&cfg));
+    try testing.expectEqual(@as(usize, 4), batchGroupCap(&cfg));
+    cfg.expert_streaming = true;
+    try testing.expect(!configBatchesDecode(&cfg));
+    try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
 }
 
 test "modelBatchable: a PARSED deepseek_v4 config can never route to batched decode" {

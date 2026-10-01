@@ -7988,6 +7988,7 @@ pub const SlidingView = struct {
 
 var sliding_block_trim_logged: bool = false; // one-shot log guard
 var gdn_batched_logged: bool = false;
+var mimo_batched_logged: bool = false;
 var gdn_batched_verify_logged: bool = false;
 var row_axis_verify_logged: bool = false;
 var verify_fail_after_flush: ?usize = null;
@@ -14909,6 +14910,11 @@ pub const ForwardCtx = struct {
     /// so the attention layer never re-derives a per-slot offset.
     batch_slots: ?[]const *ForwardCtx = null,
     batch_rope_offsets: ?mlx.mlx_array = null,
+    /// MiMo batched decode (`forwardMimoBatchedDecode`): row i of this `[1, N]` forward is
+    /// slot i's decode tick, its attention and KV append on `batch_rows[i]`'s cache at
+    /// `batch_row_offsets[i]`; every other op already computes rows independently.
+    batch_rows: ?[]const *ForwardCtx = null,
+    batch_row_offsets: []const u32 = &.{},
     /// MTP head: one QSA entry, not `ssm_entries[layer]`. Null on the trunk.
     qsa_entry: ?*SSMCacheEntry = null,
     /// Absolute position of this slot's QSA key row 0 (0 on the trunk).
@@ -21944,6 +21950,60 @@ pub const Transformer = struct {
         return sliceBatchRows(self.allocator, self.s, logits, next_tokens.len);
     }
 
+    /// MiMo batched decode: N slots' next tokens as ONE `[1, N]` forward on the verify-row
+    /// arithmetic, whose every op but attention already computes a row as its decode tick does;
+    /// row i attends and appends on slot i's own cache (`ForwardCtx.batch_rows`). Each row is
+    /// read out as its slot's tick reads it (the shortlist under `argmax_only`). Returns N
+    /// logits `[1, 1, V]`; caller owns each and the slice.
+    pub fn forwardMimoBatchedDecode(
+        self: *Transformer,
+        next_tokens: []const u32,
+        ctxs: []const *ForwardCtx,
+        rope_offsets: []const u32,
+    ) ![]mlx.mlx_array {
+        const n = next_tokens.len;
+        std.debug.assert(n == ctxs.len and n == rope_offsets.len and n >= 1 and n <= MIMO_VERIFY_ROWS_MAX);
+        if (!mimo_batched_logged) {
+            mimo_batched_logged = true;
+            log.info("[batched] mimo batched decode engaged (slots={d})\n", .{n});
+        }
+        var token_buf: [MIMO_VERIFY_ROWS_MAX]i32 = undefined;
+        for (next_tokens, 0..) |t, i| token_buf[i] = @intCast(t);
+        const token_arr = mlx.mlx_array_new_data(&token_buf, &[_]c_int{ 1, @intCast(n) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(token_arr);
+        // The scratch position only sizes the sliding decode mask, built when any row reads past the window.
+        var scratch: usize = 0;
+        for (rope_offsets) |o| scratch = @max(scratch, o);
+        var bctx: ForwardCtx = .{
+            .cache = ctxs[0].cache,
+            .moe_seq_offset = &scratch,
+            .ssm_entries = null,
+            .capture_hidden = null,
+            .vision_embeddings = null,
+            .verify_rows = true,
+            .skip_lm_head = true,
+            .batch_rows = ctxs,
+            .batch_row_offsets = rope_offsets,
+        };
+        const normed = try self.forwardMoeWith(&bctx, token_arr);
+        defer _ = mlx.mlx_array_free(normed);
+        const hidden = mlx.getShape(normed)[2];
+        const out = try self.allocator.alloc(mlx.mlx_array, n);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(out);
+        }
+        for (ctxs, 0..) |c, i| {
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            try mlx.check(mlx.mlx_slice(&row, normed, &[_]c_int{ 0, @intCast(i), 0 }, 3, &[_]c_int{ 1, @as(c_int, @intCast(i)) + 1, hidden }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
+            out[i] = try self.lmHeadProject(row, c.argmax_only);
+            filled += 1;
+        }
+        return out;
+    }
+
     /// Batched spec VERIFY: `[N, S]` rows (every slot's `[t1, drafts…]`, padded to the
     /// group's widest), per-position SSM capture ON so each slot rolls back on its own,
     /// post-norm hidden captured at the last row (`hidden_last` `[N,1,H]`) and at every
@@ -22388,6 +22448,12 @@ pub const Transformer = struct {
     /// gemma4 MoE) are NOT covered and must keep the serial path. Asked by
     /// the scheduler's batching gate, so a new arch on this forward defaults
     /// to serial instead of silently riding a path that never modelled it.
+    pub fn supportsBatchedMimoDecode(self: *const Transformer) bool {
+        // Without the packed global arms every row rebuilds its whole cache: the bill would be the context.
+        return self.config.supportsBatchedMimoDecode() and self.moe_layers != null and self.expert_stream == null and
+            mimoGlobalDecodeRebuildMaxKeys() != std.math.maxInt(u64);
+    }
+
     pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
         // Arch question: ONE predicate, shared with server.zig's
         // --max-concurrent clamp so the two cannot disagree about whether
@@ -28462,20 +28528,12 @@ pub const Transformer = struct {
         local_decode_mask: mlx.mlx_array,
     ) !mlx.mlx_array {
         const cfg = &self.config;
-        const is_global = cfg.isGlobalLayer(layer);
         const h_count: c_int = @intCast(cfg.layerNumHeads(layer));
         const kv_h: c_int = @intCast(cfg.layerKVHeads(layer));
         const hd: c_int = @intCast(cfg.layerHeadDim(layer));
         const vhd: c_int = @intCast(cfg.layerVHeadDim(layer));
-        const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(hd)) * cfg.partial_rotary_factor);
-        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
-        const k_shape = [_]c_int{ batch, seq_len, kv_h, hd };
-        const v_shape = [_]c_int{ batch, seq_len, kv_h, vhd };
         const flat_shape = [_]c_int{ batch, seq_len, h_count * vhd };
         const perm = [_]c_int{ 0, 2, 1, 3 };
-        const none_mask = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(none_mask);
 
         var proj: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
         defer for (proj) |a| {
@@ -28491,6 +28549,51 @@ pub const Transformer = struct {
             proj[1] = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
             proj[2] = try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
         }
+        const attn_out = if (ctx.batch_rows) |rows|
+            try self.mimoBatchRowsAttn(rows, ctx.batch_row_offsets, proj, fa, layer, local_decode_mask)
+        else
+            try self.mimoAttnCore(ctx, proj, fa, layer, offset, batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask);
+        defer _ = mlx.mlx_array_free(attn_out);
+
+        var attn_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_t);
+        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, self.s));
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
+        if (self.imatrix) |c| try c.observeLinear(.{ .o_proj = layer }, attn_flat);
+        return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    }
+
+    /// Rope, KV append and attention of one MiMo layer over the QKV projection `proj`, on
+    /// `ctx`'s cache at `offset`: `[batch, heads, seq_len, v_dim]`.
+    fn mimoAttnCore(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        proj: [3]mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        layer: u32,
+        offset: c_int,
+        batch: c_int,
+        seq_len: c_int,
+        is_prefill: bool,
+        local_prefill_mask: *mlx.mlx_array,
+        local_decode_mask: mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const cfg = &self.config;
+        const is_global = cfg.isGlobalLayer(layer);
+        const h_count: c_int = @intCast(cfg.layerNumHeads(layer));
+        const kv_h: c_int = @intCast(cfg.layerKVHeads(layer));
+        const hd: c_int = @intCast(cfg.layerHeadDim(layer));
+        const vhd: c_int = @intCast(cfg.layerVHeadDim(layer));
+        const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(hd)) * cfg.partial_rotary_factor);
+        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
+        const k_shape = [_]c_int{ batch, seq_len, kv_h, hd };
+        const v_shape = [_]c_int{ batch, seq_len, kv_h, vhd };
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
         var q_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rope);
         const rope_base = mlx.mlx_optional_float{
@@ -28547,7 +28650,7 @@ pub const Transformer = struct {
         defer kv_view.deinit();
 
         var attn_out = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn_out);
+        errdefer _ = mlx.mlx_array_free(attn_out);
         switch (try mimoAttnArm(ctx.verify_rows, is_prefill, is_global, seq_len)) {
             .verify_rows, .prefill_rows => {
                 if (!ctx.verify_rows and !mimo_prefill_rows_logged) {
@@ -28593,14 +28696,47 @@ pub const Transformer = struct {
             },
         }
 
-        var attn_t = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn_t);
-        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, self.s));
-        var attn_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn_flat);
-        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
-        if (self.imatrix) |c| try c.observeLinear(.{ .o_proj = layer }, attn_flat);
-        return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+        return attn_out;
+    }
+
+    /// Row i of a batched decode attends as slot i's own decode tick: row i of the QKV
+    /// projection through `mimoAttnCore` on that slot's cache at its offset. `[1, heads, N, v_dim]`.
+    fn mimoBatchRowsAttn(
+        self: *Transformer,
+        rows: []const *ForwardCtx,
+        offsets: []const u32,
+        proj: [3]mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        layer: u32,
+        local_decode_mask: mlx.mlx_array,
+    ) !mlx.mlx_array {
+        std.debug.assert(rows.len == offsets.len and rows.len <= MIMO_VERIFY_ROWS_MAX);
+        var outs: [MIMO_VERIFY_ROWS_MAX]mlx.mlx_array = undefined;
+        var n: usize = 0;
+        defer for (outs[0..n]) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        var no_prefill_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(no_prefill_mask);
+        for (rows, offsets, 0..) |row_ctx, off, i| {
+            var row_proj: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+            defer for (row_proj) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            for (proj, &row_proj) |src, *dst| {
+                const sh = mlx.getShape(src);
+                dst.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice(dst, src, &[_]c_int{ 0, @intCast(i), 0 }, 3, &[_]c_int{ 1, @as(c_int, @intCast(i)) + 1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
+            }
+            outs[n] = try self.mimoAttnCore(row_ctx, row_proj, fa, layer, @intCast(off), 1, 1, false, &no_prefill_mask, local_decode_mask);
+            n += 1;
+        }
+        const vec = mlx.mlx_vector_array_new_data(&outs, n);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, self.s));
+        return out;
     }
 
     fn lagunaAttnWith(
@@ -74344,6 +74480,116 @@ test "mimo v2 verify rows equal serial decode ticks bit for bit across the slidi
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// One decode slot of the batched-decode test: its own ringed cache and position.
+const MimoBatchTestSlot = struct {
+    cache: KVCache,
+    offset: usize = 0,
+
+    fn ctx(self: *MimoBatchTestSlot, argmax_only: bool) ForwardCtx {
+        return .{ .cache = &self.cache, .moe_seq_offset = &self.offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .argmax_only = argmax_only };
+    }
+};
+
+fn mimoBatchTestPrefill(xfm: *Transformer, slot: *MimoBatchTestSlot, ids: []const i32, kv: KVQuantConfig) !void {
+    slot.cache = try KVCache.initWithConfig(testing.allocator, xfm.config.num_hidden_layers, kv);
+    slot.cache.setSwaRing(xfm.config.sliding_window);
+    slot.offset = 0;
+    var c = slot.ctx(false);
+    const pre = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, 2, .int32);
+    defer _ = mlx.mlx_array_free(pre);
+    const logits = try xfm.forwardWith(&c, pre);
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_array_eval(logits));
+}
+
+test "mimo batched decode rows equal each slot's own decode tick bit for bit (MIMO_V2_MODEL)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| a.free(p);
+    var weights = try model_mod.loadWeightsForConfig(io, a, std.mem.span(model_dir), &config, false);
+    defer weights.deinit();
+    try stackMimoFixtureExperts(&weights, config, s);
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    const window: usize = config.sliding_window;
+    const ring_cap: usize = window + @as(usize, @intCast(ModelConfig.SWA_RING_SLACK));
+    // Slots whose ticks cross the window edge, a ring compaction, nothing, and the packed global read.
+    const prefixes = [_]usize{ window - 2, ring_cap - 2, 20, @as(usize, @intCast(QKV_MPP_DECODE_MIN_TK)) + 3 };
+    const steps: usize = 4;
+    var ids: [@as(usize, @intCast(QKV_MPP_DECODE_MIN_TK)) + 3 + steps]i32 = undefined;
+    const vocab: usize = @intCast(config.vocab_size);
+    for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |kv| {
+        for ([_]usize{ 2, 3, 4 }) |n| {
+            var solo: [4]MimoBatchTestSlot = undefined;
+            var batch: [4]MimoBatchTestSlot = undefined;
+            var made: usize = 0;
+            defer for (solo[0..made], batch[0..made]) |*x, *y| {
+                x.cache.deinit();
+                y.cache.deinit();
+            };
+            for (0..n) |i| {
+                for (&ids, 0..) |*v, j| v.* = @intCast(2 + (j * 37 + i * 101) % (config.vocab_size - 2));
+                try mimoBatchTestPrefill(&xfm, &solo[i], ids[0..prefixes[i]], kv);
+                errdefer solo[i].cache.deinit();
+                try mimoBatchTestPrefill(&xfm, &batch[i], ids[0..prefixes[i]], kv);
+                made += 1;
+            }
+            for (0..steps) |step| {
+                var tokens: [4]u32 = undefined;
+                var offsets: [4]u32 = undefined;
+                var batch_ctx: [4]ForwardCtx = undefined;
+                var batch_ptrs: [4]*ForwardCtx = undefined;
+                for (0..n) |i| {
+                    tokens[i] = @intCast(2 + (step * 53 + i * 7) % (vocab - 2));
+                    offsets[i] = @intCast(batch[i].offset);
+                    // Odd rows read the full head, even rows the argmax shortlist.
+                    batch_ctx[i] = batch[i].ctx(i % 2 == 0);
+                    batch_ptrs[i] = &batch_ctx[i];
+                }
+                const rows = try xfm.forwardMimoBatchedDecode(tokens[0..n], batch_ptrs[0..n], offsets[0..n]);
+                defer {
+                    for (rows) |r| _ = mlx.mlx_array_free(r);
+                    a.free(rows);
+                }
+                for (0..n) |i| {
+                    batch[i].offset += 1;
+                    var c = solo[i].ctx(i % 2 == 0);
+                    const tok: i32 = @intCast(tokens[i]);
+                    const one = mlx.mlx_array_new_data(&tok, &[_]c_int{ 1, 1 }, 2, .int32);
+                    defer _ = mlx.mlx_array_free(one);
+                    const want = try xfm.forwardWith(&c, one);
+                    defer _ = mlx.mlx_array_free(want);
+                    const want_host = try qwen4ReadF32(a, want, s);
+                    defer a.free(want_host);
+                    const got_host = try qwen4ReadF32(a, rows[i], s);
+                    defer a.free(got_host);
+                    try testing.expectEqual(want_host.len, got_host.len);
+                    for (want_host, got_host, 0..) |x, y, k| {
+                        if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) {
+                            std.debug.print("mimo batched row differs: kv={s} n={d} step={d} slot={d} at {d}: {d} vs {d}\n", .{ @tagName(kv.scheme), n, step, i, k, x, y });
+                            return error.RowNotBitIdentical;
+                        }
+                    }
+                }
+            }
+            for (0..n) |i| {
+                try testing.expectEqual(solo[i].offset, batch[i].offset);
+                try testing.expectEqual(solo[i].cache.step, batch[i].cache.step);
+                var x = try solo[i].cache.snapshotRetained(s);
+                defer x.deinit();
+                var y = try batch[i].cache.snapshotRetained(s);
+                defer y.deinit();
+                try testing.expect(try snapshotsBitEqual(&x, &y, s));
             }
         }
     }

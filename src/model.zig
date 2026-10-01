@@ -1184,6 +1184,12 @@ pub const ModelConfig = struct {
     ///
     /// Says nothing about MoE/hybrid archs that merely share the same
     /// forward — those stay serial, by name, in both callers.
+    /// MiMo decodes concurrent slots as rows of one forward (`forwardMimoBatchedDecode`);
+    /// a streamed load stays serial.
+    pub fn supportsBatchedMimoDecode(self: *const ModelConfig) bool {
+        return self.isMimo() and !self.expert_streaming;
+    }
+
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h

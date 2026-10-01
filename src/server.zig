@@ -5499,7 +5499,22 @@ pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
 /// per-slot constant billed at only some of them is the under-bill class.
 pub fn slotRingBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     const swa = config.swaRingBytes() +| prefix_cache_mod.SLOT_RING_CHECKPOINTS *| config.swaRingCheckpointBytes();
-    return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits);
+    return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits) +| batchedDecodeRowsBytes(config);
+}
+
+/// What the other rows of a batched MiMo decode hold beside this slot's tick: each row
+/// rebuilds one global layer dense below the packed arms' floor, where a solo tick's rebuild
+/// was alone. Zero where decode does not batch (the packed-arm kill switch turns it off).
+pub fn batchedDecodeRowsBytes(config: *const model_mod.ModelConfig) u64 {
+    if (!config.supportsBatchedMimoDecode()) return 0;
+    const keys = transformer_mod.mimoGlobalDecodeRebuildMaxKeys();
+    if (keys == std.math.maxInt(u64)) return 0;
+    var widest: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        if (config.isKvPerTokenLayer(li)) widest = @max(widest, config.layerKvBytes(li));
+    }
+    return @as(u64, scheduler_mod.batchGroupCap(config) - 1) *| keys *| widest;
 }
 
 /// The chunk-independent floor every prefill pays: MLX runtime scratch, the
@@ -7450,11 +7465,11 @@ fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
 
 /// The /props "batching" object: whether the loaded model rides the batched
 /// decode kernel, and why not when it does not.
-fn batchingPropsJson(allocator: std.mem.Allocator, why: scheduler_mod.BatchVerdict) ![]u8 {
+fn batchingPropsJson(allocator: std.mem.Allocator, why: scheduler_mod.BatchVerdict, max_group: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, ",\"batching\":{{\"supported\":{s},\"reason\":\"{s}\",\"max_group\":{d}}}", .{
         if (why == .ok) "true" else "false",
         @tagName(why),
-        scheduler_mod.MAX_BATCH_GROUP,
+        max_group,
     });
 }
 
@@ -7626,7 +7641,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // whenever no table is warming, so the object is absent off qwen4_exp.
     const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
     defer allocator.free(ngram_json);
-    const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm));
+    const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm), if (lm.config) |c| scheduler_mod.batchGroupCap(c) else scheduler_mod.MAX_BATCH_GROUP);
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
@@ -24150,6 +24165,22 @@ fn mimoV2BillConfig() model_mod.ModelConfig {
     return c;
 }
 
+test "a MiMo slot bills the decode rebuilds the other rows of its batched decode hold" {
+    const t = std.testing;
+    var cfg = mimoV2BillConfig();
+    // One global layer's dense K/V below the packed arms' floor, for every other row of a full group.
+    const rebuild = transformer_mod.mimoGlobalDecodeRebuildMaxKeys() * cfg.layerKvBytes(0);
+    try t.expect(rebuild > 0);
+    try t.expectEqual(@as(u64, @intCast(scheduler_mod.batchGroupCap(&cfg) - 1)) * rebuild, batchedDecodeRowsBytes(&cfg));
+    try t.expectEqual(@as(usize, 4), scheduler_mod.batchGroupCap(&cfg));
+    // A streamed load decodes serial and bills nothing for it.
+    cfg.expert_streaming = true;
+    try t.expectEqual(@as(u64, 0), batchedDecodeRowsBytes(&cfg));
+    var plain = mimoV2BillConfig();
+    plain.model_type = "qwen3";
+    try t.expectEqual(@as(u64, 0), batchedDecodeRowsBytes(&plain));
+}
+
 test "the sliding ring is billed once per slot and staged per chunk token" {
     const t = std.testing;
     const cfg = mimoV2BillConfig();
@@ -24159,8 +24190,9 @@ test "the sliding ring is billed once per slot and staged per chunk token" {
     // The slot also holds its ring checkpoints until the commit takes them: where it restored
     // to, the message starts its prefill crossed, and its prompt end.
     const ring_and_cp = cfg.swaRingBytes() + prefix_cache_mod.SLOT_RING_CHECKPOINTS * cfg.swaRingCheckpointBytes();
-    try t.expectEqual(ring_and_cp, slotRingBytes(&cfg, 16));
-    try t.expectEqual(kvBytesPerTokenAtBits(ring_and_cp, 8), slotRingBytes(&cfg, 8));
+    const rows = batchedDecodeRowsBytes(&cfg);
+    try t.expectEqual(ring_and_cp + rows, slotRingBytes(&cfg, 16));
+    try t.expectEqual(kvBytesPerTokenAtBits(ring_and_cp, 8) + rows, slotRingBytes(&cfg, 8));
     try t.expect(slotRingBytes(&cfg, 8) < slotRingBytes(&cfg, 16));
     // Per token of context only the two global layers count.
     try t.expectEqual(@as(u64, 2 * 2 * (192 + 128) * 2), sessionBytesPerToken(&cfg, 16));

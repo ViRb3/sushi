@@ -119,7 +119,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's
   `SLOT_RING_CHECKPOINTS` = 6 copies beside the ring (its restore, up to four message marks, its prompt end; 158
   rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`); each entry bills its own in `kv_bytes`, up to eight with
-  those it inherits from the entry it forked off (`bestRingDonor`).
+  those it inherits from the entry it forked off (`bestRingDonor`). `slotRingBytes` also bills the global-layer
+  decode rebuilds the other rows of a batched decode hold below the packed arms' floor (`batchedDecodeRowsBytes`).
 - **A hot entry holds a ringed layer's RETAINED ROWS, never the ring's capacity** (`KVCache.snapshotRetained`): the
   buffer is allocated at `ringCap` from token one, so a plain share billed and pinned rows no restore can read.
 - Per token: bf16 288 KiB → 22.5 KiB, kv8 153 KiB → 12.0 KiB; ring per slot 122 MiB bf16, 65 MiB kv8.
@@ -191,6 +192,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1` is its A/B.
 - A joined `[Q | K]` GEMV output with one rope over both passed its unit tests but moved live logits by ~0.05
   nats at the first token, cause unfound; it is not in the tree.
+
+## Batched decode
+
+- **Concurrent plain slots decode as rows of ONE forward** (`forwardMimoBatchedDecode`): the slots' next tokens
+  go through the verify-row path, whose every op but attention already computes a row as its decode tick does;
+  row i attends and appends on slot i's own cache at its own position through the solo core (`mimoAttnCore`,
+  `ForwardCtx.batch_rows`), so ring compaction and marks happen per slot as in a solo tick, and each row is read out
+  as its tick reads it (the shortlist under `argmax_only`). Byte-identical to the solo ticks (`mimo batched decode
+  rows` on the real pack; `tests/test_mimo_batched_equivalence.sh`).
+- A group holds at most four slots (`batchGroupCap`, independently of the MTP verify width); the rest decode serial by name
+  (`row_cap`). Nothing pads: rows never share a key tensor. MTP slots keep their solo rounds.
+- Measured against interleaved MTP streams: [perf-baselines](perf-baselines.md#mimo-batched-decode).
 
 ## Prompt lookup decoding
 

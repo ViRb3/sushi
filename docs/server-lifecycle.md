@@ -139,6 +139,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   budget revise.
 - Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A
   batched group is capped by PADDING WASTE (`batchedKvKeepCount`, `MAX_PAD_WASTE` 1.5 < 2.0), not slot count.
+  Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
+  ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
 - `--prefill-decode-share S` (flag > `SUSHI_PREFILL_DECODE_SHARE` > 0) targets the fraction of wall time given

@@ -622,6 +622,25 @@ final hidden states of a 2025-row chunk are byte-identical (0 of 8,294,400 bf16 
 - The synced profile overstated the trunk: unsynced microbenches put a sliding layer's FP8 QKV at 4.40 ms (MLX's bf16
   GEMM alone 4.04 ms, 60 TFLOPS) and the affine-8 o_proj at 2.74 ms (MLX `qmm_t_nax`, ~50 TFLOPS).
 
+<a id="mimo-batched-decode"></a>
+### MiMo 2.3bpw: concurrent streams, batched plain rows against interleaved MTP (d7a20bf9, the landed change's code)
+
+One boot, `--kv-quant 8 --max-concurrent 4`, greedy, thinking off, 256 tokens per stream, short distinct prompts
+(a 300-word story or a Python module with tests), N requests fired together; MTP on (default) against
+`enable_mtp:false` per request, which now decodes as rows of one forward (`forwardMimoBatchedDecode`).
+`taskpolicy -a`, GPU lock, fans max, die 78 C at start, 2026-10-01. Aggregate tok/s (tokens over wall):
+
+| streams | prose MTP | prose batched | code MTP | code batched |
+|---|---|---|---|---|
+| 1 | 57.5 | 50.4 | 62.9 | 47.9 |
+| 2 | 53.8 | 64.2 | 65.9 | 62.7 |
+| 3 | 55.2 | 74.3 | 65.7 | 71.9 |
+| 4 | 54.9 | 79.9 | 65.3 | 76.1 |
+
+Interleaved MTP streams share the GPU round by round, so their aggregate stays where one stream is (~55 prose, ~66
+code). Batched rows read most of a forward's weights once for the group: past 2 streams on prose and 3 on code
+they beat it.
+
 <a id="mimo-mtp-vs-serial"></a>
 ### MiMo 2.3bpw: MTP against serial per KV bucket (63476cd1; the 256k boot on 0f5e7a95)
 
