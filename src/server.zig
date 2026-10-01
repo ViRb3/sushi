@@ -890,12 +890,47 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/models/rescan",
     "/v1/responses",
     "/v1/responses/compact",
+    "/v1/tools",
     "/v1/unload-model",
     "/v1/update",
 };
 
 /// The browser chat page: one self-contained file that talks to this server's own API.
 const chat_page_html = @embedFile("webui/index.html");
+
+/// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
+fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, body: []const u8) !void {
+    const origin = findHeaderValueCI(headers, "origin") orelse "";
+    if (!peerIsLoopback(stream) or !update_mod.isLoopbackHost(listen_host) or
+        !update_mod.originMatches(origin, listen_host, listen_port))
+    {
+        return sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "Tools require this Mac's chat page Origin and a loopback server bind", 403);
+    }
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Expected a JSON object", 400);
+    defer parsed.deinit();
+    if (parsed.value != .object) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Expected a JSON object", 400);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(stream.io, ".", allocator);
+    defer allocator.free(root);
+    const pack = @import("repl_tools.zig");
+    const vision = if (parsed.value.object.get("vision")) |v| v == .bool and v.bool else false;
+    const name = parsed.value.object.get("name");
+    if (name == null) {
+        const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision), .{});
+        defer defs.deinit();
+        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root }, .{});
+        defer allocator.free(json);
+        return sendResponse(stream, "200 OK", "application/json", json);
+    }
+    const args = parsed.value.object.get("arguments");
+    if (name.? != .string or args == null or args.? != .string)
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Tool name and arguments must be strings", 400);
+    const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision }, name.?.string, args.?.string);
+    defer result.deinit(allocator);
+    const json = try std.json.Stringify.valueAlloc(allocator, result, .{});
+    defer allocator.free(json);
+    try sendResponse(stream, "200 OK", "application/json", json);
+}
 
 fn isChatPagePath(path: []const u8) bool {
     return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/chat");
@@ -2317,6 +2352,15 @@ fn handleConnection(
     {
         log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
         try sendUnauthorized(stream);
+        return;
+    }
+
+    if (std.mem.eql(u8, path, "/v1/tools")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST for tools", 405);
+            return;
+        }
+        try handleWebTools(allocator, stream, request[0..header_end_pos], request_body);
         return;
     }
 
@@ -25309,5 +25353,33 @@ test "ignore_eos: a completion that sets it decodes past EOS; a chat request tha
         const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
         try t.expectEqual(c.stops, requestEosSlice(&config, parsed.value.object).len);
         try t.expectEqual(c.stops == 0, chatIgnoreEosRejectReason(parsed.value.object) != null);
+    }
+}
+
+test "web tools: list, confined execution, and browser origin guard" {
+    const t = std.testing;
+    const old_host = listen_host;
+    const old_port = listen_port;
+    defer {
+        listen_host = old_host;
+        listen_port = old_port;
+    }
+    listen_host = "127.0.0.1";
+    listen_port = 12345;
+    const cases = [_]struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8 }{
+        .{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = "web_search" },
+        .{ .origin = "http://evil.test", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
+        .{ .origin = "null", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
+        .{ .origin = "http://localhost:12345", .body = "[]", .status = "400 Bad Request", .contains = "object" },
+        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside\\\"}\"}", .status = "200 OK", .contains = "refused" },
+        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"exec\",\"arguments\":\"{}\"}", .status = "200 OK", .contains = "unknown tool" },
+    };
+    for (cases) |c| {
+        const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ c.origin, c.body.len, c.body });
+        defer t.allocator.free(req);
+        const response = try serveOneForTest(req);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.indexOf(u8, response, c.status) != null);
+        try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
     }
 }

@@ -223,9 +223,26 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.
 
+## Web UI research tools
+
+- The composer's **Tools on/off** button enables the same research pack as `sushi run`, off by default.
+  The preference persists in this browser. It is fixed for a turn; the button is disabled while a reply runs.
+- The browser sends definitions, assembles streamed tool calls, executes them through `POST /v1/tools`, and
+  sends results back to the model. Eight tool rounds maximum, followed by a final request without tools.
+  Results are collapsible in the transcript. Stop cancels browser requests and records cancelled results for
+  remaining calls so the conversation stays valid. An already-running server tool may finish its bounded work.
+- `POST /v1/tools` with `{ "vision": false }` lists definitions and the file root. With `name`, JSON-string
+  `arguments`, and `vision`, it executes one call and returns `text` plus optional `image` data URL.
+  Vision models get `view_image`; returned images remain in memory only.
+- This bridge requires a loopback bind and peer, the chat page's Origin, and the normal API-key policy.
+  It works from `localhost` or `127.0.0.1`, not a remote browser or wildcard bind. File tools are confined to
+  the server's working folder, with the existing hidden/secret-file and symlink checks; network tools keep
+  the REPL's public-address restrictions. No MCP configuration is added.
+- Checks: `node tests/test_webui_tools.cjs`, `tests/test_webui.sh`, and the `web tools:` unit test.
+
 ## `sushi run` research tools (client-side)
 
-- **The REPL runs the tools, the server never does** (`src/repl_tools.zig`, loop `cli.runToolTurn`): it sends `tools`,
+- **The REPL orchestrates and runs its tools locally** (`src/repl_tools.zig`, loop `cli.runToolTurn`): it sends `tools`,
   runs the returned calls, appends `tool` messages and asks again. OFF by default: `--tool on|off`, `/tool on|off`,
   bare `/tool` shows the state and list. One dim trace line per call (`search:`, `fetch:`, `read:` …).
 - Tools: `web_search` (GET html.duckduckgo.com, top 8 title/url/snippet, `uddg=` unwrapped, ads dropped),
