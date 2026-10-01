@@ -8037,6 +8037,9 @@ pub const KVCache = struct {
     /// forward that hands `update` a non-zero `max_seq` — the one predicate
     /// that says its attention reads the tail and nothing below it.
     swa_ring_window: u32 = 0,
+    /// Restore points (`ringMark`) each ringed write fills once it reaches their `step`, before
+    /// its compaction drops the rows. Caller-owned; empty outside a prefill.
+    ring_marks: []KVCacheSnapshot = &.{},
 
     pub fn setSwaRing(self: *KVCache, window: u32) void {
         self.swa_ring_window = window;
@@ -8210,35 +8213,14 @@ pub const KVCache = struct {
     /// empty: they hold a prefix and clamp anywhere. Null when no layer rings.
     pub fn ringCheckpoint(self: *const KVCache, pos: usize, s: mlx.mlx_stream) !?KVCacheSnapshot {
         if (self.swa_ring_window == 0) return null;
-        const want: usize = @as(usize, self.swa_ring_window) + ModelConfig.SWA_RING_CHECKPOINT_BACKOFF;
-        const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
-        for (out) |*e| e.* = newEmptyKVEntry();
-        var cp: KVCacheSnapshot = .{ .entries = out, .step = pos, .allocator = self.allocator, .config = self.config, .swa_ring_window = self.swa_ring_window };
+        var cp = try self.ringMark(pos);
         errdefer cp.deinit();
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
-        for (self.entries, out) |*src, *dst| {
+        for (self.entries, cp.entries) |*src, *dst| {
             if (!src.initialized or !src.ringed) continue;
-            if (pos < src.base or pos > src.base + src.offset) return error.SlidingRingRewindPastWindow;
-            const rows = @min(pos - src.base, want);
-            if (rows < @min(pos, @as(usize, self.swa_ring_window))) return error.SlidingRingRewindPastWindow;
-            const from = pos - rows - src.base;
-            dst.initialized = true;
-            dst.ringed = true;
-            dst.base = pos - rows;
-            dst.offset = rows;
-            const pairs = [_]struct { *mlx.mlx_array, mlx.mlx_array }{
-                .{ &dst.keys, src.keys },                   .{ &dst.values, src.values },
-                .{ &dst.keys_scales, src.keys_scales },     .{ &dst.keys_biases, src.keys_biases },
-                .{ &dst.values_scales, src.values_scales }, .{ &dst.values_biases, src.values_biases },
-            };
-            const n: usize = if (self.config.scheme != .off) 6 else 2;
-            for (pairs[0..n]) |p| {
-                const owned = try rowsOwned(p[1], from, from + rows, s);
-                _ = mlx.mlx_array_free(p[0].*);
-                p[0].* = owned;
-                _ = mlx.mlx_vector_array_append_value(vec, owned);
-            }
+            const rows = self.ringRowsAt(src, pos) orelse return error.SlidingRingRewindPastWindow;
+            try self.copyRingRows(src, dst, pos, rows, s, vec);
         }
         if (mlx.mlx_vector_array_size(vec) == 0) {
             cp.deinit();
@@ -8247,6 +8229,74 @@ pub const KVCache = struct {
         // Without the eval the lazy copies pin the ring buffers they were sliced from.
         _ = mlx.mlx_eval(vec);
         return cp;
+    }
+
+    /// An empty restore point at `pos`, for `ring_marks` to fill.
+    pub fn ringMark(self: *const KVCache, pos: usize) !KVCacheSnapshot {
+        const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
+        for (out) |*e| e.* = newEmptyKVEntry();
+        return .{ .entries = out, .step = pos, .allocator = self.allocator, .config = self.config, .swa_ring_window = self.swa_ring_window };
+    }
+
+    /// Did every ringed layer fill `mark`? Only then does it restore.
+    pub fn ringMarkComplete(self: *const KVCache, mark: *const KVCacheSnapshot) bool {
+        var any = false;
+        for (self.entries, mark.entries) |*e, *m| {
+            if (!e.initialized or !e.ringed) continue;
+            if (!m.initialized) return false;
+            any = true;
+        }
+        return any;
+    }
+
+    /// Rows a restore point of `src` at `pos` holds: window + backoff at most, at least the window
+    /// (or every row from 0). Null when the ring does not hold them (yet, or any more).
+    fn ringRowsAt(self: *const KVCache, src: *const KVCacheEntry, pos: usize) ?usize {
+        if (pos < src.base or pos > src.base + src.offset) return null;
+        const want: usize = @as(usize, self.swa_ring_window) + ModelConfig.SWA_RING_CHECKPOINT_BACKOFF;
+        const rows = @min(pos - src.base, want);
+        if (rows < @min(pos, @as(usize, self.swa_ring_window))) return null;
+        return rows;
+    }
+
+    /// Owned copies of `src`'s rows `[pos - rows, pos)` into the empty `dst`, each appended to `vec`.
+    fn copyRingRows(self: *const KVCache, src: *const KVCacheEntry, dst: *KVCacheEntry, pos: usize, rows: usize, s: mlx.mlx_stream, vec: mlx.mlx_vector_array) !void {
+        const from = pos - rows - src.base;
+        dst.initialized = true;
+        dst.ringed = true;
+        dst.base = pos - rows;
+        dst.offset = rows;
+        const pairs = [_]struct { *mlx.mlx_array, mlx.mlx_array }{
+            .{ &dst.keys, src.keys },                   .{ &dst.values, src.values },
+            .{ &dst.keys_scales, src.keys_scales },     .{ &dst.keys_biases, src.keys_biases },
+            .{ &dst.values_scales, src.values_scales }, .{ &dst.values_biases, src.values_biases },
+        };
+        const n: usize = if (self.config.scheme != .off) 6 else 2;
+        for (pairs[0..n]) |p| {
+            const owned = try rowsOwned(p[1], from, from + rows, s);
+            _ = mlx.mlx_array_free(p[0].*);
+            p[0].* = owned;
+            _ = mlx.mlx_vector_array_append_value(vec, owned);
+        }
+    }
+
+    /// Fill each ring mark this layer's write has reached, from rows the ring still holds. Reads
+    /// only; a failed copy leaves its mark incomplete, and an incomplete mark is never kept.
+    fn captureRingMarks(self: *KVCache, layer: u32, s: mlx.mlx_stream) void {
+        const src = &self.entries[layer];
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (self.ring_marks) |*m| {
+            const dst = &m.entries[layer];
+            if (dst.initialized) continue;
+            const rows = self.ringRowsAt(src, m.step) orelse continue;
+            self.copyRingRows(src, dst, m.step, rows, s, vec) catch {
+                freeKVEntry(dst);
+                dst.* = newEmptyKVEntry();
+            };
+        }
+        // Left lazy, the copies would pin the pre-compaction buffer until the chunk's eval.
+        if (mlx.mlx_vector_array_size(vec) > 0) _ = mlx.mlx_async_eval(vec);
     }
 
     /// Put a ring checkpoint's rows under the ringed layers of a cache restored from the
@@ -8681,7 +8731,7 @@ pub const KVCache = struct {
         try buildSliceView(s, &entry.key_biases_view, entry.keys_biases, total, view_start);
         try buildSliceView(s, &entry.value_scales_view, entry.values_scales, total, view_start);
         try buildSliceView(s, &entry.value_biases_view, entry.values_biases, total, view_start);
-        return self.ringCompact(entry, s);
+        return self.ringCompact(layer, s);
     }
 
     /// Does a shared restore's first append copy its rows into a buffer sized for THIS request? Yes
@@ -8794,7 +8844,7 @@ pub const KVCache = struct {
         // each buffer's own last dim, so K and V may differ in width.
         try buildSliceView(s, &entry.key_view, entry.keys, total, view_start);
         try buildSliceView(s, &entry.value_view, entry.values, total, view_start);
-        if (try self.ringCompact(entry, s)) {
+        if (try self.ringCompact(layer, s)) {
             const kv = try handOffRingViews(entry, s, 2);
             return .{ .k = kv[0], .v = kv[1], .owned = true };
         }
@@ -8944,8 +8994,10 @@ pub const KVCache = struct {
     /// cap. Runs AFTER this forward's view is built: the view slices the
     /// pre-compaction buffer and holds it alive, so the rows it reads are never
     /// the rows this drops.
-    fn ringCompact(self: *KVCache, entry: *KVCacheEntry, s: mlx.mlx_stream) !bool {
+    fn ringCompact(self: *KVCache, layer: u32, s: mlx.mlx_stream) !bool {
+        const entry = &self.entries[layer];
         if (self.swa_ring_window == 0 or !entry.ringed) return false;
+        if (self.ring_marks.len > 0) self.captureRingMarks(layer, s);
         if (entry.offset <= ringCap(self.swa_ring_window)) return false;
         const keep = ringKeep(self.swa_ring_window);
         const drop = entry.offset - keep;
@@ -52743,6 +52795,84 @@ test "a ring restored from a checkpoint below its position still checkpoints a s
     try short.restore(&entry);
     try short.restoreRing(&cp);
     try std.testing.expectError(error.SlidingRingRewindPastWindow, short.ringCheckpoint(low + window - 1, s));
+}
+
+fn snapshotsBitEqual(a: *const KVCacheSnapshot, b: *const KVCacheSnapshot, s: mlx.mlx_stream) !bool {
+    if (a.step != b.step or a.entries.len != b.entries.len) return false;
+    for (a.entries, b.entries) |*x, *y| {
+        if (x.initialized != y.initialized or x.ringed != y.ringed) return false;
+        if (!x.initialized) continue;
+        if (x.base != y.base or x.offset != y.offset) return false;
+        const pairs = [_][2]mlx.mlx_array{
+            .{ x.keys, y.keys },                   .{ x.values, y.values },
+            .{ x.keys_scales, y.keys_scales },     .{ x.keys_biases, y.keys_biases },
+            .{ x.values_scales, y.values_scales }, .{ x.values_biases, y.values_biases },
+        };
+        for (pairs) |p| {
+            if ((p[0].ctx == null) != (p[1].ctx == null)) return false;
+            if (p[0].ctx == null) continue;
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, p[0], p[1], false, s));
+            try mlx.check(mlx.mlx_array_eval(eq));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            if (!same) return false;
+        }
+    }
+    return true;
+}
+
+fn ringMarksCapture(kv_cfg: KVQuantConfig) !void {
+    const alloc = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const end: usize = 1400;
+    // Inside a write that does not compact, two inside one that does, and one never reached.
+    const at = [_]usize{ 100, 610, 690, end + 5 };
+
+    var live = try KVCache.initWithConfig(alloc, 2, kv_cfg);
+    defer live.deinit();
+    live.setSwaRing(window);
+    var twin = try KVCache.initWithConfig(alloc, 2, kv_cfg);
+    defer twin.deinit();
+    twin.setSwaRing(window);
+    var marks: [at.len]KVCacheSnapshot = undefined;
+    var n: usize = 0;
+    defer for (marks[0..n]) |*m| m.deinit();
+    for (at) |p| {
+        marks[n] = try live.ringMark(p);
+        n += 1;
+    }
+    live.ring_marks = &marks;
+    // Every view the marked cache hands a forward is its unmarked twin's.
+    try ringCheckpointFeed(&live, &twin, window, 0, end, 300);
+    live.ring_marks = &.{};
+    var kept = try live.snapshotRetained(s);
+    defer kept.deinit();
+    var twin_kept = try twin.snapshotRetained(s);
+    defer twin_kept.deinit();
+    try std.testing.expect(try snapshotsBitEqual(&kept, &twin_kept, s));
+
+    for (marks[0 .. at.len - 1]) |*m| {
+        try std.testing.expect(live.ringMarkComplete(m));
+        var ref = try KVCache.initWithConfig(alloc, 2, kv_cfg);
+        defer ref.deinit();
+        ref.setSwaRing(window);
+        var scratch = try KVCache.initWithConfig(alloc, 2, kv_cfg);
+        defer scratch.deinit();
+        try ringCheckpointFeed(&ref, &scratch, window, 0, m.step, 300);
+        var want = (try ref.ringCheckpoint(m.step, s)) orelse return error.TestExpectedRingCheckpoint;
+        defer want.deinit();
+        try std.testing.expect(try snapshotsBitEqual(m, &want, s));
+    }
+    try std.testing.expect(!live.ringMarkComplete(&marks[at.len - 1]));
+}
+
+test "a ring mark holds the checkpoint at its position, taken as the writes pass it, and changes no view" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try ringMarksCapture(KVQuantConfig.dense);
+    try ringMarksCapture(.{ .scheme = .affine, .bits = 8, .group_size = 32 });
 }
 
 /// Max |a-b| between two same-shaped float arrays, with a NaN guard (a NaN

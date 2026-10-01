@@ -888,8 +888,8 @@ pub const ModelConfig = struct {
         return @as(u64, self.sliding_window) + SWA_RING_CHECKPOINT_BACKOFF;
     }
 
-    /// Dense bytes of one ring checkpoint: a slot holds one from its restore and
-    /// one from prefill end to its commit; a hot entry keeps up to four.
+    /// Dense bytes of one ring checkpoint (`prefix_cache.SLOT_RING_CHECKPOINTS` per slot,
+    /// `RING_CHECKPOINT_MAX` per hot entry).
     pub fn swaRingCheckpointBytes(self: *const ModelConfig) u64 {
         return self.swaRingCheckpointTokens() * self.slidingLayerKvBytesPerToken(self.num_hidden_layers);
     }

@@ -34,17 +34,32 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
   span (`ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
-  (`KVCache.ringCheckpoint`, `Entry.ring_cps`, the highest `RING_CHECKPOINT_MAX` = 4 kept): each ringed layer's
+  (`KVCache.ringCheckpoint`, `Entry.ring_cps`, up to `RING_CHECKPOINT_MAX` = 8): each ringed layer's
   window + 30 rows at a position (down to the window when the ring holds no more, as one restored off a checkpoint
-  does); the slot's own are its restore point and its prompt end (`SlotRingCps`). A reply longer than the
+  does); the slot's own are its restore point, its prompt end and its message marks (`SlotRingCps`). A reply longer than the
   ring's slack compacts it past where the next turn diverges (the previous reply re-renders); the checkpoint's rows
   go under the ringed layers (`restoreRing`) and the usual clamp follows.
   A checkpoint restore of fewer than `RING_RESTORE_MIN_TOKENS` (64) cold-prefills: below it a restore cost more than
   the cold prefill it replaced.
-  Below both, `SlidingRingRewindPastWindow` → cold prefill.
+  Below both, `SlidingRingRewindPastWindow` → cold prefill, and the declined entry keeps its recency: promoted, a
+  header-only match made the entry a later turn needed the next count-cap victim.
+- **A ringed prefill marks the message starts it forwards** (`ringMarkPositions`: `<|im_start|>` past the restored
+  prefix and short of the prompt end's reach, at most `RING_MARKS_MAX` = 4, thinned keeping the first and the last):
+  each ringed KV write fills a mark it reaches before its compaction drops the rows (`KVCache.ring_marks`), so no
+  chunk is split and the forward is unchanged. A new session sharing only another's system prompt and tools
+  diverges inside its first user message, below every fork and prompt end, and restores at that mark.
+  Measured (MiMo 2.3bpw, kv8, MTP and prefix cache at their defaults, a 12,042-token tools + system prefix, a
+  ~300-token first task, 12,346-token prompts, `taskpolicy -a`, lock per boot, busy box, 2026-10-01). One boot of
+  63476cd1: the first session cold-prefills in 9,876 ms; the second and third restore 12,037 / 12,042 tokens and
+  prefill in 434 / 420 ms. One boot of main 819b4751: the first session cold in 15,682 ms, and the second and third
+  cold again (`cached_n` 0) in 14,970 / 14,582 ms. Splitting a chunk at the boundary instead would cost ~0.4 s per
+  split on MiMo (the fixed per-chunk cost the 2025- and 4096-row prefill meter rows imply).
+- **Ring checkpoints thin span-preserving** (`thinRingCps`, on merge, inheritance and shed): the lowest (a shared
+  preamble's mark) and the newest stay longest; kept highest-first, a conversation's later turns pushed the preamble's
+  mark out after two turns.
 - **The SSD tier restores a ringed entry only at a ring file** (`bestRingMatch`, `restoreIntoRinged`): chunks hold the
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
-  the highest `RING_DISK_MAX_PER_ENTRY` = 8 kept, salvaged per file at scan; manifest v9, which an older reader
+  `RING_DISK_MAX_PER_ENTRY` = 8 kept, thinned as in RAM, salvaged per file at scan; manifest v9, which an older reader
   drops) ([arch-mimo-v2](arch-mimo-v2.md#sliding-layers-the-ring)).
 - **A disk restore fills its buffers chunk by chunk** (`restoreKvInto`): each chunk is evaluated into buffers
   allocated at the restored length before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
@@ -91,7 +106,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   where the ceiling holds it beside the weights, the n-gram page cache (`page_cache_claim`) and a cold full-context
   prompt's bill (MiMo refuses rather than evicts); else that room, at most half the bill, so an outgrown session's
   trim copy fits beside it. A flag stands, `2GB` too; context sizing and the chunk pin still read the raw ask.
-- A replacement over the budget sheds its lowest ring checkpoints before the entry goes (`shedRingCheckpoints`).
+- A replacement over the budget sheds ring checkpoints (thinned as above) before the entry goes (`shedRingCheckpoints`).
 - Measured (b9dbbf53 plus this change, Sushi-3bpw, auto context 1M, kv8, MTP on; a ~200k-token three-turn session; `taskpolicy -a`,
   fans max, GPU lock per boot; 2026-09-27): unset, the budget is 11516 MB and turns 2-3 prefill in 0.35 s (199.7k
   reused); `--prefix-cache-mem 2GB` keeps a 139k-147k prefix and prefills in 36.0 / 31.3 s (turn 1: 114-115 s cold). The

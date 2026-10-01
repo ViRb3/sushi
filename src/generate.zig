@@ -18239,6 +18239,65 @@ test "mimo PLD rounds decode like serial ticks and write the cache in place (MIM
     }
 }
 
+fn arraysBitEqual(x: mlx.mlx_array, y: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, x, y, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    return same;
+}
+
+test "mimo ring marks leave the prefill's logits, cache and greedy tokens unchanged (MIMO_V2_MODEL)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| a.free(p);
+    var weights = try model_mod.loadWeightsForConfig(io, a, std.mem.span(model_dir), &config, false);
+    defer weights.deinit();
+    try transformer_mod.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var tok_dummy: Tokenizer = undefined;
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    // 512-row chunks: the first mark falls in a chunk that does not compact the ring, the others in ones that do.
+    var prompt: [1500]u32 = undefined;
+    for (&prompt, 0..) |*v, i| v.* = @intCast((i * 7) % config.vocab_size);
+    const at = [_]usize{ 300, 700, 1100 };
+    for ([_]transformer_mod.KVQuantConfig{ transformer_mod.KVQuantConfig.dense, transformer_mod.KVQuantConfig.affine(8) }) |kv| {
+        var plain = try pldTestTransformer(io, config, &weights, kv);
+        defer plain.deinit();
+        var marked = try pldTestTransformer(io, config, &weights, kv);
+        defer marked.deinit();
+        var marks: [at.len]transformer_mod.KVCacheSnapshot = undefined;
+        var n: usize = 0;
+        defer for (marks[0..n]) |*m| m.deinit();
+        for (at) |p| {
+            marks[n] = try marked.cache.ringMark(p);
+            n += 1;
+        }
+        var plain_gen = try Generator.initWithOptions(io, a, &plain, &tok_dummy, &prompt, 24, greedy, &.{}, .{ .pinned_prefill_chunk = 512 });
+        defer plain_gen.deinit(a);
+        marked.cache.ring_marks = &marks;
+        var marked_gen = try Generator.initWithOptions(io, a, &marked, &tok_dummy, &prompt, 24, greedy, &.{}, .{ .pinned_prefill_chunk = 512 });
+        defer marked_gen.deinit(a);
+        marked.cache.ring_marks = &.{};
+
+        for (&marks) |*m| try testing.expect(marked.cache.ringMarkComplete(m));
+        try testing.expect(try arraysBitEqual(plain_gen.pending_logits, marked_gen.pending_logits, plain.s));
+        for (plain.cache.entries, 0..) |e, li| {
+            try testing.expectEqual(e.offset, marked.cache.entries[li].offset);
+            try testing.expect(try kvRowsEqual(&plain, &marked, li, e.offset));
+        }
+        for (0..16) |_| {
+            const want = (try plain_gen.next(a)) orelse return error.ShortSerial;
+            try testing.expectEqual(want, (try marked_gen.next(a)) orelse return error.ShortSerial);
+        }
+    }
+}
+
 test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {
     // DSpark is opt-in at load; the nextDspark arm below needs it armed.
     _ = setenv("SUSHI_DSV4_DSPARK", "1", 1);

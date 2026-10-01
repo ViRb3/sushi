@@ -742,8 +742,7 @@ pub const Slot = struct {
         }
         // Salvaged-but-never-consumed cancelled-prefill checkpoints.
         self.cancelled_prefill.deinit();
-        if (self.ring_cps.fork) |*r| r.deinit();
-        if (self.ring_cps.prompt_end) |*r| r.deinit();
+        self.ring_cps.deinit();
         self.cache.deinit();
         if (self.ssm_entries) |entries| {
             if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
@@ -4895,10 +4894,7 @@ fn slotStateBytes(s: *const Slot) u64 {
     if (s.ssm_entries) |ents| for (ents) |*e| {
         bytes += transformer_mod.ssmEntryBytes(e);
     };
-    inline for (.{ s.ring_cps.fork, s.ring_cps.prompt_end }) |cp| {
-        if (cp) |c| bytes += transformer_mod.kvEntriesBytes(c.entries);
-    }
-    return bytes;
+    return bytes + s.ring_cps.bytes();
 }
 
 /// The part of `slotStateBytes` that `resident_hot_cache_bytes` already bills: a donated checkout's
@@ -6474,6 +6470,19 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         .hc = if (slot.model.prefix_cache) |*p| p else null,
     };
 
+    // A ringed cache keeps restore points only where its prefill passes: mark the message starts,
+    // where a new session sharing this one's preamble diverges.
+    if (slot.model.prefix_cache != null and slot.cache.swa_ring_window > 0) {
+        var at: [prefix_cache_mod.RING_MARKS_MAX]usize = undefined;
+        const positions = if (slot.model.tokenizer.?.specialTokenId(prefix_cache_mod.RING_MARK_TOKEN)) |im_start|
+            prefix_cache_mod.ringMarkPositions(slot.full_prompt, hot_matched, im_start, &at)
+        else
+            at[0..0];
+        slot.ring_cps.armMarks(&slot.cache, positions);
+    }
+    slot.cache.ring_marks = slot.ring_cps.markSlice();
+    errdefer slot.cache.ring_marks = &.{};
+
     // Ownership of the restored spec caches transfers AT THE CALL:
     // initWithOptions adopts them and frees them via its own errdefers on
     // any failure past adoption (a mid-prefill disconnect throws
@@ -6573,6 +6582,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .logprobs_n = slot.logprobs_n,
         },
     );
+    slot.cache.ring_marks = &.{};
+    slot.ring_cps.keepCompleteMarks(&slot.cache);
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;

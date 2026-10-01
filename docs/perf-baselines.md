@@ -622,6 +622,29 @@ final hidden states of a 2025-row chunk are byte-identical (0 of 8,294,400 bf16 
 - The synced profile overstated the trunk: unsynced microbenches put a sliding layer's FP8 QKV at 4.40 ms (MLX's bf16
   GEMM alone 4.04 ms, 60 TFLOPS) and the affine-8 o_proj at 2.74 ms (MLX `qmm_t_nax`, ~50 TFLOPS).
 
+<a id="mimo-mtp-vs-serial"></a>
+### MiMo 2.3bpw: MTP against serial per KV bucket (63476cd1; the 256k boot on 0f5e7a95)
+
+`--kv-quant 8`, MTP on (auto depth) against `enable_mtp:false` per request, greedy, thinking off, 256 tokens; the
+context is the repo's Zig source in the system message, the task a 300-word story (prose) or a Python LRU cache
+with tests (code). Per bucket and kind two pairs, each MTP request the first with its nonce (it restores at the
+user-message mark, so its heads see a full window) and its serial twin after it; MTP == serial bytes on all 24
+pairs. One boot for 4k-128k and one for 256k, `taskpolicy -a`, GPU lock, fans max, busy box, 2026-10-01. Decode
+tok/s, MTP / serial (accepted drafts per round):
+
+| context (tokens) | prose MTP | prose serial | prose ratio | code MTP | code serial | code ratio |
+|---|---|---|---|---|---|---|
+| 4,540 | 45.7 / 44.6 (0.71) | 43.1 / 42.5 | 1.05 | 64.1 / 66.6 (2.31) | 43.6 / 43.3 | 1.51 |
+| 15,874 | 42.4 / 44.3 (0.78) | 41.1 / 40.2 | 1.07 | 59.6 / 58.0 (1.95) | 41.4 / 39.9 | 1.45 |
+| 31,742 | 40.8 / 43.9 (0.76) | 38.6 / 39.5 | 1.08 | 55.2 / 54.4 (1.55) | 37.9 / 38.4 | 1.44 |
+| 57,586 | 38.9 / 39.2 (0.66) | 37.2 / 36.5 | 1.06 | 50.4 / 50.6 (1.72) | 38.9 / 39.4 | 1.29 |
+| 109,468 | 33.0 / 34.6 (0.68) | 35.6 / 36.2 | 0.94 | 48.8 / 46.1 (1.53) | 34.0 / 36.4 | 1.35 |
+| 211,087 | 26.7 / 26.8 (0.89) | 32.7 / 32.4 | 0.82 | 39.7 / 37.1 (1.90) | 30.5 / 30.8 | 1.25 |
+
+Prose stops paying past ~100k keys (each verify row reads every global key); code pays at every context. The
+adaptive serial switch stays qwen4_exp-only: on MiMo it could win only on prose past ~100k, and a per-request
+`enable_mtp:false` already gives a long prose request the serial rate.
+
 <a id="mimo-mtp-round"></a>
 ### MiMo-V2.6-Flash-Sushi-2.3bpw: where an MTP round goes (2f15cc97)
 

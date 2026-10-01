@@ -108,17 +108,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   window declines by NAME (`SlidingRingRewindPastWindow`) and the hot-cache restore cold-prefills; a byte-budget trim
   lands only at the entry's end or a ring checkpoint ([engine-prefix-cache](engine-prefix-cache.md#candidate-ranking-and-trimming)).
 - **The SSD tier persists a ringed entry as chunks of the global layers plus one ring file per restore point**
-  (`r{pos}.safetensors`: the prompt end, inherited forks, the entry's end) and restores only at one of them
+  (`r{pos}.safetensors`: the prompt end, message marks, inherited forks, the entry's end) and restores only at one of them
   (`restoreIntoRinged`, manifest v9); a ringed slot never takes an entry without them (its sliding layers are billed
   as the ring, so a full prefix there would be unbilled).
 - **A hot entry keeps a prompt-end ring checkpoint** (window + 30 rows per sliding layer): a reply past ~256 tokens
   compacts the ring past the prompt end, and a client that sends back content only diverges at prompt + 1 (history
   renders `<think></think>` where the model wrote its thought; one that echoes `reasoning_content` matches the whole
   entry). The content-only reply re-prefills at its new positions; the restore keeps the conversation before it
-  ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's two copies
-  beside the ring (at its restore and its prompt end; 158 rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`);
-  each entry bills its own in `kv_bytes`, up to four with those it inherits from the entry it forked off
-  (`bestRingDonor`).
+  ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's
+  `SLOT_RING_CHECKPOINTS` = 6 copies beside the ring (its restore, up to four message marks, its prompt end; 158
+  rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`); each entry bills its own in `kv_bytes`, up to eight with
+  those it inherits from the entry it forked off (`bestRingDonor`).
 - **A hot entry holds a ringed layer's RETAINED ROWS, never the ring's capacity** (`KVCache.snapshotRetained`): the
   buffer is allocated at `ringCap` from token one, so a plain share billed and pinned rows no restore can read.
 - Per token: bf16 288 KiB → 22.5 KiB, kv8 153 KiB → 12.0 KiB; ring per slot 122 MiB bf16, 65 MiB kv8.
@@ -258,7 +258,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   to 4096 whose admission bill fits live memory. The ungated load-time pin subtracts the hot-cache ask first and
   pinned 2048 (512 before the fused sliding prefill) at every context; an explicit `--prefill-chunk` caps that ladder.
 - **A MiMo prefill evicts the hot cache to be admitted** (`admissionEvictsHotCache`): the warm credit is the restored
-  global rows only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and its two checkpoint
+  global rows only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and the slot's checkpoint
   copies are billed whole every turn, and a shared or SSD restore credits nothing. Adaptive width and mid-prefill
   stepping stay qwen4_exp-only.
 - **A ringed arch RESERVES its cache capacity up front** (`ModelConfig.reservesKvCapacity`, narrower than

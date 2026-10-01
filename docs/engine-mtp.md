@@ -54,7 +54,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - The `.mimo` arm maps the generic stash + merged first step onto head 0 and each later step onto head i
   (`draftStep`); the step index rides `hidden_next` (a scalar), host token ids ride `host_ids`. Depth and the free
   EV cap clamp to the head count and to the verify row budget; rounds stay solo (`mtpRoundsStaySolo`); no
-  prefix-cache persistence (the head rebuilds from the prompt's last window).
+  prefix-cache persistence (the head rebuilds from the forwarded tail's last window).
+- **The heads need no state across a prefix-cache restore**: a warm full reuse, whose heads start from one row,
+  decodes as fast as the same greedy request prefilled cold (56.5 vs 56.1 tok/s, 1.71 vs 1.51 accepted per round;
+  12 pairs, 2k-8k context, code and prose, one boot, 63476cd1, kv8, `taskpolicy -a`, busy box, 2026-10-01). The heads
+  draft from the trunk's hidden at the current position; their own window adds nothing measurable.
 - **The load warms every verify row count and head** (`warmupMimoVerify`, `Head.warmup`, `[spec-warmup] MiMo …`): each
   row count JITs its own pipelines, and a new binary's first round at each width stalled 450-630 ms.
 - **Verify rows keep decode arithmetic** (`ForwardCtx.verify_rows`, up to `MIMO_VERIFY_ROWS_MAX` = 4 rows, the FP8

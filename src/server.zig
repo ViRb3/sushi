@@ -5434,12 +5434,12 @@ pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
 
 /// Context-INDEPENDENT bytes one live slot holds beside its per-token KV: the
 /// qwen4 QSA raw-key ring (not kv-quantized) and a ringed sliding layer's
-/// retained window plus two checkpoints, at the restore and at the prompt end
-/// (stored like any other cache row, so they follow `kv_bits`).
+/// retained window plus every checkpoint a slot holds (`SLOT_RING_CHECKPOINTS`;
+/// stored like any other cache row, so they follow `kv_bits`).
 /// Every sizer that used to add `qsaRingBytes` adds this instead — a second
 /// per-slot constant billed at only some of them is the under-bill class.
 pub fn slotRingBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
-    const swa = config.swaRingBytes() +| 2 *| config.swaRingCheckpointBytes();
+    const swa = config.swaRingBytes() +| prefix_cache_mod.SLOT_RING_CHECKPOINTS *| config.swaRingCheckpointBytes();
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits);
 }
 
@@ -24080,9 +24080,9 @@ test "the sliding ring is billed once per slot and staged per chunk token" {
     // Once per slot, at the width the cache stores — the twin of the QSA ring,
     // which this arch does not have.
     try t.expectEqual(@as(u64, 0), cfg.qsaRingBytes());
-    // The slot also holds two ring checkpoints until the commit takes them: where it restored
-    // to, and its prompt end.
-    const ring_and_cp = cfg.swaRingBytes() + 2 * cfg.swaRingCheckpointBytes();
+    // The slot also holds its ring checkpoints until the commit takes them: where it restored
+    // to, the message starts its prefill crossed, and its prompt end.
+    const ring_and_cp = cfg.swaRingBytes() + prefix_cache_mod.SLOT_RING_CHECKPOINTS * cfg.swaRingCheckpointBytes();
     try t.expectEqual(ring_and_cp, slotRingBytes(&cfg, 16));
     try t.expectEqual(kvBytesPerTokenAtBits(ring_and_cp, 8), slotRingBytes(&cfg, 8));
     try t.expect(slotRingBytes(&cfg, 8) < slotRingBytes(&cfg, 16));
