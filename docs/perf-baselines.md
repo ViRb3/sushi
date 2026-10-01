@@ -895,6 +895,20 @@ differ, both are shown:
 | 128k | 94.0 | 69.8 | 1.43 | 165.2 | 43% | 793 | 759 |
 | 256k | 187.9 | 306.2 | 2.85 | 497.0 | 62% | 527 | |
 
+- The ladder column ran 4096-row chunks: MiMo picks its width per request, and before 2048 became its default the
+  64k-256k bills admitted 4096. The 2048 on the load line was only the load-time fallback.
+- 4096 vs 2048 in one boot. Build: a scratch build of 27e81cfc that caps each long request's width in turn. Lock
+  `lp-abba1`, 2026-10-01, the same 63,946-token code prompt each time, prefix cache off, thinking off, kv8, MTP on,
+  `taskpolicy -a`, fans at max. Prefill: 64.1 s at 4096, 70.4 and 72.6 s at 2048, then 75.5 s at 4096. Each request
+  ran slower than the one before (the sustained-load clock drop), and the ABBA means (69.8 vs 71.5 s) are within
+  that drift.
+  - A per-chunk fit of the live trace puts global attention at 25-27% of the prefill at 2048 and 26-32% at 4096.
+    Attention costs ~8% more per row-key at qL 4096, and the rest of the chunk is cheaper per row.
+  - The two widths are not byte-identical: the first-token logprob is -1.0685 at 4096 and -1.0807 at 2048. Each
+    width repeated its own bytes exactly.
+  - 2048 is now the default ([engine-memory-admission](engine-memory-admission.md#context-and-chunk)), so the
+    table's 2048 model is the served width.
+
 <a id="mimo-verify-global-rows"></a>
 ### MiMo verify rows on the global layers: one page walk per row group (A6)
 

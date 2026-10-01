@@ -3486,13 +3486,23 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown.
-        if (config.pinned_prefill_chunk < generate_mod.prefill_chunk_override and
-            !generate_mod.prefill_chunk_explicit)
-        {
-            log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefill_chunk_override });
+        if (!generate_mod.prefill_chunk_explicit) {
+            var buf: [256]u8 = undefined;
+            if (prefillChunkLoadLine(&buf, config, config.pinned_prefill_chunk, generate_mod.prefill_chunk_override)) |line| log.info("{s}", .{line});
         }
     }
     return config.pinned_prefill_chunk;
+}
+
+/// The load line for the frozen width, null when there is nothing to say. On a per-request arch every
+/// request prices its own rung against live memory, so the pin is only the fallback.
+pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pinned: u32, launch: usize) ?[]const u8 {
+    if (perRequestPrefillChunkEnabled(config) and generate_mod.envPrefillChunk() == 0) {
+        const widest = rungWidth(config, 1, PREFILL_CHUNK_LADDER[0], config.longCtxGated());
+        return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d} (SUSHI_PREFILL_CHUNK_PER_REQUEST=0)\n", .{ widest, pinned }) catch null;
+    }
+    if (pinned >= launch) return null;
+    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ pinned, launch }) catch null;
 }
 
 /// PURE: clamp the hot prefix cache's byte budget to what the loaded weights
@@ -24326,8 +24336,8 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
     const roomy: u64 = 200 << 30;
 
     try t.expect(cfg.perRequestPrefillChunk());
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 4096, 256, kv_bits, roomy, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 4096, 256, kv_bits, roomy, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{}));
 
     // Admitted at its exact bill; a byte under steps down the ladder, not back to the pin.
     const need = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 2048, .{});
@@ -24336,8 +24346,41 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
 
     // The forward never runs wider than the chooser prices, and runs the admitted width to the end:
     // the per-chunk estimator is calibrated on qwen4_exp and stepped a 64k MiMo prompt down to 512.
-    try t.expectEqual(@as(usize, 4096), generate_mod.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 0));
+    try t.expectEqual(@as(usize, 2048), generate_mod.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 0));
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+
+    // 2048 is a default: an explicit `--prefill-chunk 4096` raises the ladder's top rung, billed at that width.
+    const saved_explicit = generate_mod.prefill_chunk_explicit;
+    const saved_chunk = generate_mod.prefill_chunk_override;
+    defer {
+        generate_mod.prefill_chunk_explicit = saved_explicit;
+        generate_mod.prefill_chunk_override = saved_chunk;
+    }
+    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefill_chunk_override = 4096;
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 4096, .{}));
+    const need4096 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{});
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, need4096 - 1, pin, 4096, .{}));
+}
+
+test "the load line calls a per-request arch's pin the fallback, not the width it prefills at" {
+    const t = std.testing;
+    transformer_mod.fused256_override = true;
+    defer transformer_mod.fused256_override = null;
+    const saved = per_request_chunk_override;
+    defer per_request_chunk_override = saved;
+    const cfg = mimoV2FlashBillConfig();
+    var buf: [256]u8 = undefined;
+
+    per_request_chunk_override = true;
+    const line = prefillChunkLoadLine(&buf, &cfg, 1024, 8192).?;
+    try t.expect(std.mem.indexOf(u8, line, "per request, up to 2048 at a short prompt") != null);
+    try t.expect(std.mem.indexOf(u8, line, "fallback 1024") != null);
+
+    // With the ladder off the pin is the width every request runs.
+    per_request_chunk_override = false;
+    try t.expectEqualStrings("Prefill chunk: 1024 tokens (memory-sized down from 8192; --prefill-chunk overrides)\n", prefillChunkLoadLine(&buf, &cfg, 1024, 8192).?);
+    try t.expectEqual(@as(?[]const u8, null), prefillChunkLoadLine(&buf, &cfg, 8192, 8192));
 }
 
 test "mimo_v2 admission credits the hot cache: a gap the cache covers is an evict, not a refusal" {

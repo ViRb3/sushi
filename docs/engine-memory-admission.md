@@ -65,7 +65,11 @@ architectures need their own measured envelope. These runs do not simulate a 64 
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp and the ringed mimo_v2) re-picks the width for every
   request: the widest rung whose admission bill fits live memory (`chooseRequestPrefillChunk`), stepping down per
   chunk under pressure; the load-time pin is only the fallback. `boundedPrefillChunk` still caps the rung per arch
-  (4096 at qk 192).
+  (qk 192: 2048 by default, up to 4096 with an explicit `--prefill-chunk`).
+- **The load line names a per-request arch's pin as the fallback** (`prefillChunkLoadLine`: "per request, up to N at
+  a short prompt; load-time fallback M"; Flash-Next's bound narrows as the context grows). MiMo's pin swings 512-2048 between boots with the memory active at load (the ungated cap,
+  (ceiling - active - hot-cache ask) / 4, is ~4 GiB beside a 3.6 GiB 2048 reserve), while every request up to 256k
+  prefills at 2048 (bill 4.7 GiB at 64k, 7.5 GiB at 256k, against ~17.9 GiB available).
 - An explicit `--ctx-size` outranks auto-context and `model-settings.json` `ctx_size`.
 - Disconnect cancellation takes effect at the next prefill chunk boundary; a wall-time cancellation test must bound
   its chunk size rather than assume the auto-sized chunk fits a fixed deadline.
