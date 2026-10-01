@@ -1370,6 +1370,8 @@ pub const Engine = struct {
         engine.layers = layers;
         var initialized: usize = 0;
         errdefer {
+            // The layers' slabs go before the layers: the outer `releaseSlabs` finds none left.
+            engine.releaseSlabs();
             for (layers[0..initialized]) |*layer| if (layer.active) layer.cache.deinit();
             engine.layers = &.{};
             allocator.free(layers);
@@ -1377,9 +1379,7 @@ pub const Engine = struct {
         for (layers, 0..) |*layer, layer_index| {
             initialized += 1;
             if (!engine.store.hasExpertLayer(@intCast(layer_index))) continue;
-            var cache = try GroupCache.init(allocator, plan.slots_per_layer, geometry.experts);
-            errdefer cache.deinit();
-            layer.* = .{ .cache = cache, .active = true };
+            layer.* = .{ .cache = try GroupCache.init(allocator, plan.slots_per_layer, geometry.experts), .active = true };
             layer.slabs = try createSlabSetAt(allocator, &engine.store, @intCast(layer_index), plan.slots_per_layer, s);
             engine.slab_imports += presentSlabCount(layer.slabs);
         }
@@ -2152,7 +2152,7 @@ test "real qwen expert store spans and source bytes are exact" {
     try t.expectEqualSlices(u8, direct, combined);
 }
 
-fn writeTinyExpertCheckpoint(allocator: std.mem.Allocator, dir: std.Io.Dir, experts: u16, hidden: u32, inter: u32) ![]u8 {
+pub fn writeTinyExpertCheckpoint(allocator: std.mem.Allocator, dir: std.Io.Dir, experts: u16, hidden: u32, inter: u32) ![]u8 {
     const io = std.testing.io;
     const gate_key = "model.language_model.layers.0.mlp.experts.gate_up_proj";
     const down_key = "model.language_model.layers.0.mlp.experts.down_proj";

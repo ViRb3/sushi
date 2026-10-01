@@ -12301,6 +12301,34 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     try t.expect(xfm.qwen4_mtp_owner == null);
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "a streamed expert engine whose imatrix collector fails is deinit'd, not only freed" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const raw = try expert_stream_mod.writeTinyExpertCheckpoint(t.allocator, tmp.dir, 4, 64, 64);
+    defer t.allocator.free(raw);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(t.io, &path_buf);
+    const config = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 1, .num_experts = 4, .expert_cache_bytes = 2 * 24576, .expert_source_dir = path_buf[0..path_len] };
+    // Armed capture: the collector is the allocation that can fail after the engine exists.
+    _ = setenv(imatrix_capture.ENV_VAR, "/nonexistent/imatrix.safetensors", 1);
+    defer _ = unsetenv(imatrix_capture.ENV_VAR);
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        const parts = Transformer.initExpertStream(failing.allocator(), &config, .{ .layers = 1, .experts = 4, .hidden = 64, .intermediate = 64 }, mlx.gpuStream()) catch continue;
+        try t.expect(parts.imatrix != null);
+        parts.imatrix.?.deinit();
+        parts.engine.deinit();
+        failing.allocator().destroy(parts.engine);
+        break;
+    }
+}
+
 test "qwen4 MTP head: a load that fails at any allocation frees what it took (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -17637,6 +17665,10 @@ pub const Transformer = struct {
         var qwen4_mtp: ?Qwen4Mtp = null;
         errdefer if (qwen4_mtp) |*m| m.deinit(allocator);
         var expert_stream: ?*expert_stream_mod.Engine = null;
+        errdefer if (expert_stream) |e| {
+            e.deinit();
+            allocator.destroy(e);
+        };
         var imatrix: ?*imatrix_capture.Collector = null;
         errdefer if (imatrix) |c| c.deinit();
         if (config.isQwen4()) {
@@ -17684,46 +17716,28 @@ pub const Transformer = struct {
                 if (qwen4_mtp) |*mtp_head| try evalQwen4MtpResident(mtp_head);
             }
             if (config.expert_streaming) {
-                const engine = try allocator.create(expert_stream_mod.Engine);
-                errdefer allocator.destroy(engine);
-                engine.* = try expert_stream_mod.Engine.initWithOptions(
-                    allocator,
-                    config.expert_source_dir orelse return error.MissingExpertSourceDir,
-                    .{
-                        .layers = @intCast(config.num_hidden_layers),
-                        .experts = @intCast(config.num_experts),
-                        .hidden = config.hidden_size,
-                        .intermediate = config.moe_intermediate_size,
-                        .exl3_n = config.expert_quant_rate.n,
-                    },
-                    config.expert_cache_bytes,
-                    s,
-                    .{ .layout = config.expert_layout },
-                );
-                expert_stream = engine;
-                imatrix = try imatrix_capture.Collector.forModel(allocator, s, config.model_type, config.num_hidden_layers, @intCast(config.num_experts));
-            }
-            log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, {s}), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, if (config.expert_streaming and st.table.bits == 16) "sharded pread" else "mmapped", config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
-        } else if (std.mem.eql(u8, config.model_type, "mimo_v2") and config.expert_streaming) {
-            const engine = try allocator.create(expert_stream_mod.Engine);
-            errdefer allocator.destroy(engine);
-            engine.* = try expert_stream_mod.Engine.initWithOptions(
-                allocator,
-                config.expert_source_dir orelse return error.MissingExpertSourceDir,
-                .{
+                const parts = try initExpertStream(allocator, &config, .{
                     .layers = @intCast(config.num_hidden_layers),
                     .experts = @intCast(config.num_experts),
                     .hidden = config.hidden_size,
                     .intermediate = config.moe_intermediate_size,
-                    .first_moe_layer = @intCast(config.first_k_dense_replace),
                     .exl3_n = config.expert_quant_rate.n,
-                },
-                config.expert_cache_bytes,
-                s,
-                .{ .layout = config.expert_layout },
-            );
-            expert_stream = engine;
-            imatrix = try imatrix_capture.Collector.forModel(allocator, s, config.model_type, config.num_hidden_layers, @intCast(config.num_experts));
+                }, s);
+                expert_stream = parts.engine;
+                imatrix = parts.imatrix;
+            }
+            log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, {s}), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, if (config.expert_streaming and st.table.bits == 16) "sharded pread" else "mmapped", config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
+        } else if (std.mem.eql(u8, config.model_type, "mimo_v2") and config.expert_streaming) {
+            const parts = try initExpertStream(allocator, &config, .{
+                .layers = @intCast(config.num_hidden_layers),
+                .experts = @intCast(config.num_experts),
+                .hidden = config.hidden_size,
+                .intermediate = config.moe_intermediate_size,
+                .first_moe_layer = @intCast(config.first_k_dense_replace),
+                .exl3_n = config.expert_quant_rate.n,
+            }, s);
+            expert_stream = parts.engine;
+            imatrix = parts.imatrix;
         }
 
         const profile_head_shape = mlx.getShape(lm_head_w);
@@ -24093,6 +24107,24 @@ pub const Transformer = struct {
             .cache = cache,
             .entry = entry,
         };
+    }
+
+    const ExpertStreamParts = struct { engine: *expert_stream_mod.Engine, imatrix: ?*imatrix_capture.Collector };
+
+    /// The streamed expert engine and the imatrix collector that rides it. Once built, the engine
+    /// is deinit'd on failure: its I/O workers run until `deinit` joins them.
+    fn initExpertStream(allocator: std.mem.Allocator, config: *const ModelConfig, geometry: expert_stream_mod.Geometry, s: mlx.mlx_stream) !ExpertStreamParts {
+        const engine = try allocator.create(expert_stream_mod.Engine);
+        {
+            errdefer allocator.destroy(engine);
+            engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, config.expert_source_dir orelse return error.MissingExpertSourceDir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout });
+        }
+        errdefer {
+            engine.deinit();
+            allocator.destroy(engine);
+        }
+        const im = try imatrix_capture.Collector.forModel(allocator, s, config.model_type, config.num_hidden_layers, @intCast(config.num_experts));
+        return .{ .engine = engine, .imatrix = im };
     }
 
     /// The head's PER-REQUEST half. Every request owns one and installs it on the

@@ -77,6 +77,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - A qwen4_exp load that fails after the n-gram state or the MTP head exists frees both (`Qwen4Mtp.deinit`; the
   state's `deinit` joins the table's warm thread first). Guard: the `QWEN4_TEST_MODEL` FailingAllocator sweep over
   `loadQwen4Mtp`.
+- A streamed load that fails after its expert engine exists deinits it (`initExpertStream`, both archs): freed
+  alone, its I/O workers ran on in freed memory. Guard: a FailingAllocator sweep over `initExpertStream` with the
+  imatrix collector armed.
 
 - **Bind**: `server.resolveBind` defaults to `127.0.0.1:12345`; `--host` takes an IPv4 literal, `0.0.0.0` or
   `localhost` (= 127.0.0.1; anything else is refused by name, never widened). Before any model loads,
