@@ -259,6 +259,9 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     `elapsed_seconds` (0 on a cached row) and do not emit `entry_id`; a
     donated checkout is counted once, QSA banks by their capacity buffers, a
     slot's ring restore points count, and `/props` gains only `kv_cache_bytes`.
+  * `ignore_eos` (`requestEosSlice` in `src/server.zig`), from mlx-serve
+    eca42620 (#590) by David Dalcu. Modifications: `/v1/completions` only;
+    a chat request that sets it is refused by name.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)

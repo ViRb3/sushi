@@ -1631,6 +1631,21 @@ fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
     return remaining < max_tokens / 4;
 }
 
+/// vLLM's `ignore_eos`: an EOS id does not end the reply, so it runs to `max_tokens`. Stop
+/// sequences and the loop stops still end it.
+fn requestEosSlice(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) []const u32 {
+    if (root.get("ignore_eos")) |v| if (v == .bool and v.bool) return &.{};
+    return config.eosTokenSlice();
+}
+
+/// Chat refuses `ignore_eos`: past its end of turn the model writes another turn, whose think
+/// block the non-stream reply merges into the reasoning and the live stream cannot.
+fn chatIgnoreEosRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const v = root.get("ignore_eos") orelse return null;
+    if (v != .bool or !v.bool) return null;
+    return "'ignore_eos' is supported on /v1/completions only: a chat reply ends at its end of turn";
+}
+
 /// The auto budget's own tightness question: under a quarter of the window left.
 fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
     return remaining < effective_ctx / 4;
@@ -8368,6 +8383,11 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     }
+    if (chatIgnoreEosRejectReason(root)) |reason| {
+        log.warn("POST /v1/chat/completions -> 400 (ignore_eos)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Extract messages
     const messages_val = root.get("messages") orelse {
@@ -9102,7 +9122,7 @@ fn handleCompletions(
         // (see the chat-completions site).
     }
 
-    const eos_slice = config.eosTokenSlice();
+    const eos_slice = requestEosSlice(config, root);
     const sampling = generate_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
@@ -25082,5 +25102,25 @@ test "liveSessions copies the queue snapshot and stamps the effective context li
 test "sushi coder load refusals retain named group errors" {
     for ([_]anyerror{ error.Exl3GroupMissing, error.Exl3GroupNameInvalid, error.Exl3MixedGroupLayout, error.Exl3GroupGeometry, error.Exl3GroupDtype, error.Exl3RouterWidthMismatch, error.Exl3TopKExceedsExperts, error.Exl3RaggedStreamingUnsupported, error.Exl3RouterGroupsUnsupported }) |err| {
         try std.testing.expect(loadRefusalFor(err) != null);
+    }
+}
+
+test "ignore_eos: a completion that sets it decodes past EOS; a chat request that sets it is refused by name" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{};
+    config.addEosToken(248044);
+    config.addEosToken(248046);
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_]struct { body: []const u8, stops: usize }{
+        .{ .body = "{\"ignore_eos\":true}", .stops = 0 },
+        .{ .body = "{\"ignore_eos\":false}", .stops = 2 },
+        .{ .body = "{\"max_tokens\":64}", .stops = 2 },
+        .{ .body = "{\"ignore_eos\":1}", .stops = 2 },
+    }) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
+        try t.expectEqual(c.stops, requestEosSlice(&config, parsed.value.object).len);
+        try t.expectEqual(c.stops == 0, chatIgnoreEosRejectReason(parsed.value.object) != null);
     }
 }
