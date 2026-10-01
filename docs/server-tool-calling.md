@@ -16,6 +16,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `arguments` ALWAYS valid JSON).
 - Serialization `chat.serializeMessagesJson`: role "tool" native, args as JSON STRINGS, every string via
   `appendJsonString`. Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
+- Buffered calls may exceed a client's inter-event progress deadline even while SSE keepalives arrive. The omp launcher
+  disables that deadline only for its Sushi provider; argument truncation and loop-stop rules remain unchanged.
 - **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion
   never worsens conformance; a parsed NAME never contains `<|`; no tag leaks. Harness:
   `src/tool_traffic_replay_test.zig` over `src/fixtures/tool_traffic.jsonl`.
