@@ -68202,6 +68202,8 @@ const QsaPoolTestTrunk = struct {
         t.s = s;
         t.allocator = testing.allocator;
         t.config = .{};
+        // qwen4_exp's YaRN spans its partial rotary slice; the default model_type spans the whole head.
+        t.config.model_type = "qwen4_exp";
         t.config.head_dim = 256;
         t.config.partial_rotary_factor = 0.25;
         t.config.rope_theta = 10_000_000.0;

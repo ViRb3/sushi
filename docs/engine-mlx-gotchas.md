@@ -62,6 +62,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - `.string` on unchecked `std.json.Value` panics.
 - A test that aliases embedded bytes through an alignment cast is a coin flip per binary: copy fixtures to aligned
   storage (Debug builds catch what ReleaseFast hides).
+- A failing `std.debug.assert` is UB in ReleaseFast: the full suite can pass while the same test, filtered alone,
+  dies with SIGTRAP (inlining decides whether the trap is emitted). Rerun it under ReleaseSafe for the panic.
 
 ## Tokenizer
 
