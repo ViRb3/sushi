@@ -66,6 +66,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   (`mimoVerifyRowsAttn`; a sliding layer's rows in one dispatch, `mimoSlidingRowsAttn`), the rest of the forward is
   row-identical already (FP8 GEMV <= 4 rows, `mtp_qmv` affine-8, the router rows' one f32 gemv
   `mtp_qmv.f32GemvRows`, the EXL3 decode chain). A partial accept truncates the cache (attention-only trunk).
+- **A global layer's verify rows share the packed-cache walk** (`mimoGlobalRowsMpp`, `sushi_qkv_mpp_rows`): from 4096
+  keys on matrix units, rows go in pairs, with a last three in one pass. Each K/V page is staged once per group, and
+  each row runs its decode tick's own matmuls, softmax and rescale on it.
+  - A group engages only where every row shares its last row's split partition. A shorter row then reads at most one
+    more page, fully masked, which adds exact zeros. Otherwise the rows go one by one.
+  - Byte-identical to decode ticks; -5% to -7% per verify forward at 128k keys
+    ([perf-baselines](perf-baselines.md#mimo-verify-global-rows)).
 - Oracle: `tests/dump_mimo_v2_mtp_fixtures.py` renders the heads from the HF reference's own modules on the tiny
   fixture model; `mimo mtp heads track the torch rendering…` replays history, rounds, wrong drafts and rollbacks.
 - **A MiMo verify row reads its own 8 routed experts**, so it costs a large share of a forward and depth pays only

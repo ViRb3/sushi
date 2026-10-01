@@ -6,8 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
-- **Faster MiMo 2.3bpw**: the prefill's expert GEMMs, the MTP verify rows, the draft heads and long-prompt
-  attention do less work per token; output is byte-identical.
+- **Faster MiMo 2.3bpw**: the prefill's expert GEMMs, the MTP verify rows (whose global layers share one walk of a
+  long cache), the draft heads and long-prompt attention do less work per token; output is byte-identical.
 - **Faster Qwen3.8-Flash-Next prefill**: the expert routing table is built on the GPU and the expert outputs are
   reduced in place, with no host round trip or un-sort copy per layer; output is byte-identical.
 - **Greedy MiMo decode reads the vocabulary head through a coarse top-32 shortlist** re-scored on the full head,

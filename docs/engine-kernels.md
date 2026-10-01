@@ -135,6 +135,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **Metal caps each compiled kernel's threads per threadgroup by its register use**; MLX throws at a dispatch above it.
   M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
   A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
+- **A custom kernel whose source fails to compile kills the process** at its first eval (mlx-c `array.cpp:352`, exit
+  255). The JIT probe declines only kernels that build. Compile a new source offline first: wrap it in MLX's
+  custom-kernel template (inputs, their `_strides`, the attribute arguments, one instantiation per template set) and
+  run `xcrun -sdk macosx metal -std=metal4.0 -c -I lib/mlx/include`. That is CPU only and needs no GPU lock.
+- MSL takes no arrays of cooperative tensors ("cannot declare array of non-constant size type"). Name one per row:
+  `sushi_qkv_mpp_rows` expands a macro per row.
+- `matmul2d::run` and a cooperative tensor's `store` take lvalue tensors: bind a `slice<...>(...)` to a name before
+  passing it.
 
 ## Proving a kernel
 

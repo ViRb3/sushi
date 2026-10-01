@@ -15746,13 +15746,143 @@ const QKV_MPP_KERNEL_SOURCE =
     \\}
 ;
 
+// The same page walk for TQ verify rows at once: each page's K/V is staged once, and every row runs
+// the decode kernel's own GQA-row matmuls, softmax and rescale on it, so a row's partials are its
+// decode tick's when the rows share its page partition. q is (kv head, row, group head)-major.
+const QKV_MPP_ROWS_KERNEL_SOURCE =
+    \\using namespace mpp::tensor_ops;
+    \\constexpr int VPW = 32 / BITS;
+    \\constexpr int M = GQA;
+    \\constexpr int MR = GQA * TQ;
+    \\constexpr int N = 32;
+    \\constexpr int NT = 128;
+    \\constexpr int KC = DK / VPW / 2;
+    \\constexpr int VC = DV / VPW / 2;
+    \\constexpr int CPG = GS / VPW / 2;
+    \\constexpr int KIT = (N * KC + NT - 1) / NT;
+    \\constexpr int VIT = (N * VC + NT - 1) / NT;
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint hkv = threadgroup_position_in_grid.y;
+    \\const uint split = threadgroup_position_in_grid.z;
+    \\const uint nsplit = threadgroups_per_grid.z;
+    \\const int Tk = tk[0];
+    \\const float scale = scl[0];
+    \\const uint mask_bits = (1u << BITS) - 1u;
+    \\const int pages = (Tk + N - 1) / N;
+    \\const int per = (pages + int(nsplit) - 1) / int(nsplit);
+    \\const int pb = int(split) * per;
+    \\const int pe = min(pages, pb + per);
+    \\
+    \\threadgroup T tile[N * (DK > DV ? DK : DV)];
+    \\threadgroup float sp[MR * N];
+    \\threadgroup float rmax[MR];
+    \\threadgroup float rsum[MR];
+    \\threadgroup float pscale[MR];
+    \\
+    \\if (tid < uint(MR)) { rmax[tid] = -INFINITY; rsum[tid] = 0.0f; }
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\constexpr auto qk_desc = matmul2d_descriptor(M, N, DK, false, true, false, matmul2d_descriptor::mode::multiply);
+    \\constexpr auto pv_desc = matmul2d_descriptor(M, DV, N, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<qk_desc, execution_simdgroups<NT / 32>> qk;
+    \\matmul2d<pv_desc, execution_simdgroups<NT / 32>> pv;
+    \\auto qt = tensor((device T*)q + (long)hkv * MR * DK, dextents<int, 2>{DK, MR}, array<int, 2>{1, DK});
+    \\auto kt = tensor(tile, dextents<int, 2>{DK, N}, array<int, 2>{1, DK});
+    \\auto vt = tensor(tile, dextents<int, 2>{DV, N}, array<int, 2>{1, DV});
+    \\auto st = tensor(sp, dextents<int, 2>{N, MR}, array<int, 2>{1, N});
+    \\auto k0 = kt.template slice<DK, N>(0, 0);
+    \\auto v0 = vt.template slice<DV, N>(0, 0);
+    \\// One running output per verify row (MSL takes no arrays of cooperative tensors); TQ <= 4.
+    \\#define ROWS(X) X(0) if (TQ > 1) { X(1) } if (TQ > 2) { X(2) } if (TQ > 3) { X(3) }
+    \\#define RUN_DECL(b) auto running##b = pv.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(st.template slice<N, M>(0, 0))>, metal::remove_addrspace_t<decltype(v0)>, float>();
+    \\RUN_DECL(0) RUN_DECL(1) RUN_DECL(2) RUN_DECL(3)
+    \\#define RUN_ZERO(b) for (ushort i = 0; i < running##b.get_capacity(); ++i) if (running##b.is_valid_element(i)) running##b[i] = 0.0f;
+    \\ROWS(RUN_ZERO)
+    \\
+    \\const long kq0 = (long)hkv * kq_strides[1], ks0 = (long)hkv * ksc_strides[1], kb0 = (long)hkv * kbi_strides[1];
+    \\const long vq0 = (long)hkv * vq_strides[1], vs0 = (long)hkv * vsc_strides[1], vb0 = (long)hkv * vbi_strides[1];
+    \\uint2 kr[KIT]; float ksr[KIT], kbr[KIT];
+    \\uint2 vr[VIT]; float vsr[VIT], vbr[VIT];
+    \\#define QKV_LOAD(C, IT, REG, SREG, BREG, QP, Q0, QSTR, SP, S0, SSTR, BP, B0, BSTR, TOK0) \
+    \\  for (int i = 0; i < IT; ++i) { \
+    \\    const int c = int(tid) + i * NT; \
+    \\    if (c < N * C) { \
+    \\      const int n = c / C, ci = c % C, g = ci / CPG; \
+    \\      const long r = (long)min((TOK0) + n, Tk - 1); \
+    \\      REG[i] = ((const device uint2*)(QP + Q0 + r * QSTR[2]))[ci]; \
+    \\      SREG[i] = float(SP[S0 + r * SSTR[2] + g]); \
+    \\      BREG[i] = float(BP[B0 + r * BSTR[2] + g]); \
+    \\    } \
+    \\  }
+    \\#define QKV_STORE(C, D, IT, REG, SREG, BREG) \
+    \\  for (int i = 0; i < IT; ++i) { \
+    \\    const int c = int(tid) + i * NT; \
+    \\    if (c < N * C) { \
+    \\      threadgroup T* dst = tile + (c / C) * D + (c % C) * 2 * VPW; \
+    \\      for (int h = 0; h < 2; ++h) \
+    \\        for (int u = 0; u < VPW; ++u) \
+    \\          dst[h * VPW + u] = T(float((REG[i][h] >> (u * BITS)) & mask_bits) * SREG[i] + BREG[i]); \
+    \\    } \
+    \\  }
+    \\if (pb < pe) { QKV_LOAD(KC, KIT, kr, ksr, kbr, kq, kq0, kq_strides, ksc, ks0, ksc_strides, kbi, kb0, kbi_strides, pb * N) }
+    \\for (int page = pb; page < pe; ++page) {
+    \\  const int tok0 = page * N;
+    \\  QKV_STORE(KC, DK, KIT, kr, ksr, kbr)
+    \\  QKV_LOAD(VC, VIT, vr, vsr, vbr, vq, vq0, vq_strides, vsc, vs0, vsc_strides, vbi, vb0, vbi_strides, tok0)
+    \\  if (page + 1 < pe) { QKV_LOAD(KC, KIT, kr, ksr, kbr, kq, kq0, kq_strides, ksc, ks0, ksc_strides, kbi, kb0, kbi_strides, tok0 + N) }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\#define ROW_QK(b) { auto qb = qt.template slice<DK, M>(0, b * M); auto page_scores = qk.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(qb)>, metal::remove_addrspace_t<decltype(k0)>, float>(); qk.run(qb, k0, page_scores); auto sb = st.template slice<N, M>(0, b * M); page_scores.store(sb); }
+    \\  ROWS(ROW_QK)
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (int m = int(tid / 32u); m < MR; m += NT / 32) {
+    \\    const int n = int(tid % 32u);
+    \\    const int lim = Tk - TQ + 1 + m / M;
+    \\    const bool live = tok0 + n < lim;
+    \\    const float x = live ? sp[m * N + n] * scale : -INFINITY;
+    \\    const float prev = rmax[m];
+    \\    const float next = max(prev, simd_max(x));
+    \\    const float pr = live ? metal::exp(x - next) : 0.0f;
+    \\    sp[m * N + n] = pr;
+    \\    const float lsum = simd_sum(pr);
+    \\    if (n == 0) {
+    \\      const float sc = (next == -INFINITY || next == prev) ? 1.0f : metal::exp(prev - next);
+    \\      pscale[m] = sc;
+    \\      rsum[m] = rsum[m] * sc + lsum;
+    \\      rmax[m] = next;
+    \\    }
+    \\  }
+    \\  QKV_STORE(VC, DV, VIT, vr, vsr, vbr)
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\#define ROW_PV(b) { for (ushort i = 0; i < running##b.get_capacity(); ++i) { if (!running##b.is_valid_element(i)) continue; const auto c = running##b.get_multidimensional_index(i); running##b[i] *= pscale[b * M + c[1]]; } auto pb_ = st.template slice<N, M>(0, b * M); pv.run(pb_, v0, running##b); }
+    \\  ROWS(ROW_PV)
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\#undef QKV_LOAD
+    \\#undef QKV_STORE
+    \\#define ROW_OUT(b) for (ushort i = 0; i < running##b.get_capacity(); ++i) { if (!running##b.is_valid_element(i)) continue; const auto c = running##b.get_multidimensional_index(i); o_out[(((long)hkv * MR + b * M + c[1]) * nsplit + split) * DV + c[0]] = running##b[i]; }
+    \\ROWS(ROW_OUT)
+    \\#undef ROWS
+    \\#undef RUN_DECL
+    \\#undef RUN_ZERO
+    \\#undef ROW_QK
+    \\#undef ROW_PV
+    \\#undef ROW_OUT
+    \\if (tid < uint(MR)) {
+    \\  const long row = (long)hkv * MR + tid;
+    \\  m_out[row * nsplit + split] = max(rmax[tid], -1e30f);
+    \\  l_out[row * nsplit + split] = rsum[tid];
+    \\}
+;
+
 var qkv_mpp_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
-const QkvMppKey = struct { dk: c_int, dv: c_int, bits: u8, gs: u32, gqa: c_int, tq: c_int, dtype: mlx.mlx_dtype };
+var qkv_mpp_rows_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+const QkvMppKey = struct { dk: c_int, dv: c_int, bits: u8, gs: u32, gqa: c_int, tq: c_int, dtype: mlx.mlx_dtype, rows: bool = false };
 const QkvMppCfgKey = struct { t: QkvMppKey, h_kv: c_int, nsplit: c_int };
-var qkv_mpp_cfgs: [@intCast(QKV_VERIFY_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
-var qkv_mpp_cfg_keys: [@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvMppCfgKey = @splat(std.mem.zeroes(QkvMppCfgKey));
+/// [decode kernel, rows kernel][t_q]
+var qkv_mpp_cfgs: [2][@intCast(QKV_VERIFY_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(@splat(null));
+var qkv_mpp_cfg_keys: [2][@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvMppCfgKey = @splat(@splat(std.mem.zeroes(QkvMppCfgKey)));
 /// Template sets whose JIT build was proven on a one-page problem, and the ones that failed.
-var qkv_mpp_probed: [8]?struct { key: QkvMppKey, ok: bool } = @splat(null);
+var qkv_mpp_probed: [16]?struct { key: QkvMppKey, ok: bool } = @splat(null);
 var qkv_mpp_engaged: bool = false;
 
 /// µbench seam: split geometry (pages per split, split cap).
@@ -15846,21 +15976,29 @@ fn qkvMppRunProbe(kernel: mlx.mlx_fast_metal_kernel, key: QkvMppKey) bool {
 }
 
 fn qkvMppKernel() ?mlx.mlx_fast_metal_kernel {
-    if (qkv_mpp_kernel_cached) |k| return k;
+    return qkvMppKernelFor(&qkv_mpp_kernel_cached, "sushi_qkv_mpp", QKV_MPP_KERNEL_SOURCE);
+}
+
+fn qkvMppRowsKernel() ?mlx.mlx_fast_metal_kernel {
+    return qkvMppKernelFor(&qkv_mpp_rows_kernel_cached, "sushi_qkv_mpp_rows", QKV_MPP_ROWS_KERNEL_SOURCE);
+}
+
+fn qkvMppKernelFor(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, source: [*:0]const u8) ?mlx.mlx_fast_metal_kernel {
+    if (slot.*) |k| return k;
     const input_names = [_][*:0]const u8{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk" };
     const output_names = [_][*:0]const u8{ "m_out", "l_out", "o_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kk = mlx.mlx_fast_metal_kernel_new("sushi_qkv_mpp", in_vec, out_vec, QKV_MPP_KERNEL_SOURCE, QSA_SCORE_KERNEL_HEADER, false, false);
+    const kk = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, QSA_SCORE_KERNEL_HEADER, false, false);
     if (kk.ctx == null) return null;
-    qkv_mpp_kernel_cached = kk;
+    slot.* = kk;
     return kk;
 }
 
-/// Build the template set a MiMo global decode row dispatches past the packed floor, before a
-/// request needs it (its probe is the JIT).
+/// Build the template sets a MiMo global decode row and a verify's row groups (`mimoGlobalRowsGroup`)
+/// dispatch past the packed floor, before a request needs them (each probe is its JIT).
 fn mimoWarmPackedDecode(config: *const ModelConfig, kv_config: KVQuantConfig) void {
     const kernel = qkvMppKernel() orelse return;
     var li: u32 = 0;
@@ -15868,7 +16006,7 @@ fn mimoWarmPackedDecode(config: *const ModelConfig, kv_config: KVQuantConfig) vo
     if (li == config.num_hidden_layers) return;
     const h_kv: c_int = @intCast(config.layerKVHeads(li));
     if (h_kv == 0) return;
-    _ = qkvMppProbe(kernel, .{
+    var key = QkvMppKey{
         .dk = @intCast(config.layerHeadDim(li)),
         .dv = @intCast(config.layerVHeadDim(li)),
         .bits = kv_config.bits,
@@ -15876,11 +16014,23 @@ fn mimoWarmPackedDecode(config: *const ModelConfig, kv_config: KVQuantConfig) vo
         .gqa = @divTrunc(@as(c_int, @intCast(config.num_attention_heads)), h_kv),
         .tq = 1,
         .dtype = .bfloat16,
-    });
+    };
+    _ = qkvMppProbe(kernel, key);
+    const rows_kernel = qkvMppRowsKernel() orelse return;
+    key.rows = true;
+    for ([_]c_int{ 2, 3 }) |tq| {
+        key.tq = tq;
+        _ = qkvMppProbe(rows_kernel, key);
+    }
 }
 
 /// Packed-KV attention through matmul2d, t_q 1..8, no mask or end-aligned causal. Null = declined.
 pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8) !?mlx.mlx_array {
+    return qkvAttnMpp(s, q_in, view, scale, mask_mode, false);
+}
+
+/// `rows`: causal verify rows through `QKV_MPP_ROWS_KERNEL_SOURCE`, each row its own GQA block.
+fn qkvAttnMpp(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8, rows: bool) !?mlx.mlx_array {
     if (!verifyQmmNaxAvailable()) return null;
     if (!view.has_quant_triple or view.group_size == 0) return null;
     if (view.bits != 4 and view.bits != 8) return null;
@@ -15915,26 +16065,45 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     if (gqa * t_q > 64) return null;
     const t_k: c_int = ks[2];
     if (t_k < t_q) return null;
+    // The rows kernel's matmuls take one GQA block per row, so the block must be whole rows of 8, and it
+    // names one running output per row, four at most.
+    if (rows and !(causal and t_q >= 2 and t_q <= 4 and @rem(gqa, 8) == 0)) return null;
 
-    const kernel = qkvMppKernel() orelse return null;
-    const tkey = QkvMppKey{ .dk = dk, .dv = dv, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .dtype = qdt };
+    const kernel = (if (rows) qkvMppRowsKernel() else qkvMppKernel()) orelse return null;
+    const tkey = QkvMppKey{ .dk = dk, .dv = dv, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .dtype = qdt, .rows = rows };
     if (!qkvMppProbe(kernel, tkey)) return null;
     const nsplit = qkvMppSplits(t_k);
     const real_rows: c_int = gqa * t_q;
     const m_rows = qkvMppMRows(tkey);
+    const cfgs = &qkv_mpp_cfgs[@intFromBool(rows)];
+    const cfg_keys = &qkv_mpp_cfg_keys[@intFromBool(rows)];
     const slot: usize = @intCast(t_q);
     const key = QkvMppCfgKey{ .t = tkey, .h_kv = h_kv, .nsplit = nsplit };
-    if (qkv_mpp_cfgs[slot] == null or !std.meta.eql(qkv_mpp_cfg_keys[slot], key)) {
+    if (cfgs[slot] == null or !std.meta.eql(cfg_keys[slot], key)) {
         const config = try qkvMppConfig(tkey, h_kv, nsplit);
-        if (qkv_mpp_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        qkv_mpp_cfgs[slot] = config;
-        qkv_mpp_cfg_keys[slot] = key;
+        if (cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        cfgs[slot] = config;
+        cfg_keys[slot] = key;
     }
 
     // [1, Hq, TQ, D] is already (kv head, group head, row)-major: [Hkv, real_rows, D], zero-padded.
+    // The rows kernel takes (kv head, row, group head) instead.
     var q3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(q3);
-    try mlx.check(mlx.mlx_reshape(&q3, q_in, &[_]c_int{ h_kv, real_rows, dk }, 3, s));
+    if (rows) {
+        var q4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q4);
+        try mlx.check(mlx.mlx_reshape(&q4, q_in, &[_]c_int{ h_kv, gqa, t_q, dk }, 4, s));
+        var qt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qt);
+        try mlx.check(mlx.mlx_transpose_axes(&qt, q4, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+        var qc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qc);
+        try mlx.check(mlx.mlx_contiguous(&qc, qt, false, s));
+        try mlx.check(mlx.mlx_reshape(&q3, qc, &[_]c_int{ h_kv, real_rows, dk }, 3, s));
+    } else {
+        try mlx.check(mlx.mlx_reshape(&q3, q_in, &[_]c_int{ h_kv, real_rows, dk }, 3, s));
+    }
     var qp = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(qp);
     if (m_rows > real_rows) {
@@ -15959,12 +16128,22 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, qkv_mpp_kernel_cached.?, inputs_vec, qkv_mpp_cfgs[slot].?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfgs[slot].?, s));
     const o_t = try qkvMergePartials(s, outputs_vec, qdt);
     defer _ = mlx.mlx_array_free(o_t);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, o_t, &[_]c_int{ 1, h_q, t_q, dv }, 4, s));
+    if (rows) {
+        var o4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(o4);
+        try mlx.check(mlx.mlx_reshape(&o4, o_t, &[_]c_int{ h_kv, t_q, gqa, dv }, 4, s));
+        var ot = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ot);
+        try mlx.check(mlx.mlx_transpose_axes(&ot, o4, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+        try mlx.check(mlx.mlx_reshape(&out, ot, &[_]c_int{ 1, h_q, t_q, dv }, 4, s));
+    } else {
+        try mlx.check(mlx.mlx_reshape(&out, o_t, &[_]c_int{ 1, h_q, t_q, dv }, 4, s));
+    }
     if (!qkv_mpp_engaged) {
         qkv_mpp_engaged = true;
         log.info("[kv-attn] matmul2d packed attention engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} Tq={d} Tk={d}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, t_q, t_k });
@@ -16310,6 +16489,11 @@ fn mimoSlidingRowsAttn(
     return out;
 }
 
+/// Test seam: global verify forwards whose rows went through row-group passes.
+pub var mimo_global_rows_mpp_count: u32 = 0;
+/// Meter seam: false keeps every global verify row on its own dispatch.
+pub var mimo_global_rows_override: ?bool = null;
+
 /// A spec verify's rows, or a global prefill too short for the fused kernel, each attending
 /// exactly the keys its own decode tick would have seen through `mimoDecodeAttn`, so an
 /// accepted row is the serial row bit for bit. `kv_view` is the forward's cache update: it
@@ -16329,7 +16513,87 @@ fn mimoVerifyRowsAttn(
     if (!is_global and seq_len <= MIMO_VERIFY_ROWS_MAX) {
         if (try mimoSlidingRowsAttn(s, window, q_rope, kv_view, sinks, offset, seq_len, attn_scale, decode_mask)) |out| return out;
     }
+    if (is_global and sinks.ctx == null) {
+        if (try mimoGlobalRowsMpp(s, q_rope, kv_view, seq_len, attn_scale)) |out| return out;
+    }
     return mimoVerifyRowsAttnPerRow(s, window, q_rope, kv_view, sinks, is_global, offset, seq_len, attn_scale, decode_mask);
+}
+
+/// The (splits, pages per split) a matmul2d read over `t_k` keys cuts its pages into.
+fn qkvMppPartition(t_k: c_int) [2]c_int {
+    const pages = @divTrunc(t_k + QKV_MPP_PAGE - 1, QKV_MPP_PAGE);
+    const nsplit = qkvMppSplits(t_k);
+    return .{ nsplit, @divTrunc(pages + nsplit - 1, nsplit) };
+}
+
+var mimo_global_rows_mpp_logged = false;
+
+/// Whether a decode row (t_q 1) over `view` gets the matmul2d kernel, its template set probed.
+fn qkvMppDecodeProbeOk(q: mlx.mlx_array, view: *const DenseKVView) bool {
+    if (view.bits != 4 and view.bits != 8) return false;
+    const kernel = qkvMppKernel() orelse return false;
+    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, view.bits));
+    const ks = mlx.getShape(view.k_triple_q);
+    return qkvMppProbe(kernel, .{
+        .dk = ks[3] * vpw,
+        .dv = mlx.getShape(view.v_triple_q)[3] * vpw,
+        .bits = view.bits,
+        .gs = view.group_size,
+        .gqa = @divTrunc(mlx.getShape(q)[1], ks[1]),
+        .tq = 1,
+        .dtype = mlx.mlx_array_dtype(q),
+    });
+}
+
+/// Rows per rows-kernel pass with `left` rows still to place: pairs, since each row's running output
+/// costs the kernel registers, and a last three in one pass, which beats a pair and a lone row.
+fn mimoGlobalRowsGroup(left: c_int) c_int {
+    return if (left == 3) 3 else 2;
+}
+
+/// A global layer's verify rows through the packed cache in groups (`mimoGlobalRowsGroup`), one
+/// rows-kernel pass each, when every row's decode tick takes the matmul2d arm and each group shares
+/// its last row's split partition: a shorter row then reads at most one more page, fully masked,
+/// which adds exact zeros. Null = the per-row path serves.
+fn mimoGlobalRowsMpp(s: mlx.mlx_stream, q_rope: mlx.mlx_array, kv_view: *const DenseKVView, seq_len: c_int, attn_scale: f32) !?mlx.mlx_array {
+    if (mimo_global_rows_override == false) return null;
+    if (seq_len < 2 or seq_len >= FUSED256_MIN_Q_LEN or !kv_view.has_quant_triple or !mimoDecodeUsesNax()) return null;
+    const t_k = mlx.getShape(kv_view.k_triple_q)[2];
+    const first = t_k - seq_len + 1;
+    if (!kvAttnFusedEnvEnabled() or first < kvAttnFusedMinTk() or first < packedDecodeFloor(QKV_MPP_DECODE_MIN_TK)) return null;
+    // A serial tick whose decode template set failed its probe reads through dense SDPA instead.
+    if (!qkvMppDecodeProbeOk(q_rope, kv_view)) return null;
+    var r: c_int = 0;
+    while (r < seq_len) : (r += mimoGlobalRowsGroup(seq_len - r)) {
+        const last = first + r + mimoGlobalRowsGroup(seq_len - r) - 1;
+        if (!std.meta.eql(qkvMppPartition(first + r), qkvMppPartition(last))) return null;
+    }
+    var parts: [@divTrunc(FUSED256_MIN_Q_LEN, 2)]mlx.mlx_array = @splat(.{});
+    var n: usize = 0;
+    defer for (parts[0..n]) |part| {
+        _ = mlx.mlx_array_free(part);
+    };
+    r = 0;
+    while (r < seq_len) : (r += mimoGlobalRowsGroup(seq_len - r)) {
+        const g = mimoGlobalRowsGroup(seq_len - r);
+        var rows = try KvPrefixView.initRange(s, kv_view.*, 0, first + r + g - 1);
+        defer rows.deinit();
+        const q_g = try sliceAttentionSeq(s, q_rope, r, r + g);
+        defer _ = mlx.mlx_array_free(q_g);
+        parts[n] = (try qkvAttnMpp(s, q_g, &rows.view, attn_scale, "causal", true)) orelse return null;
+        n += 1;
+    }
+    const vec = mlx.mlx_vector_array_new_data(&parts, n);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+    mimo_global_rows_mpp_count +%= 1;
+    if (!mimo_global_rows_mpp_logged) {
+        mimo_global_rows_mpp_logged = true;
+        log.info("[mimo-verify] global rows in matmul2d row groups engaged: rows={d} keys={d}\n", .{ seq_len, t_k });
+    }
+    return out;
 }
 
 fn mimoVerifyRowsAttnPerRow(
@@ -45789,11 +46053,13 @@ test "mimoGlobalDecodeRebuildMaxKeys: the dense decode arm serves every length o
 
 /// Serial decode ticks against one verify forward over the same rows, on twin caches.
 fn mimoVerifyRowsIdentityCase(config: KVQuantConfig, is_global: bool, prefix: c_int, width: c_int) !void {
+    return mimoVerifyRowsIdentityCaseHeads(config, is_global, prefix, width, 16, if (is_global) 1 else 2);
+}
+
+fn mimoVerifyRowsIdentityCaseHeads(config: KVQuantConfig, is_global: bool, prefix: c_int, width: c_int, hq: c_int, hkv: c_int) !void {
     const s = mlx.gpuStream();
     const a = testing.allocator;
     const window: c_int = 128;
-    const hq: c_int = 16;
-    const hkv: c_int = if (is_global) 1 else 2;
     const scale: f32 = 1.0 / @sqrt(192.0);
     var caches: [2]KVCache = undefined;
     for (&caches) |*c| {
@@ -45960,6 +46226,116 @@ test "mimo verify rows attend with each serial decode tick's arithmetic (dense, 
     for ([_]c_int{ 5, FUSED256_MIN_Q_LEN - 1 }) |width| {
         try mimoVerifyRowsIdentityCase(KVQuantConfig.affine(8), true, QKV_MPP_DECODE_MIN_TK + 3, width);
         try mimoVerifyRowsIdentityCase(KVQuantConfig.dense, true, 700, width);
+    }
+}
+
+test "mimo global verify rows on a packed cache share matmul2d passes in groups, each row its decode tick's bytes" {
+    if (mlx.noGpuBackend() or !mimoDecodeUsesNax()) return error.SkipZigTest;
+    const Case = struct { prefix: c_int, width: c_int, shared: bool, kv_heads: c_int = 1, bits: u8 = 8 };
+    // A row's split partition follows its own key count: a group of rows shares a pass only where every
+    // partition is the group's last row's, and a shorter row then reads one fully masked page more.
+    const cases = [_]Case{
+        .{ .prefix = QKV_MPP_DECODE_MIN_TK, .width = 4, .shared = true },
+        .{ .prefix = QKV_MPP_DECODE_MIN_TK, .width = 4, .shared = true, .kv_heads = 4 },
+        .{ .prefix = QKV_MPP_DECODE_MIN_TK + 61, .width = 4, .shared = false }, // pages 130 -> 131: 2 -> 3 per split
+        .{ .prefix = 65566, .width = 4, .shared = true }, // pages 2049 -> 2050, 17 per split
+        .{ .prefix = 65566, .width = 4, .shared = true, .kv_heads = 4 },
+        .{ .prefix = 65567, .width = 4, .shared = true, .bits = 4 },
+        .{ .prefix = 65567, .width = 4, .shared = true }, // pages 2049 -> 2050 inside the first pair
+        .{ .prefix = 65534, .width = 4, .shared = true }, // pages 2048 -> 2049 between the two pairs
+        .{ .prefix = 65535, .width = 4, .shared = false }, // pages 2048 -> 2049 inside the first pair: 16 -> 17 per split
+        .{ .prefix = 65567, .width = 3, .shared = true }, // three rows in one pass, a page edge inside
+        .{ .prefix = 262175, .width = 4, .shared = true }, // pages 8193 -> 8194 inside the first pair, 65 per split
+        .{ .prefix = 262174, .width = 3, .shared = true },
+        // Wider verifies and short warm tails: pairs, then a last three.
+        .{ .prefix = 65566, .width = 5, .shared = true },
+        .{ .prefix = 65566, .width = 8, .shared = true },
+        .{ .prefix = 65565, .width = 7, .shared = true, .kv_heads = 4 }, // pages 2049 -> 2050 inside the second pair
+        .{ .prefix = 65533, .width = 6, .shared = false }, // pages 2048 -> 2049 inside the second pair: 16 -> 17 per split
+        .{ .prefix = QKV_MPP_DECODE_MIN_TK, .width = FUSED256_MIN_Q_LEN - 1, .shared = true },
+    };
+    for (cases) |c| {
+        mimo_global_rows_mpp_count = 0;
+        try mimoVerifyRowsIdentityCaseHeads(KVQuantConfig.affine(c.bits), true, c.prefix, c.width, 16 * c.kv_heads, c.kv_heads);
+        try testing.expectEqual(c.shared, mimo_global_rows_mpp_count > 0);
+    }
+}
+
+test "mimo global verify rows µbench: per-row dispatches vs row-group passes, 9 dependent layers (SUSHI_MIMO_ROWS_UBENCH=1)" {
+    if (!diagEnvOn("SUSHI_MIMO_ROWS_UBENCH")) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !mimoDecodeUsesNax()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var prng = std.Random.DefaultPrng.init(0xA6A6);
+    const rnd = prng.random();
+    const layers: usize = 9;
+    const reps: usize = 5;
+    const scale: f32 = 1.0 / @sqrt(192.0);
+    const none = mlx.mlx_array{ .ctx = null };
+    defer mimo_global_rows_override = null;
+    std.debug.print("\n[rows-ub] MiMo global verify attention, 64/4 heads, kv8, {d} dependent layers, median of {d}, us per layer\n", .{ layers, reps });
+    std.debug.print("[rows-ub]     keys rows  per-row  one-pass  saved\n", .{});
+    for ([_]c_int{ 65536, 131072 }) |kv| {
+        var cache = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.affine(8));
+        defer cache.deinit();
+        {
+            const k = try testRandWeightBf16(rnd, &[_]c_int{ 1, 4, kv - 4, 192 }, s);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try testRandWeightBf16(rnd, &[_]c_int{ 1, 4, kv - 4, 128 }, s);
+            defer _ = mlx.mlx_array_free(v);
+            var d0 = try cache.update(0, k, v, s, 0);
+            d0.deinit();
+        }
+        for ([_]c_int{ 2, 3, 4 }) |rows| {
+            const k = try testRandWeightBf16(rnd, &[_]c_int{ 1, 4, rows, 192 }, s);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try testRandWeightBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+            defer _ = mlx.mlx_array_free(v);
+            // The verify's view ends at the last row; the next width rewinds to the same prefix.
+            defer cache.truncate(@intCast(kv - 4), s) catch {};
+            var view = try cache.update(0, k, v, s, 0);
+            defer view.deinit();
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            for ([_]mlx.mlx_array{ view.k_triple_q, view.k_triple_scales, view.k_triple_biases, view.v_triple_q, view.v_triple_scales, view.v_triple_biases }) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
+            try mlx.check(mlx.mlx_eval(ev));
+            const q0 = try attn256RandBf16Scaled(rnd, &[_]c_int{ 1, 64, rows, 192 }, 8.0, s);
+            defer _ = mlx.mlx_array_free(q0);
+            var t: [2][reps]f64 = undefined;
+            for (0..reps + 2) |r| {
+                for (0..2) |arm| {
+                    mimo_global_rows_override = arm == 1;
+                    const t0 = std.Io.Timestamp.now(io, .boot);
+                    var q = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_array_set(&q, q0));
+                    for (0..layers) |_| {
+                        const out = try mimoVerifyRowsAttn(s, 128, q, &view, none, true, kv - 4, rows, scale, none);
+                        defer _ = mlx.mlx_array_free(out);
+                        // [1,64,rows,128] -> [1,64,rows,192]: the next layer's query depends on this output.
+                        var head = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(head);
+                        try mlx.check(mlx.mlx_slice(&head, out, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, 64, rows, 64 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+                        const parts = [_]mlx.mlx_array{ out, head };
+                        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+                        defer _ = mlx.mlx_vector_array_free(vec);
+                        var nq = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_concatenate_axis(&nq, vec, 3, s));
+                        _ = mlx.mlx_array_free(q);
+                        q = nq;
+                    }
+                    try mlx.check(mlx.mlx_array_eval(q));
+                    _ = mlx.mlx_array_free(q);
+                    if (r >= 2) t[arm][r - 2] = @as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e3 / @as(f64, @floatFromInt(layers));
+                }
+            }
+            var med: [2]f64 = undefined;
+            for (&med, 0..) |*m, a| {
+                std.mem.sort(f64, &t[a], {}, std.sort.asc(f64));
+                m.* = t[a][reps / 2];
+            }
+            std.debug.print("[rows-ub] {d:>8} {d:>4} {d:>8.1} {d:>9.1} {d:>5.1}%\n", .{ @as(u32, @intCast(kv)), @as(u32, @intCast(rows)), med[0], med[1], 100.0 * (med[0] - med[1]) / med[0] });
+        }
+        _ = mlx.mlx_clear_cache();
     }
 }
 

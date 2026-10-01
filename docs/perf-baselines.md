@@ -860,6 +860,39 @@ differ, both are shown:
 | 128k | 94.0 | 69.8 | 1.43 | 165.2 | 43% | 793 | 759 |
 | 256k | 187.9 | 306.2 | 2.85 | 497.0 | 62% | 527 | |
 
+<a id="mimo-verify-global-rows"></a>
+### MiMo verify rows on the global layers: one page walk per row group (A6)
+
+Arms: each global layer's verify rows one `sushi_qkv_mpp` decode dispatch at a time, against `sushi_qkv_mpp_rows`,
+which runs each group's rows on one page walk (pairs, a last three in one pass). Both arms are byte-identical to the
+decode ticks: unit test at 4k / 64k / 256k keys, 16/1 and 64/4 heads, page and split edges, widths 2-8 and 15, kv8 and kv4.
+
+Attention microbench (`SUSHI_MIMO_ROWS_UBENCH=1`, 9 dependent layers, 64/4 heads, kv8, median of 5, arms interleaved,
+`taskpolicy -a`, lock `attn-rows7`, branch perf/mimo-a6-verify-rows at 829187c5), us per layer, per row -> grouped.
+829187c5 runs the landed commit's kernel and its groups for 2-4 rows; the landed commit only adds the groups for
+wider verifies, the warmup order and test cases. Neither run pinned the fans; the arms are interleaved in one process
+or boot.
+
+| keys | 2 rows | 3 rows | 4 rows |
+|---|---|---|---|
+| 64k | 585 -> 482 (-17.6%) | 854 -> 744 (-12.9%) | 1112 -> 886 (-20.3%) |
+| 128k | 1024 -> 857 (-16.3%) | 1519 -> 1304 (-14.1%) | 2021 -> 1683 (-16.7%) |
+
+- All rows in one pass through `sushi_qkv_mpp` at TQ = rows is also byte-identical, but it is 17-31% slower at 3-4
+  rows: its matmuls grow to 16 x rows, and each simdgroup's softmax loop walks 4 x rows rows in turn.
+- The rows kernel with all four rows in one pass saves only 3-4%: four running outputs cost registers. Two pairs save
+  17-20%.
+
+Decode-forward meter (`SUSHI_DECODE_FWD_UBENCH=12`, `_S=2,3,4`, `_KV=131072`, `_GLOBAL_ROWS_ARMS=1` off / on / on /
+off), MiMo-V2.6-Flash-Sushi-2.3bpw, `--kv-quant 8 --mtp --ctx-size 1048576`, binary from 829187c5 (SHA-256
+`e44e8894`), `taskpolicy -a`, lock `attn-meter128`, 2026-10-01. Results are ms per verify forward at 131k keys:
+
+| rows | off | on | change |
+|---|---|---|---|
+| 2 | 37.52 / 38.70 | 34.34 / 36.39 | -7.2% |
+| 3 | 51.21 / 50.74 | 46.31 / 48.29 | -7.2% |
+| 4 | 63.65 / 63.25 | 60.57 / 59.89 | -5.1% |
+
 <a id="exl3-decode-layout"></a>
 ## EXL3 decode GEMV layout (two tiles per threadgroup)
 
