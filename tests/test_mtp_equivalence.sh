@@ -41,8 +41,8 @@
 # mimo_v2 (MTP_TEST_MODEL=<MiMo pack>): a pack without its heads FAILS, never skips. Its
 # thinking is on by default, so reasoning + content is the compared answer. It checks the
 # qk-192 fused prefill engagement instead of Qwen's hd-256 and GDN lines, the head-count
-# depth cap instead of the chunk-B extension, expects no prompt-lookup round (qwen4_exp only),
-# and adds a SUSHI_MTP_FORCE_DEPTH=3 boot that must be byte-identical to --no-mtp.
+# depth cap instead of the chunk-B extension, and adds a SUSHI_MTP_FORCE_DEPTH=3 boot that
+# must be byte-identical to --no-mtp. Its copy task runs prompt-lookup rounds as Qwen's does.
 
 set -u
 MODEL="${MTP_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
@@ -412,14 +412,7 @@ copy_request true > "$ARTIFACTS/mtp_on_copy_stream.txt"
 PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
     check "copy stream (lookup on)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_on_copy_stream.txt" yes
 LOOKUP_ROUNDS=$(lookup_rounds_max)
-if [ "$ARCH" = mimo_v2 ]; then
-    # Prompt lookup drafts for the qwen4_exp head only (`mtpLookupAllowed`).
-    if [ "${LOOKUP_ROUNDS:-0}" = "0" ] && ! grep -q "prompt-lookup drafts engaged" "$LOG"; then
-        echo "PASS [MiMo runs no prompt-lookup round]"; PASS=$((PASS+1))
-    else
-        echo "FAIL [MiMo prompt lookup]: lookup rounds=${LOOKUP_ROUNDS:-none}, want none"; FAIL=$((FAIL+1))
-    fi
-elif [ "${LOOKUP_ROUNDS:-0}" -gt 0 ] && grep -q "\[mtp\] prompt-lookup drafts engaged" "$LOG"; then
+if [ "${LOOKUP_ROUNDS:-0}" -gt 0 ] && grep -q "\[mtp\] prompt-lookup drafts engaged" "$LOG"; then
     echo "PASS [prompt lookup engages on the copy task] (lookup rounds=$LOOKUP_ROUNDS)"; PASS=$((PASS+1))
 else
     echo "FAIL [prompt lookup engagement]: lookup rounds=${LOOKUP_ROUNDS:-none} on a copy task"; FAIL=$((FAIL+1))
@@ -552,9 +545,7 @@ if [ -s "$ARTIFACTS/mtp_seeded_copy.txt" ] && cmp -s "$ARTIFACTS/mtp_seeded_copy
 else
     echo "FAIL [seeded sampled copy]: stream and non-stream bytes differ"; FAIL=$((FAIL+1))
 fi
-if [ "$ARCH" = mimo_v2 ]; then
-    : # no lookup on MiMo, checked on the default-on boot
-elif [ "$(lookup_rounds_max)" -gt 0 ] 2>/dev/null; then
+if [ "$(lookup_rounds_max)" -gt 0 ] 2>/dev/null; then
     echo "PASS [prompt lookup engages on the seeded copy]"; PASS=$((PASS+1))
 else
     echo "FAIL [prompt lookup on the seeded copy]: no lookup round"; FAIL=$((FAIL+1))

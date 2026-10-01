@@ -717,6 +717,41 @@ boot, A B B A (A = d1408a57, B = this change): decode 69.8 / 70.0 -> 73.8 / 70.5
 192-token decodes 69.9 -> 72.6); prefill 1307 / 1287 -> 1289 / 1305 tok/s (unchanged). 16x512 KLD to first EOS on B:
 0.086034761, unchanged (the KLD tool reads the full head).
 
+<a id="mimo-verify-8"></a>
+### MiMo-V2.6-Flash-Sushi-2.3bpw: verify to 8 rows and prompt lookup in MTP rounds (this change vs main 27e81cfc)
+
+FP8 trunk GEMV, `SUSHI_FP8_UBENCH=1` (`_SWEEP=direct` for the geometry), bf16 x, six weight copies, median of 30-60
+laps, `taskpolicy -a`, GPU lock, busy box, 2026-10-01; us per call at 8 rows (5-7 rows rank the same):
+
+| shape | staged (NR 4, SGS 8) | direct, one-row geometry (NR 1, SGS 2) | direct, NR 2, SGS 8 (shipped past 4 rows) |
+|---|---|---|---|
+| qkv global | 208 | 331 | 155 |
+| qkv sliding | 220 | 368 | 169 |
+| L0 gate/up | 256 | 439 | 163 |
+| L0 down | 288 | 465 | 201 |
+
+Decode forward meter on this change (`SUSHI_DECODE_FWD_UBENCH=40`, `_S=1..8`, 1024 keys, kv8, quiet box, lock): 21.6 /
+30.1 / 38.0 / 46.4 / 54.6 / 62.1 / 72.0 / 80.0 ms at 1-8 rows, ~8.2 ms per extra row; a fully accepted 8-row round is
+10.0 ms per token against 11.6 at 4 rows.
+
+`tests/bench_mtp_lookup.sh`, greedy, thinking off, `--kv-quant 8 --prefix-cache-entries 0`, 2 reps per boot, quiet box
+(other workers frozen), fans at max, 3 min idle first, lock per boot, A B B A (A = main 27e81cfc, B = this change), mean
+tok/s over the four runs per arm:
+
+| task | main | lookup + 8-row verify | ratio | lookup rounds/drafted/landed (rep0, rep1) |
+|---|---|---|---|---|
+| copy_verbatim | 85.0 | 104.8 | 1.23 | 66/462/439, 33/231/216 |
+| rename | 84.2 | 99.9 | 1.19 | 54/378/361, 35/245/233 |
+| prose | 65.5 | 67.7 | 1.03 (no lookup round; noise) | 0/0/0 |
+
+- Greedy bytes identical across all eight runs of each task.
+- Each boot's second rep runs fewer lookups (33 vs 66) at +10-18%: the rep0 prose request trains the model's round
+  table to narrow MTP widths, and the gate prices the MTP chain at the plan's base width with the request's
+  MTP-round acceptance.
+- Lookup alone at three drafts (ae92c897, `SUSHI_MTP_LOOKUP=0|1`, A B B A, busy box) was neutral: the three heads
+  already land ~3.9 tokens per round on a verbatim copy, and a three-draft lookup round (47-51 ms) costs what an MTP
+  round does.
+
 <a id="mimo-ttft-idle"></a>
 ### MiMo-V2.6-Flash-Sushi-2.3bpw: where the time to first token goes, and the GPU wake after idle (e2d5be76 base)
 

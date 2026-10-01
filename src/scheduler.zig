@@ -2518,16 +2518,32 @@ fn ubenchArms(buf: *[8]UbenchArm, rows: usize, is_mimo: bool, row_arms: bool, po
     return buf[0..n];
 }
 
-fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: *mimo_mtp.Head, kv_config: transformer_mod.KVQuantConfig) void {
+/// A resident MiMo warms its verify rows with or without its heads: a PLD request verifies on them too.
+fn mimoVerifyWarmWanted(config: *const ModelConfig) bool {
+    return config.isMimo() and !config.expert_streaming;
+}
+
+test "a resident MiMo warms its verify rows without its heads; a streamed one and another arch do not" {
+    var mimo = ModelConfig{};
+    mimo.model_type = "mimo_v2";
+    try testing.expect(mimoVerifyWarmWanted(&mimo));
+    mimo.expert_streaming = true;
+    try testing.expect(!mimoVerifyWarmWanted(&mimo));
+    var qwen = ModelConfig{};
+    qwen.model_type = "qwen4_exp";
+    try testing.expect(!mimoVerifyWarmWanted(&qwen));
+}
+
+fn mimoSpecWarmup(io: std.Io, xfm: *Transformer, head: ?*mimo_mtp.Head, kv_config: transformer_mod.KVQuantConfig) void {
     const start = std.Io.Timestamp.now(io, .awake);
     const rows = xfm.warmupMimoVerify(kv_config) catch |err| {
         log.warn("[spec-warmup] MiMo verify failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
         return;
     };
-    const steps = head.warmup(xfm) catch |err| {
+    const steps = if (head) |h| h.warmup(xfm) catch |err| {
         log.warn("[spec-warmup] MiMo heads failed ({s}); the first round pays their kernel compile inside the round.\n", .{@errorName(err)});
         return;
-    };
+    } else 0;
     const ms: u64 = @as(u64, @intCast(start.untilNow(io, .awake).nanoseconds)) / std.time.ns_per_ms;
     log.info("[spec-warmup] MiMo verify rows 0x{x}, {d} head steps ({d} ms).\n", .{ rows, steps, ms });
 }
@@ -4179,7 +4195,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
         }
-        if (mimo_head) |head| mimoSpecWarmup(sch.io, xfm_ptr, head, params.kv_quant_config);
+        if (mimoVerifyWarmWanted(params.config)) mimoSpecWarmup(sch.io, xfm_ptr, mimo_head, params.kv_quant_config);
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark

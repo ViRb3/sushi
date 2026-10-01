@@ -16636,7 +16636,7 @@ fn mimoVerifyRowsAttnPerRow(
 
 /// Widest MiMo spec verify: the FP8 trunk GEMV keeps a decode row's arithmetic only up
 /// to `fp8_block.gemv_direct_max_rows` rows.
-pub const MIMO_VERIFY_ROWS_MAX: c_int = 4;
+pub const MIMO_VERIFY_ROWS_MAX: c_int = 8;
 
 const MimoAttnArm = enum { verify_rows, decode, prefill_global, prefill_sliding, prefill_rows };
 var mimo_prefill_rows_logged: bool = false; // one-shot log guard
@@ -46186,7 +46186,7 @@ test "mimo sliding verify rows run in one dispatch, each row bit-identical to it
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         for ([_]c_int{ 128, 129, 700 }) |prefix| {
-            for ([_]c_int{ 2, 3, 4 }) |width| {
+            for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |width| {
                 for ([_]f32{ 0.05, 1.0, 6.0 }) |gain| try mimoSlidingRowsCase(config, prefix, width, gain);
             }
         }
@@ -46215,7 +46215,7 @@ test "mimo verify rows attend with each serial decode tick's arithmetic (dense, 
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         for ([_]bool{ false, true }) |is_global| {
             for ([_]c_int{ 1, 60, 125, 126, 700 }) |prefix| {
-                for ([_]c_int{ 2, 3, 4 }) |width| try mimoVerifyRowsIdentityCase(config, is_global, prefix, width);
+                for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |width| try mimoVerifyRowsIdentityCase(config, is_global, prefix, width);
             }
         }
     }
@@ -74190,7 +74190,7 @@ test "mimo v2 verify rows equal serial decode ticks bit for bit across the slidi
             for ([_]usize{ 20, 126, 136, long_prefix }) |prefix| {
                 for (&ids, 0..) |*v, i| v.* = @intCast(2 + (i * 37) % (config.vocab_size - 2));
                 if (repeat) @memset(ids[prefix..], ids[prefix]);
-                for ([_]usize{ 2, 3, 4 }) |rows| {
+                for ([_]usize{ 2, 3, 4, 5, 6, 7, 8 }) |rows| {
                     const ticks = try mimoVerifyOrTicks(a, &xfm, &ids, prefix, rows, false, kv);
                     defer a.free(ticks);
                     const verify = try mimoVerifyOrTicks(a, &xfm, &ids, prefix, rows, true, kv);

@@ -39,7 +39,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - **Original checkpoint**: `.mxfp4_individual` streams per-expert U8 payloads directly into U32 slabs without
   changing bytes. The FP8 trunk (`qkv_proj`, layer-0 MLP) stays resident AS STORED: e4m3 codes + f32 128x128
-  tile scales, served by `fp8_block.zig` (f32 decode GEMV for 1-4 rows, staged x for 5-16, one linear dequantized to
+  tile scales, served by `fp8_block.zig` (f32 decode GEMV for 1-8 rows, staged x for 9-16, one linear dequantized to
   billed bf16 scratch + MLX matmul for wider forwards). That is the checkpoint's exact math, so the KLD teacher
   carries no quantization of its own ([quality-kld](quality-kld.md#teacher-path)); sources are read-only, MTP/media
   excluded, residency billed as stored plus `server.fp8DequantScratchBytes` at prefill. All three kernels are plain
@@ -167,8 +167,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - QKV is ONE FP8 GEMV per layer with three outputs (`fp8_block` `gemv3`); V leaves it already multiplied by
   `attention_value_scale` (`RowSplit.v_scale`, rounded to the output dtype first, as the composed multiply did).
 - The GEMV's three width arms REASSOCIATE the f32 sum, so a row is byte-identical to a decode tick only at or below
-  `MIMO_VERIFY_ROWS_MAX`: direct (<=4 rows) strides each row in 16-byte chunks per lane, staged x (5-16) gives each
-  lane one 4-column group per 128-column tile, and the wide arm (>=17) dequantizes the weights to bf16.
+  `MIMO_VERIFY_ROWS_MAX`: direct (<=8 rows) strides each row in 16-byte chunks per lane, staged x (9-16) gives each
+  lane one 4-column group per 128-column tile, and the wide arm (>=17) dequantizes the weights to bf16. Past four
+  rows the direct arm runs two stored rows per simdgroup (8 per group), which moves no row's sum and beat the staged
+  arm by 23-36% at 8 rows on every FP8 trunk shape ([perf-baselines](perf-baselines.md#mimo-verify-8)).
 - Every residual add runs in one kernel with the norm that reads its sum (`fusedAddRmsNormUngated`): the
   post-attention norm (`fusedAddRmsNormRouted` also emits the f32 router input), the next layer's input norm and the
   final norm. The router is widened to f32 once at load (source-trunk packs), not per forward.
@@ -184,19 +186,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   (`mimoDecodeQkvPrep`, FP8 QKV only; decode, verify rows, short tails, the final prompt token): the kernel writes
   fresh quantized rows and `KVCache.appendQuantized` appends them through the usual slice updates, so the ring, its
   compaction and the packed-arm switch are untouched. Bit-identical to the composed rope + `quantizeAffine` (unit test
-  at MiMo shapes, both rope bases, 1-4 rows). It removes ~380 primitives from a decode forward;
+  at MiMo shapes, both rope bases, 1-8 rows). It removes ~380 primitives from a decode forward;
   `SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1` is its A/B.
 - A joined `[Q | K]` GEMV output with one rope over both passed its unit tests but moved live logits by ~0.05
   nats at the first token, cause unfound; it is not in the tree.
 
 ## Prompt lookup decoding
 
-- **A PLD verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 3): every
+- **A PLD verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 7): every
   row reads the packed cache as its own decode tick would, a partial accept truncates, and no `KVCache.snapshot` is
   taken, so greedy PLD is serial byte for byte. The prefill-shaped verify it replaced declined the fused kernel below
   16 rows, rebuilt every global layer's whole cache dense, copied the cache on every write under the snapshot and
   re-forwarded partial accepts.
-- MTP outranks PLD (`server.requestSpecModes`), so PLD runs only on requests without MTP.
+- MTP outranks PLD (`server.requestSpecModes`), so PLD runs only on requests without MTP; an MTP request copies its
+  context through prompt lookup inside the round instead ([engine-mtp](engine-mtp.md#lookup)).
 - PLD stays on by default: it pays on echo workloads (a code edit that echoes the context). The prompt n-gram gate
   passes ordinary prompts too (score 0.16-0.32 against 0.01), so the runtime yield and per-draft gates are what bound
   the loss on text that does not echo.

@@ -61,11 +61,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   draft from the trunk's hidden at the current position; their own window adds nothing measurable.
 - **The load warms every verify row count and head** (`warmupMimoVerify`, `Head.warmup`, `[spec-warmup] MiMo …`): each
   row count JITs its own pipelines, and a new binary's first round at each width stalled 450-630 ms.
-- **Verify rows keep decode arithmetic** (`ForwardCtx.verify_rows`, up to `MIMO_VERIFY_ROWS_MAX` = 4 rows, the FP8
-  GEMV's direct-row limit): every row's attention runs through `mimoDecodeAttn` on the keys its own decode tick saw
-  (`mimoVerifyRowsAttn`; a sliding layer's rows in one dispatch, `mimoSlidingRowsAttn`), the rest of the forward is
-  row-identical already (FP8 GEMV <= 4 rows, `mtp_qmv` affine-8, the router rows' one f32 gemv
-  `mtp_qmv.f32GemvRows`, the EXL3 decode chain). A partial accept truncates the cache (attention-only trunk).
+- **Verify rows keep decode arithmetic** (`ForwardCtx.verify_rows`, up to `MIMO_VERIFY_ROWS_MAX` = 8 rows, the FP8
+  GEMV's direct-row limit; the three heads still draft at most 3, so only a lookup or PLD verify runs wider): every
+  row's attention runs through `mimoDecodeAttn` on the keys its own decode tick saw (`mimoVerifyRowsAttn`; a
+  sliding layer's rows in one dispatch, `mimoSlidingRowsAttn`), the rest of the forward is row-identical already
+  (FP8 GEMV <= 8 rows, `mtp_qmv` affine-8, the router rows' one f32 gemv `mtp_qmv.f32GemvRows`, the EXL3 decode
+  chain). A partial accept truncates the cache (attention-only trunk).
 - **A global layer's verify rows share the packed-cache walk** (`mimoGlobalRowsMpp`, `sushi_qkv_mpp_rows`): from 4096
   keys on matrix units, rows go in pairs, with a last three in one pass. Each K/V page is staged once per group, and
   each row runs its decode tick's own matmuls, softmax and rescale on it.
@@ -145,7 +146,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 
 - **A lookup stands in for the chain when the output copies its context** (`mtpLookupChain`, ported from mlx-serve
   #523/#533): the last 3 committed tokens plus t1 matched earlier in the prompt or output, agreeing back 8+ tokens,
-  make the drafts with no head forward. On by default for the qwen4 head; `SUSHI_MTP_LOOKUP=0` turns it off.
+  make the drafts with no head forward. On by default for the qwen4 and MiMo heads; `SUSHI_MTP_LOOKUP=0` turns it off.
 - **An ordinary match (suffix under 32) must agree past the start of a line**: a unified diff echoes the file's
   lines behind a `-`/`+`/space prefix, so its matches agree to the end of one line and fail at the next (-4.8% on
   the diff before the rule, -1.6% after). A line's own last token (`):\n`) agrees whatever the next line starts
@@ -160,8 +161,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   round is billed for it.
 - **A lookup round applies the pending history stash** (`mtpApplyStash`): left pending, it grows across lookup
   rounds into one oversized head forward.
-- **Declined on MiMo** (three drafts per round), under `SUSHI_MTP_FORCE_DEPTH` (the byte bar's measurement mode),
-  for a batched head and in planner-owned rounds; a serial block (adaptive serial past 32k) runs none either.
+- **On MiMo a lookup drafts no wider than its verify keeps decode rows** (`mtpLookupDraftCap` =
+  `mtpVerifyDraftsMax(true)`); its stash append is the head-generic `mtpApplyStash`, and a lookup as round 1 leaves the
+  prompt's lazy head catch-up to the next head forward, as an MTP round 1 does.
+- **Declined** under `SUSHI_MTP_FORCE_DEPTH` (the byte bar's measurement mode), for a batched head and in
+  planner-owned rounds; a serial block (adaptive serial past 32k) runs none either.
 - **Output**: greedy is serial byte for byte (every row is a decode tick's); sampled under `exact` keeps the target
   distribution, but seeded text differs from lookup-off because the draws land differently. A lookup round always
   verifies with `exact` (`acceptGraphFor`/`acceptPrefixFor`, keep the copy with probability p; MTP rounds keep the
@@ -169,6 +173,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   its context and the loop guard cuts it (mlx-serve #614).
 - **Measured on Sushi-3bpw**: copies and edits of a file +16-21%, a write_file tool call +9-11%, long-context edits
   +18-24%; diff, new code and prose inside noise ([perf-baselines](perf-baselines.md#mtp-lookup)).
+- **Measured on MiMo 2.3bpw** at seven drafts (8-row verify): a verbatim copy +23%, a rename +19%, prose unchanged;
+  at three drafts it was neutral, since the heads already land ~3.9 tokens per round on a copy
+  ([perf-baselines](perf-baselines.md#mimo-verify-8)).
 - Engagement: `[mtp] prompt-lookup drafts engaged: k=… suffix=…` once, `[spec-stats] … lookup=rounds/drafted/landed`
   and `lookup_table=`. A/B driver: `tests/bench_mtp_lookup.sh`.
 

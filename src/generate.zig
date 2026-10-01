@@ -6010,14 +6010,19 @@ pub const Generator = struct {
         return on;
     }
 
-    /// May a lookup stand in for this request's next MTP chain? qwen4 only: MiMo verifies
-    /// at most three drafts per round. A forced depth is the byte bar's measurement mode,
-    /// and a batched head or a planner-owned round builds every chain as a group.
+    /// May a lookup stand in for this request's next MTP chain? A forced depth is the byte
+    /// bar's measurement mode, and a batched head or a planner-owned round builds every chain
+    /// as a group.
     pub fn mtpLookupAllowed(self: *const Generator) bool {
         if (!mtpLookupEnabled()) return false;
         const head = self.mtp orelse return false;
-        if (head != .qwen4 or mtpForcedDepth() != null or self.mtp_batch_head) return false;
+        if (head == .qwen or mtpForcedDepth() != null or self.mtp_batch_head) return false;
         return !(group_planner.enabled() and self.mtp_planner_owned);
+    }
+
+    /// A lookup's drafts are verify rows too, so MiMo's stop at its decode-row budget.
+    pub fn mtpLookupDraftCap(is_mimo: bool) u32 {
+        return @min(mtp_lookup.MAX_DRAFT_STRONG, mtpVerifyDraftsMax(is_mimo));
     }
 
     /// End a round that stays out of the cost table. The regime clock runs from
@@ -6091,7 +6096,7 @@ pub const Generator = struct {
         if (!self.mtpLookupAllowed()) return null;
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
-        const got = idx.match(t1, mtp_lookup.MAX_DRAFT_STRONG);
+        const got = idx.match(t1, mtpLookupDraftCap(self.xfm.config.isMimo()));
         const kv = self.mtpKvLen();
         const src = MtpCostSource.init(self.mtp_ev_costs, kv, if (mtpCostTableEnabled()) &self.xfm.round_cost else null);
         const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, mtpLookupCostsFor(src, plan.m_lo));
@@ -18157,7 +18162,7 @@ fn kvRowsEqual(x: *Transformer, y: *Transformer, layer: usize, rows: usize) !boo
 /// Greedy PLD against serial decode, each on its own transformer over `weights`: the tokens and
 /// every committed K/V row must match, and a verify round that did not grow the cache must leave
 /// the last global layer's buffer in place.
-fn expectPldMatchesSerial(io: std.Io, config: model_mod.ModelConfig, weights: anytype, prompt: []const u32, kv: transformer_mod.KVQuantConfig) !void {
+fn expectPldMatchesSerial(io: std.Io, config: model_mod.ModelConfig, weights: anytype, prompt: []const u32, kv: transformer_mod.KVQuantConfig, draft_len: u32) !void {
     const a = testing.allocator;
     var tok_dummy: Tokenizer = undefined;
     const greedy = SamplingParams{ .temperature = 0.0 };
@@ -18191,7 +18196,7 @@ fn expectPldMatchesSerial(io: std.Io, config: model_mod.ModelConfig, weights: an
     while (n < want) {
         const before = try globalKeysBuffer(&xfm);
         const attempted = gen.pld_attempted;
-        const r = (try gen.nextPld(a, 5, 3)) orelse break;
+        const r = (try gen.nextPld(a, draft_len, 3)) orelse break;
         defer a.free(r.tokens);
         const after = try globalKeysBuffer(&xfm);
         if (gen.pld_attempted > attempted and after.cap == before.cap) {
@@ -18235,7 +18240,8 @@ test "mimo PLD rounds decode like serial ticks and write the cache in place (MIM
     var prompt: [168]u32 = undefined;
     for (&prompt, 0..) |*v, i| v.* = @intCast((i * 7) % config.vocab_size);
     for ([_]transformer_mod.KVQuantConfig{ transformer_mod.KVQuantConfig.dense, transformer_mod.KVQuantConfig.affine(8) }) |kv| {
-        try expectPldMatchesSerial(io, config, &weights, &prompt, kv);
+        // Five drafts, and the seven an 8-row verify serves.
+        for ([_]u32{ 5, 7 }) |draft_len| try expectPldMatchesSerial(io, config, &weights, &prompt, kv, draft_len);
     }
 }
 
@@ -18296,6 +18302,88 @@ test "mimo ring marks leave the prefill's logits, cache and greedy tokens unchan
             try testing.expectEqual(want, (try marked_gen.next(a)) orelse return error.ShortSerial);
         }
     }
+}
+
+test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first round included (MIMO_V2_MODEL)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = std.mem.span(model_dir);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer if (config.ngram_table_path) |p| a.free(p);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    try transformer_mod.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var mtp_weights = try @import("mimo_source.zig").loadMtpWeights(io, a, dir);
+    defer mtp_weights.deinit();
+    var head = (try mimo_mtp.Head.load(a, mlx.gpuStream(), &config, &mtp_weights)) orelse return error.SkipZigTest;
+    defer head.deinit();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const want: usize = 64;
+    const kv = transformer_mod.KVQuantConfig.affine(8);
+    var prompt: [168]u32 = undefined;
+    for (&prompt, 0..) |*v, i| v.* = @intCast((i * 7) % config.vocab_size);
+
+    var serial_xfm = try pldTestTransformer(io, config, &weights, kv);
+    defer serial_xfm.deinit();
+    var serial_gen = try Generator.initWithOptions(io, a, &serial_xfm, &tok, &prompt, want + 16, greedy, &.{}, .{ .skip_lazy_preforward = true });
+    defer serial_gen.deinit(a);
+    var serial: [want]u32 = undefined;
+    for (&serial) |*t| t.* = (try serial_gen.next(a)) orelse return error.ShortSerial;
+
+    var xfm = try pldTestTransformer(io, config, &weights, kv);
+    defer xfm.deinit();
+    head.target = &xfm;
+    xfm.mtp_depth_free = Generator.mtpVerifyDraftsMax(true);
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want + 16, greedy, &.{}, .{
+        .mtp_enabled = true,
+        .mtp = .{ .mimo = &head },
+        .model_has_mtp = true,
+        .mtp_depth = Generator.mtpVerifyDraftsMax(true),
+    });
+    defer gen.deinit(a);
+    // The index ends on the prompt, so the round opens on its tail: an earlier copy of that
+    // tail runs into the serial continuation with one wrong token, so a lookup serves round 1,
+    // lands and misses drafts, and MTP rounds take over where the copy stops agreeing.
+    var idx = mtp_lookup.Index.init(a);
+    const Lines = struct {
+        pub fn hasNewline(_: @This(), _: u32) bool {
+            return false;
+        }
+    };
+    try idx.extend(prompt[prompt.len - 40 ..], Lines{});
+    var copy = serial;
+    copy[20] = (copy[20] + 1) % @as(u32, @intCast(config.vocab_size));
+    try idx.extend(&copy, Lines{});
+    try idx.extend(&prompt, Lines{});
+    gen.mtp_lookup_idx = idx;
+    gen.mtp_lookup_gen = 0;
+
+    var got: [want]u32 = undefined;
+    var n: usize = 0;
+    var first_round_lookup = false;
+    while (n < want) {
+        const r = (try gen.nextMtp(a)) orelse break;
+        defer a.free(r.tokens);
+        if (n == 0) first_round_lookup = gen.mtp_lookup_rounds == 1;
+        for (r.tokens) |t| {
+            if (n == want) break;
+            got[n] = t;
+            n += 1;
+        }
+    }
+    try testing.expectEqual(want, n);
+    try testing.expect(first_round_lookup);
+    try testing.expect(gen.mtp_attempted > 0);
+    try testing.expectEqualSlices(u32, &serial, &got);
+    const eval = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(eval);
+    gen.mtp_cache.?.appendEvalArrays(eval);
+    try mlx.check(mlx.mlx_eval(eval));
 }
 
 test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {
@@ -21264,7 +21352,7 @@ test "serial and MTP agree at the greedy temperature cutoff" {
     }
 }
 
-test "mtpLookupAllowed: the qwen4 head only, never under a forced depth, a batched head or a planner-owned round" {
+test "mtpLookupAllowed: the qwen4 and MiMo heads, never under a forced depth, a batched head or a planner-owned round" {
     const env = Generator.mtp_lookup_env_cache;
     const forced = Generator.mtp_force_depth_cache;
     const planner = group_planner.enabled_override;
@@ -21283,7 +21371,7 @@ test "mtpLookupAllowed: the qwen4 head only, never under a forced depth, a batch
     try testing.expect(g.mtpLookupAllowed());
 
     g.mtp = .{ .mimo = undefined };
-    try testing.expect(!g.mtpLookupAllowed());
+    try testing.expect(g.mtpLookupAllowed());
     g.mtp = .{ .qwen = undefined };
     try testing.expect(!g.mtpLookupAllowed());
     g.mtp = null;
@@ -21305,6 +21393,25 @@ test "mtpLookupAllowed: the qwen4 head only, never under a forced depth, a batch
 
     Generator.mtp_lookup_env_cache = false;
     try testing.expect(!g.mtpLookupAllowed());
+}
+
+test "mtpLookupDraftCap: a MiMo lookup drafts no wider than its verify keeps decode rows" {
+    try testing.expectEqual(Generator.mtpVerifyDraftsMax(true), Generator.mtpLookupDraftCap(true));
+    try testing.expectEqual(mtp_lookup.MAX_DRAFT_STRONG, Generator.mtpLookupDraftCap(false));
+    var idx = mtp_lookup.Index.init(testing.allocator);
+    defer idx.deinit();
+    const Lines = struct {
+        pub fn hasNewline(_: @This(), id: u32) bool {
+            return id == 0;
+        }
+    };
+    var text: [80]u32 = undefined;
+    for (&text, 0..) |*t, i| t.* = @intCast(1 + i % 40);
+    try idx.extend(&text, Lines{});
+    const got = idx.match(1, Generator.mtpLookupDraftCap(true)) orelse return error.NoMatch;
+    var free = Generator.mtpLookupCostsFor(Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, null), 3);
+    for (&free.lookup) |*c| c.* = 0.01;
+    try testing.expectEqual(Generator.mtpVerifyDraftsMax(true), mtp_lookup.gate(got, 1000, 8, 0, true, free));
 }
 
 test "mtpLookupCostsFor: a lookup is the MTP round at its draft count minus the head steps, until the lookup row is measured" {

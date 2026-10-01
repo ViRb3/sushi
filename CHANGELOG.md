@@ -10,6 +10,8 @@ earlier history is mlx-serve's, in that project's changelog.
   long cache), the draft heads and long-prompt attention do less work per token; output is byte-identical.
 - **Faster Qwen3.8-Flash-Next prefill**: the expert routing table is built on the GPU and the expert outputs are
   reduced in place, with no host round trip or un-sort copy per layer; output is byte-identical.
+- **MiMo echoes and edits of a file in context decode faster**: prompt lookup now runs inside MiMo's MTP rounds, and a
+  lookup or PLD round verifies up to seven drafts; output is byte-identical.
 - **Greedy MiMo decode reads the vocabulary head through a coarse top-32 shortlist** re-scored on the full head,
   with or without MTP; sampled, logprob, penalty and grammar requests keep the full head.
 - **`--gpu-warm-secs <n>`** (default 60, 0 = off): the server keeps the GPU awake for this long after a request, so
