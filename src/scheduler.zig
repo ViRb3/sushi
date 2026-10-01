@@ -2821,6 +2821,27 @@ pub fn resolveExpertCache(
     return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger, .overridden = false };
 }
 
+/// The 2-bit lm_head copy a MiMo source trunk keeps, resident or streamed: the heads draft on it
+/// and a greedy readout shortlists on it.
+fn mimoCoarseHeadBytes(config: *const ModelConfig) u64 {
+    if (!config.usesMimoSourceTrunk() or mimo_mtp.rerankBits() == 0) return 0;
+    return mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mimo_mtp.rerankBits());
+}
+
+test "a MiMo source trunk bills one coarse lm_head copy, streamed or resident; another arch none" {
+    var mimo = ModelConfig{ .model_type = "mimo_v2", .vocab_size = 152576, .hidden_size = 4096 };
+    const want = mtp_mod.rerankCoarseBytes(152576, 4096, mimo_mtp.rerankBits());
+    for ([_]@import("expert_quant.zig").Layout{ .exl3_k4, .mxfp4_individual }) |layout| {
+        mimo.expert_layout = layout;
+        mimo.expert_streaming = false;
+        try std.testing.expectEqual(want, mimoCoarseHeadBytes(&mimo));
+        mimo.expert_streaming = true;
+        try std.testing.expectEqual(want, mimoCoarseHeadBytes(&mimo));
+    }
+    const qwen = ModelConfig{ .model_type = "qwen4_exp", .vocab_size = 248320, .hidden_size = 2560, .expert_layout = .exl3_k4 };
+    try std.testing.expectEqual(@as(u64, 0), mimoCoarseHeadBytes(&qwen));
+}
+
 test "mimo_v2 expert cache budget excludes the dense prefix" {
     const per_expert: u64 = 1024 * 1024;
     const config = model_mod.ModelConfig{
@@ -3027,9 +3048,7 @@ pub var load_context_bytes: ?*const fn (*const model_mod.ModelConfig) ?u64 = nul
 fn mimoResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
     var bytes = try model_mod.mimoSourceResidentBytes(io, allocator, model_dir, load_vision and config.mimo_vision);
     if (mtp_on) bytes += try model_mod.mimoMtpResidentBytes(io, allocator, model_dir);
-    if (mimo_mtp.rerankBits() != 0)
-        bytes += mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mimo_mtp.rerankBits());
-    return bytes;
+    return bytes + mimoCoarseHeadBytes(config);
 }
 
 /// The drafter a load binds: `--no-drafter` wins, then an explicit dir, then one shipped in the model dir.
@@ -3523,7 +3542,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const geometry = streamingGeometryOf(params.config);
         const layout = try expert_stream_mod.quant.streamingLayoutOfDir(sch.allocator, sch.io, params.config.model_type, params.model_dir, geometry.layers, geometry.first_moe_layer);
         params.config.expert_layout = layout;
-        const split = try model_mod.streamingResidentSplit(sch.io, sch.allocator, params.model_dir, layout);
+        var split = try model_mod.streamingResidentSplit(sch.io, sch.allocator, params.model_dir, layout);
+        split.trunk +|= mimoCoarseHeadBytes(params.config);
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
         if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
         switch (mtpStreamingVerdict(mtp)) {
@@ -4114,7 +4134,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     };
     // The heads built the coarse copy for their drafts; without them the trunk's greedy readout still takes one.
     // Same predicate as the resident bill that prices this copy.
-    if (params.config.usesMimoSourceTrunk() and !params.config.expert_streaming and xfm_ptr.lm_head_coarse == null)
+    if (mimoCoarseHeadBytes(params.config) > 0 and xfm_ptr.lm_head_coarse == null)
         xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
     if (mtp_enabled and !params.config.isMimo() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {

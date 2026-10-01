@@ -52,9 +52,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   rank-local tiles, not trailing padding on the full tensor. Tensor-parallel 4 is solved from geometry.
 - **A MiMo EXL3 pack serves RESIDENT**: see [engine-exl3-experts](engine-exl3-experts.md#mimo). The trunk takes
   the source loader (`usesMimoSourceTrunk`), billed as stored by `mimoSourceResidentBytes`.
-- **A resident load holds ONE 2-bit coarse copy of the lm_head** (`Transformer.lm_head_coarse`, ~0.19 GB, billed
-  with or without MTP): the heads draft on it and the trunk's greedy readout shortlists on it, so a greedy argmax is
-  the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)).
+- **A load holds ONE 2-bit coarse copy of the lm_head** (`Transformer.lm_head_coarse`, ~0.19 GB, billed with or
+  without MTP, `scheduler.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it,
+  so a greedy argmax is the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)). A streamed load
+  keeps it too, billed as trunk in the SSD budget ledger.
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`): a MiMo pack read without its source trunk
   binds the raw FP8 fused QKV and its logits stop following the routed experts (two packs sharing a hard-linked
   trunk produced bit-identical logits until `kld` took the served loader).
