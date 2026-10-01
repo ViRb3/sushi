@@ -106,7 +106,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   correction from ORIGINAL `verify_logits[accepted]`.
 - A block decoder checks its ENTRY token before drafting (`generate.tokenStops`); the token budget is a PRE-COMMIT
   invariant; a committed argmax is a `CommittedArgmax` (only `verifyArgmax` builds one, masking reserved ids).
-- logprobs>0 + grammar disable spec.
+- logprobs>0, grammar and a repeat/presence penalty disable spec.
 
 ## Cost and acceptance
 

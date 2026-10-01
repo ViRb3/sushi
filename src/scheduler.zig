@@ -2165,6 +2165,7 @@ pub const Scheduler = struct {
             if (cf.pending()) return .forced_call;
         }
         if (slot.logprobs_n > 0) return .logprobs;
+        if (generate_mod.penaltyActive(slot.sampling)) return .penalty;
         const cfg = slot.model.config orelse return .arch;
         if (modelBatchable(cfg)) return .ok;
         // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
@@ -2185,6 +2186,7 @@ pub const BatchVerdict = enum {
     grammar,
     forced_call,
     logprobs,
+    penalty,
     arch,
     pad_waste,
 };

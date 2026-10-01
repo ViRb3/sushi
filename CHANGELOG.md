@@ -31,6 +31,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **The MiMo pack loads on demand on a 128 GB Mac at default flags** (the app's path): the automatic resident-memory
   cap now limits only models sharing memory, and a model loading alone is judged by the load's own memory check; an
   explicit `--max-resident-mem` still applies.
+- **`presence_penalty`, `frequency_penalty` and `repeat_penalty` take effect**: the default decode path and MTP
+  ignored them; a penalised request now decodes serially, so it is slower than an unpenalised one.
 - **A request that names a pack by its path is answered by that pack or refused**: an unregistered path is a 404
   instead of an answer from the default model; unknown model names still fall back to the default.
 - **A new MiMo session that shares only another's system prompt and tools reuses them from the prefix cache**

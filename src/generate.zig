@@ -1021,8 +1021,7 @@ pub const SamplingParams = struct {
 /// forward serve pruned or shortlisted logits.
 pub fn argmaxOnlyRequest(sampling: SamplingParams, logprobs_n: u32, pld_enabled: bool) bool {
     return (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
-        sampling.repeat_penalty == 1.0 and
-        sampling.presence_penalty == 0.0 and
+        !penaltyActive(sampling) and
         sampling.constraint == null and
         sampling.call_force == null and
         !pld_enabled and
@@ -1195,9 +1194,20 @@ fn specDecodeUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
     return draftsRefused(sampling) or logprobs_n != 0;
 }
 
-/// A grammar mask or a forced tool call decides tokens a draft run would skip past.
+/// A grammar mask or a forced tool call decides tokens a draft run would skip past, and a
+/// repeat or presence penalty reads ids no verify row has committed yet.
 pub fn draftsRefused(sampling: SamplingParams) bool {
-    return sampling.constraint != null or sampling.call_force != null;
+    return sampling.constraint != null or sampling.call_force != null or penaltyActive(sampling);
+}
+
+/// Only the synchronous serial sampler (`sampleToken`) applies these penalties. A repeat
+/// penalty of 0 or below is off: it would divide by zero or flip signs.
+pub fn penaltyActive(sampling: SamplingParams) bool {
+    return repeatPenaltyOn(sampling.repeat_penalty) or sampling.presence_penalty != 0.0;
+}
+
+fn repeatPenaltyOn(repeat_penalty: f32) bool {
+    return repeat_penalty > 0.0 and repeat_penalty != 1.0;
 }
 
 /// Generation result (for non-streaming use).
@@ -3933,7 +3943,14 @@ pub const Generator = struct {
     /// The ONE lazy sampler for a slot's own draws: advances the seed draw index.
     pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) mlx.mlx_array {
         defer self.sampling.draw +%= 1;
-        return sampleTokenLazy(logits, self.sampling, self.xfm.s);
+        // A penalised slot reaches here only from the constrained steps and a forced call's
+        // name choice, whose logits follow `generated_ids` (`samplesSync`, `draftsRefused`).
+        return penalizedSampleLazy(logits, self.sampling, self.generated_ids.items, self.xfm.s);
+    }
+
+    /// This slot samples on the synchronous serial path (`sampleToken`), never the lazy pipeline.
+    pub fn samplesSync(self: *const Generator) bool {
+        return self.logprobs_n > 0 or penaltyActive(self.sampling);
     }
 
     /// What a forced tool call makes of the next position.
@@ -10937,7 +10954,7 @@ pub const Generator = struct {
         // invariant, so this only fires for drafter→next runtime-gate
         // fallbacks (and any future spec methods that share drafter's shape).
         if (!self.has_pending_logits and !self.has_pending_token and
-            self.step < self.max_tokens and self.logprobs_n == 0)
+            self.step < self.max_tokens and !self.samplesSync())
         {
             const tok_i32: i32 = @intCast(self.next_token_id);
             const tok_shape = [_]c_int{ 1, 1 };
@@ -10952,7 +10969,7 @@ pub const Generator = struct {
         // ── Phase 1: Build and submit the NEXT step FIRST ──
         // This forces the GPU to compute the pending token as a dependency,
         // so when we eval it in Phase 2, it's already ready.
-        if (self.has_pending_logits and self.logprobs_n == 0 and self.step + 1 < self.max_tokens and !self.callForcePending()) {
+        if (self.has_pending_logits and !self.samplesSync() and self.step + 1 < self.max_tokens and !self.callForcePending()) {
             const step_logits = self.pending_logits;
             self.has_pending_logits = false;
 
@@ -11038,8 +11055,8 @@ pub const Generator = struct {
             break :blk out;
         };
 
-        // Logprobs: fully synchronous
-        if (self.logprobs_n > 0) {
+        // Logprobs and penalties: fully synchronous
+        if (self.samplesSync()) {
             defer _ = mlx.mlx_array_free(step_logits);
             const t_sample = tick_prof.mark();
             const result: SampleResult = switch (self.forcedNext()) {
@@ -12137,6 +12154,18 @@ fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.ml
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, key, s));
     return sampled;
+}
+
+/// `sampleTokenLazy` under the request's repeat/presence penalty over `generated_ids`.
+fn penalizedSampleLazy(logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: []const u32, s: mlx.mlx_stream) mlx.mlx_array {
+    if (penaltyActive(sampling) and generated_ids.len > 0) {
+        var penalized = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(penalized);
+        if (applyRepeatPenalty(&penalized, logits, generated_ids, sampling.repeat_penalty, sampling.presence_penalty, s)) {
+            return sampleTokenLazy(penalized, sampling, s);
+        } else |err| log.err("[sampling] penalty not applied ({s})\n", .{@errorName(err)});
+    }
+    return sampleTokenLazy(logits, sampling, s);
 }
 
 /// A committed token as the `[1]` int32 array a sample would be.
@@ -13536,8 +13565,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         _ = mlx.mlx_array_free(penalized);
     };
 
-    const needs_penalty = (sampling.repeat_penalty != 1.0 or sampling.presence_penalty != 0.0);
-    if (needs_penalty) {
+    if (penaltyActive(sampling)) {
         if (generated_ids) |ids| {
             if (ids.len > 0) {
                 try applyRepeatPenalty(&penalized, current, ids, sampling.repeat_penalty, sampling.presence_penalty, s);
@@ -14110,7 +14138,7 @@ fn applyRepeatPenalty(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids:
         _ = mlx.mlx_array_free(penalized);
     };
 
-    if (repeat_penalty != 1.0) {
+    if (repeatPenaltyOn(repeat_penalty)) {
         const rp = mlx.mlx_array_new_float(repeat_penalty);
         defer _ = mlx.mlx_array_free(rp);
         const inv_rp = mlx.mlx_array_new_float(1.0 / repeat_penalty);
@@ -14228,6 +14256,62 @@ test "specDecodeUnsupported: a forced tool call keeps every draft path off" {
     // the think closer to the forced call.
     var cf = CallForce{ .forced = &.{1}, .call_at = 0, .closer_id = null, .phase = .answer, .last = 0 };
     try testing.expect(specDecodeUnsupported(.{ .call_force = &cf }, 0));
+}
+
+test "a repeat or presence penalty keeps every draft path off and samples on the synchronous path" {
+    try testing.expect(specDecodeUnsupported(.{ .presence_penalty = 0.5 }, 0));
+    try testing.expect(specDecodeUnsupported(.{ .repeat_penalty = 1.1 }, 0));
+    try testing.expect(draftsRefused(.{ .presence_penalty = 0.5 }));
+    try testing.expect(!draftsRefused(.{}));
+    var g: Generator = undefined;
+    g.logprobs_n = 0;
+    g.sampling = .{ .presence_penalty = 0.5 };
+    try testing.expect(g.samplesSync());
+    g.sampling = .{ .repeat_penalty = 1.2 };
+    try testing.expect(g.samplesSync());
+    g.sampling = .{};
+    try testing.expect(!g.samplesSync());
+    g.logprobs_n = 2;
+    try testing.expect(g.samplesSync());
+}
+
+test "a repeat penalty of 0 or below is off" {
+    try testing.expect(!penaltyActive(.{ .repeat_penalty = 0 }));
+    try testing.expect(!penaltyActive(.{ .repeat_penalty = -1.5 }));
+    try testing.expect(penaltyActive(.{ .repeat_penalty = 0, .presence_penalty = 0.3 }));
+    try testing.expect(!argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 1.1 }, 0, false));
+    try testing.expect(argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 0 }, 0, false));
+}
+
+test "a constrained penalised step picks what sampleToken picks on the same masked logits, penalised once" {
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const v = 16;
+    // Once: id 0 falls below id 1 in case A and stays above it in case B; twice would flip B too.
+    const Case = struct { runner_up: f32, want: u32 };
+    for ([_]Case{ .{ .runner_up = 4.8, .want = 1 }, .{ .runner_up = 4.2, .want = 0 } }) |c| {
+        var host: [v]f32 = @splat(0);
+        host[0] = 5.0;
+        host[1] = c.runner_up;
+        host[9] = 9.0;
+        const shape = [_]c_int{ 1, 1, v };
+        const logits = mlx.mlx_array_new_data(&host, &shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(logits);
+        var allowed: [v]bool = @splat(true);
+        allowed[9] = false;
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        try applyGrammarMask(a, &masked, logits, &allowed, s);
+        const sampling = SamplingParams{ .temperature = 0, .presence_penalty = 0.5 };
+        const generated = [_]u32{ 0, 3 };
+        const sync = try sampleToken(a, masked, sampling, &generated, 0, s);
+        const lazy = penalizedSampleLazy(masked, sampling, &generated, s);
+        defer _ = mlx.mlx_array_free(lazy);
+        const got = try samplerTestReadFlat(a, lazy, 1, s);
+        defer a.free(got);
+        try testing.expectEqual(c.want, sync.token_id);
+        try testing.expectEqual(@as(f32, @floatFromInt(c.want)), got[0]);
+    }
 }
 
 test "GenerationResult fields" {

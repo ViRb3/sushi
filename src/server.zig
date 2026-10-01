@@ -8470,13 +8470,7 @@ fn handleChatCompletions(
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
-    const repeat_penalty: f32 = blk: {
-        const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-        if (rp > 0.0) break :blk rp;
-        // Also check frequency_penalty (OpenAI format: 0-2 range, mapped to 1.0 + fp)
-        const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-        break :blk if (fp > 0.0) 1.0 + fp else 1.0;
-    };
+    const repeat_penalty = parseRepeatPenalty(root);
 
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
@@ -9028,17 +9022,7 @@ fn handleCompletions(
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
-    const repeat_penalty: f32 = if (root.get("repeat_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => blk: {
-            break :blk if (root.get("frequency_penalty")) |fp| switch (fp) {
-                .float => |f| 1.0 + @as(f32, @floatCast(f)),
-                .integer => |i| 1.0 + @as(f32, @floatFromInt(i)),
-                else => 1.0,
-            } else 1.0;
-        },
-    } else 1.0;
+    const repeat_penalty = parseRepeatPenalty(root);
 
     const presence_penalty_c: f32 = if (root.get("presence_penalty")) |v| switch (v) {
         .float => |f| @floatCast(@min(@max(f, 0.0), 2.0)),
@@ -13114,6 +13098,15 @@ fn formatLogprobsObject(
 }
 
 /// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
+/// `repeat_penalty` (0 or absent = unset, at most 10), else OpenAI's `frequency_penalty` (0-2) as
+/// `1 + fp`, else 1.0 (off).
+fn parseRepeatPenalty(root: std.json.ObjectMap) f32 {
+    const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    if (rp > 0.0) return rp;
+    const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    return if (fp > 0.0) 1.0 + fp else 1.0;
+}
+
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
     const raw = if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -19308,6 +19301,25 @@ test "utf8TrailingIncomplete partial after complete" {
 
 test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+}
+
+test "repeat_penalty: 0 or below is unset, then frequency_penalty, then off, on chat and completions alike" {
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, want: f32 };
+    const cases = [_]Case{
+        .{ .body = "{}", .want = 1.0 },
+        .{ .body = "{\"repeat_penalty\":1.3}", .want = 1.3 },
+        .{ .body = "{\"repeat_penalty\":0}", .want = 1.0 },
+        .{ .body = "{\"repeat_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.5 },
+        .{ .body = "{\"repeat_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.1 },
+        .{ .body = "{\"frequency_penalty\":0.1}", .want = 1.1 },
+        .{ .body = "{\"repeat_penalty\":50}", .want = 10.0 },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectApproxEqAbs(c.want, parseRepeatPenalty(parsed.value.object), 1e-6);
+    }
 }
 
 test "parseJsonFloat returns value when present" {
