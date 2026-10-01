@@ -12301,6 +12301,29 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     try t.expect(xfm.qwen4_mtp_owner == null);
 }
 
+test "qwen4 MTP head: a load that fails at any allocation frees what it took (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, t.allocator, std.mem.span(model_dir));
+    defer config.deinit(t.allocator);
+    var weights = try model_mod.loadWeights(io, t.allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var name_buf: [256]u8 = undefined;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        const head = Transformer.loadQwen4Mtp(failing.allocator(), config, &weights, &name_buf, s) catch continue;
+        var h = head orelse return error.SkipZigTest;
+        h.deinit(failing.allocator());
+        break;
+    }
+    try t.expect(fail_index > 0);
+}
+
 test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at depths 1/2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -14097,6 +14120,18 @@ pub const Qwen4Mtp = struct {
     rerank: ?mtp_mod.RerankCoarse = null,
     rerank_logged: bool = false,
     rerank_tried: bool = false,
+
+    /// `allocator` is the one `loadQwen4Mtp` took; the layer's weights are the trunk's `Weights`.
+    pub fn deinit(self: *Qwen4Mtp, allocator: std.mem.Allocator) void {
+        for (self.owned) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(self.owned);
+        self.cache.deinit();
+        _ = mlx.mlx_array_free(self.entry.conv_state);
+        _ = mlx.mlx_array_free(self.entry.ssm_state);
+        ssmFreeQsaState(&self.entry);
+        self.qsa_marks.deinit();
+        if (self.rerank) |*rc| rc.deinit();
+    }
 };
 
 const LinearAttnWeights = struct {
@@ -17593,8 +17628,14 @@ pub const Transformer = struct {
         // qwen4_exp: the final hyper-connection read (replaces model.norm)
         // and the module-owned n-gram hash + mmapped table.
         var qwen4_state: ?*qwen4_mod.Qwen4State = null;
+        // Once published the state may run its table's warm thread, which `deinit` joins.
+        errdefer if (qwen4_state) |st| {
+            st.deinit();
+            allocator.destroy(st);
+        };
         var qwen4_mixer: ?HcWeights = null;
         var qwen4_mtp: ?Qwen4Mtp = null;
+        errdefer if (qwen4_mtp) |*m| m.deinit(allocator);
         var expert_stream: ?*expert_stream_mod.Engine = null;
         var imatrix: ?*imatrix_capture.Collector = null;
         errdefer if (imatrix) |c| c.deinit();
@@ -17614,29 +17655,30 @@ pub const Transformer = struct {
             // `config.ple_layer_idx` (pinned by the oracle fixture with `ple_layer_ids=[2]`).
             try checkQsaCompressRatio(config.indexer_compress_ratio);
             const st = try allocator.create(qwen4_mod.Qwen4State);
-            errdefer allocator.destroy(st);
-            st.* = .{
-                .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
-                .table = switch (config.ngramTableSource()) {
-                    .bf16_override => blk: {
-                        const dir = config.ngram_bf16_dir.?;
-                        log.info("[qwen4] ngram table from the bf16 shards in {s} (SUSHI_NGRAM_BF16_DIR)\n", .{dir});
-                        break :blk try qwen4_mod.NgramTable.openBf16(allocator, dir);
+            {
+                errdefer allocator.destroy(st);
+                st.* = .{
+                    .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
+                    .table = switch (config.ngramTableSource()) {
+                        .bf16_override => blk: {
+                            const dir = config.ngram_bf16_dir.?;
+                            log.info("[qwen4] ngram table from the bf16 shards in {s} (SUSHI_NGRAM_BF16_DIR)\n", .{dir});
+                            break :blk try qwen4_mod.NgramTable.openBf16(allocator, dir);
+                        },
+                        .bf16_streamed => try qwen4_mod.NgramTable.openBf16(allocator, config.expert_source_dir orelse return error.MissingExpertSourceDir),
+                        .quantized => try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
                     },
-                    .bf16_streamed => try qwen4_mod.NgramTable.openBf16(allocator, config.expert_source_dir orelse return error.MissingExpertSourceDir),
-                    .quantized => try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
-                },
-            };
+                };
+            }
+            qwen4_state = st;
             if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
                 log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
-                st.table.close();
                 return error.NgramTableMismatch;
             }
             var gpu_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&gpu_bytes);
             st.table.calibrateArm();
             st.table.startWarm(); // the weights load just evicted the table from page cache
-            qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
             if (config.expert_streaming) {
                 if (qwen4_mtp) |*mtp_head| try evalQwen4MtpResident(mtp_head);
@@ -18614,14 +18656,7 @@ pub const Transformer = struct {
         self.ssm_group.deinit();
         if (self.moe_layers) |ml| self.allocator.free(ml);
         if (self.qwen4_mtp) |*m| {
-            for (m.owned) |a| _ = mlx.mlx_array_free(a);
-            self.allocator.free(m.owned);
-            m.cache.deinit();
-            _ = mlx.mlx_array_free(m.entry.conv_state);
-            _ = mlx.mlx_array_free(m.entry.ssm_state);
-            ssmFreeQsaState(&m.entry);
-            m.qsa_marks.deinit();
-            if (m.rerank) |*rc| rc.deinit();
+            m.deinit(self.allocator);
             self.qwen4_mtp = null;
         }
         if (self.expert_stream) |engine| {
@@ -24023,14 +24058,18 @@ pub const Transformer = struct {
         mcfg.ple_layer_idx = -1;
         mcfg.expert_streaming = false;
         const ml = try initMoeLayers(allocator, mcfg, weights, name_buf, s);
-        var owned: std.ArrayList(mlx.mlx_array) = .empty;
-        errdefer owned.deinit(allocator);
-        try owned.appendSlice(allocator, ml.owned_bf16);
-        allocator.free(ml.owned_bf16);
         const layer = ml.moe_layers[0];
         allocator.free(ml.moe_layers);
-        const entry = ml.ssm_entries[0];
+        var entry = ml.ssm_entries[0];
         allocator.free(ml.ssm_entries);
+        var owned: std.ArrayList(mlx.mlx_array) = .fromOwnedSlice(ml.owned_bf16);
+        errdefer {
+            for (owned.items) |a| _ = mlx.mlx_array_free(a);
+            owned.deinit(allocator);
+            _ = mlx.mlx_array_free(entry.conv_state);
+            _ = mlx.mlx_array_free(entry.ssm_state);
+            ssmFreeQsaState(&entry);
+        }
         const fe = try weightTriple(weights, mtp_prefix ++ ".fc_embedding", &owned, allocator, s);
         const fh = try weightTriple(weights, mtp_prefix ++ ".fc_hidden", &owned, allocator, s);
         const mixer = try loadHcWeights(weights, mtp_prefix ++ ".hyper_connection_mixer", false, config.hc_count, config.hidden_size, &owned, allocator, s);

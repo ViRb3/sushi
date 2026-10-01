@@ -74,6 +74,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## What loads
 
 - A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.
+- A qwen4_exp load that fails after the n-gram state or the MTP head exists frees both (`Qwen4Mtp.deinit`; the
+  state's `deinit` joins the table's warm thread first). Guard: the `QWEN4_TEST_MODEL` FailingAllocator sweep over
+  `loadQwen4Mtp`.
 
 - **Bind**: `server.resolveBind` defaults to `127.0.0.1:12345`; `--host` takes an IPv4 literal, `0.0.0.0` or
   `localhost` (= 127.0.0.1; anything else is refused by name, never widened). Before any model loads,
