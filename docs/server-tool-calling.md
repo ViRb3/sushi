@@ -54,6 +54,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 ## Parsing tool calls
 
+- Nameless calls are discarded; XML function names reject empty placeholders and whitespace or tag fragments from prose.
+
 - **A `<tool_call>` body carrying `<function=` is the XML dialect and is read FIRST** (qwen 3.5+ template mandates
   it); a parameter VALUE never decides the call. A `<parameter>` VALUE may spell the dialect's own close tags
   (`hermesValueEnd` = LAST `</parameter>` before the next opener). A Hermes value keeps its own whitespace

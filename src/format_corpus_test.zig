@@ -231,6 +231,34 @@ const shell_tool_schema =
 ;
 
 const corpus = [_]Expect{
+    .{
+        .family = "qwen",
+        .name = "explanation cannot become an XML function name",
+        .raw = "A `<tool_call>` body carrying `<function=` uses XML. See `<tool_call>`.",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "hermes",
+        .name = "JSON nameless call is not executable",
+        .raw = "<tool_call>{\"name\":\"\",\"arguments\":{}}</tool_call>",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "qwen",
+        .name = "documentation placeholder is not a callable function",
+        .raw = "The XML format uses `<tool_call><function=></function></tool_call>`.",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "qwen",
+        .name = "nameless call does not discard a valid sibling",
+        .raw = "<tool_call>{\"name\":\" \",\"arguments\":{}}</tool_call>" ++
+            "<tool_call><function=read_file><parameter=path>README.md</parameter></function></tool_call>",
+        .tool_name = "read_file",
+        .tool_count = 1,
+        .tool_arg_key = "path",
+        .tool_arg_value = "README.md",
+    },
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
     .{
         .family = "qwen",
@@ -1966,6 +1994,9 @@ test "format corpus: recorded model outputs across families" {
                 // `<|content_text|>bash` reached pi, whose "Tool ... not found"
                 // error taught the model to echo the garbage name back into its
                 // own payloads — a self-reinforcing loop the parser started.
+                if (std.mem.trim(u8, tc.name, " \t\r\n").len == 0) {
+                    try fail(entry, "tool NAME is empty", tc.name);
+                }
                 if (std.mem.indexOf(u8, tc.name, "<|") != null) {
                     try fail(entry, "tool NAME carries a channel marker", tc.name);
                 }

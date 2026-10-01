@@ -3797,7 +3797,22 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         for (calls.items) |*tc| tc.inferred = true;
     }
 
-    if (calls.items.len == 0) return null;
+    // A nameless placeholder cannot be executed or repaired by a client.
+    var named: usize = 0;
+    for (calls.items) |tc| {
+        if (std.mem.trim(u8, tc.name, " \t\r\n").len == 0) {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+            continue;
+        }
+        calls.items[named] = tc;
+        named += 1;
+    }
+    calls.items.len = named;
+    if (calls.items.len == 0) {
+        calls.deinit(allocator);
+        return null;
+    }
 
     // Final safety net: EVERY emitted call carries valid-JSON arguments, whatever
     // converter built them. The direct-construction converters (Gemma custom
@@ -6696,6 +6711,7 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
     const name_start = fn_start + fn_start_tag.len;
     const name_end = std.mem.indexOf(u8, block[name_start..], ">") orelse return null;
     const fn_name = std.mem.trim(u8, block[name_start .. name_start + name_end], " \n");
+    if (!isPlausibleParamName(fn_name)) return null;
 
     var args_map = std.ArrayList(u8).empty;
     defer args_map.deinit(allocator);
