@@ -41,6 +41,8 @@ earlier history is mlx-serve's, in that project's changelog.
   load line now says each request picks its own chunk width, with the load-time width only a fallback.
 - **`ignore_eos: true`** on a `/v1/completions` request decodes past the end-of-sequence token up to `max_tokens`,
   as in vLLM; a chat request that sets it gets a 400 naming the field.
+- **A reasoning budget closes the thought on time when several requests decode at once**; batched, a thought could
+  run thousands of tokens past it.
 - **A Flash-Next turn restored from the SSD prompt cache is no longer billed as if its restored prefix were new**,
   so a long session after a restart is admitted where that bill refused it.
 - **A malformed `config.json` is refused by name** (a wrong field type, a negative or oversized number) instead of

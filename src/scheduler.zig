@@ -8508,6 +8508,52 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (inner_err) |e| return e;
 }
 
+/// The slots a plain batched tick forwards, in `live`: each past the per-tick guards every decode
+/// path runs (loop stop, thinking budget), drained of its pipeline state, the ones that finish
+/// or spend their tick left out.
+fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
+    var live_n: usize = 0;
+    for (active) |slot| {
+        const gen = if (slot.legacy_gen) |*g| g else {
+            slot.markError("no_generator");
+            continue;
+        };
+        if (try loopGuardTick(sch, slot, gen)) continue;
+        if (gen.has_pending_logits or gen.has_pending_token) {
+            const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
+                slot.markError(@errorName(err));
+                continue;
+            };
+            if (emitted) |tok| {
+                slot.pushToken(tok);
+                if (Planner.enabled() and gen.mtp_planner_owned) {
+                    gen.mtp_planner_plain_ticks += 1;
+                    plannerOutputClock(slot, gen);
+                }
+                if (tok != 0) slot.was_pad_only = false;
+                slot.completion_tokens = gen.completion_tokens;
+                if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
+                    finishSlot(sch, slot, "stop");
+                    continue;
+                }
+                if (slot.completion_tokens >= slot.max_tokens) {
+                    finishSlot(sch, slot, "length");
+                    continue;
+                }
+            } else {
+                // checkStop fired on the pipelined lookahead (EOS / pad-run
+                // / max_tokens / timeout); nothing to emit.
+                slot.completion_tokens = gen.completion_tokens;
+                finishSlot(sch, slot, gen.finish_reason);
+                continue;
+            }
+        }
+        live[live_n] = slot;
+        live_n += 1;
+    }
+    return live_n;
+}
+
 fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const N = active.len;
     if (N == 0) return;
@@ -8553,44 +8599,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // finish during the drain are excluded from the batch.
     const live = try allocator.alloc(*Slot, N);
     defer allocator.free(live);
-    var live_n: usize = 0;
-    for (active) |slot| {
-        const gen = if (slot.legacy_gen) |*g| g else {
-            slot.markError("no_generator");
-            continue;
-        };
-        if (gen.has_pending_logits or gen.has_pending_token) {
-            const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
-                slot.markError(@errorName(err));
-                continue;
-            };
-            if (emitted) |tok| {
-                slot.pushToken(tok);
-                if (Planner.enabled() and gen.mtp_planner_owned) {
-                    gen.mtp_planner_plain_ticks += 1;
-                    plannerOutputClock(slot, gen);
-                }
-                if (tok != 0) slot.was_pad_only = false;
-                slot.completion_tokens = gen.completion_tokens;
-                if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
-                    finishSlot(sch, slot, "stop");
-                    continue;
-                }
-                if (slot.completion_tokens >= slot.max_tokens) {
-                    finishSlot(sch, slot, "length");
-                    continue;
-                }
-            } else {
-                // checkStop fired on the pipelined lookahead (EOS / pad-run
-                // / max_tokens / timeout); nothing to emit.
-                slot.completion_tokens = gen.completion_tokens;
-                finishSlot(sch, slot, gen.finish_reason);
-                continue;
-            }
-        }
-        live[live_n] = slot;
-        live_n += 1;
-    }
+    const live_n = try batchedTickRows(sch, active, live);
     if (live_n == 0) return;
     const batch = live[0..live_n];
 
@@ -9964,6 +9973,30 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
+}
+
+test "a plain batched tick checks the thinking budget before its rows forward" {
+    // A thought past its budget with no room left to close it: the bound fires, the slot decodes on.
+    const forced = [_]u32{ 9, 7 };
+    var tb = generate_mod.ThinkBound{ .budget = 2, .opener_id = 5, .closer_id = 7, .forced = &forced, .in_think = false };
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &.{ 5, 11, 12, 13 });
+    var gen: Generator = undefined;
+    gen.generated_ids = ids;
+    gen.loop_guard_start = 0;
+    gen.sampling = .{ .think_bound = &tb };
+    gen.completion_tokens = 4;
+    gen.max_tokens = 4;
+    gen.has_pending_logits = false;
+    gen.has_pending_token = false;
+    var slot: Slot = undefined;
+    slot.legacy_gen = gen;
+    var sch: Scheduler = undefined;
+    var active = [_]*Slot{&slot};
+    var live: [1]*Slot = undefined;
+    try testing.expectEqual(@as(usize, 1), try batchedTickRows(&sch, &active, &live));
+    try testing.expect(tb.fired);
 }
 
 test "merged verify: an uncertified [N,S] shape is declined by name, never dispatched" {

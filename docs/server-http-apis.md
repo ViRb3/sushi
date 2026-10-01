@@ -89,7 +89,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 
 Enforced at DECODE (`server.armThinkBound` → `SamplingParams.think_bound`, `scheduler.thinkBoundTick`): at the budget
 the early-stop line + the atomic closer commit as ONE multi-token forward (`commitForcedTokens`); the whole closed
-thought is delivered. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder
+thought is delivered. Every decode tick checks it with the loop stop (`loopGuardTick`), the plain batched tick too
+(`batchedTickRows`): skipped there, a budget under `--max-concurrent` overran by up to ~2.5k tokens while its slot
+batched plain. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder
 (`model.effortArms` for served arches, `responses.effortBudget` for the rest).
 Every surface arms it with one precedence: explicit budget (`reasoning_budget_tokens`, Anthropic `budget_tokens`) > the
 effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and dropped the budget.
