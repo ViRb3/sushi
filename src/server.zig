@@ -4886,15 +4886,18 @@ test "with no --kv-quant, the per-token KV bill and the auto-context follow the 
     const saved_kv = configured_kv_quant;
     defer configured_kv_quant = saved_kv;
 
+    // One fixed memory reading for every arm: live free RAM moves between two reads.
+    const ceiling: u64 = 96 << 30;
+    const active: u64 = 40 << 30;
     configured_kv_quant = null;
     try t.expectEqual(@as(u64, 8), defaultKvBits(&cfg));
     try t.expectEqual(sessionBytesPerToken(&cfg, 8), sessionBytesPerToken(&cfg, defaultKvBits(&cfg)));
-    const ctx_default = computeMemoryContext(&cfg);
+    const ctx_default = memoryContextAt(&cfg, ceiling, active);
 
     configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
-    try t.expectEqual(ctx_default, computeMemoryContext(&cfg));
+    try t.expectEqual(ctx_default, memoryContextAt(&cfg, ceiling, active));
     configured_kv_quant = transformer_mod.KVQuantConfig.dense;
-    try t.expect(computeMemoryContext(&cfg) < ctx_default);
+    try t.expect(memoryContextAt(&cfg, ceiling, active) < ctx_default);
 
     // A per-model setting still outranks the default.
     configured_kv_quant = null;
@@ -5386,6 +5389,13 @@ test "admissionVerdict names the same three arms the guard acts on" {
 
 /// The largest context this model's per-token footprint fits into RAM right now, ignoring the checkpoint's own maximum.
 fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    return memoryContextAt(config, currentGpuMemoryCeiling(config, active_mem), active_mem);
+}
+
+/// `computeMemoryContext` at one reading of the ceiling and MLX's active memory.
+fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
 
@@ -5404,12 +5414,9 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         config.pinned_prefill_chunk,
     ));
 
-    var active_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
-
     return safeContextForBudget(
         // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
-        currentGpuMemoryCeiling(config, active_mem),
+        ceiling,
         active_mem,
         // The hot prefix cache fills to this cap over a session, and a prefill has to land on
         // top of whatever context we report. `CTX_SIZING_CACHE_RESERVE`, not the resolved
@@ -19370,9 +19377,9 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     // No declared max: fall back to the margined memory ceiling.
     var unbounded = small;
     unbounded.max_position_embeddings = 0;
-    const got = autoContextFor(&unbounded);
-    try testing.expect(got > 0);
-    try testing.expectEqual(safeAutoContext(computeMemoryContext(&unbounded)), got);
+    try testing.expect(autoContextFor(&unbounded) > 0);
+    const memory_ctx = memoryContextAt(&unbounded, 96 << 30, 40 << 30);
+    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap()));
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
