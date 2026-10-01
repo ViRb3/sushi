@@ -30,18 +30,25 @@ cleanup() {
     rm -rf "$OUT"
 }
 trap cleanup EXIT
-trap 'cat "$OUT/refused.log" "$OUT/server.log" >&2 2>/dev/null' ERR
+trap 'cat "$OUT/pick.log" "$OUT/server.log" >&2 2>/dev/null' ERR
 mkdir "$OUT/home"
-# A sigmoid router refuses the lossy pick by name at load instead of routing exact.
+# A sigmoid router takes the lossy pick on its sigmoid probabilities: a decode engages the swap.
 HOME="$OUT/home" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
     --ssd-budget-gb "$BUDGET" --no-mtp --no-vision --expert-pick-tolerance 0.2 \
-    --log-file "$OUT/refused.log" >"$OUT/refused-console.log" 2>&1 &
+    --log-file "$OUT/pick.log" >"$OUT/pick-console.log" 2>&1 &
 PID=$!
-for ((i=0; i<300; i++)); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
-if kill -0 "$PID" 2>/dev/null; then echo "a streamed MiMo load accepted --expert-pick-tolerance" >&2; cat "$OUT/refused.log" >&2; exit 1; fi
-if wait "$PID"; then echo "the --expert-pick-tolerance boot exited 0" >&2; cat "$OUT/refused.log" >&2; exit 1; fi
+for ((i=0; i<1200; i++)); do
+    if curl --connect-timeout 1 --max-time 2 -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then break; fi
+    kill -0 "$PID"
+    sleep 1
+done
+curl --max-time 600 -fsS "http://127.0.0.1:$PORT/v1/chat/completions" -H 'content-type: application/json' \
+    -d '{"messages":[{"role":"user","content":"Count from one to twenty in words."}],"max_tokens":32,"temperature":0}' >/dev/null
+grep -q 'expert-swap\] engaged: tolerance=0.20' "$OUT/pick.log"
+grep -Eq 'expert-swap\] swapped [1-9][0-9]* of [0-9]+ routed ids' "$OUT/pick.log"
+kill "$PID"
+wait "$PID" 2>/dev/null || true
 PID=
-grep -q 'expert-pick-tolerance needs a softmax router' "$OUT/refused.log"
 HOME="$OUT/home" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
     --ssd-budget-gb "$BUDGET" --no-mtp --no-pld --no-vision --kv-quant off \
     --ctx-size 4096 --prefill-chunk 512 --prefix-cache-entries 0 --metrics \
@@ -99,4 +106,4 @@ STATUS=$(curl --max-time 30 -sS -o "$OUT/mtp.json" -w '%{http_code}' \
 jq -e '.error.type == "invalid_request_error" and (.error.message | contains("MTP speculative decode is not supported"))' "$OUT/mtp.json" >/dev/null
 grep -q '\[expert-stream\] ssd budget' "$OUT/server.log"
 grep -q '\[expert-stream\] cache' "$OUT/server.log"
-echo "PASS: MiMo streaming discovery, pick-tolerance refusal, greedy determinism, window-crossing prefill, and MTP refusal"
+echo "PASS: MiMo streaming discovery, sigmoid lossy pick, greedy determinism, window-crossing prefill, and MTP refusal"

@@ -1117,3 +1117,19 @@ Each chunk saves ~0.1 s at both widths (106 ms at 4096 rows, 109 ms at 8192). Th
 chunk, which points at the per-layer host round trip of the host-built table rather than the copy. A 32k prompt would
 save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one arm's samples ranged 17.9 to 20.1 s). The served path also drops the un-sort buffer
 (`[rows x 10, 2560]` f16: 210 MB at 4096 rows, 420 MB at 8192).
+
+<a id="mimo-stream-pick"></a>
+## Streamed MiMo: the sigmoid-probability lossy pick
+
+MiMo-V2.6-Flash-MOPD (MXFP4 experts) streamed, `--ssd-budget-gb 60 --no-mtp --kv-quant 8 --ctx-size 65536`, M5 Max,
+llmprobe 0.6.12 `--bench-only --rungs 4k`, one boot per arm on the same binary (built at cf23043d, the landed change's
+pick code), `taskpolicy -a`, GPU lock per boot, fans max + 10 s, 2026-10-01:
+
+| `--expert-pick-tolerance` | decode tok/s (min-max) | prefill tok/s @2k | ids swapped | speculated layers kept | mean fill / wall per forward |
+|---|---|---|---|---|---|
+| 0 (exact) | 5.8 (5.5-5.8) | 228.6 | - | 37% | 1.10 GB / 188 ms |
+| 0.2 | 10.5 (10.3-11.2) | 228.3 | ~9% | 56% | 0.67 GB / 114 ms |
+
+The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per token the exact arm spends ~85 ms waiting
+on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
+cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).

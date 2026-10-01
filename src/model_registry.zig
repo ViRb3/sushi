@@ -1192,7 +1192,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertPickToleranceUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3RateGroupsStreamingUnsupported, Exl3NonuniformStreamingUnsupported, Exl3GateUpRateMismatch } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3RateGroupsStreamingUnsupported, Exl3NonuniformStreamingUnsupported, Exl3GateUpRateMismatch } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
@@ -1203,7 +1203,6 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "SsdBudgetBelowResident")) return error.SsdBudgetBelowResident;
             if (std.mem.eql(u8, n, "SsdBudgetExceedsWiredLimit")) return error.SsdBudgetExceedsWiredLimit;
             if (std.mem.eql(u8, n, "ExpertStreamingMtpUnsupported")) return error.ExpertStreamingMtpUnsupported;
-            if (std.mem.eql(u8, n, "ExpertPickToleranceUnsupported")) return error.ExpertPickToleranceUnsupported;
             if (std.mem.eql(u8, n, "ExpertStreamingUnsupportedLayout")) return error.ExpertStreamingUnsupportedLayout;
             if (std.mem.eql(u8, n, "ExpertSlabImportCopied")) return error.ExpertSlabImportCopied;
             if (std.mem.eql(u8, n, "ExpertLayoutUnsupported")) return error.ExpertLayoutUnsupported;
@@ -1232,7 +1231,6 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.SsdBudgetBelowResident, loadErrorFromName("SsdBudgetBelowResident"));
         try std.testing.expectEqual(error.SsdBudgetExceedsWiredLimit, loadErrorFromName("SsdBudgetExceedsWiredLimit"));
         try std.testing.expectEqual(error.ExpertStreamingMtpUnsupported, loadErrorFromName("ExpertStreamingMtpUnsupported"));
-        try std.testing.expectEqual(error.ExpertPickToleranceUnsupported, loadErrorFromName("ExpertPickToleranceUnsupported"));
         try std.testing.expectEqual(error.ExpertStreamingUnsupportedLayout, loadErrorFromName("ExpertStreamingUnsupportedLayout"));
         try std.testing.expectEqual(error.ExpertSlabImportCopied, loadErrorFromName("ExpertSlabImportCopied"));
         try std.testing.expectEqual(error.ExpertLayoutUnsupported, loadErrorFromName("ExpertLayoutUnsupported"));

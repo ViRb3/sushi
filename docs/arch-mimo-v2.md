@@ -82,7 +82,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - `first_moe_layer` preserves absolute layer indices while excluding dense prefix layers from expert slabs and cache
   budgets. MXFP4 has six operands in nine stable component slots; absent biases acquire no slab or lease. MTP
-  remains refused while streaming, and so is `--expert-pick-tolerance` (the sigmoid router has no ratio test).
+  remains refused while streaming; `--expert-pick-tolerance` compares the router's sigmoid probabilities.
   Streaming engine: [engine-expert-streaming](engine-expert-streaming.md).
 - **Imatrix** keys by ARCH (`imatrix.Arch.mimo_v2` → `model.layers.{L}.mlp.experts.*`, one flat entry per layer) and
   reaches the streamed QUANTIZED layer through the routing override's tap; armed, it forces the SORTED expert arm —

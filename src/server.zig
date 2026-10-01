@@ -12481,7 +12481,6 @@ test "every load refusal the registry preserves answers under its own name" {
         "SsdBudgetBelowResident",
         "SsdBudgetExceedsWiredLimit",
         "ExpertStreamingMtpUnsupported",
-        "ExpertPickToleranceUnsupported",
         "ExpertStreamingUnsupportedLayout",
         "ExpertSlabImportCopied",
         "ExpertLayoutUnsupported",
@@ -12500,7 +12499,6 @@ test "every load refusal the registry preserves answers under its own name" {
     }
     try t.expectEqualStrings("architecture_unsupported", loadRefusalFor(error.ArchitectureUnsupported).?.type);
     try t.expectEqualStrings("model_format_unsupported", loadRefusalFor(error.ModelFormatUnsupported).?.type);
-    try t.expectEqualStrings("expert_pick_tolerance_unsupported", loadRefusalFor(error.ExpertPickToleranceUnsupported).?.type);
     try t.expectEqualStrings("expert_streaming_unsupported_layout", loadRefusalFor(error.ExpertStreamingUnsupportedLayout).?.type);
     try t.expectEqualStrings("expert_slab_import_copied", loadRefusalFor(error.ExpertSlabImportCopied).?.type);
     try t.expectEqualStrings("expert_layout_unsupported", loadRefusalFor(error.ExpertLayoutUnsupported).?.type);
@@ -12530,7 +12528,6 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (qwen4_exp or mimo_v2)." },
         error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --expert-cache-gb or free memory." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
-        error.ExpertPickToleranceUnsupported => .{ .type = "expert_pick_tolerance_unsupported", .message = expert_stream_mod.PICK_TOLERANCE_UNSUPPORTED },
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = "This checkpoint streams its experts from SSD and needs a resident budget: set this model's \"ssd_budget_gb\" in model-settings.json, or launch with --ssd-budget-gb <n> (or --expert-cache-gb <n>)." },
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards. For MiMo, repack the checkpoint first; raw per-expert HF shards cannot be streamed directly." },
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },

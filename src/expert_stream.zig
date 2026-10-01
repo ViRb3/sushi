@@ -305,14 +305,6 @@ pub fn parsePickTolerance(raw: []const u8) error{InvalidPickTolerance}!f32 {
     return value;
 }
 
-pub const PICK_TOLERANCE_UNSUPPORTED: []const u8 = "--expert-pick-tolerance needs a softmax router; this model routes by sigmoid with a selection-only bias, so the pick would never run. Drop the flag for this model";
-
-/// PURE: the pick reads a router logit gap as a probability ratio, which only a softmax router
-/// gives; a streamed sigmoid router (MiMo) is refused at load rather than silently routed exact.
-pub fn pickToleranceRefused(tolerance: f32, sigmoid_router: bool) bool {
-    return tolerance > 0 and sigmoid_router;
-}
-
 pub const PICK_STARVE_LIMIT: u8 = 3;
 
 pub fn substituteMisses(ids: []u16, logits: []const f32, cached: []const bool, tolerance: f32, k: usize, taken: []bool, loading: []bool, starved: []u8) u32 {
@@ -3179,14 +3171,6 @@ test "expert stream: under streaming an MTP on by flag refuses, a settings mtp i
     try t.expectEqual(MtpUnderStreaming.off, mtpUnderStreaming(false, false, false));
     // The engine default never refuses a streamed load: it resolves off.
     try t.expectEqual(MtpUnderStreaming.drop_default, mtpUnderStreaming(true, false, true));
-}
-
-test "expert stream: a sigmoid router refuses a lossy pick tolerance; exact routing and a softmax router pass" {
-    const t = std.testing;
-    try t.expect(pickToleranceRefused(0.2, true));
-    try t.expect(pickToleranceRefused(MAX_PICK_TOLERANCE, true));
-    try t.expect(!pickToleranceRefused(0, true));
-    try t.expect(!pickToleranceRefused(0.2, false));
 }
 
 test "exl3 Sushi CPU expert bytes at K1 and K8 include all three scale pairs" {

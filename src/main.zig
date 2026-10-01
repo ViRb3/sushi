@@ -306,7 +306,7 @@ fn printUsage(io: std.Io) void {
         \\                        router did not pick, when that expert's probability
         \\                        is at least (1 - n) x the missed one's. 0..0.6;
         \\                        0.3 is a mild setting. A sigmoid router (MiMo)
-        \\                        refuses it at load.
+        \\                        compares sigmoid probabilities.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-

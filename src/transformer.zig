@@ -31377,13 +31377,14 @@ pub const Transformer = struct {
         defer self.allocator.free(flags);
         const starved = engine.pickState(layer, flags[0..experts]) orelse return;
         const swapped = expert_stream_mod.substituteMisses(occurrences, logits_ptr[0 .. rows * experts], flags[0..experts], tolerance, k, flags[experts .. experts * 2], flags[experts * 2 ..], starved);
+        const first_swap = swapped > 0 and expert_swap_total_swapped == 0;
         expert_swap_total_swapped +%= swapped;
         expert_swap_total_ids +%= occurrences.len;
         if (!expert_swap_logged) {
             expert_swap_logged = true;
             log.info("[expert-swap] engaged: tolerance={d:.2} (lossy: a missed expert is replaced by a cached one within that relative probability)\n", .{tolerance});
         }
-        if (expert_swap_total_ids -% expert_swap_last_report >= 100_000) {
+        if (swapReportDue(first_swap, expert_swap_total_ids, expert_swap_last_report)) {
             expert_swap_last_report = expert_swap_total_ids;
             log.info("[expert-swap] swapped {d} of {d} routed ids so far\n", .{ expert_swap_total_swapped, expert_swap_total_ids });
         }
@@ -31408,12 +31409,9 @@ pub const Transformer = struct {
         const swap_tolerance = expert_stream_mod.pick_tolerance;
         var swap_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(swap_logits);
-        if (expertSwapApplies(swap_tolerance, mw.expert_bias != null, self.imatrix != null, mlx.getShape(inds)) and router_logits.ctx != null) {
-            var logits_f32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(logits_f32);
-            try mlx.check(mlx.mlx_astype(&logits_f32, router_logits, .float32, self.s));
-            try mlx.check(mlx.mlx_contiguous(&swap_logits, logits_f32, false, self.s));
-        }
+        if (expertSwapKind(swap_tolerance, mw.expert_bias != null, self.config.moe_sigmoid_router, self.imatrix != null, mlx.getShape(inds))) |kind| if (router_logits.ctx != null) {
+            try routerSwapLogits(&swap_logits, router_logits, kind, self.s);
+        };
         detail.build_ns = sync_clock.lap();
         if (engine.routeProbeActive()) {
             try mlx.check(mlx.mlx_array_eval(expert_x));
@@ -36257,6 +36255,18 @@ var expert_swap_total_swapped: u64 = 0;
 var expert_swap_total_ids: u64 = 0;
 var expert_swap_last_report: u64 = 0;
 
+/// The running swap count is logged at the first swap, so a short run shows the pick swapping, then every 100k ids.
+fn swapReportDue(first_swap: bool, total_ids: u64, last_report: u64) bool {
+    return first_swap or total_ids -% last_report >= 100_000;
+}
+
+test "the swap count is reported at the first swap and then every 100k routed ids" {
+    try testing.expect(swapReportDue(true, 376, 0));
+    try testing.expect(!swapReportDue(false, 376, 0));
+    try testing.expect(swapReportDue(false, 100_000, 0));
+    try testing.expect(!swapReportDue(false, 199_999, 100_000));
+}
+
 const STREAM_DECODE_MAX_ROWS: c_int = 16;
 
 fn streamRows(shape: []const c_int) c_int {
@@ -36273,8 +36283,34 @@ fn streamSharedEarlyApplies(eligible: bool, inds_shape: []const c_int) bool {
     return eligible and streamRows(inds_shape) <= STREAM_DECODE_MAX_ROWS;
 }
 
-fn expertSwapApplies(tolerance: f32, biased_router: bool, imatrix_armed: bool, inds_shape: []const c_int) bool {
-    return tolerance > 0 and !biased_router and !imatrix_armed and streamRows(inds_shape) <= STREAM_DECODE_MAX_ROWS;
+/// What the lossy pick compares: softmax logits differ by the log of a probability ratio as they are; a
+/// sigmoid router's do once mapped to log sigmoid, unbiased (the correction bias only selects).
+const SwapLogits = enum { softmax, log_sigmoid };
+
+fn expertSwapKind(tolerance: f32, biased_router: bool, sigmoid_router: bool, imatrix_armed: bool, inds_shape: []const c_int) ?SwapLogits {
+    if (!(tolerance > 0) or imatrix_armed or streamRows(inds_shape) > STREAM_DECODE_MAX_ROWS) return null;
+    if (sigmoid_router) return .log_sigmoid;
+    return if (biased_router) null else .softmax;
+}
+
+/// The pick's f32 logits; log sigmoid as -logaddexp(0, -x), finite where sigmoid underflows.
+fn routerSwapLogits(out: *mlx.mlx_array, router_logits: mlx.mlx_array, kind: SwapLogits, s: mlx.mlx_stream) !void {
+    var wide = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wide);
+    try mlx.check(mlx.mlx_astype(&wide, router_logits, .float32, s));
+    if (kind == .softmax) return mlx.check(mlx.mlx_contiguous(out, wide, false, s));
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, wide, s));
+    const zero = mlx.mlx_array_new_float(0);
+    defer _ = mlx.mlx_array_free(zero);
+    var softplus = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(softplus);
+    try mlx.check(mlx.mlx_logaddexp(&softplus, neg, zero, s));
+    var log_sigmoid = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(log_sigmoid);
+    try mlx.check(mlx.mlx_negative(&log_sigmoid, softplus, s));
+    try mlx.check(mlx.mlx_contiguous(out, log_sigmoid, false, s));
 }
 
 /// One-row twin of `expert_stream.substituteMisses` on the GPU, so a lossy pick
@@ -36447,12 +36483,45 @@ test "streamed expert work is handed to the GPU early only at decode widths" {
     try testing.expect(!streamSharedEarlyApplies(false, &.{ 1, 1, 10 }));
 }
 
-test "expert swap applies only to unbiased routers at decode widths without a capture" {
-    try testing.expect(expertSwapApplies(0.3, false, false, &.{ 1, 4, 10 }));
-    try testing.expect(!expertSwapApplies(0, false, false, &.{ 1, 1, 10 }));
-    try testing.expect(!expertSwapApplies(0.3, true, false, &.{ 1, 1, 10 }));
-    try testing.expect(!expertSwapApplies(0.3, false, true, &.{ 1, 1, 10 }));
-    try testing.expect(!expertSwapApplies(0.3, false, false, &.{ 1, 512, 10 }));
+test "expert swap reads softmax logits raw and a biased sigmoid router through log sigmoid, at decode widths without a capture" {
+    try testing.expectEqual(@as(?SwapLogits, .softmax), expertSwapKind(0.3, false, false, false, &.{ 1, 4, 10 }));
+    try testing.expectEqual(@as(?SwapLogits, .log_sigmoid), expertSwapKind(0.3, true, true, false, &.{ 1, 1, 8 }));
+    try testing.expectEqual(@as(?SwapLogits, null), expertSwapKind(0.3, true, false, false, &.{ 1, 1, 10 }));
+    try testing.expectEqual(@as(?SwapLogits, null), expertSwapKind(0, true, true, false, &.{ 1, 1, 8 }));
+    try testing.expectEqual(@as(?SwapLogits, null), expertSwapKind(0.3, false, false, true, &.{ 1, 1, 10 }));
+    try testing.expectEqual(@as(?SwapLogits, null), expertSwapKind(0.3, true, true, false, &.{ 1, 512, 8 }));
+}
+
+test "a sigmoid router's swap logits make the pick test its sigmoid probability ratio" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // (missed logit, cached candidate logit, tolerance): near saturation a raw logit gap would refuse a
+    // substitute the sigmoid ratio accepts, and -120 must stay finite.
+    const cases = [_][3]f32{ .{ 8, 3, 0.2 }, .{ 8, 3, 0.04 }, .{ -2, -2.3, 0.2 }, .{ -2, -2.1, 0.2 }, .{ 0, -0.2, 0.2 }, .{ 20, -5, 0.6 }, .{ -120, -120.1, 0.2 } };
+    for (cases) |c| {
+        const raw = [_]f32{ c[0], c[1], -50, -50 };
+        const arr = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(arr);
+        var swap = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(swap);
+        try routerSwapLogits(&swap, arr, .log_sigmoid, s);
+        try mlx.check(mlx.mlx_array_eval(swap));
+        const got = mlx.mlx_array_data_float32(swap).?;
+        var ids = [_]u16{0};
+        const cached = [_]bool{ false, true, false, false };
+        var taken: [4]bool = undefined;
+        var loading: [4]bool = undefined;
+        var starved = [_]u8{ 0, 0, 0, 0 };
+        _ = expert_stream_mod.substituteMisses(&ids, got[0..4], &cached, c[2], 1, &taken, &loading, &starved);
+        const sig = struct {
+            fn f(x: f64) f64 {
+                return 1.0 / (1.0 + @exp(-x));
+            }
+        }.f;
+        const ratio = if (c[0] < -100) @exp(@as(f64, c[1] - c[0])) else sig(c[1]) / sig(c[0]);
+        try testing.expect(std.math.isFinite(got[0]) and std.math.isFinite(got[1]));
+        try testing.expectEqual(@as(u16, if (ratio >= 1.0 - c[2]) 1 else 0), ids[0]);
+    }
 }
 
 test "speculative expert compute runs at decode widths without an imatrix capture" {
@@ -75177,16 +75246,35 @@ test "streamed deferred verification preserves outputs states and accounting on 
 }
 
 test "the GPU expert pick matches the host substitution on one row" {
+    try gpuPickMatchesHost(512, 10, 0x5eed, false);
+}
+
+test "the GPU expert pick matches the host on a sigmoid router's log-sigmoid logits, MiMo's E and K" {
+    try gpuPickMatchesHost(256, 8, 0x51a7, true);
+}
+
+fn gpuPickMatchesHost(comptime E: usize, comptime K: usize, seed: u64, log_sigmoid: bool) !void {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var prng = std.Random.DefaultPrng.init(0x5eed);
+    var prng = std.Random.DefaultPrng.init(seed);
     const rand = prng.random();
-    const E = 512;
-    const K = 10;
     for (0..200) |case| {
         var logits: [E]f32 = undefined;
         for (&logits) |*v| v.* = rand.floatNorm(f32) * 2;
         if (case % 7 == 0) logits[rand.uintLessThan(usize, E)] = logits[3];
+        if (log_sigmoid) {
+            // Every value <= 0, some where sigmoid underflows: the pick reads what the served path feeds it.
+            for (&logits) |*v| if (rand.float(f32) < 0.05) {
+                v.* = -120;
+            };
+            const raw = mlx.mlx_array_new_data(&logits, &[_]c_int{ 1, 1, E }, 3, .float32);
+            defer _ = mlx.mlx_array_free(raw);
+            var swap = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(swap);
+            try routerSwapLogits(&swap, raw, .log_sigmoid, s);
+            try mlx.check(mlx.mlx_array_eval(swap));
+            @memcpy(&logits, mlx.mlx_array_data_float32(swap).?[0..E]);
+        }
         var map: [E]i32 = undefined;
         var cached: [E]bool = undefined;
         for (&map, &cached, 0..) |*m, *c, e| {

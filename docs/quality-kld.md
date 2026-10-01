@@ -86,6 +86,18 @@ same KLD to the ninth digit (0.021600648): it picks exactly what the host picks.
 Repetition: 8 prompts x 600 tokens at temperature 0 and 1, tolerance 0 / 0.2 / 0.3: mean distinct 4-grams 0.997-0.999
 in every arm (worst run 0.983), no loop-stop cut in any of the 48 runs.
 
+<a id="lossy-expert-pick-mimo"></a>
+MiMo (sigmoid router: the pick compares sigmoid probabilities), the MOPD checkpoint (MXFP4 experts) streamed at
+`--ssd-budget-gb 60` (81 slots/layer), kv8, 16x512 raw, teacher = the same load with exact routing captured on this
+binary (built at cf23043d, the landed change's pick code; strict NLL 0.2609, cache hit 84.6%):
+
+| tolerance | KLD (to first EOS) | top-1 | NLL | cache hit | ids swapped |
+|---|---|---|---|---|---|
+| 0.2 | 0.00958 | 97.2% | 0.2725 | 92.9% | 7.7% |
+
+Decode at a 4k prompt (llmprobe 0.6.12, `--no-mtp`, one boot each): 5.8 tok/s exact, 10.5 at 0.2
+([perf-baselines](perf-baselines.md#mimo-stream-pick)).
+
 ## Cross-engine check
 
 mlx-lm's MiMo support (upstream PR 1219, router patched to f32), streamed one layer at a time, against our MiMo
