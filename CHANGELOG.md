@@ -22,6 +22,8 @@ earlier history is mlx-serve's, in that project's changelog.
   M1 Max).
 - **A reply cut short while thinking streams the reasoning the non-streamed reply returns**: no lone `<think>` as
   reasoning (MiMo at `max_tokens: 1`), no empty Anthropic thinking block, and no dropped thought of a few characters.
+- **A request that names a pack by its path is answered by that pack or refused**: an unregistered path is a 404
+  instead of an answer from the default model; unknown model names still fall back to the default.
 
 ---
 

@@ -732,15 +732,7 @@ pub const ModelRegistry = struct {
 
         // Fast path: already registered (discovered, --model, or a previous
         // register-by-path). No filesystem touch.
-        {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            if (self.entries.get(base)) |existing| return existing.id;
-        }
-
-        // A discovery entry may hold this path under an org/name id whose
-        // basename differs — resolve by path before probing the filesystem.
-        if (self.peekByPath(trimmed)) |existing| return existing.id;
+        if (self.peekPath(trimmed)) |existing| return existing.id;
 
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
         defer self.allocator.free(probe.model_type);
@@ -778,6 +770,18 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.peekByPathLocked(path);
+    }
+
+    /// The entry a model-directory path names: the one AT that path (a
+    /// discovery entry's org/name id differs from the basename), else the one
+    /// registered under its basename. `/v1/load-model` and request routing
+    /// both resolve a path here, so they cannot disagree on the model.
+    pub fn peekPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.peekByPathLocked(path)) |e| return e;
+        const base = std.fs.path.basename(std.mem.trimEnd(u8, path, "/"));
+        return if (base.len == 0) null else self.entries.get(base);
     }
 
     fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {

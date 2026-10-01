@@ -813,6 +813,57 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
     return null;
 }
 
+const ModelRoute = union(enum) { entry: []const u8, default, not_found };
+
+/// Where a request's `model` routes. An unknown NAME is the default, so SDK
+/// names like "gpt-4" keep working; a path (`/…`, `~/…`, never `org/repo`)
+/// names its own entry or nothing, since another model answering it would
+/// pass for the pack the client asked for.
+fn routeRequestModel(registry: *ModelRegistry, id: []const u8, home: ?[]const u8) ModelRoute {
+    if (id.len == 0 or std.mem.eql(u8, id, "sushi")) return .default;
+    if (registry.peek(id)) |e| return .{ .entry = e.id };
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = if (std.mem.startsWith(u8, id, "~/"))
+        std.fmt.bufPrint(&buf, "{s}{s}", .{ std.mem.trimEnd(u8, home orelse return .not_found, "/"), id[1..] }) catch return .not_found
+    else if (std.mem.startsWith(u8, id, "/"))
+        id
+    else
+        return .default;
+    const e = registry.peekPath(path) orelse return .not_found;
+    return .{ .entry = e.id };
+}
+
+test "routeRequestModel: a path names its own entry, an unknown name the default" {
+    const t = std.testing;
+    const reg = try ModelRegistry.init(t.allocator, t.io, null, 4, 0, null);
+    defer reg.deinit();
+    _ = try reg.registerStub("org/good", "/m/org/good", 1);
+    // The exact path wins over another pack registered under the same basename.
+    _ = try reg.registerStub("good", "/elsewhere/good", 1);
+    // `--model` and `/v1/load-model` register a path under its basename.
+    _ = try reg.registerStub("Pack", "/x/y/Pack", 1);
+    _ = try reg.registerStub("home-pack", "/Users/t/.sushi/models/home-pack", 1);
+    const home: ?[]const u8 = "/Users/t";
+
+    try t.expectEqualDeep(ModelRoute{ .entry = "org/good" }, routeRequestModel(reg, "org/good", home));
+    try t.expectEqualDeep(ModelRoute{ .entry = "org/good" }, routeRequestModel(reg, "/m/org/good", home));
+    try t.expectEqualDeep(ModelRoute{ .entry = "org/good" }, routeRequestModel(reg, "/m/org/good/", home));
+    try t.expectEqualDeep(ModelRoute{ .entry = "Pack" }, routeRequestModel(reg, "/x/y/Pack", home));
+    // The same basename-id resolution `/v1/load-model` applies.
+    try t.expectEqualDeep(ModelRoute{ .entry = "Pack" }, routeRequestModel(reg, "/elsewhere/Pack", home));
+    try t.expectEqualDeep(ModelRoute{ .entry = "home-pack" }, routeRequestModel(reg, "~/.sushi/models/home-pack", home));
+
+    try t.expectEqualDeep(ModelRoute.not_found, routeRequestModel(reg, "/m/org/missing", home));
+    try t.expectEqualDeep(ModelRoute.not_found, routeRequestModel(reg, "~/.sushi/models/missing", home));
+    try t.expectEqualDeep(ModelRoute.not_found, routeRequestModel(reg, "~/.sushi/models/home-pack", null));
+    try t.expectEqualDeep(ModelRoute.not_found, routeRequestModel(reg, "/", home));
+
+    try t.expectEqualDeep(ModelRoute.default, routeRequestModel(reg, "gpt-4", home));
+    try t.expectEqualDeep(ModelRoute.default, routeRequestModel(reg, "org/unknown", home));
+    try t.expectEqualDeep(ModelRoute.default, routeRequestModel(reg, "sushi", home));
+    try t.expectEqualDeep(ModelRoute.default, routeRequestModel(reg, "", home));
+}
+
 /// Every path `handleConnection` dispatches. Kept beside the chain rather than
 /// derived from it because one question has to be answerable BEFORE a model is
 /// resolved: does this endpoint exist at all?
@@ -2327,8 +2378,8 @@ fn handleConnection(
         return;
     };
     // Strip whatever the client passed in `"model":"..."` — except when the
-    // id literally matches one we've discovered, in which case we honor it
-    // and route. The OpenAI / Anthropic ecosystem commonly sends marketing
+    // id or path matches one we've registered (`routeRequestModel`): we honor
+    // it and route. The OpenAI / Anthropic ecosystem commonly sends marketing
     // names like "gpt-4" or "claude-opus-4-x" expecting the local server to
     // just respond with whatever it has loaded; the multi-model registry's
     // strict-id semantics are opt-in by sending an id we registered.
@@ -2346,14 +2397,19 @@ fn handleConnection(
         &model_id_buf,
         parseModelFromBody(request_body) orelse queryModel(&query_model_buf, raw_path) orelse "",
     );
-    if (requested_model_id.len > 0 and !std.mem.eql(u8, requested_model_id, "sushi")) {
-        if (registry.peek(requested_model_id) == null) {
-            // Unknown id — fall back to the default model rather than 404,
-            // so off-the-shelf SDK clients keep working. Multi-model
-            // clients that care about routing precision pass an exact id
-            // we registered (and `peek` will find it).
-            requested_model_id = "";
-        }
+    const home: ?[]const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else null;
+    switch (routeRequestModel(registry, requested_model_id, home)) {
+        .entry => |id| requested_model_id = id,
+        .default => requested_model_id = "",
+        .not_found => {
+            const msg = "No model is registered at that path; POST /v1/load-model with the absolute path registers it";
+            if (std.mem.eql(u8, path, "/v1/messages")) {
+                try sendAnthropicError(allocator, stream, "not_found_error", msg, 404);
+            } else {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", msg, 404);
+            }
+            return;
+        },
     }
     // Text-gen route aimed at a KNOWN non-text model: reject before
     // ensureLoaded, or the request cold-loads a multi-GB media model just
