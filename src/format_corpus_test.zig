@@ -3154,3 +3154,8 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
         }
     }
 }
+
+
+test "format corpus: tokenizer rules are model-local across Unicode scripts" {
+    try @import("tokenizer.zig").checkTokenizerRuleFixtures();
+}
