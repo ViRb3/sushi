@@ -82,7 +82,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
 - **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no draft
-  path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it. Chat and
+  path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+  A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
   completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off.
 
 ## Reasoning budget

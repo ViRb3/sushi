@@ -3927,8 +3927,10 @@ pub const Generator = struct {
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        const lazy = self.sampleLazy(step_logits);
-        _ = mlx.mlx_array_free(step_logits);
+        const lazy = blk: {
+            defer _ = mlx.mlx_array_free(step_logits);
+            break :blk try self.sampleLazy(step_logits);
+        };
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
@@ -3941,11 +3943,11 @@ pub const Generator = struct {
     /// This is called at the START of each iteration, giving the GPU maximum time
     /// to compute since the async_eval at the END of the previous iteration.
     /// The ONE lazy sampler for a slot's own draws: advances the seed draw index.
-    pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) mlx.mlx_array {
+    pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) !mlx.mlx_array {
         defer self.sampling.draw +%= 1;
         // A penalised slot reaches here only from the constrained steps and a forced call's
         // name choice, whose logits follow `generated_ids` (`samplesSync`, `draftsRefused`).
-        return penalizedSampleLazy(logits, self.sampling, self.generated_ids.items, self.xfm.s);
+        return penalizedSampleLazy(std.heap.page_allocator, logits, self.sampling, self.generated_ids.items, self.xfm.s);
     }
 
     /// This slot samples on the synchronous serial path (`sampleToken`), never the lazy pipeline.
@@ -4026,8 +4028,10 @@ pub const Generator = struct {
         self.has_pending_logits = false;
         // With the latch these checks return instead of ending the process, so the handle needs an owner.
         const val: i32 = blk: {
-            const lazy = self.sampleLazy(step_logits);
-            _ = mlx.mlx_array_free(step_logits);
+            const lazy = sampled: {
+                defer _ = mlx.mlx_array_free(step_logits);
+                break :sampled try self.sampleLazy(step_logits);
+            };
             defer _ = mlx.mlx_array_free(lazy);
             try mlx.check(mlx.mlx_array_eval(lazy));
             var v: i32 = 0;
@@ -4452,7 +4456,7 @@ pub const Generator = struct {
             const cold_logits = try xfm.forwardWith(&self.ctx, t1_input); // cache.step += 1
             defer _ = mlx.mlx_array_free(cold_logits);
 
-            const lazy = self.sampleLazy(cold_logits);
+            const lazy = try self.sampleLazy(cold_logits);
             try mlx.check(mlx.mlx_array_eval(lazy));
             var lv: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&lv, lazy));
@@ -4642,7 +4646,7 @@ pub const Generator = struct {
                     break :blk try sampleFromProbs(probs, s);
                 }
             } else {
-                const lazy = self.sampleLazy(correction_logits);
+                const lazy = try self.sampleLazy(correction_logits);
                 try mlx.check(mlx.mlx_array_eval(lazy));
                 var v: i32 = 0;
                 try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
@@ -4894,9 +4898,12 @@ pub const Generator = struct {
                 const step_out = try drafter_mod.stepArr(drafter, xfm, self.ctx.cache, prev_tok_arr, h_prev_arg, rope_offset);
                 // Sample lazily — `sampleTokenLazy` for greedy returns the
                 // argmax as a [1]-shaped lazy array. NO eval here.
-                draft_arrs[i] = self.sampleLazy(step_out.logits);
+                draft_arrs[i] = blk: {
+                    defer _ = mlx.mlx_array_free(step_out.logits);
+                    errdefer _ = mlx.mlx_array_free(step_out.h_prev_next);
+                    break :blk try self.sampleLazy(step_out.logits);
+                };
                 draft_arrs_n = i + 1;
-                _ = mlx.mlx_array_free(step_out.logits);
 
                 // Roll h_prev forward.
                 if (h_prev_owner) |h_old| {
@@ -7291,7 +7298,7 @@ pub const Generator = struct {
         // Both checks below return on a Metal abort instead of ending the process, so the
         // handle needs an owner on the error path; a scoped `defer`, not errdefer + manual free.
         const val: i32 = blk: {
-            const lazy = self.sampleLazy(logits);
+            const lazy = try self.sampleLazy(logits);
             defer _ = mlx.mlx_array_free(lazy);
             try mlx.check(mlx.mlx_array_eval(lazy));
             var v: i32 = 0;
@@ -10974,9 +10981,11 @@ pub const Generator = struct {
             self.has_pending_logits = false;
 
             const t_sample = tick_prof.mark();
-            const lazy_token = self.sampleLazy(step_logits);
+            const lazy_token = blk: {
+                defer _ = mlx.mlx_array_free(step_logits);
+                break :blk try self.sampleLazy(step_logits);
+            };
             tick_prof.add(.sample, t_sample);
-            _ = mlx.mlx_array_free(step_logits);
 
             var adopted = false;
             defer if (!adopted) {
@@ -11086,13 +11095,15 @@ pub const Generator = struct {
 
         // Last token or pipeline bootstrap
         const t_sample = tick_prof.mark();
-        const lazy_token = switch (self.forcedNext()) {
-            .sample => self.sampleLazy(step_logits),
-            .force => |id| tokenArray(id),
-            .choose => |ids| try self.sampleAmong(allocator, step_logits, ids),
+        const lazy_token = blk: {
+            defer _ = mlx.mlx_array_free(step_logits);
+            break :blk switch (self.forcedNext()) {
+                .sample => try self.sampleLazy(step_logits),
+                .force => |id| tokenArray(id),
+                .choose => |ids| try self.sampleAmong(allocator, step_logits, ids),
+            };
         };
         tick_prof.add(.sample, t_sample);
-        _ = mlx.mlx_array_free(step_logits);
 
         if (self.step < self.max_tokens) {
             const t_fwd = tick_prof.mark();
@@ -11159,11 +11170,11 @@ pub const Generator = struct {
         // degraded afterwards.
         const invalid_crossers = try rp_mod.applyReasoningMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf);
         const lazy = blk: {
-            if (invalid_crossers == 0) break :blk self.sampleLazy(step_logits);
+            if (invalid_crossers == 0) break :blk try self.sampleLazy(step_logits);
             var masked_logits = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(masked_logits);
             try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, self.xfm.s);
-            break :blk self.sampleLazy(masked_logits);
+            break :blk try self.sampleLazy(masked_logits);
         };
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
@@ -11285,7 +11296,7 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(masked_logits);
         try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
 
-        const lazy = self.sampleLazy(masked_logits);
+        const lazy = try self.sampleLazy(masked_logits);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -11438,7 +11449,7 @@ pub const Generator = struct {
         // build overlaps this step's GPU work; the token is realized after
         // dispatch and only then advances the grammar (the mask for the next
         // logits is built on the next call, off the realized state).
-        const lazy = self.sampleLazy(masked_logits);
+        const lazy = try self.sampleLazy(masked_logits);
         defer _ = mlx.mlx_array_free(lazy);
         var next_logits: ?mlx.mlx_array = null;
         if (self.step + 1 < self.max_tokens) {
@@ -12157,13 +12168,12 @@ fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.ml
 }
 
 /// `sampleTokenLazy` under the request's repeat/presence penalty over `generated_ids`.
-fn penalizedSampleLazy(logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: []const u32, s: mlx.mlx_stream) mlx.mlx_array {
+fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
     if (penaltyActive(sampling) and generated_ids.len > 0) {
         var penalized = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(penalized);
-        if (applyRepeatPenalty(&penalized, logits, generated_ids, sampling.repeat_penalty, sampling.presence_penalty, s)) {
-            return sampleTokenLazy(penalized, sampling, s);
-        } else |err| log.err("[sampling] penalty not applied ({s})\n", .{@errorName(err)});
+        try applyRepeatPenaltyWithAllocator(allocator, &penalized, logits, generated_ids, sampling.repeat_penalty, sampling.presence_penalty, s);
+        return sampleTokenLazy(penalized, sampling, s);
     }
     return sampleTokenLazy(logits, sampling, s);
 }
@@ -14099,23 +14109,27 @@ fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bou
 /// Apply repeat penalty to already-generated tokens.
 /// Uses pure MLX GPU ops — no CPU readback, preserves lazy evaluation graph.
 fn applyRepeatPenalty(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
+    return applyRepeatPenaltyWithAllocator(std.heap.page_allocator, res, logits, generated_ids, repeat_penalty, presence_penalty, s);
+}
+
+fn applyRepeatPenaltyWithAllocator(allocator: std.mem.Allocator, res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
     const shape = mlx.getShape(logits);
     const vocab_size: usize = @intCast(shape[shape.len - 1]);
 
     // Collect unique token ids
-    var seen_set = std.AutoHashMap(u32, void).init(std.heap.page_allocator);
+    var seen_set = std.AutoHashMap(u32, void).init(allocator);
     defer seen_set.deinit();
     for (generated_ids) |id| {
         if (id < vocab_size) {
-            seen_set.put(id, {}) catch continue;
+            try seen_set.put(id, {});
         }
     }
 
     if (seen_set.count() == 0) return;
 
     // Build boolean mask: true at positions of seen tokens
-    const mask_data = try std.heap.page_allocator.alloc(u8, vocab_size);
-    defer std.heap.page_allocator.free(mask_data);
+    const mask_data = try allocator.alloc(u8, vocab_size);
+    defer allocator.free(mask_data);
     @memset(mask_data, 0);
 
     var it = seen_set.keyIterator();
@@ -14305,7 +14319,7 @@ test "a constrained penalised step picks what sampleToken picks on the same mask
         const sampling = SamplingParams{ .temperature = 0, .presence_penalty = 0.5 };
         const generated = [_]u32{ 0, 3 };
         const sync = try sampleToken(a, masked, sampling, &generated, 0, s);
-        const lazy = penalizedSampleLazy(masked, sampling, &generated, s);
+        const lazy = try penalizedSampleLazy(std.heap.page_allocator, masked, sampling, &generated, s);
         defer _ = mlx.mlx_array_free(lazy);
         const got = try samplerTestReadFlat(a, lazy, 1, s);
         defer a.free(got);
@@ -21756,4 +21770,15 @@ test "argmax-only requests: greedy with nothing that reads past the argmax" {
     try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .call_force = &cf }, 0, false));
     var c: Constraint = undefined;
     try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .constraint = &c }, 0, false));
+}
+
+test "a lazy penalty allocation failure fails the request instead of sampling unpenalized" {
+    const s = mlx.gpuStream();
+    const host = [_]f32{ 5, 4, 3, 2 };
+    const logits = mlx.mlx_array_new_data(&host, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    for (0..2) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        try testing.expectError(error.OutOfMemory, penalizedSampleLazy(failing.allocator(), logits, .{ .temperature = 0, .presence_penalty = 2 }, &.{0}, s));
+    }
 }
