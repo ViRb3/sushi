@@ -69,9 +69,12 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
 
 ## Kernels
 
-- **Prefill**: run-aligned 32-row windows over a window table built on the GPU, K-generic cooperative readers, the
-  NAX 16x32x16 GEMM body with a K4 fast branch; ONE GEMM config reused across window counts (a per-row-count JIT
-  compiled per novel prompt length). The prefill scatter is fused into the finish reduce.
+- **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
+  branch; ONE GEMM config reused across window counts (a per-row-count JIT compiled per novel prompt length).
+- **At the two served geometries (`mimoPrefillOn`: MiMo, Flash-Next) the routing never leaves the GPU**: one
+  threadgroup (a thread per expert, at most 512) builds the window table and the inverse sort order, and the finish
+  reduce reads the sorted down plane through that inverse, bytes equal to un-sorting it first. Any other geometry
+  builds the table on the host (a sync) and un-sorts with a copy ([perf-baselines](perf-baselines.md#exl3-gpu-routing-meta)).
 - **The NAX body's x loads carry no bounds branch**: a lane's row pointers are clamped into the input once per run
   (a padded row reads a live neighbour whose product is never stored), the k loop is unswitched on the window's
   second 16-row block and unrolled by two. Every row's products are the branch-guarded body's, so its bytes are

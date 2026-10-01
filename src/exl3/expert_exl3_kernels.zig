@@ -7706,8 +7706,11 @@ var mimo_window_cfgs: CfgCache(MimoWindowKey, 8) = .{};
 var mimo_window_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mimo_window_engaged: bool = false;
 
+/// One thread per expert, in one threadgroup.
+const MIMO_WINDOW_MAX_EXPERTS: c_int = 512;
+
 fn buildMimoWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, order: mlx.mlx_array, n: c_int, win: c_int, experts: c_int) !MimoWindowTable {
-    if (experts < 1 or experts > 256 or win < 1 or n < 1) return error.BadExl3Shape;
+    if (experts < 1 or experts > MIMO_WINDOW_MAX_EXPERTS or win < 1 or n < 1) return error.BadExl3Shape;
     const capacity = @divTrunc(n + win - 1, win) + experts;
     const key = MimoWindowKey{ .rows = n, .win = win, .experts = experts };
     const cfg = mimo_window_cfgs.get(key) orelse blk: {
@@ -7748,25 +7751,30 @@ fn buildMimoWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, order: mlx.mlx_a
 test "exl3 MiMo GPU window metadata has a routing-independent capacity" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    for ([_]usize{ 1, 31, 32, 33, 513, 2049 }) |n| {
+    for ([_]c_int{ 256, MIMO_WINDOW_MAX_EXPERTS }) |experts| try mimoWindowCapacityCase(s, experts);
+}
+
+fn mimoWindowCapacityCase(s: mlx.mlx_stream, experts: c_int) !void {
+    const ne: usize = @intCast(experts);
+    for ([_]usize{ 1, 31, 32, 33, 513, 2049, 16 * 1024 }) |n| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
         const ids = try alloc.alloc(u32, n);
         const ord = try alloc.alloc(u32, n);
         for (ids, ord, 0..) |*id, *o, i| {
-            id.* = @intCast((i / 97) * 3);
+            id.* = @intCast(@min((i / 97) * 3, ne - 1));
             o.* = @intCast((i + 7) % n);
         }
         const ea = mlx.mlx_array_new_data(ids.ptr, &.{@intCast(n)}, 1, .uint32);
         defer _ = mlx.mlx_array_free(ea);
         const oa = mlx.mlx_array_new_data(ord.ptr, &.{@intCast(n)}, 1, .uint32);
         defer _ = mlx.mlx_array_free(oa);
-        const m = try buildMimoWindowTable(s, ea, oa, @intCast(n), 32, 256);
+        const m = try buildMimoWindowTable(s, ea, oa, @intCast(n), 32, experts);
         defer _ = mlx.mlx_array_free(m.table.starts);
         defer _ = mlx.mlx_array_free(m.table.nlives);
         defer _ = mlx.mlx_array_free(m.inverse);
-        try std.testing.expectEqual(@as(c_int, @intCast((n + 31) / 32 + 256)), m.table.nwin);
+        try std.testing.expectEqual(@as(c_int, @intCast((n + 31) / 32 + ne)), m.table.nwin);
         try mlx.check(mlx.mlx_array_eval(m.table.starts));
         try mlx.check(mlx.mlx_array_eval(m.table.nlives));
         try mlx.check(mlx.mlx_array_eval(m.inverse));
@@ -7896,9 +7904,12 @@ test "exl3 MiMo sorted BF16 finish uses one dispatch and preserves f32 truth err
 
 var mimo_prefill_force: ?bool = null;
 
+/// The GPU window metadata and the inverse-indexed finish, at the two served geometries (MiMo, Flash-Next).
 fn mimoPrefillOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int) bool {
     if (mimo_prefill_force) |v| return v;
-    return hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8;
+    if (experts < 1) return false;
+    return (hidden == 4096 and inter == 2048 and experts <= 256 and topk == 8) or
+        (hidden == 2560 and inter == 640 and experts <= MIMO_WINDOW_MAX_EXPERTS and topk == 10);
 }
 
 test "exl3 MiMo prefill metadata and sorted finish preserve BF16 f32-truth bar" {
@@ -7907,9 +7918,41 @@ test "exl3 MiMo prefill metadata and sorted finish preserve BF16 f32-truth bar" 
     for (0..3) |seed| try n40PrefillBf16Truth(318 + seed, 32);
 }
 
-test "exl3 MiMo prefill optimization keys on MiMo geometry, never on the rate" {
+test "exl3 prefill GPU metadata keys on the served geometries, never on the rate" {
     try std.testing.expect(mimoPrefillOn(4096, 2048, 256, 8));
-    try std.testing.expect(!mimoPrefillOn(2560, 640, 512, 10));
+    try std.testing.expect(mimoPrefillOn(2560, 640, 512, 10));
+    try std.testing.expect(!mimoPrefillOn(2560, 640, 513, 10));
+    try std.testing.expect(!mimoPrefillOn(2048, 512, 256, 8));
+}
+
+test "exl3 Flash-Next prefill reads the sorted down plane through the inverse, to the byte" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const c: MimoMoeCase = .{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = 200, .rate = .{ .n = 48 }, .dec = .{ .codebook = .mcg, .window = .w15 }, .seed = 653 };
+    setDecodeParams(c.dec);
+    defer setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var f = try mimoMoeFixture(arena.allocator(), c);
+    defer f.deinit();
+    defer mimo_prefill_force = null;
+    mimo_prefill_force = false;
+    const scattered = try mimoPrefillArm(s, &f, c.topk);
+    defer _ = mlx.mlx_array_free(scattered);
+    mimo_prefill_force = null;
+    mimo_window_engaged = false;
+    mimo_reduce_engaged = false;
+    const served = try mimoPrefillArm(s, &f, c.topk);
+    defer _ = mlx.mlx_array_free(served);
+    try std.testing.expect(mimo_window_engaged and mimo_reduce_engaged);
+    var ca = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ca);
+    var cb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cb);
+    const a = try evalF16(s, scattered, &ca);
+    const b = try evalF16(s, served, &cb);
+    const n = c.rows * c.hidden;
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(a[0..n]), std.mem.sliceAsBytes(b[0..n]));
 }
 
 test "exl3 n40 decode lane codewords and decoded weights are exact" {
@@ -8827,7 +8870,7 @@ test "MiMo EXL3 streaming CPU slab capacities preserve resident kernel arms" {
     try t.expect(!preparedMidOn(4096, 2048, 257, 8, 1, .bfloat16));
     try t.expect(!preparedMidOn(4096, 2048, 16, 8, 9, .bfloat16));
     try t.expect(!preparedMidOn(4096, 2048, 16, 8, 1, .float16));
-    try t.expect(!mimoPrefillOn(2560, 640, 16, 10));
+    try t.expect(mimoPrefillOn(2560, 640, 16, 10));
     try t.expect(!preparedMidOn(2560, 640, 16, 10, 1, .bfloat16));
 }
 

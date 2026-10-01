@@ -990,3 +990,25 @@ Every on boot records the N=2 stride-4 ladder engagement; no off boot does.
 Correctness: synthetic eager/lazy PLE and N=2 logits/history parity, full suite
 2735 passed / 93 skipped, plus the live batched-equivalence suite (short and long
 serial/batched checks, concurrent streams, logprob isolation and kv8 crash guard).
+
+<a id="exl3-gpu-routing-meta"></a>
+## Flash-Next: prefill routing metadata on the GPU and the inverse-indexed finish
+
+Main's path (arm 0: host-built window table, then an f16 copy that un-sorts the down plane) against the served path
+(arm 1: the window table and inverse built in one GPU threadgroup, the finish reduce reading through the inverse),
+alternated inside one boot per row by a local switch in the prefill meter (`SUSHI_PREFILL_UBENCH`): cold prefills from
+an empty cache on real text. This change on 90fdedae (4096 rows, 32k) and on 27e81cfc (8192 rows), ReleaseFast, M5 Max
+128 GB, Sushi-3bpw, `--ctx-size 65536 --prefix-cache-entries 0`, kv8, `taskpolicy -a`, GPU lock per boot, fans max and
+10 s (die 72-83 °C), 2026-10-01; other workers' builds were not frozen. Output bytes are equal (unit test at
+Flash-Next geometry).
+
+| chunk | arm order | arm 0, ms per chunk | arm 1, ms per chunk | change of means |
+|---|---|---|---|---|
+| 4096 rows, median of 3 | 0 1 1 0 0 1 1 0 | 2190.0 / 2216.5 / 2233.9 / 2267.1 | 2141.2 / 2068.9 / 2128.2 / 2145.5 | -4.8% (A B B A sets -4.5%, -5.0%) |
+| 8192 rows, median of 5 | 0 1 1 0 0 1 | 3738.3 / 3965.7 / 3999.5 | 3841.2 / 3690.0 / 3844.8 | -2.8% (sets -2.2%, -3.9%) |
+| 4 x 8192 rows (a 32k prompt), mean of 2 | 0 1 1 0 0 1 | 18590 / 18325 / 19596 | 18964 / 19047 / 18816 | +0.6%, inside the spread |
+
+Each chunk saves ~0.1 s at both widths (106 ms at 4096 rows, 109 ms at 8192). The saving does not grow with the
+chunk, which points at the per-layer host round trip of the host-built table rather than the copy. A 32k prompt would
+save ~0.4 s of ~18.8 s (~2%), below the spread of the two-sample 32k run (one arm's samples ranged 17.9 to 20.1 s). The served path also drops the un-sort buffer
+(`[rows x 10, 2560]` f16: 210 MB at 4096 rows, 420 MB at 8192).
