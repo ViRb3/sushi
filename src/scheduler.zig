@@ -3424,7 +3424,7 @@ pub fn loadRequirementBytes(weights_bytes: u64, ctx_bytes: ?u64) u64 {
     return weights_bytes +| headroom;
 }
 
-/// Resident Flash-Next EXL3 load/warmup scratch; measured envelope in engine-memory-admission.md.
+/// Resident Flash-Next and MiMo EXL3 load/warmup scratch; measured envelope in engine-memory-admission.md.
 const LOAD_WARMUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 test "a refusal quotes the number it actually compared" {

@@ -25,9 +25,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`).
-- Resident Flash-Next EXL3 with an explicit context bills weights plus min(flat headroom, 2 GiB load/warmup scratch
-  + `sizerCtxKvBytes`); auto context, other layouts/architectures, sidecars and ANE keep flat headroom (min(weights/8,
-  6 GiB) + 1 GiB). This is a load gate, not the request admission bill.
+- Resident Flash-Next or MiMo EXL3 with an explicit context bills weights plus min(flat headroom, 2 GiB load/warmup
+  scratch + `sizerCtxKvBytes`); auto context, other layouts/architectures, streamed loads, sidecars and ANE keep flat
+  headroom (min(weights/8, 6 GiB) + 1 GiB). This is a load gate, not the request admission bill.
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
 - Load-time bills run INSIDE `Scheduler.init` ([engine-qsa-long-context](engine-qsa-long-context.md)).
@@ -54,6 +54,11 @@ The baseline is the existing flat formula, not an old-binary rerun.
 | Sushi-3bpw | off | 56.33 | 51.35 | 47.6341 |
 | Sushi-4bpw | on | 70.68 | 65.70 | 64.2628 |
 | Sushi-4bpw | off | 70.68 | 65.70 | 61.6967 |
+
+MiMo-V2.6-Flash-Sushi-2.3bpw on the MiMo lookup branch (verify warm-up at 1-8 rows and the three heads), startup
+`--ctx-size 1248 --kv-quant 8`, MTP and vision on, `taskpolicy -a`, GPU lock, one boot (2026-10-01): the preflight
+billed weights 89.65 GiB (flat requirement 96.65 GiB); the pre-request `/props` peak was 89.88 GiB, unchanged after a
+short chat. The 2 GiB allowance leaves ~1.8 GiB unused there, so MiMo takes the same term.
 
 The 2 GiB allowance covers load/warmup scratch and fixed state outside the context bill, not arbitrary prompt
 activations. Separate MTP sidecar files, assistant drafters and ANE retain flat headroom; other expert layouts and

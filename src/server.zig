@@ -3426,8 +3426,9 @@ pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
 
 /// The explicit-context cache bill for the load preflight, or the flat-headroom fallback.
 pub fn loadContextBytes(config: *const model_mod.ModelConfig) ?u64 {
-    // Other architectures and expert layouts need their own measured warmup allowance.
-    if (!std.mem.eql(u8, config.model_type, "qwen4_exp") or config.expert_layout != .exl3_k4 or config.expert_streaming) return null;
+    // Measured on resident Flash-Next and MiMo EXL3; any other arch or layout needs its own envelope.
+    const measured = std.mem.eql(u8, config.model_type, "qwen4_exp") or config.isMimo();
+    if (!measured or config.expert_layout != .exl3_k4 or config.expert_streaming) return null;
     if (manualContext(config) == 0) return null;
     return sizerCtxKvBytes(config, defaultKvBits(config));
 }
@@ -3463,6 +3464,11 @@ test "loadContextBytes reuses the sizer with launch and model settings precedenc
     try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
     cfg.expert_layout = .exl3_k4;
     cfg.model_type = "mimo_v2";
+    try std.testing.expectEqual(@as(?u64, sizerCtxKvBytes(&cfg, 8)), loadContextBytes(&cfg));
+    cfg.expert_streaming = true;
+    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
+    cfg.expert_streaming = false;
+    cfg.model_type = "qwen3_moe";
     try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
 }
 
