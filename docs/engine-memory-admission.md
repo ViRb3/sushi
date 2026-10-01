@@ -36,6 +36,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   them as taken (45 GB free where 95 GB was a moment later).
 - A ready entry's `bytes_resident` (the registry's resident-memory gate, `/v1/models`) is the weights the preflight
   billed (`residentWeightBytes`): a boot `--model` entry has no discovery `bytes_on_disk`, so it measures the shards.
+- **A resident MiMo cold load reserves its load preflight's own requirement** (`mimoColdLoadBillBytes`: the shared
+  `mimoResidentLoadBytes` plus `preflightCtxBytes`), never the 1.1x disk-size guess (105.9 GB against a 96.65 GB bill
+  for the 2.3bpw pack). The auto resident cap bounds co-residence only ([server-lifecycle](server-lifecycle.md)).
 
 ### Explicit-context warmup envelope
 

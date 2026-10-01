@@ -561,6 +561,9 @@ pub const ModelRegistry = struct {
     /// Cap on summed bytes_resident across `.ready` entries.
     /// 0 disables the byte cap (count cap still applies).
     max_resident_mem: u64,
+    /// An explicit `--max-resident-mem` binds a model loading alone too; the auto cap only bounds
+    /// co-residence, and a sole model is the load preflight's call.
+    mem_cap_binds_alone: bool = true,
     /// When non-null, `server.idleEvictLoop` evicts `.ready` entries with
     /// refcount == 0 whose `last_used_ms` is older than this window. Read
     /// there, not here — the registry only carries the setting.
@@ -1166,6 +1169,7 @@ pub const ModelRegistry = struct {
             if (mem_ok and count_ok) return n;
 
             const victim = self.pickLruEvictable(exclude_id) orelse {
+                if (count_ok and self.loadsAloneLocked(exclude_id, freed)) return n;
                 // Can't satisfy the caps — roll back every marking we made.
                 for (out[0..n]) |v| self.unmarkEvictingLocked(v);
                 return null;
@@ -1179,6 +1183,13 @@ pub const ModelRegistry = struct {
             out[n] = victim;
             n += 1;
         }
+    }
+
+    /// Past the planned evictions nothing else is resident or reserved, and the cap allows a sole model.
+    fn loadsAloneLocked(self: *ModelRegistry, id: []const u8, freed: u64) bool {
+        if (self.mem_cap_binds_alone) return false;
+        const entry = self.entries.get(id) orelse return false;
+        return (self.current_resident_bytes -| freed) == 0 and self.reserved_bytes == entry.load_estimate;
     }
 
     /// Map a stored load-failure name back to the typed error `ensureLoaded`
@@ -1937,6 +1948,47 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     reg.mutex.unlock(io);
     try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
     a.refcount.store(0, .release);
+}
+
+test "planEvictions: the auto memory cap bounds co-residence; a model alone past it is the load preflight's call" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    reg.mem_cap_binds_alone = false;
+    _ = try makeReadyStub(reg, "a", 40);
+    const big = try beginLoad(reg, "big", 120); // over the cap even alone
+    reg.mutex.lockUncancelable(io);
+    var buf: [16]*LoadedModel = undefined;
+    // Every other model goes first, then the sole load proceeds to its own preflight.
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(big.id, &buf));
+    try testing.expectEqualStrings("a", buf[0].id);
+    reg.unmarkEvictingLocked(buf[0]);
+    // A pinned model stays resident, so the load would co-reside past the cap: refused.
+    _ = buf[0].refcount.fetchAdd(1, .acq_rel);
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(big.id, &buf));
+    _ = buf[0].refcount.fetchSub(1, .acq_rel);
+    // An explicit cap binds a sole model too.
+    reg.mem_cap_binds_alone = true;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(big.id, &buf));
+    reg.markUnloadedLocked(big);
+    reg.mutex.unlock(io);
+}
+
+test "planEvictions: under the auto cap a load is not alone while another load's reservation is in flight" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    reg.mem_cap_binds_alone = false;
+    const first = try beginLoad(reg, "first", 60); // reserved, not yet resident
+    const second = try beginLoad(reg, "second", 120);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(second.id, &buf));
+    reg.markUnloadedLocked(first);
+    // With the other reservation gone, the same load is alone and passes to its preflight.
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(second.id, &buf));
+    reg.markUnloadedLocked(second);
 }
 
 test "reservation: concurrent in-flight load is visible in the budget gate" {

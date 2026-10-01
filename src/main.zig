@@ -1388,6 +1388,7 @@ pub fn main(init: std.process.Init) !void {
             idle_evict_secs,
         );
         defer registry.deinit();
+        registry.mem_cap_binds_alone = max_resident_mem_explicit;
 
         // Register the loaded model. Use the pre-registered discovery entry
         // when available (so id/path/bytes_on_disk are consistent across
@@ -1677,6 +1678,7 @@ fn runHeadlessServe(
 
     const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
     defer registry.deinit();
+    registry.mem_cap_binds_alone = max_resident_mem_explicit;
 
     // Carrier entry for LoadParams (required field), never loaded here
     // (`no_initial_load`). Prefer a discovered stub (so it's listed in

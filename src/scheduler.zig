@@ -1799,7 +1799,20 @@ pub const Scheduler = struct {
                 per_expert,
             );
             break :blk expertStreamingGateBytes(split.trunk +| split.mtp, plan.cache_bytes, plan.prefill_peak_bytes, plan.bounce_bytes);
-        } else null;
+        } else if (owned.config.usesMimoSourceTrunk())
+            try mimoColdLoadBillBytes(
+                self.io,
+                self.allocator,
+                owned.config,
+                entry.path,
+                coldLoadVision(owned.config.has_vision),
+                mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config).on,
+                self.no_drafter,
+                coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
+                self.ane_prefill,
+            )
+        else
+            null;
 
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
@@ -3009,10 +3022,70 @@ pub var skip_mem_preflight: bool = false;
 /// Explicit context's cache bill at the resolved KV width; null preserves flat headroom.
 pub var load_context_bytes: ?*const fn (*const model_mod.ModelConfig) ?u64 = null;
 
+/// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads
+/// when MTP is on, and the coarse lm_head copy the heads and the greedy readout share.
+fn mimoResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
+    var bytes = try model_mod.mimoSourceResidentBytes(io, allocator, model_dir, load_vision and config.mimo_vision);
+    if (mtp_on) bytes += try model_mod.mimoMtpResidentBytes(io, allocator, model_dir);
+    if (mimo_mtp.rerankBits() != 0)
+        bytes += mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mimo_mtp.rerankBits());
+    return bytes;
+}
+
+/// The drafter a load binds: `--no-drafter` wins, then an explicit dir, then one shipped in the model dir.
+const LoadDrafterDir = struct {
+    dir: []const u8,
+    owned: ?[]u8 = null,
+
+    fn resolve(io: std.Io, allocator: std.mem.Allocator, no_drafter: bool, drafter_dir: []const u8, model_dir: []const u8) LoadDrafterDir {
+        if (no_drafter) return .{ .dir = "" };
+        if (drafter_dir.len > 0) return .{ .dir = drafter_dir };
+        const in_dir = dflash_mod.resolveInDirDrafter(io, allocator, model_dir) orelse return .{ .dir = "" };
+        return .{ .dir = in_dir, .owned = in_dir };
+    }
+
+    fn deinit(self: LoadDrafterDir, allocator: std.mem.Allocator) void {
+        if (self.owned) |p| allocator.free(p);
+    }
+};
+
+/// The context term of the load preflight's requirement (`loadRequirementBytes`).
+fn preflightCtxBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, drafter_dir: []const u8, ane_prefill: bool, mtp_on: bool) ?u64 {
+    const mtp_sidecar = if (mtp_on) blk: {
+        var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch break :blk true;
+        defer dir.close(io);
+        break :blk mtp_mod.resolveMtpSidecarInDir(io, allocator, dir) != null;
+    } else false;
+    return loadContextBill(config, drafter_dir, ane_prefill, mtp_sidecar);
+}
+
+/// What a resident MiMo cold load reserves in the registry: the requirement its load preflight
+/// compares with free memory, so the gate and the preflight read one bill.
+fn mimoColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, load_vision: bool, mtp_on: bool, no_drafter: bool, drafter_dir: []const u8, ane_prefill: bool) !u64 {
+    const weights = try mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
+    const drafter = LoadDrafterDir.resolve(io, allocator, no_drafter, drafter_dir, model_dir);
+    defer drafter.deinit(allocator);
+    return loadRequirementBytes(weights, preflightCtxBytes(io, allocator, config, model_dir, drafter.dir, ane_prefill, mtp_on));
+}
+
 fn loadContextBill(config: *const model_mod.ModelConfig, drafter_dir: []const u8, ane_prefill: bool, mtp_sidecar: bool) ?u64 {
     // Sidecars and ANE allocations are outside the measured target warmup allowance.
     if (drafter_dir.len > 0 or ane_prefill or mtp_sidecar) return null;
     return if (load_context_bytes) |bill| bill(config) else null;
+}
+
+test "a resident MiMo cold load reserves its load preflight's requirement" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try @import("mimo_source.zig").makeTinySourceFixture(io, a, &tmp);
+    defer fixture.deinit();
+    fixture.config.expert_layout = .mxfp4_individual;
+    const weights = try mimoResidentLoadBytes(io, a, fixture.path, &fixture.config, false, false);
+    const preflight = loadRequirementBytes(weights, preflightCtxBytes(io, a, &fixture.config, fixture.path, "", false, false));
+    try testing.expectEqual(preflight, try mimoColdLoadBillBytes(io, a, &fixture.config, fixture.path, false, false, false, "", false));
+    try testing.expect(weights > 0);
 }
 
 test "sidecars and ANE keep the flat load headroom" {
@@ -3502,28 +3575,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         streaming_resident_bytes = split.trunk +| split.mtp;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
     } else if (params.config.usesMimoSourceTrunk()) {
-        // A resident MiMo load is billed by what the source loader serves: the
-        // FP8 trunk as stored plus its scale grids, and the vision tower it loads.
-        streaming_resident_bytes = try model_mod.mimoSourceResidentBytes(sch.io, sch.allocator, params.model_dir, params.load_vision and params.config.mimo_vision);
-        if (mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on)
-            streaming_resident_bytes.? += try model_mod.mimoMtpResidentBytes(sch.io, sch.allocator, params.model_dir);
-        // One coarse lm_head copy: the heads' drafts and the trunk's greedy readout share it.
-        if (mimo_mtp.rerankBits() != 0)
-            streaming_resident_bytes.? += mtp_mod.rerankCoarseBytes(@intCast(params.config.vocab_size), @intCast(params.config.hidden_size), mimo_mtp.rerankBits());
+        streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     }
 
     // Resolve the sidecar before preflight so billing and loading see the same dependency.
-    const in_dir_drafter: ?[]u8 = if (params.no_drafter or params.drafter_dir.len > 0)
-        null
-    else
-        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir);
-    defer if (in_dir_drafter) |p| sch.allocator.free(p);
-    const drafter_dir: []const u8 = if (params.no_drafter)
-        ""
-    else if (params.drafter_dir.len > 0)
-        params.drafter_dir
-    else
-        in_dir_drafter orelse "";
+    const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter, params.drafter_dir, params.model_dir);
+    defer drafter.deinit(sch.allocator);
+    const drafter_dir = drafter.dir;
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
@@ -3534,12 +3592,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (!skip_mem_preflight) {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
-        const mtp_sidecar = if (mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on) blk: {
-            var dir = std.Io.Dir.openDirAbsolute(sch.io, params.model_dir, .{}) catch break :blk true;
-            defer dir.close(sch.io);
-            break :blk mtp_mod.resolveMtpSidecarInDir(sch.io, sch.allocator, dir) != null;
-        } else false;
-        const ctx_bytes = loadContextBill(params.config, drafter_dir, params.ane_prefill, mtp_sidecar);
+        const ctx_bytes = preflightCtxBytes(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.ane_prefill, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
         log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes, ctx_bytes))) / (1024.0 * 1024.0 * 1024.0),

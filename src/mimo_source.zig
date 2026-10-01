@@ -1180,7 +1180,7 @@ fn testF32Bytes(allocator: Allocator, values: []const f32) ![]u8 {
     return bytes;
 }
 
-const TinySourceFixture = struct {
+pub const TinySourceFixture = struct {
     allocator: Allocator,
     path: []u8,
     config: model.ModelConfig,
@@ -1190,7 +1190,7 @@ const TinySourceFixture = struct {
     mlp_scales: []u8,
     embed: []u8,
 
-    fn deinit(self: *TinySourceFixture) void {
+    pub fn deinit(self: *TinySourceFixture) void {
         self.allocator.free(self.path);
         self.allocator.free(self.qkv_weight);
         self.allocator.free(self.qkv_scales);
@@ -1238,7 +1238,7 @@ fn redirectToNewShard(io: std.Io, allocator: Allocator, tmp: *std.testing.TmpDir
     try writeTestIndex(io, allocator, dir, entries.items);
 }
 
-fn makeTinySourceFixture(
+pub fn makeTinySourceFixture(
     io: std.Io,
     allocator: Allocator,
     tmp: *std.testing.TmpDir,

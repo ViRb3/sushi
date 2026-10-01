@@ -97,6 +97,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Discovery (`src/model_discovery.zig` / `src/model_registry.zig`): two-level org/name, multi-root, streaming stubs,
   multi-model registry. **`--model-dir` is REPEATABLE** (`discoverModelsMany` merges roots FIRST-WINS). One path never
   registers under TWO ids (`registry.peekByPath`).
+- **The auto `--max-resident-mem` (80% of the GPU working-set limit) bounds CO-RESIDENCE only**: a cold load evicts
+  every other model first, and one that then loads alone is the load preflight's call (`mem_cap_binds_alone`); an
+  explicit `--max-resident-mem` binds a sole model too. Before this the 2.3bpw MiMo pack could not cold-load through
+  `/v1/load-model` (the app's path) on a 128 GB Mac at default flags.
 - **A reload FREES the CPU state `unloadResident` retains** while the entry is `.loading` (`releaseRetainedCpuState`):
   a reader holding no refcount takes the mutex AND skips them while `.loading`.
 
