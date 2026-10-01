@@ -1791,6 +1791,7 @@ pub const Scheduler = struct {
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
             }
+            if (expert_stream_mod.pickToleranceRefused(expert_stream_mod.pick_tolerance, owned.config.moe_sigmoid_router)) return error.ExpertPickToleranceUnsupported;
             const mtp_resident = false;
             const per_expert = try expert_stream_mod.expertBytesFor(self.allocator, entry.path, geometry, layout);
             const resolved = try resolveExpertCache(self.expert_cache_bytes, settings_budget, owned.config, split, mtp_resident, per_expert);
@@ -3448,6 +3449,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.config.mtp_override = false;
             },
             .drop_default, .off => {},
+        }
+        if (expert_stream_mod.pickToleranceRefused(expert_stream_mod.pick_tolerance, params.config.moe_sigmoid_router)) {
+            log.err("[expert-stream] {s}\n", .{expert_stream_mod.PICK_TOLERANCE_UNSUPPORTED});
+            return error.ExpertPickToleranceUnsupported;
         }
         const mtp_resident = false;
         if (budget.from_setting)

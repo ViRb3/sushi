@@ -19,7 +19,7 @@ earlier history is mlx-serve's, in that project's changelog.
   decodes 10.3 -> 19.6 tok/s (llmprobe, 512 context) with byte-identical output.
 - **`--expert-pick-tolerance <n>`** (0 to 0.6, default off): a streamed pack may serve a cached expert in place of a
   missed one when the router rates it at least `1 - n` as likely; lossy, trading a little accuracy for fewer SSD reads (KLD in `docs/quality-kld.md`; 22.3 tok/s greedy at 0.2 on the same
-  M1 Max).
+  M1 Max); a streamed MiMo refuses the flag by name, since its sigmoid router has no probability-ratio test.
 - **A reply cut short while thinking streams the reasoning the non-streamed reply returns**: no lone `<think>` as
   reasoning (MiMo at `max_tokens: 1`), no empty Anthropic thinking block, and no dropped thought of a few characters.
 - **A request that names a pack by its path is answered by that pack or refused**: an unregistered path is a 404

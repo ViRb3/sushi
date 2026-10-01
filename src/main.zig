@@ -305,7 +305,8 @@ fn printUsage(io: std.Io) void {
         \\                        cache is replaced by the best cached expert the
         \\                        router did not pick, when that expert's probability
         \\                        is at least (1 - n) x the missed one's. 0..0.6;
-        \\                        0.3 is a mild setting.
+        \\                        0.3 is a mild setting. A sigmoid router (MiMo)
+        \\                        refuses it at load.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-

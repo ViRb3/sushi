@@ -82,7 +82,9 @@ zero-copy slabs. With no budget a pack loads resident as before.
 
 - On a cache miss at decode widths, a routed expert may be replaced by the best cached expert outside the row's top-k
   when its router probability is at least `(1-n)` times the missed one's (`ln(1-n)` on the logit difference). The substitute keeps the
-  missed expert's routing weight. `expert_stream.substituteMisses`; skipped for biased routers and imatrix capture.
+  missed expert's routing weight. `expert_stream.substituteMisses`; skipped under imatrix capture.
+- A streamed sigmoid router (MiMo) refuses the flag at load by name (`ExpertPickToleranceUnsupported`, server,
+  `--model` and `kld compare`): its logit gap is not a probability ratio, so the pick would never run.
 - A row's expert is swapped at most `PICK_STARVE_LIMIT` (3) times in a row, then fetched, so a hot expert cannot stay
   out of the cache. Misses are taken in descending logit order, and a missed expert another row is already fetching
   counts as loading, not as a swap target.

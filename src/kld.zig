@@ -871,6 +871,10 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
             },
             .drop_default, .off => {},
         }
+        if (expert_stream_mod.pickToleranceRefused(opts.pick_tolerance, self.config.moe_sigmoid_router)) {
+            log.err("[expert-stream] {s}\n", .{expert_stream_mod.PICK_TOLERANCE_UNSUPPORTED});
+            return error.ExpertPickToleranceUnsupported;
+        }
         const mtp_resident = false;
         const geometry = scheduler_mod.streamingGeometryOf(&self.config);
         self.config.expert_layout = expert_stream_mod.quant.layoutOfDirWithFirstMoe(allocator, io, self.config.model_type, opts.model_dir, geometry.layers, geometry.first_moe_layer) orelse
