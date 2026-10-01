@@ -16893,6 +16893,10 @@ pub const Transformer = struct {
     /// samplers reference it non-owning via `SamplingParams.suppress_mask`.
     /// Null = suppression off (kill switch, no chat template, GGUF engines).
     suppress_mask: ?mlx.mlx_array = null,
+    /// Overthinking-marker mask (`[vocab]` bool, `think_penalty.markerIds`), built once at load;
+    /// owned here, read by the Generator's think penalty. Null = no penalty can apply.
+    think_marker_mask: ?mlx.mlx_array = null,
+    logit_bias: []const @import("logit_bias.zig").Bias = &.{},
     /// Measured spec round-cost table (`round_cost.Table`): per draft
     /// width, per KV bucket, fed by every MTP/DFlash round on this model and
     /// read by the EV plan in place of the fitted surface once a bucket has
@@ -18614,6 +18618,8 @@ pub const Transformer = struct {
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
+        if (self.think_marker_mask) |m| _ = mlx.mlx_array_free(m);
+        self.allocator.free(self.logit_bias);
         self.qsa_consts.deinit();
         self.qsa_pooled_rope.deinit();
         self.yarn_mscale_cast.deinit();

@@ -2499,6 +2499,8 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
     config.preserve_thinking_override = o.preserve_thinking;
+    config.think_penalty_override = o.think_penalty;
+    config.logit_bias_file_override = o.logit_bias_file;
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.streamsExperts()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
@@ -3666,6 +3668,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
     generate_mod.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
+    generate_mod.installThinkMarkers(xfm_ptr, params.tok);
+    try generate_mod.installLogitBias(sch.io, xfm_ptr, params.tok);
 
     // Propagate the kv-quant config to the Transformer's own cache. Slot
     // caches in serve mode honor this independently in `Slot.init`; this
@@ -3694,6 +3698,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", model_settings.sourceLabel(keep.source, "--preserve-thinking") });
     }
+    const think = model_settings.pick(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, 0);
+    log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, model_settings.sourceLabel(think.source, "--think-penalty") });
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
@@ -8442,11 +8448,12 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     defer allocator.free(last_rows);
     const all_rows = try Transformer.sliceBatchRows(allocator, s_stream, hidden_all, n);
     defer allocator.free(all_rows);
-    for (states[0..n], 0..) |*st, i| {
+    for (states[0..n], live[0..n], 0..) |*st, slot, i| {
         st.verify_logits = logit_rows[i];
         st.new_hidden = last_rows[i];
         st.verify_hidden_all = all_rows[i];
         st.verify_len = width;
+        _ = try slot.legacy_gen.?.thinkShiftRows(&st.verify_logits, padded[i]);
     }
     if (sch.metrics) |m| m.batched_group_size.set(n);
     for (states[0..n], live[0..n]) |*st, slot| {
@@ -8717,9 +8724,15 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
     std.debug.assert(live_n == logits_arr.len);
     std.debug.assert(live_n <= sample_params.len);
+    var shifted_n: usize = 0;
+    defer for (sample_rows[0..shifted_n], logits_arr[0..shifted_n]) |row, raw| {
+        if (row.ctx != raw.ctx) _ = mlx.mlx_array_free(row);
+    };
     for (batch, 0..) |slot, i| {
-        sample_params[i] = slot.legacy_gen.?.sampling;
-        sample_rows[i] = logits_arr[i];
+        const gen = &slot.legacy_gen.?;
+        sample_rows[i] = try gen.thinkShifted(logits_arr[i], .{ .decided = &.{gen.next_token_id} });
+        shifted_n = i + 1;
+        sample_params[i] = gen.sampling;
     }
     if (live_n > 0) {
         try generate_mod.sampleRows(sample_ids[0..live_n], sample_rows[0..live_n], sample_params[0..live_n], xfm_ptr.s);

@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **Long-context MiMo requests switch to serial decode when their MTP rounds lose on measured cost**, while
   workloads that benefit from speculation keep it.
+- **Experimental token logit biases**: load scoped penalties and rewards from JSON/CSV with `--logit-bias-file`,
+  or send an OpenAI `logit_bias` map per request; the optional think-penalty preset remains off by default.
 
 - **Faster MiMo 2.3bpw**: the prefill's expert GEMMs, the MTP verify rows (whose global layers share one walk of a
   long cache), the draft heads and long-prompt attention do less work per token; output is byte-identical.

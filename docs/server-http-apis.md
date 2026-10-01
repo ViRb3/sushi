@@ -85,6 +85,47 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
   completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off.
+- **Think penalty** (`think_penalty` request > `--think-penalty` > model-settings.json > off, 0-20; arXiv 2606.00206):
+  while the thought is open every single-token spelling of the paper's markers (bare or space-led, lower or capital)
+  loses λ; a split spelling is skipped (its first piece starts other words). The paper penalises everywhere; we stop
+  at the closer. Every sampled position, serial or verify row, is shifted by its own prefix (`thinkShifted`,
+  `thinkShiftRows`), so greedy MTP keeps serial's bytes; logprobs stay RAW.
+
+
+## Experimental logit bias
+
+`--logit-bias-file <path>` loads a JSON or CSV file at model load; the launch flag overrides the per-model
+`logit_bias_file` setting. The default is off. Each entry names exactly one `id`, exact vocabulary `token` string,
+or `word`; words expand to single-token lower/capital spellings with and without a leading space. Split spellings
+are skipped and counted in the load log.
+
+```json
+{"entries":[{"word":"Wait","delta":-1,"scope":"reasoning"},{"id":1234,"delta":2}]}
+```
+
+The equivalent CSV columns are `kind,target,delta,scope`:
+
+```csv
+kind,target,delta,scope
+word,Wait,-1,reasoning
+id,1234,2,all
+```
+
+`delta` is finite and between -100 and 100: negative penalizes, positive rewards. `scope` is `reasoning`, `answer`,
+or `all` (default). Answer scope applies outside reasoning, including before an opener; the closer ends reasoning.
+Unknown targets/scopes, out-of-vocabulary ids and malformed files fail model load with a named `LogitBias*` error.
+The load line reports the file, entry count, expanded ids and skipped spellings.
+
+`/v1/chat/completions` and `/v1/completions` accept OpenAI `logit_bias`, a map such as `{"1234":-2}`. These deltas
+apply to all positions and add to file entries and the optional think-penalty preset. Invalid ids, nonnumeric or
+out-of-range biases return 400. `think_penalty: 0` disables the preset only; file and request biases still apply.
+Overlapping entries add. Sampling uses shifted logits; returned logprobs remain raw.
+
+Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
+head, including positive rewards. Serial, MTP, PLD and prompt-lookup rows apply the same prefix-dependent shifts;
+streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
+can still shorten displayed loop-stop replies; `SUSHI_LOOP_TRIM=0` disables that presentation step for strict byte
+comparisons while retaining loop detection. The unchanged `--think-penalty` preset remains off by default.
 
 ## Reasoning budget
 

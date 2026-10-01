@@ -1260,6 +1260,32 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
 }
 
+/// The think penalty's lambda: the request's `think_penalty` > `--think-penalty` >
+/// model-settings.json > off.
+fn resolveThinkPenalty(root: std.json.ObjectMap, flag: ?f32, setting: ?f32) f32 {
+    if (parseJsonFloatOpt(root, "think_penalty", 0, model_settings.think_penalty_max)) |v| return v;
+    return model_settings.pick(f32, flag, setting, 0).value;
+}
+
+/// The penalty for one request: off unless it thinks, lambda > 0 and its span is trackable
+/// (a single-token closer, and an opener when the prompt leaves the thought to the model).
+fn thinkPenaltyFor(lambda: f32, enable_thinking: bool, opener: ?u32, closer: ?u32, prompt_opened: bool) generate_mod.ThinkPenalty {
+    if (lambda <= 0 or !enable_thinking) return .{};
+    const close = closer orelse return .{};
+    if (opener == null and !prompt_opened) return .{};
+    return .{ .lambda = lambda, .opener_id = opener, .closer_id = close, .phase = if (prompt_opened) .inside else .before };
+}
+
+fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, lambda: f32) generate_mod.ThinkPenalty {
+    if (!enable_thinking or lm.transformer == null) return .{};
+    if (!@import("think_penalty.zig").needsSpan(lambda, lm.transformer.?.logit_bias)) return .{};
+    const closer = promptOpenerMarkerCloser(allocator, tok, prompt_ids) orelse atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
+    var tp = thinkPenaltyFor(@max(lambda, 1), enable_thinking, atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER), closer, promptOpensThink(allocator, tok, prompt_ids));
+    tp.lambda = if (tp.lambda > 0) lambda else 0;
+    if (tp.armed()) log.info("  think penalty {d}: markers lowered inside the reasoning span\n", .{lambda});
+    return tp;
+}
+
 const TOOL_CHOICE_UNDECLARED = "tool_choice names a function that is not in tools";
 
 /// Arm the decode-time half of a forced tool_choice (required or named), or
@@ -8941,6 +8967,13 @@ fn handleChatCompletions(
 
     // A decode-time bound owns the budget; the surfaces then deliver the
     // whole (closed) thought instead of trimming it.
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
+    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(if (config.unpadded_vocab_size > 0) config.unpadded_vocab_size else config.vocab_size, tok.definedVocabSize())) catch |err| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
+        return;
+    } else &.{};
+    defer allocator.free(request_bias);
+    sampling.think_penalty.biases = request_bias;
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
@@ -9156,7 +9189,7 @@ fn handleCompletions(
     }
 
     const eos_slice = requestEosSlice(config, root);
-    const sampling = generate_mod.SamplingParams{
+    var sampling = generate_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -9164,6 +9197,13 @@ fn handleCompletions(
         .presence_penalty = presence_penalty_c,
         .seed = seed,
     };
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, true, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
+    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(if (config.unpadded_vocab_size > 0) config.unpadded_vocab_size else config.vocab_size, tok.definedVocabSize())) catch |err| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
+        return;
+    } else &.{};
+    defer allocator.free(request_bias);
+    sampling.think_penalty.biases = request_bias;
 
     if (is_stream) {
         handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
@@ -15629,6 +15669,7 @@ fn handleAnthropicMessages(
         }
     }
 
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
@@ -17362,6 +17403,7 @@ fn handleResponsesInner(
     }
 
     // Enforced at decode: the bound closes the thought, so this surface parses a closed block.
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
@@ -25004,6 +25046,41 @@ test "preserve_thinking: request > --preserve-thinking > model-settings.json > t
     try t.expectEqual(@as(?bool, true), resolvePreserveThinking(null, true, false));
     try t.expectEqual(@as(?bool, false), resolvePreserveThinking(null, null, false));
     try t.expectEqual(@as(?bool, null), resolvePreserveThinking(null, null, null));
+}
+
+test "think penalty: request > --think-penalty > model-settings.json > off, clamped" {
+    const a = std.testing.allocator;
+    const Case = struct { body: []const u8, flag: ?f32, setting: ?f32, want: f32 };
+    const cases = [_]Case{
+        .{ .body = "{\"think_penalty\":0}", .flag = 2, .setting = 3, .want = 0 },
+        .{ .body = "{\"think_penalty\":1.5}", .flag = null, .setting = null, .want = 1.5 },
+        .{ .body = "{\"think_penalty\":-4}", .flag = 2, .setting = null, .want = 0 },
+        .{ .body = "{\"think_penalty\":1e9}", .flag = null, .setting = null, .want = model_settings.think_penalty_max },
+        .{ .body = "{\"think_penalty\":\"2\"}", .flag = 2, .setting = 3, .want = 2 },
+        .{ .body = "{}", .flag = null, .setting = 3, .want = 3 },
+        .{ .body = "{}", .flag = null, .setting = null, .want = 0 },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(c.want, resolveThinkPenalty(parsed.value.object, c.flag, c.setting));
+    }
+}
+
+test "think penalty: arms a thinking request whose think markers are single tokens" {
+    const t = std.testing;
+    const open: u32 = 7;
+    const close: u32 = 8;
+    const prompt_opened = thinkPenaltyFor(1.5, true, open, close, true);
+    try t.expectEqual(@as(f32, 1.5), prompt_opened.lambda);
+    try t.expectEqual(generate_mod.ThinkPenalty.Phase.inside, prompt_opened.phase);
+    try t.expectEqual(close, prompt_opened.closer_id);
+    try t.expectEqual(generate_mod.ThinkPenalty.Phase.before, thinkPenaltyFor(1.5, true, open, close, false).phase);
+    try t.expect(!thinkPenaltyFor(0, true, open, close, true).armed());
+    try t.expect(!thinkPenaltyFor(1.5, false, open, close, true).armed());
+    try t.expect(!thinkPenaltyFor(1.5, true, open, null, true).armed());
+    try t.expect(!thinkPenaltyFor(1.5, true, null, close, false).armed());
+    try t.expect(thinkPenaltyFor(1.5, true, null, close, true).armed());
 }
 
 test "chat_template_kwargs is read in one place, and only a bool counts" {

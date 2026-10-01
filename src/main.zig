@@ -155,6 +155,11 @@ fn printUsage(io: std.Io) void {
         \\                      keep every turn's thinking (on, the template default)
         \\                      or only the latest user turn's (off). Request
         \\                      chat_template_kwargs > this flag > model-settings.json
+        \\  --logit-bias-file <path> Experimental JSON/CSV scoped token penalties and rewards.
+        \\  --think-penalty <f> Lower the logits of ~50 overthinking markers ("Wait",
+        \\                      "But", "Alternatively", ...) by f inside the reasoning
+        \\                      span (default 0 = off). Request think_penalty > this
+        \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
@@ -825,6 +830,17 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--logit-bias-file") and i + 1 < args.len) {
+            i += 1;
+            model_settings_mod.logit_bias_file_flag = args[i];
+        } else if (std.mem.eql(u8, args[i], "--think-penalty") and i + 1 < args.len) {
+            i += 1;
+            const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
+            if (!(lambda >= 0 and lambda <= model_settings_mod.think_penalty_max)) {
+                log.err("--think-penalty: expected a number from 0 to {d}; got '{s}'\n", .{ model_settings_mod.think_penalty_max, args[i] });
+                std.process.exit(1);
+            }
+            model_settings_mod.think_penalty_flag = lambda;
         } else if (std.mem.eql(u8, args[i], "--preserve-thinking") and i + 1 < args.len) {
             i += 1;
             model_settings_mod.preserve_thinking_flag = server_mod.parseOnOff(args[i]) orelse {
@@ -1486,6 +1502,8 @@ pub fn main(init: std.process.Init) !void {
 
         // Reserved-token suppression, same derivation as the serve path.
         generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
+        generate_mod.installThinkMarkers(&xfm, tok);
+        try generate_mod.installLogitBias(io, &xfm, tok);
 
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
