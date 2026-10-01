@@ -37,7 +37,12 @@ fi
 LOG="$(mktemp)"
 SERVER_PID=""
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null
+        for _ in $(seq 1 60); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.5; done
+        kill -9 "$SERVER_PID" 2>/dev/null
+        SERVER_PID=""
+    fi
     rm -f "$LOG"
 }
 trap cleanup EXIT INT TERM

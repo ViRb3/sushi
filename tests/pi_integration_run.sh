@@ -51,14 +51,16 @@ SUSHI_PID=""
 kill_sushi() {
     [ -n "$SUSHI_PID" ] || return 0
     kill "$SUSHI_PID" 2>/dev/null
-    for _ in $(seq 1 10); do
+    # A large model unloads slowly; past a minute it is forced, never left on the port.
+    for _ in $(seq 1 120); do
         if ! kill -0 "$SUSHI_PID" 2>/dev/null; then
             SUSHI_PID=""
             return 0
         fi
         sleep 0.5
     done
-    return 1
+    kill -9 "$SUSHI_PID" 2>/dev/null
+    SUSHI_PID=""
 }
 
 # A server still on the port would answer the next case with the wrong model.

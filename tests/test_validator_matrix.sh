@@ -75,6 +75,11 @@ stop_server() {
 }
 
 start_server() { # path logfile extra-flags -> 0 on healthy
+    # A previous row's server still on the port would be scored as this row's.
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+        echo "port $PORT is still in use; not booting this row" >&2
+        return 1
+    fi
     # shellcheck disable=SC2086 # $3 is a flag list
     "$BINARY" --model "$1" --serve --port "$PORT" --log-level info \
         --ctx-size 32768 $3 > "$2" 2>&1 &

@@ -1783,7 +1783,10 @@ pub const Scheduler = struct {
             if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
             const geometry = streamingGeometryOf(owned.config);
             const layout = try expert_stream_mod.quant.streamingLayoutOfDir(self.allocator, self.io, owned.config.model_type, entry.path, geometry.layers, geometry.first_moe_layer);
-            const split = try model_mod.streamingResidentSplit(self.io, self.allocator, entry.path, layout);
+            var split = try model_mod.streamingResidentSplit(self.io, self.allocator, entry.path, layout);
+            var layout_config = owned.config.*;
+            layout_config.expert_layout = layout;
+            split.trunk +|= mimoCoarseHeadBytes(&layout_config);
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
             switch (mtpStreamingVerdict(mtp)) {
                 .refuse => return error.ExpertStreamingMtpUnsupported,

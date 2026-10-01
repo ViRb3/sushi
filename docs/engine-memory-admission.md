@@ -55,10 +55,15 @@ The baseline is the existing flat formula, not an old-binary rerun.
 | Sushi-4bpw | on | 70.68 | 65.70 | 64.2628 |
 | Sushi-4bpw | off | 70.68 | 65.70 | 61.6967 |
 
-MiMo-V2.6-Flash-Sushi-2.3bpw on the MiMo lookup branch (verify warm-up at 1-8 rows and the three heads), startup
-`--ctx-size 1248 --kv-quant 8`, MTP and vision on, `taskpolicy -a`, GPU lock, one boot (2026-10-01): the preflight
-billed weights 89.65 GiB (flat requirement 96.65 GiB); the pre-request `/props` peak was 89.88 GiB, unchanged after a
-short chat. The 2 GiB allowance leaves ~1.8 GiB unused there, so MiMo takes the same term.
+MiMo-V2.6-Flash-Sushi-2.3bpw, `--ctx-size 1248 --kv-quant 8`, MTP and vision on (1-8-row verify warm-up and the three
+heads), `taskpolicy -a`, GPU lock, one boot per row, 2026-10-01:
+
+| Mode | Binary | Billed weights (GiB) | Requirement (GiB) | Pre-request `/props` peak (GiB) |
+|---|---|---:|---:|---:|
+| startup, flat headroom | gap/mimo-g1b e425a1a2, built 10:17:14 | 89.65 | 96.65 | 89.88 |
+| cold `/v1/load-model`, context term | gap/mimo-g1b c5f8f3ac, built 10:46:23 | 89.65 | 91.76 | 89.88 |
+
+Both peaks were unchanged after a short chat. The 2 GiB allowance leaves ~1.9 GiB unused, so MiMo takes the same term.
 
 The 2 GiB allowance covers load/warmup scratch and fixed state outside the context bill, not arbitrary prompt
 activations. Separate MTP sidecar files, assistant drafters and ANE retain flat headroom; other expert layouts and

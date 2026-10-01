@@ -14,7 +14,7 @@ earlier history is mlx-serve's, in that project's changelog.
   lookup or PLD round verifies up to seven drafts; output is byte-identical.
 - **`sushi run mimo-v2.6-flash`** (and `sushi pull`) fetches and serves the MiMo 2.3bpw pack by its short name.
 - **Greedy MiMo decode reads the vocabulary head through a coarse top-32 shortlist** re-scored on the full head,
-  with or without MTP; sampled, logprob, penalty and grammar requests keep the full head.
+  with or without MTP, and on a streamed MiMo too; sampled, logprob, penalty and grammar requests keep the full head.
 - **`--gpu-warm-secs <n>`** (default 60, 0 = off): the server keeps the GPU awake for this long after a request, so
   the next request no longer starts with a GPU wake-up delay.
 - **With MTP, the first token streams when prefill ends** instead of after the first speculative round (when that
