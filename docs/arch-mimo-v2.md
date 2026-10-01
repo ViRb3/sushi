@@ -133,6 +133,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   coordinates), never rebuilt whole; the sliding ring view is window + chunk rows, dequantized per view.
   Landed 2026-09-23 (668278c): 39-layer band attention 39.5 -> 20.3 ms at chunk 512, 603 -> 95.5 at 2048, 2439 -> 181
   at 4096; 16x512 KLD -0.2%, inside the rounding-flip floor.
+- **Global-layer attention is what grows a long prompt's TTFT**: ~26% of it at 64k, ~43% at 128k and ~62% at 256k at
+  chunk 2048; the band calls are ~1% ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)).
 - **A global-layer forward under 16 rows runs row by row** (`MimoAttnArm.prefill_rows`, the verify rows' arm): the
   fused kernel declines there, and the composed arm would rebuild the whole packed cache dense beside a
   [heads, rows, keys] score sheet, unbilled. A warm restore's short tail (a follow-up of a few tokens) is the case;

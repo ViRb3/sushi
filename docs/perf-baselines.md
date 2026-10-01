@@ -771,6 +771,72 @@ From 4k to 16k keys the new kernel costs 3-10 us more per layer, under 0.1 ms pe
 Byte identity, no PLD: greedy serial new == main on 3 prompts (4.9k / 9.8k / 18.6k tokens, 256 generated each).
 Forced-depth-3 MTP == serial on the same 3 prompts, on the new kernel rebased onto 36ae6d0.
 
+<a id="mimo-longctx-prefill-attn"></a>
+### MiMo long-context prefill: what the global layers' attention costs (kernels of 819b4751)
+
+In-process microbench `SUSHI_ATTN_PD_UBENCH=1` (test filter "MiMo prefill attention per chunk"): one chunk over a kv8
+cache built by `KVCache.update`, the served `fusedSdpaPrefillKv` chain, arms interleaved, median of 5. Built on
+5834210c, whose attention code is unchanged in 819b4751. `taskpolicy -a`, locks `attn-ub1` / `attn-ub2`, fans at max,
+2026-10-01. The table gives ms per global layer per chunk (Hq 64 / Hk 4, qk 192 / v 128, causal); where two runs
+differ, both are shown:
+
+| keys | qL 1024 | qL 2048 | qL 4096 |
+|---|---|---|---|
+| = qL | 0.76 | 1.90 | |
+| 16k | 15.7 | 26.8 | |
+| 32k | 34.1 | 53.4 | |
+| 64k | 69.4 | 108.4-108.7 | 263.4 |
+| 128k | 139.8 | 239.6-261.2 | 510.0 |
+| 256k | 282.8 | 540.9-554.9 | 1004.6 |
+
+- Throughput counts only the useful causal FLOPs. It is 39-45 TFLOPS at long context, and up to 50 at 32k-64k with
+  qL 2048. qL 2048 is the fastest width per row at 128k keys or fewer.
+- The dequant and the fp32 carries cost little:
+  - The per-dispatch dequant alone takes 0.4 / 1.2 / 2.1 / 3.9-8.2 ms at 16k / 64k / 128k / 256k keys.
+  - The same dispatches over pre-dequantized bf16 K/V run 0-10% faster than the served chain.
+  - One carry-free dispatch is 6-13% slower than the chained ones from 64k keys up, because K/V fall out of cache.
+  - The dispatch budget is not a lever: 5e8, 1e9 and 2e9 land within ±3% of each other.
+- One sliding layer's band call, ring dequant included, takes 0.42 / 0.57 / 0.90 ms at qL 1024 / 2048 / 4096. Over 39
+  layers that is 16 / 22 / 35 ms per chunk.
+- Kernel ablations at 128k keys, qL 2048, on the dense chain (timing-only source edits, `AttnPdNaxAblation`), ms:
+
+  | variant | ms |
+  |---|---|
+  | served kernel | 240.2 |
+  | K/V rows pinned to one block (L1 hits) | 238.1 |
+  | K/V fragments built in registers | 200.1 |
+  | Q fragments built in registers | 223.2 |
+  | no loads at all (55.6 TFLOPS) | 196.3 |
+  | no loads and no matmuls | 29.9 |
+
+  So about 69% of the time is matmul issue, about 18% is load instructions (Q is reloaded every key block, and every
+  simdgroup loads its own K/V fragments), and about 12% is the softmax, masks and rescale. K/V memory traffic is about
+  1%.
+- The load diet, measured the same way with lock `attn-fin1`, 9 samples per arm. Build: ba87fd2b's tree before a
+  comment-only edit to the header, test binary SHA-256 `f6264dab`. Each fragment row is now one 8-byte
+  vector load (`SushiNax::load2`) instead of four element reads. Old kernel vs new, ms per
+  global layer: 26.27 -> 25.14 at 16k keys, 108.96 -> 103.40 at 64k, 244.87 -> 226.48 at 128k, 543.56 -> 520.06 at
+  256k (-4% to -8%). The output is byte-identical to the old kernel on the kv8 chain at all four lengths and on the
+  band + sinks call. Two earlier runs with the loads inlined read -3% to -6%.
+- Load-diet attempts that were byte-identical but slower: Q held in registers +39%, which needs the d loop fully
+  unrolled, and that unroll alone costs +43%. K/V staged once per threadgroup in threadgroup memory: +107%. Two key
+  blocks per Q load: +10%. Unroll 2 or 6 instead of 4: +3-4%. Dropping the mid-PV barrier: +20%. The vector loads
+  with unroll 3 read the same as with unroll 4.
+- Prefill meter (`SUSHI_PREFILL_UBENCH=6`, rows 2048, real text) on 819b4751, lock `attn-meter2048`: median 1669 ms
+  per chunk, minimum 1342. Chunks run back to back slow down ([mimo-ttft-idle](#mimo-ttft-idle)). Attention at
+  2048 keys is 39 ms of that time.
+- Predicted TTFT, summed over full 2048-row chunks: each chunk costs the rest of the chunk + 9 x global + 39 x band.
+  The rest is 1468 ms, fit to the ladder's 16k rung, so that rung matches by construction. The ladder's measured TTFT
+  is 12.9 / 28.0 / 67.0 / 172.6 s at 16.3k / 32.7k / 65.6k / 131.0k tokens.
+
+| prompt | rest s | global s | band s | TTFT s | attention share | predicted tok/s | ladder on 819b4751 |
+|---|---|---|---|---|---|---|---|
+| 16k | 11.7 | 1.0 | 0.18 | 13.0 | 9% | 1265 | 1268 |
+| 32k | 23.5 | 4.0 | 0.36 | 27.9 | 16% | 1175 | 1167 |
+| 64k | 47.0 | 15.9 | 0.71 | 63.6 | 26% | 1030 | 980 |
+| 128k | 94.0 | 69.8 | 1.43 | 165.2 | 43% | 793 | 759 |
+| 256k | 187.9 | 306.2 | 2.85 | 497.0 | 62% | 527 | |
+
 <a id="exl3-decode-layout"></a>
 ## EXL3 decode GEMV layout (two tiles per threadgroup)
 

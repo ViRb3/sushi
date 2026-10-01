@@ -2557,6 +2557,16 @@ var attn_pd_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 fn getAttnPdKernel(arm: AttnPdArm) !mlx.mlx_fast_metal_kernel {
     const slot = &attn_pd_kernels[@intFromEnum(arm)];
     if (slot.*) |kk| return kk;
+    const kernel = try newAttnPdKernel(
+        if (arm == .nax) "sushi_attn_pd_nax" else "sushi_attn_pd",
+        if (arm == .nax) @embedFile("kernels/attn_pd_nax.metal") else ATTN_PD_KERNEL_SOURCE,
+        if (arm == .nax) @embedFile("kernels/attn_pd_nax_header.metal") else ATTN_PD_KERNEL_HEADER,
+    );
+    slot.* = kernel;
+    return kernel;
+}
+
+fn newAttnPdKernel(name: [*:0]const u8, source: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "win", "kr", "phase", "m_in", "l_in", "o_in", "mask", "skip", "sinks" };
     const output_names = [_][*:0]const u8{ "out", "m_out", "l_out", "o_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
@@ -2564,17 +2574,16 @@ fn getAttnPdKernel(arm: AttnPdArm) !mlx.mlx_fast_metal_kernel {
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const kernel = mlx.mlx_fast_metal_kernel_new(
-        if (arm == .nax) "sushi_attn_pd_nax" else "sushi_attn_pd",
+        name,
         in_vec,
         out_vec,
-        if (arm == .nax) @embedFile("kernels/attn_pd_nax.metal") else ATTN_PD_KERNEL_SOURCE,
-        if (arm == .nax) @embedFile("kernels/attn_pd_nax_header.metal") else ATTN_PD_KERNEL_HEADER,
+        source,
+        header,
         false, // ensure_row_contiguous=false — K/V are cache VIEWS; a forced
         // contiguous copy of the full cache per layer would erase the win.
         false,
     );
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-    slot.* = kernel;
     return kernel;
 }
 
@@ -57665,6 +57674,42 @@ test "sushi_attn_pd_nax takes a 4x dispatch budget: fewer key chunks than the SI
     }
 }
 
+test "sushi_attn_pd_nax: rows that start off an 8-byte boundary give the bytes of a contiguous copy" {
+    if (mlx.noGpuBackend() or !verifyQmmNaxAvailable() or !qsaNaxOsOk()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    attn_pd_nax_override = true;
+    defer attn_pd_nax_override = null;
+    var prng = std.Random.DefaultPrng.init(0x1b4e);
+    const rnd = prng.random();
+    // Row strides of 193 and 129 elements: rows start on every 2-byte offset of an 8-byte word.
+    var strided: [3]mlx.mlx_array = undefined;
+    var dense: [3]mlx.mlx_array = undefined;
+    var built: usize = 0;
+    defer for (0..built) |i| {
+        _ = mlx.mlx_array_free(strided[i]);
+        _ = mlx.mlx_array_free(dense[i]);
+    };
+    for ([_][4]c_int{ .{ 1, 4, 40, 192 }, .{ 1, 1, 96, 192 }, .{ 1, 1, 96, 128 } }) |sh| {
+        const wide = try attn256RandBf16(rnd, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] + 1 }, s);
+        defer _ = mlx.mlx_array_free(wide);
+        strided[built] = mlx.mlx_array_new();
+        dense[built] = mlx.mlx_array_new();
+        built += 1;
+        try mlx.check(mlx.mlx_slice(&strided[built - 1], wide, &[_]c_int{ 0, 0, 0, 0 }, 4, &sh, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+        try mlx.check(mlx.mlx_contiguous(&dense[built - 1], strided[built - 1], false, s));
+    }
+    const scale: f32 = 1.0 / @sqrt(192.0);
+    const want = (try fusedSdpaPrefill(s, dense[0], dense[1], dense[2], scale, 0)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(want);
+    try std.testing.expectEqual(AttnPdArm.nax, attn_pd_last_arm);
+    const got = (try fusedSdpaPrefill(s, strided[0], strided[1], strided[2], scale, 0)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expectEqual(AttnPdArm.nax, attn_pd_last_arm);
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(got, want, s));
+}
+
 test "attnPdNaxEnabledFrom: absent or anything but 0 keeps the NAX arm" {
     try std.testing.expect(attnPdNaxEnabledFrom(null));
     try std.testing.expect(attnPdNaxEnabledFrom("1"));
@@ -57701,6 +57746,449 @@ test "sushi_attn_pd_nax: a failed probe declines to the SIMD kernel by name" {
     defer _ = mlx.mlx_array_free(out);
     try std.testing.expectEqual(AttnPdArm.simd, attn_pd_last_arm);
     try std.testing.expect(!mlx.errorPending());
+}
+
+/// Comma-separated ints from `name`, else from `default`.
+fn attnPdUbenchList(name: [*:0]const u8, default: []const u8, out: []c_int) !usize {
+    const raw = if (std.c.getenv(name)) |r| std.mem.sliceTo(r, 0) else default;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |t| : (n += 1) {
+        if (n == out.len) return error.TooManyEntries;
+        out[n] = try std.fmt.parseInt(c_int, t, 10);
+    }
+    return n;
+}
+
+/// The served query of one chunk: projection rows split into heads, transposed, partially roped.
+fn attnPdUbenchQuery(rnd: std.Random, ql: c_int, base: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const proj = try testRandUniformBf16(rnd, &[_]c_int{ 1, ql, 64 * 192 }, -2.0, 2.0, s);
+    defer _ = mlx.mlx_array_free(proj);
+    var r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r);
+    try mlx.check(mlx.mlx_reshape(&r, proj, &[_]c_int{ 1, ql, 64, 192 }, 4, s));
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose_axes(&t, r, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+    var q = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_fast_rope(&q, t, 64, false, .{ .value = base, .has_value = true }, 1.0, 0, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_array_eval(q));
+    return q;
+}
+
+/// Timing-only variants of the NAX kernel, each a set of source edits. The register stand-ins
+/// vary with the key block so no matmul can be hoisted out of the key loop.
+const AttnPdNaxAblation = enum {
+    /// K/V rows pinned to the first key block: the same loads, served from L1.
+    kv_const,
+    /// K/V fragments built in registers: no K/V loads at all.
+    kv_reg,
+    /// Q fragments built in registers (Q is otherwise re-read every key block).
+    q_reg,
+    /// Neither Q nor K/V loads: the two matmuls, the softmax and the loop.
+    qkv_reg,
+    /// No loads and no matmuls: the softmax, masks, rescale and loop alone.
+    floor,
+};
+
+fn attnPdNaxAblatedSource(alloc: std.mem.Allocator, abl: AttnPdNaxAblation) ![:0]u8 {
+    const Sub = struct { []const u8, []const u8 };
+    const kv_const = [_]Sub{
+        .{ "const int kr = c0 + ik * 16 + cc.y;", "const int kr = ik * 16 + cc.y;" },
+        .{ "const int vr = c0 + ik * 16 + cc.y;", "const int vr = ik * 16 + cc.y;" },
+    };
+    const kv_reg = [_]Sub{
+        .{ "SushiNax::load2(k0f, K0 + d * 16, K1 + d * 16);", "k0f = tfrag(T(0.01f * float(kb & 7)));" },
+        .{ "SushiNax::load2(k1f, K2 + d * 16, K3 + d * 16);", "k1f = k0f;" },
+        .{ "SushiNax::load2(v0f, V0, V1);", "v0f = tfrag(T(0.02f * float(kb & 7)));" },
+        .{ "SushiNax::load2(v1f, V0 + 16, V1 + 16);", "v1f = v0f;" },
+    };
+    const q_reg = [_]Sub{
+        .{ "SushiNax::load2(qf, Q0 + d * 16, Q1 + d * 16);", "qf = tfrag(T(0.01f * float(d + 1)));" },
+    };
+    const floor = [_]Sub{
+        .{ "SushiNax::load2(qf, Q0 + d * 16, Q1 + d * 16);", "" },
+        .{ "SushiNax::load2(k0f, K0 + d * 16, K1 + d * 16);", "" },
+        .{ "SushiNax::load2(k1f, K2 + d * 16, K3 + d * 16);", "" },
+        .{ "SushiNax::load2(v0f, V0, V1);", "" },
+        .{ "SushiNax::load2(v1f, V0 + 16, V1 + 16);", "" },
+        .{ "SushiNax::mma<float, T, T, false, true>(S[ik], S[ik + 1], qf, k0f, k1f);", "S[ik][0] += 0.001f * float(d + kb);" },
+        .{ "SushiNax::mma<float, half, T, false, false>(O[d], O[d + 1], ph[ik], v0f, v1f);", "O[d][0] += float(ph[ik][0]);" },
+    };
+    const sets: []const []const Sub = switch (abl) {
+        .kv_const => &.{&kv_const},
+        .kv_reg => &.{&kv_reg},
+        .q_reg => &.{&q_reg},
+        .qkv_reg => &.{ &kv_reg, &q_reg },
+        .floor => &.{&floor},
+    };
+    var src: []u8 = try alloc.dupe(u8, @embedFile("kernels/attn_pd_nax.metal"));
+    defer alloc.free(src);
+    for (sets) |subs| for (subs) |sub| {
+        if (std.mem.count(u8, src, sub[0]) != 1) return error.AblationPatternMissing;
+        const next = try std.mem.replaceOwned(u8, alloc, src, sub[0], sub[1]);
+        alloc.free(src);
+        src = next;
+    };
+    return alloc.dupeSentinel(u8, src, 0);
+}
+
+// DIAGNOSTIC (SUSHI_ATTN_PD_UBENCH=1): MiMo prefill attention for ONE chunk of `_QL` rows (default
+// 2048) at the end of `_KL` keys (0 = the chunk alone), arms interleaved. served = the kv8 chain the
+// forward runs (per-dispatch slice + dequant, fp32 carries); dense = the same dispatches over
+// pre-dequantized bf16 K/V; one = a single carry-free dispatch; dequant = the slices alone.
+// band = one sliding layer's call (8 KV heads, window 128, sinks, its ring view dequantized).
+// `_BUDGETS=5e8,...` adds dense chains at other dispatch budgets, `_LEAN=1` keeps served and dense only,
+// `_REPS` (default 5, up to 15) sets the samples per arm.
+// `_ABL=1` adds the `AttnPdNaxAblation` kernels and `_ALT=<a.metal>,...` replacement kernels, on the dense
+// chain at `_ABL_KL` keys (default 131072); `_KL=` (empty) skips the main table.
+test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long context (SUSHI_ATTN_PD_UBENCH=1)" {
+    if (!diagEnvOn("SUSHI_ATTN_PD_UBENCH")) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !verifyQmmNaxAvailable() or !qsaNaxOsOk()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const alloc = std.testing.allocator;
+    fused256_override = true;
+    defer fused256_override = null;
+    attn_pd_nax_override = true;
+    defer attn_pd_nax_override = null;
+    defer fused256_budget_override = null;
+    var prng = std.Random.DefaultPrng.init(0xA77D_0B3C);
+    const rnd = prng.random();
+    const scale: f32 = 1.0 / @sqrt(192.0);
+    const reps_max = 15;
+    var reps_buf: [1]c_int = undefined;
+    const reps: usize = if (try attnPdUbenchList("SUSHI_ATTN_PD_UBENCH_REPS", "5", &reps_buf) == 1) @intCast(std.math.clamp(reps_buf[0], 1, reps_max)) else 5;
+
+    var qls_buf: [8]c_int = undefined;
+    const qls = qls_buf[0..try attnPdUbenchList("SUSHI_ATTN_PD_UBENCH_QL", "2048", &qls_buf)];
+    var kls_buf: [16]c_int = undefined;
+    const kls = kls_buf[0..try attnPdUbenchList("SUSHI_ATTN_PD_UBENCH_KL", "0,16384,32768,65536,131072,262144", &kls_buf)];
+    const abl_on = diagEnvOn("SUSHI_ATTN_PD_UBENCH_ABL");
+    var max_keys: c_int = 0;
+    {
+        var abl_kls: [8]c_int = undefined;
+        for (abl_kls[0..try attnPdUbenchList("SUSHI_ATTN_PD_UBENCH_ABL_KL", "131072", &abl_kls)]) |kl| max_keys = @max(max_keys, kl);
+    }
+    for (qls) |ql| max_keys = @max(max_keys, ql);
+    for (kls) |kl| max_keys = @max(max_keys, kl);
+    if (max_keys > 524288) return error.UbenchTooManyKeys;
+
+    // One global layer's kv8 cache, filled once; each kL reads the first kL rows of its views.
+    var cache = try KVCache.initWithConfig(alloc, 1, KVQuantConfig.affine(8));
+    defer cache.deinit();
+    var full = blk: {
+        const k = try testRandUniformBf16(rnd, &[_]c_int{ 1, 4, max_keys, 192 }, -2.0, 2.0, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try testRandUniformBf16(rnd, &[_]c_int{ 1, 4, max_keys, 128 }, -1.0, 1.0, s);
+        defer _ = mlx.mlx_array_free(v);
+        break :blk try cache.update(0, k, v, s, 0);
+    };
+    defer full.deinit();
+    const triple = [6]mlx.mlx_array{ full.k_triple_q, full.k_triple_scales, full.k_triple_biases, full.v_triple_q, full.v_triple_scales, full.v_triple_biases };
+    {
+        const ev = mlx.mlx_vector_array_new_data(&triple, triple.len);
+        defer _ = mlx.mlx_vector_array_free(ev);
+        try mlx.check(mlx.mlx_eval(ev));
+    }
+
+    const View = struct {
+        parts: [6]mlx.mlx_array,
+        view: DenseKVView,
+
+        /// The first `kl` cached rows as the forward's view: packed slices, plus the dense arrays
+        /// evaluated once for the arms that skip the dequant.
+        fn init(st: mlx.mlx_stream, trip: [6]mlx.mlx_array, kl: c_int) !@This() {
+            var parts: [6]mlx.mlx_array = undefined;
+            var n: usize = 0;
+            errdefer for (parts[0..n]) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            for (trip) |src| {
+                const sh = mlx.getShape(src);
+                parts[n] = mlx.mlx_array_new();
+                n += 1;
+                try mlx.check(mlx.mlx_slice(&parts[n - 1], src, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ sh[0], sh[1], kl, sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, st));
+            }
+            const kd = try kv_quant.dequantizeAffine(st, parts[0], parts[1], parts[2], 64, 8);
+            errdefer _ = mlx.mlx_array_free(kd);
+            const vd = try kv_quant.dequantizeAffine(st, parts[3], parts[4], parts[5], 64, 8);
+            errdefer _ = mlx.mlx_array_free(vd);
+            try mlx.check(mlx.mlx_array_eval(kd));
+            try mlx.check(mlx.mlx_array_eval(vd));
+            return .{ .parts = parts, .view = .{
+                .k = kd,
+                .v = vd,
+                .owned = true,
+                .k_triple_q = parts[0],
+                .k_triple_scales = parts[1],
+                .k_triple_biases = parts[2],
+                .v_triple_q = parts[3],
+                .v_triple_scales = parts[4],
+                .v_triple_biases = parts[5],
+                .has_quant_triple = true,
+                .bits = 8,
+                .group_size = 64,
+            } };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.view.deinit();
+            for (self.parts) |a| _ = mlx.mlx_array_free(a);
+        }
+    };
+
+    const Arm = enum { served, dense, one, dequant };
+    const Spec = struct { arm: Arm, budget: ?i64 = null };
+    var specs_buf: [12]Spec = undefined;
+    var n_specs: usize = 0;
+    const lean = diagEnvOn("SUSHI_ATTN_PD_UBENCH_LEAN");
+    for (std.enums.values(Arm)) |a| if (!lean or a == .served or a == .dense) {
+        specs_buf[n_specs] = .{ .arm = a };
+        n_specs += 1;
+    };
+    var budgets_buf: [6]c_int = undefined;
+    for (budgets_buf[0..try attnPdUbenchList("SUSHI_ATTN_PD_UBENCH_BUDGETS", "", &budgets_buf)]) |b| {
+        specs_buf[n_specs] = .{ .arm = .dense, .budget = b };
+        n_specs += 1;
+    }
+    const specs = specs_buf[0..n_specs];
+    const Run = struct {
+        fn global(st: mlx.mlx_stream, arm: Arm, budget: ?i64, q: mlx.mlx_array, v: *const DenseKVView, sc: f32) !void {
+            fused256_budget_override = if (arm == .one) 0 else budget;
+            defer fused256_budget_override = null;
+            if (arm == .dequant) {
+                const qs = mlx.getShape(q);
+                const kl = mlx.getShape(v.k)[2];
+                const step = @min(PACKED_KV_SLICE_MAX, fused256KvChunkLen(1, qs[1], qs[2], kl, fused256DispatchBudget(.nax)));
+                const ev = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(ev);
+                var k0: c_int = 0;
+                while (k0 < kl) : (k0 += step) {
+                    const k1 = @min(k0 + step, kl);
+                    const ks = try dequantKvSlice(st, v.k_triple_q, v.k_triple_scales, v.k_triple_biases, k0, k1, 64, 8);
+                    defer _ = mlx.mlx_array_free(ks);
+                    const vs = try dequantKvSlice(st, v.v_triple_q, v.v_triple_scales, v.v_triple_biases, k0, k1, 64, 8);
+                    defer _ = mlx.mlx_array_free(vs);
+                    _ = mlx.mlx_vector_array_append_value(ev, ks);
+                    _ = mlx.mlx_vector_array_append_value(ev, vs);
+                }
+                try mlx.check(mlx.mlx_eval(ev));
+                return;
+            }
+            const out = (if (arm == .served)
+                try fusedSdpaPrefillKv(st, q, v, sc, 0, .{ .ctx = null })
+            else
+                try fusedSdpaPrefill(st, q, v.k, v.v, sc, 0)) orelse return error.FusedDeclined;
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+            if (attn_pd_last_arm != .nax) return error.NaxArmNotEngaged;
+        }
+    };
+    const causalFlops = struct {
+        fn f(ql: c_int, kl: c_int) f64 {
+            const qf: f64 = @floatFromInt(ql);
+            const kf: f64 = @floatFromInt(kl);
+            return 2.0 * 64.0 * (192.0 + 128.0) * (qf * (kf - qf) + qf * (qf + 1.0) / 2.0);
+        }
+    }.f;
+    const median = struct {
+        fn f(xs: []f64) f64 {
+            std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+            return xs[xs.len / 2];
+        }
+    }.f;
+
+    std.debug.print("\n[attn-pd-ub] MiMo prefill attention, one chunk, Hq 64, kv8 g64, median of {d}, arms interleaved (ms)\n", .{reps});
+    std.debug.print("[attn-pd-ub] global (Hk 4, qk 192 / v 128, causal):\n", .{});
+    for (qls) |ql| {
+        const q = try attnPdUbenchQuery(rnd, ql, 1.0e7, s);
+        defer _ = mlx.mlx_array_free(q);
+        for (kls) |kl_raw| {
+            const kl = if (kl_raw == 0) ql else kl_raw;
+            if (kl < ql) continue;
+            var view = try View.init(s, triple, kl);
+            defer view.deinit();
+            var t: [12][reps_max]f64 = undefined;
+            var disp: [12]u32 = @splat(0);
+            for (0..reps + 1) |r| {
+                for (specs, 0..) |sp, a| {
+                    const t0 = std.Io.Timestamp.now(io, .boot);
+                    try Run.global(s, sp.arm, sp.budget, q, &view.view, scale);
+                    disp[a] = fused256_last_dispatch_count;
+                    if (r > 0) t[a][r - 1] = @as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e6;
+                }
+            }
+            const fl = causalFlops(ql, kl);
+            std.debug.print("[attn-pd-ub] qL {d} kL {d}", .{ @as(u32, @intCast(ql)), @as(u32, @intCast(kl)) });
+            for (specs, 0..) |sp, a| {
+                const m = median(t[a][0..reps]);
+                if (sp.arm == .dequant) {
+                    std.debug.print(" | dequant {d:.2}", .{m});
+                } else if (sp.budget) |b| {
+                    std.debug.print(" | dense@{d} {d:.2} {d:.1}TF x{d}", .{ b, m, fl / m / 1e9, disp[a] });
+                } else {
+                    std.debug.print(" | {s} {d:.2} {d:.1}TF x{d}", .{ @tagName(sp.arm), m, fl / m / 1e9, disp[a] });
+                }
+            }
+            std.debug.print("\n", .{});
+            _ = mlx.mlx_clear_cache();
+        }
+
+        // One sliding layer: its ring view (window - 1 + chunk rows) is dequantized whole per call.
+        const qsl = try attnPdUbenchQuery(rnd, ql, 1.0e4, s);
+        defer _ = mlx.mlx_array_free(qsl);
+        const sinks = try testRandUniformBf16(rnd, &[_]c_int{64}, -1.0, 1.0, s);
+        defer _ = mlx.mlx_array_free(sinks);
+        const ring = ql + 127;
+        const ks = try testRandUniformBf16(rnd, &[_]c_int{ 1, 8, ring, 192 }, -2.0, 2.0, s);
+        defer _ = mlx.mlx_array_free(ks);
+        const vs = try testRandUniformBf16(rnd, &[_]c_int{ 1, 8, ring, 128 }, -1.0, 1.0, s);
+        defer _ = mlx.mlx_array_free(vs);
+        var kq = try kv_quant.quantizeAffine(s, ks, 64, 8);
+        defer kq.deinit();
+        var vq = try kv_quant.quantizeAffine(s, vs, 64, 8);
+        defer vq.deinit();
+        for ([_]mlx.mlx_array{ kq.q, kq.scales, kq.biases, vq.q, vq.scales, vq.biases, sinks }) |a| try mlx.check(mlx.mlx_array_eval(a));
+        var tb: [2][reps_max]f64 = undefined;
+        for (0..reps + 1) |r| {
+            for (0..2) |arm| {
+                const t0 = std.Io.Timestamp.now(io, .boot);
+                const kd = try kv_quant.dequantizeAffine(s, kq.q, kq.scales, kq.biases, 64, 8);
+                defer _ = mlx.mlx_array_free(kd);
+                const vd = try kv_quant.dequantizeAffine(s, vq.q, vq.scales, vq.biases, 64, 8);
+                defer _ = mlx.mlx_array_free(vd);
+                if (arm == 1) {
+                    try mlx.check(mlx.mlx_array_eval(kd));
+                    try mlx.check(mlx.mlx_array_eval(vd));
+                }
+                const t1 = std.Io.Timestamp.now(io, .boot);
+                const bv = DenseKVView{ .k = kd, .v = vd, .owned = false };
+                const out = (try fusedSdpaPrefillKv(s, qsl, &bv, scale, 128, sinks)) orelse return error.FusedDeclined;
+                defer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_array_eval(out));
+                if (attn_pd_last_arm != .nax) return error.NaxArmNotEngaged;
+                const from = if (arm == 1) t1 else t0;
+                if (r > 0) tb[arm][r - 1] = @as(f64, @floatFromInt(from.untilNow(io, .boot).nanoseconds)) / 1e6;
+            }
+        }
+        const band = median(tb[0][0..reps]);
+        std.debug.print("[attn-pd-ub] band (Hk 8, window 128, sinks) qL {d}: {d:.3} ms per layer incl. ring dequant, kernel {d:.3}; x39 = {d:.1} ms\n", .{
+            @as(u32, @intCast(ql)), band, median(tb[1][0..reps]), 39.0 * band,
+        });
+    }
+
+    // Kernel variants on the dense chain (the dispatches, budget and carries stay the served ones): the
+    // ablations, and `_ALT=<a.metal>,...` whole replacement sources, each checked for byte identity
+    // against the served kernel on the served chain.
+    var alt_paths_buf: [4][]const u8 = undefined;
+    var n_alt: usize = 0;
+    if (std.c.getenv("SUSHI_ATTN_PD_UBENCH_ALT")) |raw| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.sliceTo(raw, 0), ',');
+        while (it.next()) |path| : (n_alt += 1) {
+            if (n_alt == alt_paths_buf.len) return error.TooManyEntries;
+            alt_paths_buf[n_alt] = path;
+        }
+    }
+    if (!abl_on and n_alt == 0) return;
+    const abls = std.enums.values(AttnPdNaxAblation);
+    const n_abl: usize = if (abl_on) abls.len else 0;
+    const alt_names = [_][*:0]const u8{ "sushi_attn_pd_nax_alt0", "sushi_attn_pd_nax_alt1", "sushi_attn_pd_nax_alt2", "sushi_attn_pd_nax_alt3" };
+    var kernels: [abls.len + alt_paths_buf.len]mlx.mlx_fast_metal_kernel = undefined;
+    var built: usize = 0;
+    defer for (kernels[0..built]) |kk| {
+        _ = mlx.mlx_fast_metal_kernel_free(kk);
+    };
+    if (abl_on) inline for (abls) |a| {
+        const src = try attnPdNaxAblatedSource(alloc, a);
+        defer alloc.free(src);
+        kernels[built] = try newAttnPdKernel("sushi_attn_pd_nax_abl_" ++ @tagName(a), src, @embedFile("kernels/attn_pd_nax_header.metal"));
+        built += 1;
+    };
+    for (alt_paths_buf[0..n_alt], 0..) |path, i| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
+        defer alloc.free(text);
+        const src = try alloc.dupeSentinel(u8, text, 0);
+        defer alloc.free(src);
+        kernels[built] = try newAttnPdKernel(alt_names[i], src, @embedFile("kernels/attn_pd_nax_header.metal"));
+        built += 1;
+    }
+    const n_var = 1 + built;
+    const served_kernel = attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] orelse return error.NaxKernelNotBuilt;
+    defer attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+    var var_kls_buf: [8]c_int = undefined;
+    const var_kls = var_kls_buf[0..try attnPdUbenchList("SUSHI_ATTN_PD_UBENCH_ABL_KL", "131072", &var_kls_buf)];
+    std.debug.print("[attn-pd-ub] kernel variants, dense chain (ms):\n[attn-pd-ub]    qL       kL   served  TFLOPS", .{});
+    if (abl_on) for (abls) |a| std.debug.print(" {s:>9}", .{@tagName(a)});
+    for (0..n_alt) |i| std.debug.print("    alt{d} identical", .{i});
+    std.debug.print("\n", .{});
+    for (qls) |ql| {
+        const q = try attnPdUbenchQuery(rnd, ql, 1.0e7, s);
+        defer _ = mlx.mlx_array_free(q);
+        if (n_alt > 0) {
+            // The band + sinks instantiation, ring view of one sliding layer.
+            const sinks = try testRandUniformBf16(rnd, &[_]c_int{64}, -1.0, 1.0, s);
+            defer _ = mlx.mlx_array_free(sinks);
+            const kb = try testRandUniformBf16(rnd, &[_]c_int{ 1, 8, ql + 127, 192 }, -2.0, 2.0, s);
+            defer _ = mlx.mlx_array_free(kb);
+            const vb = try testRandUniformBf16(rnd, &[_]c_int{ 1, 8, ql + 127, 128 }, -1.0, 1.0, s);
+            defer _ = mlx.mlx_array_free(vb);
+            const bv = DenseKVView{ .k = kb, .v = vb, .owned = false };
+            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+            const ref = (try fusedSdpaPrefillKv(s, q, &bv, scale, 128, sinks)) orelse return error.FusedDeclined;
+            defer _ = mlx.mlx_array_free(ref);
+            try mlx.check(mlx.mlx_array_eval(ref));
+            const n = mlx.mlx_array_size(ref);
+            const ref_bits = (mlx.mlx_array_data_bfloat16(ref) orelse return error.Unreadable)[0..n];
+            std.debug.print("[attn-pd-ub] band qL {d} identical:", .{@as(u32, @intCast(ql))});
+            for (0..n_alt) |i| {
+                attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = kernels[n_abl + i];
+                const got = (try fusedSdpaPrefillKv(s, q, &bv, scale, 128, sinks)) orelse return error.FusedDeclined;
+                defer _ = mlx.mlx_array_free(got);
+                try mlx.check(mlx.mlx_array_eval(got));
+                std.debug.print(" alt{d} {}", .{ i, std.mem.eql(u16, ref_bits, (mlx.mlx_array_data_bfloat16(got) orelse return error.Unreadable)[0..n]) });
+            }
+            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+            std.debug.print("\n", .{});
+        }
+        for (var_kls) |vkl| {
+            var view = try View.init(s, triple, vkl);
+            defer view.deinit();
+            var same: [4]bool = @splat(true);
+            {
+                attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+                const ref = (try fusedSdpaPrefillKv(s, q, &view.view, scale, 0, .{ .ctx = null })) orelse return error.FusedDeclined;
+                defer _ = mlx.mlx_array_free(ref);
+                try mlx.check(mlx.mlx_array_eval(ref));
+                const n = mlx.mlx_array_size(ref);
+                const ref_bits = (mlx.mlx_array_data_bfloat16(ref) orelse return error.Unreadable)[0..n];
+                for (0..n_alt) |i| {
+                    attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = kernels[n_abl + i];
+                    const got = (try fusedSdpaPrefillKv(s, q, &view.view, scale, 0, .{ .ctx = null })) orelse return error.FusedDeclined;
+                    defer _ = mlx.mlx_array_free(got);
+                    try mlx.check(mlx.mlx_array_eval(got));
+                    same[i] = std.mem.eql(u16, ref_bits, (mlx.mlx_array_data_bfloat16(got) orelse return error.Unreadable)[0..n]);
+                }
+            }
+            var t: [abls.len + alt_paths_buf.len + 1][reps_max]f64 = undefined;
+            for (0..reps + 1) |r| {
+                for (0..n_var) |a| {
+                    attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = if (a == 0) served_kernel else kernels[a - 1];
+                    const t0 = std.Io.Timestamp.now(io, .boot);
+                    try Run.global(s, .dense, null, q, &view.view, scale);
+                    if (r > 0) t[a][r - 1] = @as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e6;
+                }
+            }
+            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+            const m0 = median(t[0][0..reps]);
+            std.debug.print("[attn-pd-ub] {d:>5} {d:>8} {d:>8.2} {d:>7.1}", .{ @as(u32, @intCast(ql)), @as(u32, @intCast(vkl)), m0, causalFlops(ql, vkl) / m0 / 1e9 });
+            for (1..n_abl + 1) |a| std.debug.print(" {d:>9.2}", .{median(t[a][0..reps])});
+            for (0..n_alt) |i| std.debug.print(" {d:>8.2} {}", .{ median(t[1 + n_abl + i][0..reps]), same[i] });
+            std.debug.print("\n", .{});
+            _ = mlx.mlx_clear_cache();
+        }
+    }
 }
 
 test "the sliding arm engages exactly where slidingPrefillFused says it does" {

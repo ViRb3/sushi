@@ -83,6 +83,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   - A chunked chain is bit-identical to one dispatch on either arm.
   - Gate `attnPdNaxServes`: NAX + macOS 26.3 + a one-tile probe of both instantiations (causal, band + sinks)
     against an f32 reference; a failed probe declines by name. `SUSHI_ATTN_PD_NAX=0` = SIMD.
+- At 128k keys its time is ~69% matmul issue, ~18% load instructions (Q reloaded each key block, K/V fragments per
+  simdgroup) and ~12% softmax; K/V memory traffic is ~1% (`SUSHI_ATTN_PD_UBENCH_ABL=1`,
+  [perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)).
+- Each fragment row is ONE 8-byte vector load (`SushiNax::load2`); element-wise reads cost ~5% of the kernel
+  ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn) has the ruled-out load layouts).
+- Contract: every q/k/v row the engine hands it starts 8-byte aligned (views slice only the token axis). A misaligned
+  row reads correctly on M5 (unit test), but a misaligned vector load is undefined in MSL.
 - Its PV feeds P as ONE f16 term (P is in [0, 1]; f16 keeps 11 bits): 16x512 KLD -0.19%, inside the rounding-flip
   floor ([quality-kld](quality-kld.md#the-standard-reading)). Parity bar: per element vs fp64 no
   worse than the SIMD kernel beyond a store rounding flip plus 2^-11 of max|V|. A float P operand into the relaxed
@@ -164,4 +171,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
 - Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;
   `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX reference and served bodies in one boot).
+- Time MiMo's prefill attention for one chunk with `SUSHI_ATTN_PD_UBENCH=1` (test filter "MiMo prefill attention per
+  chunk"). Knobs: `_QL`, `_KL` (empty skips the main table), `_BUDGETS`, `_LEAN`, `_REPS`; kernel variants on the
+  dense chain at `_ABL_KL` keys: `_ABL=1` (ablations) and `_ALT=<a.metal>,...` (replacement sources, byte-checked
+  against the served kernel).
 - Every timing run takes the GPU lock and restores QoS ([CLAUDE.md, Team process](../CLAUDE.md#team-process)).
