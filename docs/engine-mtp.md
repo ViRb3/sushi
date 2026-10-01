@@ -156,6 +156,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - **The gate prices both rounds from the planner's own `MtpCostSource`** (measured width row, else the EV surface):
   a lookup of k drafts reads the table's runtime lookup row, else the MTP round at k without its k head steps. The
   lookup row is never stored, and the first round at each draft count is dropped as its compile.
+- **The MTP side is priced at the width its rounds draft** (`mtpLookupPriceWidth`: the request's drafted-per-round
+  EMA inside [m_lo, m_hi]), the width its acceptance EMA came from. Priced at a two-chunk plan's m_lo, a copy after a
+  prose request (m_lo 1 extending to 3, ~2.7 accepted) read MTP as a 3.7-token one-draft round and ran half its lookup
+  rounds (MiMo 2.3bpw: 33 vs 66 per 550-token copy; 62 with the fix, same bytes).
 - **A lookup round feeds no EV, depth, planner, round-cost, regime or adaptive-serial price state**, and the MTP
   round after one stays untimed; an untimed round ends the regime interval (`mtpRoundUntimed`), or the next MTP
   round is billed for it.

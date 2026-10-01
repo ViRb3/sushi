@@ -1760,6 +1760,8 @@ pub const Generator = struct {
     /// Landed drafts per round, smoothed, for lookup and MTP rounds (`mtp_lookup.gate`).
     mtp_lookup_ema: f32 = @floatFromInt(mtp_lookup.MAX_DRAFT),
     mtp_round_ema: f32 = 0,
+    /// Drafts per MTP round, smoothed: the width `mtp_round_ema`'s rounds actually ran.
+    mtp_round_drafted_ema: f32 = 0,
     /// The previous round was a lookup round.
     mtp_after_lookup: bool = false,
     /// The last lookup round landed every draft (`mtp_lookup.gate` streak).
@@ -6022,6 +6024,13 @@ pub const Generator = struct {
         return !(group_planner.enabled() and self.mtp_planner_owned);
     }
 
+    /// The width the lookup gate prices the MTP chain at: the one its rounds have been drafting,
+    /// inside this plan. A two-chunk plan's rounds extend past `m_lo`, and their acceptance with them.
+    pub fn mtpLookupPriceWidth(plan: MtpRoundPlan, drafted_ema: f32) u32 {
+        const drafted: u32 = @intFromFloat(@round(std.math.clamp(drafted_ema, 0, @as(f32, @floatFromInt(mtp_mod.MAX_DEPTH)))));
+        return std.math.clamp(drafted, plan.m_lo, @max(plan.m_lo, plan.m_hi));
+    }
+
     /// A lookup's drafts are verify rows too, so MiMo's stop at its decode-row budget.
     pub fn mtpLookupDraftCap(is_mimo: bool) u32 {
         return @min(mtp_lookup.MAX_DRAFT_STRONG, mtpVerifyDraftsMax(is_mimo));
@@ -6065,6 +6074,7 @@ pub const Generator = struct {
         } else {
             self.mtp_accepted_tokens += accepted;
             self.mtp_round_ema = mtp_lookup.emaStep(self.mtp_round_ema, accepted);
+            self.mtp_round_drafted_ema = mtp_lookup.emaStep(self.mtp_round_drafted_ema, drafted);
             self.mtp_lookup_ema = mtp_lookup.driftStep(self.mtp_lookup_ema);
         }
     }
@@ -6101,7 +6111,7 @@ pub const Generator = struct {
         const got = idx.match(t1, mtpLookupDraftCap(self.xfm.config.isMimo()));
         const kv = self.mtpKvLen();
         const src = MtpCostSource.init(self.mtp_ev_costs, kv, if (mtpCostTableEnabled()) &self.xfm.round_cost else null);
-        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, mtpLookupCostsFor(src, plan.m_lo));
+        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, self.mtp_lookup_streak, mtpLookupCostsFor(src, mtpLookupPriceWidth(plan, self.mtp_round_drafted_ema)));
         if (k == 0) return null;
         const Once = struct {
             var logged = false;
@@ -21454,6 +21464,7 @@ test "mtpRoundAcceptObserve: a lookup round feeds only the lookup counters, an M
     g.mtp_lookup_accepted = 0;
     g.mtp_lookup_ema = @floatFromInt(mtp_lookup.MAX_DRAFT);
     g.mtp_round_ema = 0;
+    g.mtp_round_drafted_ema = 0;
     g.mtp_lookup_streak = false;
 
     g.mtpRoundAcceptObserve(true, 8, 8);
@@ -21471,7 +21482,34 @@ test "mtpRoundAcceptObserve: a lookup round feeds only the lookup counters, an M
     try testing.expectEqual(@as(u64, 2), g.mtp_accepted_tokens);
     try testing.expectEqual(@as(u64, 11), g.mtp_lookup_accepted);
     try testing.expectApproxEqAbs(mtp_lookup.emaStep(0, 2), g.mtp_round_ema, 1e-6);
+    try testing.expectApproxEqAbs(mtp_lookup.emaStep(0, 4), g.mtp_round_drafted_ema, 1e-6);
     try testing.expectApproxEqAbs(mtp_lookup.driftStep(lookup_before), g.mtp_lookup_ema, 1e-6);
+}
+
+test "the lookup gate prices the MTP chain at the width its rounds draft, not the plan's base width" {
+    // A two-chunk plan (m_lo 1, extending to 3) whose rounds accept ~2.7: priced at its base width, the
+    // MTP side reads 3.7 tokens for a one-draft round and a copy's seven-draft lookup loses.
+    const two_chunk = Generator.MtpRoundPlan{ .m_lo = 1, .m_hi = 3, .tau_ln = 0 };
+    try testing.expectEqual(@as(u32, 1), Generator.mtpLookupPriceWidth(two_chunk, 0));
+    try testing.expectEqual(@as(u32, 3), Generator.mtpLookupPriceWidth(two_chunk, 2.9));
+    try testing.expectEqual(@as(u32, 3), Generator.mtpLookupPriceWidth(two_chunk, 6));
+    try testing.expectEqual(@as(u32, 3), Generator.mtpLookupPriceWidth(.{ .m_lo = 3, .m_hi = 3, .tau_ln = 0 }, 1));
+
+    var t = round_cost.Table{};
+    for (0..round_cost.MIN_SAMPLES + 1) |_| {
+        _ = t.observe(1, 1000, 28.0, 1.9, true, false);
+        _ = t.observe(3, 1000, 45.0, 3.0, true, false);
+    }
+    _ = t.observeLookup(7, 1000, 500.0, 8.0, true);
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observeLookup(7, 1000, 71.0, 7.5, true);
+    const src = Generator.MtpCostSource.init(Generator.MTP_EV_MIMO_EXL3_COSTS, 1000, &t);
+    try testing.expect(src.fromTable());
+    var d: [20]u32 = undefined;
+    for (&d, 0..) |*x, i| x.* = @intCast(i);
+    const copy = mtp_lookup.Match{ .draft = d[0..7], .suffix = mtp_lookup.STRONG_SUFFIX };
+    try testing.expectEqual(@as(u32, 0), mtp_lookup.gate(copy, 1000, 6.5, 2.7, false, Generator.mtpLookupCostsFor(src, two_chunk.m_lo)));
+    const width = Generator.mtpLookupPriceWidth(two_chunk, 2.9);
+    try testing.expectEqual(@as(u32, 7), mtp_lookup.gate(copy, 1000, 6.5, 2.7, false, Generator.mtpLookupCostsFor(src, width)));
 }
 
 test "mtpLookupEnabledFromEnv: on by default, 0 turns it off" {
