@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const primitive = @import("glm5_next.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
+const profiling = @import("glm5_dflash_profile.zig");
 
 const SOURCE =
     \\constexpr int N = Dk / 32;
@@ -203,10 +204,12 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     const dim: c_int = @intCast(cfg.linear_key_head_dim);
     const width = heads * dim;
     const dtype = mlx.mlx_array_dtype(x);
+    var profile = profiling.Timer.start(parents.len);
     const qraw = try linearRows(ops, layer.q, x, mode);
     const kraw = try linearRows(ops, layer.k, x, mode);
     const vraw = try linearRows(ops, layer.v, x, mode);
     const raw = try ops.concat(&.{ qraw, kraw, vraw }, -1);
+    try profile.finish("kda_qkv", &.{raw});
     const old = if (state.initialized) state.conv_state else try ops.zeros(&.{ 1, 3, width * 3 }, dtype);
     const conv_input = try ops.concat(&.{ old, raw }, 1);
     const conv_w = if (layer.prepared_conv.ctx != null) layer.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ layer.conv_q, layer.conv_k, layer.conv_v }, 0), &.{ 0, 2, 1 }));
@@ -214,6 +217,7 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     const dims = [_]c_int{ 1, sh[1], heads, dim };
     const a_raw = try linearRows(ops, layer.fb, try linearRows(ops, layer.fa, x, mode), mode);
     const beta_raw = try linearRows(ops, layer.beta, x, mode);
+    try profile.finish("kda_lowrank_beta", &.{ a_raw, beta_raw });
     const fused = if (!force_staged_for_tests and dim == 128) try @import("glm5_kda_prework.zig").applyTree(ops.s, .{
         .qkv = raw,
         .a = a_raw,
@@ -255,9 +259,11 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
         const beta = try ops.unary(.sigmoid, beta_raw);
         break :blk [_]Arr{ q, k, values, decay, beta };
     };
+    try profile.finish("kda_prework", &.{ work[0], work[1], work[2], work[3], work[4], conv_input });
     const initial = if (state.initialized) state.ssm_state else try ops.zeros(&.{ 1, heads, dim, dim }, .float32);
     const inputs = primitive.KdaInputs{ .q = work[0], .k = work[1], .v = work[2], .decay = work[3], .beta = work[4], .state = initial };
     const y_bf = try ops.own(try recurrent(inputs, parents, ops.s));
+    try profile.finish("kda_recurrence", &.{y_bf});
     const gate_bf = try ops.reshape(try linearRows(ops, layer.gb, try linearRows(ops, layer.ga, x, mode), mode), &dims);
     const post = if (!force_staged_for_tests and sh[1] > 1) try @import("glm5_kda_fused.zig").post(ops.s, y_bf, gate_bf, layer.out_norm, cfg.rms_norm_eps) else null;
     const gated = if (post) |value| try ops.own(value) else blk: {
@@ -268,7 +274,9 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
         const gate = try ops.cast(gate_bf, .float32);
         break :blk try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, gate)), dtype);
     };
+    try profile.finish("kda_gate_post", &.{gated});
     const output = try linearRows(ops, layer.out, try ops.reshape(gated, &.{ 1, sh[1], width }), mode);
+    try profile.finish("kda_out", &.{output});
     var tape = Tape{ .inputs = .{ .q = .{ .ctx = null }, .k = .{ .ctx = null }, .v = .{ .ctx = null }, .decay = .{ .ctx = null }, .beta = .{ .ctx = null }, .state = .{ .ctx = null } }, .conv_input = .{ .ctx = null } };
     errdefer tape.deinit();
     inline for (.{ "q", "k", "v", "decay", "beta", "state" }) |name| @field(tape.inputs, name) = try ops.result(@field(inputs, name));
