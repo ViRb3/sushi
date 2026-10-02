@@ -267,3 +267,60 @@ module/header. The gated test filter is `GLM QMM prefill isolated scheduling tim
 enabled by `SUSHI_GLM_QMM_PREFILL_BENCH_OUT` naming its JSON result file. A launcher
 path error occurred before the first attempted binary execution; no sample came
 from that attempt, and its lock/fan cleanup completed before the recorded run.
+
+### Tile aspect experiment
+
+The same isolated body was subsequently parameterized for BM/BN/WM/WN while
+retaining BK64 and G1 scheduling. The explicit staging allocation is
+`BN*(64+8)*sizeof(BF16)`. Fragment counts below describe live logical tensors,
+not compiler register allocation or measured occupancy.
+
+| BM / BN; WM / WN | Shared weights | Per-SIMD M / N | FP32 D elements/lane | BF16 A / B elements/lane |
+|---|---:|---|---:|---|
+| 64 / 64; 2 / 2 (native) | 9 KiB | 32 / 32 | 32 | 32 / 32 |
+| 128 / 32; 2 / 2 | 4.5 KiB | 64 / 16 | 32 | 64 / 16 |
+| 128 / 32; 4 / 1 | 4.5 KiB | 32 / 32 | 32 | 32 / 32 |
+| 64 / 128; 2 / 2 | 18 KiB | 32 / 64 | 64 | 32 / 64 |
+
+All use 128 threads. Shared-memory fit does not establish residency: cooperative
+tensor temporaries, compiler register allocation and spills can dominate it.
+The WM4/WN1 tall tile retains the native per-SIMD fragment geometry and shares
+each weight tile across four distinct M simdgroups. It halves the number of
+M-tile bank/dequantization traversals. It doubles the number of distinct N tile
+groups, but removes the native WN2 duplication of activation loads between
+simdgroups; source-level issued activation element counts are therefore not
+simply doubled. Cache reuse and residency still change.
+
+The WM2/WN2 tall candidate failed its first native-parity gate, with zero values
+starting at output row 16. It selects `tile_matmad_nax`'s TN1 paired-M overload;
+the pinned overload uses a 16×32×16 MPP descriptor while loading two M fragments.
+That branch differs from the native TN2 paired-N operation. It was rejected and
+removed from the callable aspect enum without changing upstream arithmetic.
+The failure log and candidate snapshot are preserved privately.
+
+Native64/64, tall128/32 WM4/WN1 and wide64/128 WM2/WN2 all passed every native BF16
+output bit at both real shapes. The timing run rechecked all supported arms on
+four independent banks. It used the same exclusive, interleaved protocol as the
+scheduling experiment: twelve warmups, eleven alternating rounds, eight
+apply/evaluate/free evaluations per sample, one-bank and four-bank rotation.
+
+| Projection / bank rotation | Native library ms | Same-body 64/64 ms | Tall 128/32 ms | Wide 64/128 ms |
+|---|---:|---:|---:|---:|
+| Q/K/V / one | 0.871395 | 0.875073 | 0.874625 | 1.040260 |
+| Q/K/V / four | 0.882625 | 0.874083 | 0.878192 | 1.054390 |
+| Output / one | 0.934260 | 0.939963 | 0.899296 | 1.121791 |
+| Output / four | 0.962312 | 0.951948 | 0.958046 | 1.107265 |
+
+The wide tile loses 16–21% against the same-body control and is not an adoption
+candidate. The tall tile saves 4.33% on the warm output projection (11/11 paired
+wins), but loses 0.64% with four-bank rotation (3/11 wins); Q/K/V is effectively
+flat. No robust improvement justifies engine integration. The isolated aspect
+options remain available for reproducing the result, while normal execution
+continues through MLX.
+
+Private artifact `glm53-qmm-prefill-aspect-20261003` contains the rejected-case
+log, supported parity log, raw samples, summaries and exact provenance. Its gated
+filter is `GLM QMM prefill isolated aspect timing`, enabled by
+`SUSHI_GLM_QMM_ASPECT_BENCH_OUT`. This experiment demonstrates why fewer logical
+weight traversals or smaller explicit shared-memory storage alone do not predict
+an end-to-end win. No full-model timing was performed for either tile candidate.

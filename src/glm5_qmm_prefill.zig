@@ -8,14 +8,28 @@ const SOURCE =
     \\uint3 tile = threadgroup_position_in_grid;
     \\tile.y = tile.y * uint(GROUP_M) + tile.x % uint(GROUP_M);
     \\tile.x /= uint(GROUP_M);
-    \\threadgroup bfloat16_t Ws[64 * 72];
-    \\qmm_t_nax_tgp_impl<bfloat16_t,128,8,true,64,64,64,2,2>(
+    \\threadgroup bfloat16_t Ws[BN * 72];
+    \\qmm_t_nax_tgp_impl<bfloat16_t,128,8,true,BM,64,BN,WM,WN>(
     \\  w, scales, biases, x, y, Ws, K, N, M, tile,
     \\  thread_index_in_threadgroup, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 ;
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
+pub const Aspect = enum {
+    native,
+    // WM2/WN2 at BN32 enters upstream's TN1 paired-M MMA branch and failed parity.
+    // Keep TN2 here so the original native 16x32 NAX instruction remains selected.
+    tall_m,
+    wide,
+    fn tile(self: Aspect) struct { bm: c_int, bn: c_int, wm: c_int, wn: c_int } {
+        return switch (self) {
+            .native => .{ .bm = 64, .bn = 64, .wm = 2, .wn = 2 },
+            .tall_m => .{ .bm = 128, .bn = 32, .wm = 4, .wn = 1 },
+            .wide => .{ .bm = 64, .bn = 128, .wm = 2, .wn = 2 },
+        };
+    }
+};
 
 fn ready(a: Arr) !bool {
     if (a.ctx == null) return false;
@@ -35,6 +49,10 @@ fn ready(a: Arr) !bool {
 }
 
 pub fn apply(s: mlx.mlx_stream, input: Input, group_m: u32) !?Arr {
+    return applyAspect(s, input, group_m, .native);
+}
+
+pub fn applyAspect(s: mlx.mlx_stream, input: Input, group_m: u32, aspect: Aspect) !?Arr {
     if (!mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
     if (group_m != 1 and group_m != 2 and group_m != 4 and group_m != 8) return error.InvalidQmmSchedule;
     for ([_]Arr{ input.x, input.w, input.scales, input.biases }) |a| if (!try ready(a)) return null;
@@ -43,6 +61,8 @@ pub fn apply(s: mlx.mlx_stream, input: Input, group_m: u32) !?Arr {
     if (xs.len != 3 or xs[0] != 1 or xs[1] != 512 or ws.len != 2) return null;
     const k = xs[2];
     const n = ws[0];
+    const tile = aspect.tile();
+    if (group_m > @as(u32, @intCast(@divExact(512, tile.bm)))) return null;
     if (!((k == 4096 and n == 8192) or (k == 8192 and n == 4096)) or ws[1] != @divExact(k, 4)) return null;
     const ss = [_]c_int{ n, @divExact(k, 128) };
     if (!std.mem.eql(c_int, &ss, mlx.getShape(input.scales)) or !std.mem.eql(c_int, &ss, mlx.getShape(input.biases)) or
@@ -61,8 +81,13 @@ pub fn apply(s: mlx.mlx_stream, input: Input, group_m: u32) !?Arr {
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, 512, n }, 3, .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GROUP_M", @intCast(group_m)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(n, 64) * @as(c_int, @intCast(group_m)) * 32, @intCast(16 / group_m), 2));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 2, 2));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BM", tile.bm));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BN", tile.bn));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WM", tile.wm));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WN", tile.wn));
+    const group: c_int = @intCast(group_m);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(n, tile.bn) * group * 32, @divExact(@divExact(512, tile.bm), group) * tile.wn, tile.wm));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, tile.wn, tile.wm));
     const ka = mlx.mlx_array_new_int(k);
     defer _ = mlx.mlx_array_free(ka);
     const na = mlx.mlx_array_new_int(n);
@@ -142,6 +167,23 @@ test "GLM QMM prefill swizzles preserve every native BF16 output bit" {
     }
 }
 
+test "GLM QMM prefill aspects preserve every native BF16 output bit" {
+    const s = mlx.gpuStream();
+    for ([_]c_int{ 4096, 8192 }) |k| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const input = try fixture(&ops, k, if (k == 4096) 8192 else 4096, 355);
+        const reference = try native(s, input);
+        defer _ = mlx.mlx_array_free(reference);
+        for ([_]Aspect{ .native, .tall_m, .wide }) |aspect| {
+            const got = (try applyAspect(s, input, 1, aspect)) orelse return error.TestExpectedQmm;
+            defer _ = mlx.mlx_array_free(got);
+            try exact(reference, got);
+        }
+        try std.testing.expect((try applyAspect(s, input, 8, .tall_m)) == null);
+    }
+}
+
 test "GLM QMM prefill rejects unsupported layouts without materialization" {
     const s = mlx.gpuStream();
     var ops = Ops{ .s = s };
@@ -213,6 +255,66 @@ test "GLM QMM prefill isolated scheduling timing" {
         .shapes = .{ .{ .m = 512, .n = 8192, .k = 4096 }, .{ .m = 512, .n = 4096, .k = 8192 } },
         .groups = groups,
         .group_zero = "native MLX",
+        .bank_counts = .{ 1, 4 },
+        .warmup = 12,
+        .evaluations_per_sample = 8,
+        .nanoseconds = samples,
+    }, .{ .whitespace = .indent_2 });
+    defer std.testing.allocator.free(json);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = json });
+}
+
+fn aspectArm(s: mlx.mlx_stream, input: Input, id: usize) !Arr {
+    if (id == 0) return native(s, input);
+    const aspects = [_]Aspect{ .native, .tall_m, .wide };
+    return (try applyAspect(s, input, 1, aspects[id - 1])) orelse error.TestExpectedQmm;
+}
+
+fn timedAspect(s: mlx.mlx_stream, banks: []const Input, id: usize, start: usize, repetitions: usize) !u64 {
+    const timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
+    for (0..repetitions) |i| {
+        const y = try aspectArm(s, banks[(start + i) % banks.len], id);
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+    }
+    return timer.read() / repetitions;
+}
+
+test "GLM QMM prefill isolated aspect timing" {
+    const path = std.c.getenv("SUSHI_GLM_QMM_ASPECT_BENCH_OUT") orelse return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var samples: [2][2][11][4]u64 = undefined;
+    for ([_]c_int{ 4096, 8192 }, 0..) |k, geometry| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        var banks: [4]Input = undefined;
+        for (&banks, 0..) |*bank, bi| bank.* = try fixture(&ops, k, if (k == 4096) 8192 else 4096, @intCast(721 + bi));
+        for (banks) |bank| {
+            const expected = try native(s, bank);
+            defer _ = mlx.mlx_array_free(expected);
+            for (1..4) |id| {
+                const y = try aspectArm(s, bank, id);
+                defer _ = mlx.mlx_array_free(y);
+                try exact(expected, y);
+            }
+        }
+        for ([_]usize{ 1, 4 }, 0..) |bank_count, rotation| {
+            const input = banks[0..bank_count];
+            for (0..4) |id| _ = try timedAspect(s, input, id, 0, 12);
+            for (0..11) |round| for (0..4) |step| {
+                const id = if (round % 2 == 0) step else 3 - step;
+                samples[geometry][rotation][round][id] = try timedAspect(s, input, id, round, 8);
+            };
+        }
+    }
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+        .complete = true,
+        .exact_against_native = true,
+        .timing = "host apply+eval+free; alternating arm order; evaluated inputs; no model",
+        .shapes = .{ .{ .m = 512, .n = 8192, .k = 4096 }, .{ .m = 512, .n = 4096, .k = 8192 } },
+        .arms = .{ "native MLX", "BM64 BN64 WM2 WN2", "BM128 BN32 WM4 WN1", "BM64 BN128 WM2 WN2" },
+        .bk = 64,
+        .group_m = 1,
         .bank_counts = .{ 1, 4 },
         .warmup = 12,
         .evaluations_per_sample = 8,
