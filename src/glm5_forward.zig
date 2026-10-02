@@ -256,6 +256,8 @@ const LayerState = struct {
     }
 };
 
+pub const Capture = struct { ids: []const u32, out: []Arr };
+
 pub const Request = struct {
     allocator: std.mem.Allocator,
     layers: []LayerState,
@@ -265,6 +267,7 @@ pub const Request = struct {
     decode_async: bool = true,
     dense_prefill: bool = false,
     prefill_async: bool = false,
+    capture: ?*Capture = null,
     layer_ns: [128]u64 = @splat(0),
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
@@ -296,6 +299,12 @@ fn appendLayerState(evals: mlx.mlx_vector_array, state: *const LayerState) !void
     }
     for (state.attention.arrays()) |cache| if (cache.ctx != null) {
         try mlx.check(mlx.mlx_vector_array_append_value(evals, cache));
+    };
+}
+
+fn appendCaptures(evals: mlx.mlx_vector_array, capture: ?*Capture, first: usize, end: usize) !void {
+    if (capture) |c| for (c.ids, 0..) |id, i| {
+        if (id >= first and id < end) try mlx.check(mlx.mlx_vector_array_append_value(evals, c.out[i]));
     };
 }
 
@@ -348,6 +357,25 @@ pub const Model = struct {
         self.allocator.free(self.layers);
     }
 
+    pub fn rawEmbedding(self: *const Model, ids: Arr) !Arr {
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        const e = self.embedding;
+        const code = try ops.take(e.w, ids, 0);
+        const hidden = if (e.scales.ctx != null)
+            try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0))
+        else
+            code;
+        return ops.result(hidden);
+    }
+    pub fn projectHead(self: *const Model, hidden: Arr) !Arr {
+        const sh = mlx.getShape(hidden);
+        if (sh.len < 2 or sh[sh.len - 1] != self.cfg.hidden_size) return error.InvalidGlmInput;
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        return ops.result(try self.head.apply(&ops, hidden));
+    }
+
     pub fn forward(self: *const Model, request: *Request, ids: Arr) !Arr {
         return self.forwardLast(request, ids, false);
     }
@@ -355,6 +383,12 @@ pub const Model = struct {
     pub fn forwardLast(self: *const Model, request: *Request, ids: Arr, last_only: bool) !Arr {
         const ish = mlx.getShape(ids);
         if (ish.len != 2 or ish[0] != 1 or ish[1] < 1 or request.layers.len != self.layers.len) return error.InvalidGlmInput;
+        if (request.capture) |capture| {
+            if (capture.ids.len != capture.out.len) return error.InvalidGlmCapture;
+            for (capture.ids, 0..) |id, i| {
+                if (id >= self.layers.len or (i > 0 and id <= capture.ids[i - 1]) or capture.out[i].ctx == null) return error.InvalidGlmCapture;
+            }
+        }
         if (request.failed) return error.GlmRequestNeedsReset;
         if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
         errdefer request.failed = true;
@@ -390,10 +424,16 @@ pub const Model = struct {
                 .moe => |moe| try moe.apply(&ops, fx, &self.cfg),
             };
             const next = try ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
+            if (request.capture) |capture| {
+                for (capture.ids, 0..) |id, i| {
+                    if (id == layer_index) try mlx.check(mlx.mlx_array_set(&capture.out[i], try ops.reduce(next, 2, true, false)));
+                }
+            }
             if (staged_prefill) {
                 const evals = mlx.mlx_vector_array_new_value(next);
                 defer _ = mlx.mlx_vector_array_free(evals);
                 const first = layer_index - layer_index % 2;
+                try appendCaptures(evals, request.capture, first, layer_index + 1);
                 for (request.layers[first .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
                 if (layer_index % 2 == 0) {
                     try mlx.check(mlx.mlx_async_eval(evals));
@@ -406,10 +446,12 @@ pub const Model = struct {
                 const evals = mlx.mlx_vector_array_new_value(next);
                 defer _ = mlx.mlx_vector_array_free(evals);
                 if (staged_decode) {
+                    try appendCaptures(evals, request.capture, layer_index - 3, layer_index + 1);
                     for (request.layers[layer_index - 3 .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
                     try mlx.check(mlx.mlx_async_eval(evals));
                     if (@import("builtin").is_test) schedule_test_asyncs += 1;
                 } else {
+                    try appendCaptures(evals, request.capture, layer_index, layer_index + 1);
                     try appendLayerState(evals, state);
                     try mlx.check(mlx.mlx_eval(evals));
                     if (@import("builtin").is_test) schedule_test_syncs += 1;
@@ -425,11 +467,12 @@ pub const Model = struct {
         const logits = try self.head.apply(&ops, normalized);
         const result = try ops.result(logits);
         errdefer _ = mlx.mlx_array_free(result);
-        if (staged_decode or staged_prefill) {
+        if (staged_decode or staged_prefill or request.capture != null) {
             // Cache side outputs must settle even when they are not ancestors of logits.
             const evals = mlx.mlx_vector_array_new_value(result);
             defer _ = mlx.mlx_vector_array_free(evals);
             for (request.layers) |*state| try appendLayerState(evals, state);
+            try appendCaptures(evals, request.capture, 0, self.layers.len);
             try mlx.check(mlx.mlx_eval(evals));
             if (@import("builtin").is_test) schedule_test_syncs += 1;
         }
@@ -452,7 +495,7 @@ fn fixtureMlp(weights: *model.Weights, prefix: []const u8) !void {
         try fixtureTensor(weights, prefix, leaf, &.{ 128, 128 }, .bfloat16, false);
 }
 
-fn completeFixture(weights: *model.Weights) !model.ModelConfig {
+pub fn completeFixture(weights: *model.Weights) !model.ModelConfig {
     const a = std.testing.allocator;
     const cfg = model.ModelConfig{
         .model_type = "glm5_next",
@@ -822,4 +865,46 @@ test "GLM two-layer prefill schedule preserves every nonzero cache bit" {
     try mlx.check(mlx.mlx_array_eval(y));
     try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
     try std.testing.expectEqual(@as(usize, 4), schedule_test_syncs);
+}
+
+test "GLM post-layer capture and shared draft projections retain their contracts" {
+    const a = std.testing.allocator;
+    const stream = mlx.gpuStream();
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try completeFixture(&weights);
+    var net = try Model.load(a, cfg, &weights, stream);
+    defer net.deinit();
+    var request = try Request.init(a, 4);
+    defer request.deinit();
+    var outputs = [_]Arr{ mlx.mlx_array_new_float(0), mlx.mlx_array_new_float(0) };
+    defer for (outputs) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    var capture = Capture{ .ids = &.{ 0, 3 }, .out = &outputs };
+    request.capture = &capture;
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &[_]c_int{ 1, 3 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const logits = try net.forwardLast(&request, ids, true);
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_array_eval(logits));
+    var ops = Ops{ .s = stream };
+    defer ops.deinit();
+    for (outputs) |out| {
+        try std.testing.expectEqualSlices(c_int, &.{ 1, 3, 128 }, mlx.getShape(out));
+        const f = try ops.cast(out, .float32);
+        try mlx.check(mlx.mlx_array_eval(f));
+        for (mlx.mlx_array_data_float32(f).?[0..384]) |v| try std.testing.expectEqual(@as(f32, 1), v);
+    }
+    const embedding = try ops.own(try net.rawEmbedding(ids));
+    try expectArrayBits(embedding, outputs[0]);
+    const twice = try ops.binary(.mul, embedding, try ops.scalar(2, .bfloat16));
+    const projected = try ops.own(try net.projectHead(twice));
+    const f = try ops.cast(projected, .float32);
+    try mlx.check(mlx.mlx_array_eval(f));
+    for (mlx.mlx_array_data_float32(f).?[0..12]) |v| try std.testing.expectEqual(@as(f32, 256), v);
+    request.reset();
+    capture.ids = &.{ 3, 0 };
+    try std.testing.expectError(error.InvalidGlmCapture, net.forwardLast(&request, ids, true));
+    try std.testing.expectEqual(@as(usize, 0), request.offset);
 }

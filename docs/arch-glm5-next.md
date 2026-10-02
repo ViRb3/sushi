@@ -235,3 +235,13 @@ An optional two-layer prefill schedule overlaps host construction with GPU work 
 at most two layer graphs in flight. Nonzero fixtures at17/33/2-token chunks preserve every logit
 and cache bit; profiling retains synchronous layers. The final cache-inclusive evaluation also
 settles an odd final layer. Actual full-model peak memory and throughput are measured separately.
+
+
+## Draft-model integration hooks
+
+The diagnostic model exposes resident embedding lookup and an unnormalized output-head projection
+for a separate assistant. Optional capture requests name sorted target layer IDs and own their output
+handles. Captures are the mean of the four post-layer residual streams, before final normalization.
+They are evaluated with layer/final cache outputs to avoid retaining an unevaluated full residual history.
+A regression checks shape, dtype, value, head-without-extra-normalization semantics and fail-closed
+layer selection. These hooks do not by themselves implement speculative verification or serving.
