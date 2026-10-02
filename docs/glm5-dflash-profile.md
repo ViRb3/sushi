@@ -63,3 +63,67 @@ with profiling enabled, and unchanged captures after the binding is restored.
 The broader DFlash filter passed 22 tests with the full-checkpoint gate skipped.
 These component checks do not replace profile-on real-checkpoint parity or a
 separate profile-off throughput measurement.
+
+## First full-checkpoint profile
+
+At `daa6d524`, the profile-on 512-prefix/64-committed-token N3 run passed all token
+and complete final-state checks. A separate process using the same binary with
+profiling off passed the same checks and produced identical tokens, including
+the earlier tree-fusion N3 output. Both retained the original BF16 assistant,
+chunk-128 captured prefix, affine row tiles, batched FFN, one warmup, 23 rounds,
+41 accepted drafts and 92 verified rows. The new batched router engaged 966 times.
+
+The profiled verifier took 4427.24 ms. Disjoint top-level component totals account
+for 4416.23 ms; the remaining 11.01 ms includes unmarked host work. The following
+numbers include the added synchronization and must not be treated as GPU-only
+times or substituted into the normal throughput measurement.
+
+| Component | Total ms |
+|---|---:|
+| FFN overall, inclusive | 1687.91 |
+| FFN routed experts, child | 1079.12 |
+| FFN shared expert, child | 273.30 |
+| FFN router, child | 159.29 |
+| FFN combine, child | 133.93 |
+| KDA Q/K/V | 330.26 |
+| KDA lowrank/beta | 184.21 |
+| KDA prework | 134.98 |
+| KDA recurrence | 127.15 |
+| KDA gate/post | 162.79 |
+| KDA output projection | 227.57 |
+| MLA common projections | 110.01 |
+| MLA branch attention/unembedding | 186.54 |
+| MLA output projection | 116.45 |
+| HC attention / FFN collapse | 241.49 / 239.72 |
+| Attention / FFN norm | 149.71 / 154.18 |
+| Attention / FFN expansion | 150.95 / 151.93 |
+| Existing layer settle | 18.64 |
+| Head / embedding | 37.76 / 3.98 |
+
+Several tiny elementwise/norm/expand stages cost about 0.14–0.15 ms per marker,
+demonstrating how strongly synchronization perturbs this run. These observations
+support investigating routed experts and KDA projections with separate controlled
+component experiments, not assigning all recorded time to their arithmetic. The
+routed-expert stage is the largest individually timed arithmetic stage; actual
+route-overlap data is still needed before predicting a gain from expert reuse.
+The profile does not identify the recurrence as the main remaining KDA cost.
+
+With profiling **off**, normal committed-token throughput was **27.6650 tok/s**
+versus **26.2660 tok/s** for the matched serial reference, a ratio of **1.05326**.
+Draft/verify/replay/commit totals were 156.76 / 2087.18 / 44.23 / 24.23 ms.
+Captured prefill measured 369.64 tok/s; decode-phase peak was 98.534 GB. The peak
+counter resets after prefill, and the prefix path differs from the separately
+measured dense chunk-512 serial benchmark.
+
+This normal run does not establish a router throughput gain over the previous
+27.9314 tok/s tree-fusion sample: matched serial throughput also declined by
+approximately 1%, while the relative advantage remained about 5.3%. Do not use
+the profile-on 13.716 tok/s as a throughput comparison; the JSON explicitly marks
+it noncomparable and reports no speedup ratio. The 60 tok/s decode goal remains open.
+
+Private artifact `glm53-dflash-profile-20261003` contains separate `profile-on`
+and `profile-off` result/provenance/summary directories. Both processes had their
+own GPU lock, interactive QoS, max-fan request and ten-second idle, then restored
+fan auto and released the lock. Initial temperatures were 44.53°C and 48.78°C.
+The shared binary SHA-256 is
+`f9ee41a3d8b01375cc07a1b12084683521354c707143fc4dbc31ac10b29a9d3b`.
