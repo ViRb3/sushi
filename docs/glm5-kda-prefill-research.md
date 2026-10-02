@@ -149,3 +149,77 @@ and varied-prompt KL against the current runtime are subsequent gates. This is
 kernel drift validation, distinct from quantization KLD against a BF16 teacher.
 Keep any changed-order candidate opt-in until those gates pass, and ensure
 DFlash verification agrees with whichever serial arithmetic is selected.
+
+## Affine NAX tile ordering audit
+
+A subsequent CPU audit examined the actual coordinate mapping for
+M512/K4096/N8192. The host `qmm_nax` launch is `(128,8,1)` threadgroups, with
+`(32,2,2)` threads per group. `affine_qmm_t_nax` passes its threadgroup ID unchanged
+to `qmm_t_nax_tgp_impl`, which computes `y_row=tid.y*64` and `y_col=tid.x*64`.
+`CommandEncoder::dispatch_threadgroups` forwards the grid directly to Metal.
+There is **no explicit M-tile swizzle on this affine path**.
+
+The pinned and runtime `quantized_nax.h` revisions differ only in a later gather
+RHS tail-shape expression; the audited ordinary affine wrapper/body are unchanged.
+Relevant primary sources are `qmm_nax` in `quantized.cpp`,
+`affine_qmm_t_nax`, `qmm_t_nax_tgp_impl` and `QuantizedBlockLoader` in
+`kernels/quantized_nax.h`, and `CommandEncoder::dispatch_threadgroups` in
+`device.cpp`, at the runtime revision above.
+
+Each logical tile owns a 64-output-column stripe. Its loader iterates over the
+4096 input columns in blocks of 64, dequantizing weights into a private
+`Ws[64][72]` BF16 threadgroup buffer (9 KiB). The two M-direction simdgroups reuse
+this staged weight tile within the group. Across the eight M tiles, independent
+groups load and dequantize the same stripe again. One entire projection bank is
+32 MiB packed codes plus 1 MiB BF16 scales/biases. Eight logical bank traversals
+do **not** demonstrate eight DRAM reads: the GPU's scheduling/cache behavior is
+not established by this source audit.
+
+MLX's dense NAX path does have an explicit locality mapping.
+`steel_matmul_regular_axpby_nax` in `matmul.cpp` selects `swizzle_log=2` for
+architecture suffixes s/c/d. `steel_gemm_fused_nax` maps physical IDs to
+`logical_n=x>>2`, `logical_m=(y<<2)+(x&3)` and guards padded tiles. Four adjacent
+physical x IDs therefore refer to different M tiles of one N tile. This is
+direct evidence of a grouping mechanism elsewhere in MLX; it is not evidence
+that the affine path would benefit from the same mechanism. Metal does not
+guarantee an x-major execution order for the original or remapped grid.
+
+A contained experiment can keep the affine body and its arithmetic unchanged,
+altering only the ID passed to it:
+
+| M tiles grouped, G | Physical grid | Logical N tile | Logical M tile |
+|---:|---|---|---|
+| 1, control | 128×8 | x | y |
+| 2 | 256×4 | x/2 | 2y + x%2 |
+| 4 | 512×2 | x/4 | 4y + x%4 |
+| 8 | 1024×1 | x/8 | 8y + x%8 |
+
+All four are bijections of the same 1024 tiles. Swizzling leaves the number of
+issued loads and dequantizations unchanged; the possible benefit is fewer cache
+misses when neighboring groups read the same weight stripe. It also changes
+activation locality: neighboring N tiles previously reused an M tile's inputs.
+The 4 MiB activation matrix and 33 MiB bank have different reuse footprints, but
+size alone cannot establish the best schedule.
+
+No shared `lib/mlx` binary needs modification. A separate opt-in Sushi custom
+Metal kernel can embed the pinned NAX helper/quantized loader source and call the
+same `qmm_t_nax_tgp_impl` with remapped IDs. `get_qmm_nax_kernel` documents its
+preamble composition: MLX utils, GEMM NAX helpers, quantized utils and quantized
+NAX body. The custom-kernel backend already prepends MLX utils; avoid duplicating
+those definitions. Vendor only the required MIT-licensed helpers with revision
+and attribution, or generate a reproducible standalone header from the pinned
+source. Do not rely on filesystem includes into an unrelated checkout or private
+JIT C++ symbols; the inspected staged library does not export the four preamble
+accessors as public dynamic symbols.
+
+First establish that the unmodified G1 clone matches stock QMM output bits and
+latency, since custom source packaging and compiler options can themselves
+change code generation. Then validate each remap's tile coverage and raw BF16
+outputs at the actual geometry. Keep the first guard narrow: contiguous BF16
+input, U32 affine8/group128 transposed weights, BF16 scale/bias, batch one and
+fully aligned dimensions. Any broader tail case needs an explicit out-of-range
+return before barriers. Measure same-body G1/G2/G4/G8 with identical geometry,
+fresh graph inputs, rotated banks and paired order, plus the unchanged library
+reference. A schedule-only win would not establish a benefit from larger M
+tiles or shared dequantization across threadgroups. No such experiment was run
+as part of this audit.
