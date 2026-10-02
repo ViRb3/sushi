@@ -69,14 +69,14 @@ activation dtypes; configuration compute precision must not be mistaken for chec
 
 ## Dense/shared BF16 activation
 
-`glm5_activation.apply` combines gate upper-clamping, up-clamping to[-10,10], SiLU and
+`glm5_activation.apply` combines gate upper-clamping, up-clamping to [-10,10], SiLU and
 multiplication into one dispatch. It uses the existing exhaustive BF16 sigmoid table and rounds
 both products separately to BF16, matching `DenseMlp` and the source fixtures. It applies only to
-matching BF16 arrays with the checkpoint's limit10; other inputs use the original operations.
+matching BF16 arrays with the checkpoint's limit 10; other inputs use the original operations.
 The EXL3 expert middle stage has a different arithmetic contract and does not use this helper.
 
-Tests sweep all65,536 BF16 encodings in both gate and up, crossed with values at and adjacent to
+Tests sweep all 65,536 BF16 encodings in both gate and up, crossed with values at and adjacent to
 clamp boundaries, signed values and zero. Every non-NaN result bit matches the original operations;
 NaN results remain NaN. Broadcast inputs exercise the kernel's contiguous-input preparation.
-The diagnostic reports activation dispatches, excluding warmup. This adds a small shared128KiB
+The diagnostic reports activation dispatches, excluding warmup. This adds a small shared 128KiB
 sigmoid table when not already present, rather than changing any stored model weight.

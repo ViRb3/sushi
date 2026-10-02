@@ -210,7 +210,7 @@ residency are the next tuning steps. DFlash2 integration follows serial tuning; 
 
 ### Serial tuning measurements
 
-The following follow-ups use the same512/64 prompt, warmup/reset, EXL3 checkpoint, BF16 attention
+The following follow-ups use the same 512/64 prompt, warmup/reset, EXL3 checkpoint, BF16 attention
 cache and exclusive-run protocol. Scheduling code is `379ff876`; diagnostic controls are `bfb5931c`.
 The final two rows use the same binary and change only the named setting relative to async/chunk128.
 
@@ -221,14 +221,14 @@ The final two rows use the same binary and change only the named setting relativ
 | Async4 plus fit residency, zero slack | 128 | 344.39 | 24.12 | 96.067 |
 | Async4, original residency, larger prefill | 512 | 527.21 | 23.40 | 96.788 |
 
-Async4 and fit residency each retained all64 output IDs from the baseline. Fit has no demonstrated
+Async4 and fit residency each retained all 64 output IDs from the baseline. Fit has no demonstrated
 speed gain at this precision. Chunk512 produced coherent English but changed one word near the end;
 changing GEMM row shape changes rounding, so this is not a byte-equivalent scheduling improvement.
 It remains an explicit benchmark setting, not proof of full-model quality equivalence. The requested
 1,000/60 tok/s targets are still unmet; all measurements here are serial, without DFlash2.
 
 The opt-in source-style dense-prefill path (`324bd016`, diagnostic `6ceb3eea`) measured
-745.60 tok/s prefill and24.53 tok/s serial decode at chunk512, peak96.788 GB. It produced
+745.60 tok/s prefill and24.53 tok/s serial decode at chunk512, peak 96.788 GB. It produced
 coherent English with different token choices from absorbed prefill, as expected from the
 different BF16 rounding boundaries. Tiny reference and causal-boundary fixtures pass;
 whole-model KLD is still required before treating this experiment as a quality-equivalent default.
@@ -250,7 +250,7 @@ layer selection. These hooks do not by themselves implement speculative verifica
 
 
 The combined scheduling/QKV/metadata version (`b133d4ce`) measured747.83 tok/s prefill and24.57 tok/s
-serial decode on512/64, peak96.965 GB, with all64 output IDs equal to the prior dense-prefill arm.
+serial decode on512/64, peak 96.965 GB, with all 64 output IDs equal to the prior dense-prefill arm.
 All2,142 timed KDA QKV calls used the new kernel. These extra changes did not demonstrate a material
 speed gain beyond the earlier async/dense-prefill improvements.
 
@@ -260,18 +260,18 @@ coherent English. This is a different workload, not a same-length speedup or ach
 
 
 The BF16-storage router correction plus paired cooperative gate/up projections (`0188bb9d`)
-measured **749.28 tok/s prefill and 26.44 tok/s serial decode** on the same warmed512/64 workload,
-peak96.965 GB (90.306 GiB). All64 output IDs match the fused-KDA arm (25.50 tok/s decode).
-Both router and paired-expert counters recorded2,646 calls; QKV and KDA body recorded2,142 each.
-This combined change measured3.67% faster decode; it does not isolate either component's contribution.
+measured **749.28 tok/s prefill and 26.44 tok/s serial decode** on the same warmed 512/64 workload,
+peak 96.965 GB (90.306 GiB). All 64 output IDs match the fused-KDA arm (25.50 tok/s decode).
+Both router and paired-expert counters recorded 2,646 calls; QKV and KDA body recorded 2,142 each.
+This combined change measured 3.67% faster decode; it does not isolate either component's contribution.
 The earlier FP32-storage-only router arm recorded zero router calls and establishes no router gain.
-The1,000/60 targets and whole-model quality gate remain open.
+The 1,000/60 targets and whole-model quality gate remain open.
 
 
 The subsequent activation/sorted-finish/selection-batching arm (`24b1437b`) measured
-765.94 tok/s prefill and26.54 tok/s decode on the same512/64 configuration. All64 output IDs
-remain equal;2,880 dense/shared activation calls engaged. Prefill was2.22% faster in this pair;
-the0.39% decode difference is not a robust isolated gain. Peak active memory was97.020 GB,
+765.94 tok/s prefill and 26.54 tok/s decode on the same 512/64 configuration. All 64 output IDs
+remain equal; 2,880 dense/shared activation calls engaged. Prefill was 2.22% faster in this pair;
+the 0.39% decode difference is not a robust isolated gain. Peak active memory was97.020 GB,
 55.15 MB above the preceding arm despite removal of the sorted-output scatter intermediate;
 do not infer a whole-model memory saving from the local buffer removal. Combined ReleaseFast
-validation passed3,028 tests with105 skipped. These results remain diagnostic, without public serving.
+validation passed 3,028 tests with 105 skipped. These results remain diagnostic, without public serving.

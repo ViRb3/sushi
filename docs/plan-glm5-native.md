@@ -12,15 +12,15 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
 ## Progress
 
 - Completed: KDA preparation, independent layer fixtures, bounded IndexPool/latent attention,
-  stored-grid MLA comparisons, complete diagnostic forward, request reset and coherent512/64 generation.
-- Latest warmed serial512/64 result:749.28 tok/s prefill,26.44 tok/s decode; peak96.965 GB.
-  All64 output IDs match the previous fused-KDA arm. The2K workload separately measured863.10/20.23.
+  stored-grid MLA comparisons, complete diagnostic forward, request reset and coherent 512/64 generation.
+- Latest warmed serial 512/64 result: 749.28 tok/s prefill,26.44 tok/s decode; peak 96.965 GB.
+  All 64 output IDs match the previous fused-KDA arm. The 2K workload separately measured 863.10/20.23.
 - Completed serial optimizations: async4 scheduling, copy-free QKV, fused KDA body, BF16-storage
   FP32 router and paired cooperative expert gate/up. Dense-prefill SDPA remains opt-in pending KLD.
 - DFlash2: BF16 assistant, layerwise tree verifier and transactional accepted-state commit are
   implemented. Two short real-checkpoint tests preserve serial output IDs and full final state;
   warmed full-prompt performance remains open. See [the DFlash2 plan](plan-glm5-dflash2.md).
-- Remaining: optimize and measure toward1,000/60; full-model lossless-teacher KLD;
+- Remaining: optimize and measure toward 1,000/60; full-model lossless-teacher KLD;
   broader long-context coverage; production loader/lifecycle/server integration. The sections below
   retain the acceptance criteria, including completed foundations, rather than implying each is missing.
 
