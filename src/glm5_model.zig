@@ -424,7 +424,22 @@ pub const KdaLayer = struct {
         const dim: c_int = @intCast(cfg.linear_key_head_dim);
         const width = heads * dim;
         const keep: c_int = @intCast(cfg.linear_conv_kernel_dim - 1);
-        const projections = [_]Arr{ try self.q.apply(ops, x), try self.k.apply(ops, x), try self.v.apply(ops, x) };
+        const projections = if (try @import("glm5_decode.zig").qkv(ops.s, x, .{
+            .{ .weight = self.q.w, .scales = self.q.scales, .biases = self.q.biases },
+            .{ .weight = self.k.w, .scales = self.k.scales, .biases = self.k.biases },
+            .{ .weight = self.v.w, .scales = self.v.scales, .biases = self.v.biases },
+        })) |group| blk: {
+            var owned: usize = 0;
+            errdefer for (group[owned..]) |value| {
+                _ = mlx.mlx_array_free(value);
+            };
+            var result: [3]Arr = undefined;
+            for (group, 0..) |value, i| {
+                owned += 1; // Ops.own also frees its argument if ownership fails.
+                result[i] = try ops.own(value);
+            }
+            break :blk result;
+        } else [_]Arr{ try self.q.apply(ops, x), try self.k.apply(ops, x), try self.v.apply(ops, x) };
         const joined = try ops.concat(&projections, -1);
         const previous = if (state.initialized) state.conv_state else try ops.zeros(&.{ sh[0], keep, width * 3 }, mlx.mlx_array_dtype(x));
         const conv_input = try ops.concat(&.{ previous, joined }, 1);

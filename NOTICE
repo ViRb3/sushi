@@ -68,6 +68,14 @@ Reproduced from MTPLX's NOTICE file:
     (https://github.com/bstnxbt/dflash-mlx), Copyright dflash-mlx contributors,
     licensed under the Apache License 2.0. See mtplx/nax_verify.py for details.
 
+Used in sushi (`src/glm5_decode.zig`):
+
+  * The copy-free three-bank affine QKV dispatch adapts `multi_qmv` from
+    `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py` at 6745c39c.
+    It is restricted to one BF16 input row, 8-bit weights and group128;
+    each bank keeps its original packed weights, scales and biases.
+    Its MLX-derived qmv-fast arithmetic retains the MIT attribution below.
+
 Used in sushi (`src/transformer.zig`):
 
   * The verify-shaped quantized matmul kernel family (`verifyQmm`), ported from
@@ -327,6 +335,11 @@ The row-identical 8-bit projection kernel in `src/mtp_qmv.zig` adapts
 `backend/metal/kernels/quantized.h` (Copyright (c) 2023-2024 Apple Inc.).
 It shares packed weights across input rows while preserving each serial
 row's lane assignment, reduction order and output rounding.
+
+The affine QKV kernel in `src/glm5_decode.zig` also adapts `qmv_fast_impl`,
+`load_vector` and `qdot` from MLX quantized.h through oMLX's multi_qmv wrapper.
+It preserves each independent row's arithmetic while selecting three banks
+inside one dispatch; no concatenated weight buffer is created.
 
 The row-identical dense projection kernels in `src/mtp_dense_rows.zig`
 adapt MLX v0.32.2 `backend/metal/kernels/gemv.h` and `dot.h`.
