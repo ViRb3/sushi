@@ -61,6 +61,7 @@ test "GLM DFlash real checkpoint diagnostic" {
     const count = try number("SUSHI_GLM_DFLASH_PREFILL", 32);
     const steps = try number("SUSHI_GLM_DFLASH_DECODE", 8);
     const nodes = try number("SUSHI_GLM_DFLASH_NODES", 3);
+    const affine_rows = @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_AFFINE_ROWS");
     const chunk = try number("SUSHI_GLM_DFLASH_CHUNK", 128);
     if (count == 0 or count > 65536 or steps == 0 or steps > 4096 or nodes == 0 or nodes > 15 or chunk == 0) return error.InvalidGlmDiagnosticBudget;
     const memory = (try number("SUSHI_GLM_DFLASH_MEMORY_GIB", 110)) * 1024 * 1024 * 1024;
@@ -125,11 +126,12 @@ test "GLM DFlash real checkpoint diagnostic" {
     var rounds: std.ArrayList(Round) = .empty;
     defer rounds.deinit(a);
     try mlx.check(mlx.mlx_reset_peak_memory());
+    @import("glm5_dflash_qmm.zig").resetDispatchCount();
     var decode_ns: u64 = 0;
     while (generated.items.len < steps) {
         try writeJson(io, a, progress, .{ .complete = false, .phase = "tree_decode", .generated = generated.items.len, .rounds = rounds.items.len });
         timer.reset();
-        const round = try adapter.roundTreeLayerwise(io, &assistant, &context, &target, &request, pending, nodes, steps - generated.items.len, cfg.eosTokenSlice());
+        const round = try adapter.roundTreeLayerwiseMode(io, &assistant, &context, &target, &request, pending, nodes, steps - generated.items.len, cfg.eosTokenSlice(), if (affine_rows) .affine_rows else .serial_rows);
         decode_ns += timer.read();
         try generated.appendSlice(a, round.tokens[0..round.count]);
         try rounds.append(a, .{ .emitted = round.count, .accepted_drafts = round.accepted_drafts, .verified_rows = round.verified_rows, .draft_ns = round.draft_ns, .verify_ns = round.verify_ns, .replay_ns = round.replay_ns, .commit_ns = round.commit_ns });
@@ -151,11 +153,14 @@ test "GLM DFlash real checkpoint diagnostic" {
     }
     const ids_match = std.mem.eql(u32, reference, generated.items);
     const state_match = try stateMatches(&request, &serial, stream);
+    const affine_dispatches = @import("glm5_dflash_qmm.zig").dispatchCount();
+    const engaged = !affine_rows or affine_dispatches > 0;
     var tok = try @import("tokenizer.zig").loadTokenizer(io, a, model_path);
     defer tok.deinit();
     const text = try tok.decode(a, generated.items, false);
     defer a.free(text);
-    try writeJson(io, a, output_path, .{ .complete = ids_match and state_match, .model = model_path, .assistant = assistant_path, .assistant_precision = "BF16", .verifier = "layerwise_tree_serial_projections", .sampling = "greedy", .warmup = false, .timing_provisional = true, .input_ids = ids, .output_ids = generated.items, .serial_output_ids = reference, .output_text = if (std.unicode.utf8ValidateSlice(text)) text else null, .token_parity = ids_match, .state_parity = state_match, .prefill_ns = prefill_ns, .decode_ns = decode_ns, .decode_tokens_per_second = @as(f64, @floatFromInt(generated.items.len)) * 1e9 / @as(f64, @floatFromInt(decode_ns)), .peak_bytes = peak, .memory_limit_bytes = memory, .wired_limit_bytes = wired, .nodes = nodes, .rounds = rounds.items, .public_serving_enabled = false });
+    try writeJson(io, a, output_path, .{ .complete = ids_match and state_match and engaged, .model = model_path, .assistant = assistant_path, .assistant_precision = "BF16", .verifier = if (affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections", .affine_row_tiles = affine_rows, .affine_row_dispatches = affine_dispatches, .sampling = "greedy", .warmup = false, .timing_provisional = true, .input_ids = ids, .output_ids = generated.items, .serial_output_ids = reference, .output_text = if (std.unicode.utf8ValidateSlice(text)) text else null, .token_parity = ids_match, .state_parity = state_match, .prefill_ns = prefill_ns, .decode_ns = decode_ns, .decode_tokens_per_second = @as(f64, @floatFromInt(generated.items.len)) * 1e9 / @as(f64, @floatFromInt(decode_ns)), .peak_bytes = peak, .memory_limit_bytes = memory, .wired_limit_bytes = wired, .nodes = nodes, .rounds = rounds.items, .public_serving_enabled = false });
     if (!ids_match or !state_match) return error.GlmDflashSerialParityFailed;
+    if (!engaged) return error.GlmAffineRowsNotEngaged;
     try writeJson(io, a, progress, .{ .complete = true, .phase = "complete" });
 }

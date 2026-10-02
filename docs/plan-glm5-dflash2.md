@@ -41,13 +41,15 @@ by this entry point. This reduces repeated model orchestration and recurrent wor
 per-row projection work and per-branch MLA evaluation. It is not the final performance endpoint.
 Real-checkpoint parity, broad row-exact qualification, admission accounting and tuning remain gates.
 
-`glm5_dflash_qmm.zig` contains a separate, currently unselected affine8/group128 candidate. It reuses
+`glm5_dflash_qmm.zig` contains a separate, opt-in affine8/group128 candidate. It reuses
 each weight group across up to four rows while preserving the serial qmv dot and reduction order.
 Focused tests match every output bit for 1, 2, 3, 4, 5, 8 and 16 rows at input/output geometries
 4096/8192, 8192/4096 and 4096/1536, plus a small guard geometry. The optional 154880-row head test is
-gated by `SUSHI_GLM_DFLASH_HEAD_FIXTURE=1`; its completion must be recorded separately. The candidate
-is not yet used by `linearRows` or the real-checkpoint diagnostic. Dense BF16 projections retain their
-serial geometry and are not covered by this affine candidate.
+gated by `SUSHI_GLM_DFLASH_HEAD_FIXTURE=1`; it passed at 4096 input width in a direct test-executable
+run on 2026-10-03. `linearRows` uses the candidate only in explicit `.affine_rows` mode, and its test
+requires a real dispatch before checking bit equality. Dense BF16 projections, unsupported affine
+geometry, per-head MLA projections and the FFN path retain their serial geometry. The real-checkpoint
+diagnostic defaults to the original strict mode until the opt-in path passes its own parity run.
 
 Focused ReleaseFast tests cover tree validation, zero acceptance, sibling exclusion, pre-commit
 budget/EOS handling, immutable request forks, a complete tiny native assistant proposal/round, and
@@ -82,6 +84,7 @@ error; it never labels a fallback as speculative success.
 | `SUSHI_GLM_DFLASH_NODES` | Draft node budget, default 3, maximum 15; root is additional |
 | `SUSHI_GLM_DFLASH_CHUNK` | Prefill chunk, default 128 |
 | `SUSHI_GLM_DFLASH_MEMORY_GIB` | MLX limit, default 110; wired limit capped at recommended set |
+| `SUSHI_GLM_DFLASH_AFFINE_ROWS` | `1` opts into exact affine row tiles; unset/`0` keeps strict projections |
 
 The JSON records exact input/output and serial-reference IDs, token/state parity, per-round accepted
 drafts and verified rows, draft/verify/replay/commit times, peak memory and decoded text. Progress is
@@ -105,6 +108,10 @@ assistant drafting took about 6.6 ms. The final budget-one round also paid first
 its one-row tree shape. This diagnostic commits every emitted input token, including the final one;
 its accounting differs from a serial harness that leaves the final emitted token unprocessed.
 The affine row-tile candidate was disconnected. Measurement key: `glm53-dflash-strict-32x8-20261003`.
+
+With affine row tiles requested, the diagnostic also records `affine_row_dispatches` and requires a
+nonzero count before reporting success. The flag is confined to this diagnostic; it does not alter
+ordinary target decoding or register a public speculative serving mode.
 
 ## Sources and evidence
 

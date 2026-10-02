@@ -362,6 +362,14 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     var layerwise = try @import("glm5_dflash_model.zig").verify(&target, &request, &tokens, &parents, &taps, .serial_rows);
     defer layerwise.deinit();
     try std.testing.expectEqualSlices(u32, verified.targets[0..verified.count], layerwise.targets[0..layerwise.count]);
+    const qmm_before = @import("glm5_dflash_qmm.zig").dispatchCount();
+    var affine = try @import("glm5_dflash_model.zig").verify(&target, &request, &tokens, &parents, &taps, .affine_rows);
+    defer affine.deinit();
+    try std.testing.expectEqual(qmm_before, @import("glm5_dflash_qmm.zig").dispatchCount());
+    try std.testing.expectEqualSlices(u32, layerwise.targets[0..layerwise.count], affine.targets[0..affine.count]);
+    var affine_committed = try affine.prepareCommit(&request, 3, &.{}, s);
+    defer affine_committed.deinit();
+    try sameRequest(&affine_committed.states[3].?, &verified.states[3].?, s);
     var replayed = try layerwise.prepareCommit(&request, 3, &.{}, s);
     defer replayed.deinit();
     try sameRequest(&replayed.states[3].?, &verified.states[3].?, s);
@@ -506,6 +514,12 @@ test {
 }
 
 pub fn roundTreeLayerwise(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32) !RoundResult {
+    return roundTreeLayerwiseMode(io, assistant, context, target, request, pending, max_nodes, budget, eos, .serial_rows);
+}
+
+pub fn roundTreeLayerwiseMode(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode) !RoundResult {
+    if (mode == .batched) return error.GlmBatchedVerifyUnqualified;
+    try validatePair(assistant, target);
     if (budget == 0) return error.InvalidGlmDraftBudget;
     if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
     var timer = @import("io_util.zig").Stopwatch.init(io);
@@ -517,7 +531,7 @@ pub fn roundTreeLayerwise(io: std.Io, assistant: *draft.DflashModel, context: *d
     } else try proposeTree(assistant, context, target, pending, max_nodes);
     const draft_ns = timer.read();
     timer.reset();
-    var layerwise = try @import("glm5_dflash_model.zig").verify(target, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], assistant.config.target_layer_ids, .serial_rows);
+    var layerwise = try @import("glm5_dflash_model.zig").verify(target, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], assistant.config.target_layer_ids, mode);
     defer layerwise.deinit();
     const verify_ns = timer.read();
     timer.reset();
@@ -526,7 +540,7 @@ pub fn roundTreeLayerwise(io: std.Io, assistant: *draft.DflashModel, context: *d
     const replay_ns = timer.read();
     timer.reset();
     const kept = try commitVerified(assistant, context, request, &verified, budget, eos);
-    var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = "layerwise_tree_serial_projections" };
+    var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = if (mode == .affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections" };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
     return result;
 }

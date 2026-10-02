@@ -43,6 +43,13 @@ const SOURCE =
     \\  if (lane == 0 && token0 + m < M) y[(token0 + m) * N + output0 + r] = bfloat(value);
     \\}
 ;
+var dispatch_count: usize = 0;
+pub fn dispatchCount() usize {
+    return dispatch_count;
+}
+pub fn resetDispatchCount() void {
+    dispatch_count = 0;
+}
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 const Key = struct { m: c_int, n: c_int, k: c_int };
 const Cached = struct { key: Key, config: mlx.mlx_fast_metal_kernel_config };
@@ -116,6 +123,7 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     var output = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(output);
     try mlx.check(mlx.mlx_vector_array_get(&output, ov, 0));
+    dispatch_count += 1;
     return output;
 }
 
@@ -143,6 +151,14 @@ test "GLM DFlash affine row tiles preserve serial qmv bits" {
             const input = try scope.slice(x.*, 1, 0, rows);
             const actual = try scope.own((try project(s, input, linear)) orelse return error.TestExpectedGlmTreeQmm);
             try mlx.check(mlx.mlx_array_eval(actual));
+            if (rows > 1) {
+                const before = dispatchCount();
+                const integrated = try @import("glm5_dflash_kda.zig").linearRows(&scope, linear, input, .affine_rows);
+                try mlx.check(mlx.mlx_array_eval(integrated));
+                try std.testing.expectEqual(before + 1, dispatchCount());
+                const total: usize = @intCast(rows * shape.n);
+                try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(actual).?[0..total], mlx.mlx_array_data_bfloat16(integrated).?[0..total]);
+            }
             for (0..@intCast(rows)) |row| {
                 var one = Ops{ .s = s };
                 defer one.deinit();
