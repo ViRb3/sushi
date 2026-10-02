@@ -57,3 +57,28 @@ No foreign kernel code is included in this source-adapter change.
 
 The `GLM BF16` unit tests cover layout recognition, shuffled multi-shard reads, dense/MTP exclusion, malformed
 source rejection, zero-copy imports, cache hits/evictions, union overflow and selected-expert matrix products.
+
+## BF16 source sanity run
+
+2026-10-02: the complete official 120-shard checkpoint was downloaded and structurally verified against its
+index: 38,770 tensors and 642,646,653,816 payload bytes. A separate diagnostic Python runner used oMLX
+`6745c39c`'s GLM forward and lossless BF16 reads of the selected routed experts. It did not use Sushi's native
+forward, quantization, MTP or a persistent expert cache. The text trunk remained resident (16.775 GiB at load).
+The runner used a reference HC fallback for two unavailable optional imports and disabled compiled/fused
+decode so the synchronous expert reader could run outside graph tracing. Its selected-expert reader matched
+resident BF16 expert results bit-for-bit on synthetic single-token and multi-token cases.
+
+On an M5 Max 128 GB, a single greedy request used exactly 512 input tokens and generated 64 tokens:
+
+| metric | result |
+|---|---:|
+| Prompt processing, including SSD expert reads | 6.4228 tok/s |
+| Decode, mlx-lm generation timer | 0.5578 tok/s |
+| Total generation wall time | 194.553 s |
+| Peak active Metal memory | 34.099 GB |
+
+Foreground `taskpolicy -a`, an exclusive GPU lock, max fans and a 10-second cooldown were used. The official
+chat template requested low reasoning effort. Output began `</think>Rain forms through the water cycle.`
+and continued with coherent English about evaporation, condensation and droplets, stopping at the token
+limit. This establishes a source-checkpoint sanity result for that diagnostic forward, not full reference
+parity, broad model quality or native Sushi throughput. The native integration work above remains required.
