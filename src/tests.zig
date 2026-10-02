@@ -69,6 +69,7 @@ test {
     _ = @import("model_discovery.zig");
     _ = @import("mimo_source.zig");
     _ = @import("glm5_next.zig");
+    _ = @import("glm5_model.zig");
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
