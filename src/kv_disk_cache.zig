@@ -3731,10 +3731,33 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
-/// Default persistence root: `~/.sushi/kv-cache`.
+/// Persistence root; an explicit directory also isolates live cache tests.
 pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHome);
-    return std.fmt.allocPrint(allocator, "{s}/.sushi/kv-cache", .{home});
+    return cacheBaseDir(allocator,
+        if (std.c.getenv("HOME")) |h| std.mem.span(h) else null,
+        if (std.c.getenv("SUSHI_PREFIX_CACHE_DIR")) |p| std.mem.span(p) else null);
+}
+
+fn cacheBaseDir(allocator: std.mem.Allocator, home: ?[]const u8, override: ?[]const u8) ![]u8 {
+    if (override) |path| {
+        if (path.len > 0) {
+            if (!std.fs.path.isAbsolute(path)) return error.InvalidCacheDirectory;
+            return allocator.dupe(u8, path);
+        }
+    }
+    return std.fmt.allocPrint(allocator, "{s}/.sushi/kv-cache", .{home orelse return error.NoHome});
+}
+
+test "prefix cache root: explicit absolute directory and default home path" {
+    const a = std.testing.allocator;
+    const explicit = try cacheBaseDir(a, null, "/tmp/sushi-cache-test");
+    defer a.free(explicit);
+    try std.testing.expectEqualStrings("/tmp/sushi-cache-test", explicit);
+    const fallback = try cacheBaseDir(a, "/tmp/sushi-test-user", "");
+    defer a.free(fallback);
+    try std.testing.expectEqualStrings("/tmp/sushi-test-user/.sushi/kv-cache", fallback);
+    try std.testing.expectError(error.InvalidCacheDirectory, cacheBaseDir(a, null, "relative"));
+    try std.testing.expectError(error.NoHome, cacheBaseDir(a, null, null));
 }
 
 // ── Small fs helpers ──

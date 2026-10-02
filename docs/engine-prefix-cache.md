@@ -117,12 +117,28 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Eviction is WORKLOAD-fair (`cache_key`: `prompt_cache_key` > `metadata.user_id` > system-prompt hash;
   `lruIndexExcluding`).
 
+## SSD-only storage
+
+`--no-prefix-cache-ram --prefix-cache-disk 10GB` keeps reusable text prefixes on SSD without retaining idle
+KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
+buffers temporarily. The entry count must remain positive: `--prefix-cache-entries 0` disables both tiers.
+With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports
+`settings.prefix_cache.ram_enabled=false` and `mem_bytes=0` when RAM retention is off.
+
+Qwen prefill chunks write through continuously in SSD-only mode. Hybrid SSM checkpoints and MiMo ring
+restore points survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD defaults
+are unchanged. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
+`~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.
+
+Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
+
 ## SSD-first
 
 - Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed.
 
-- `prefix_cache.ssdFirstActive` = capable arch AND a disk tier, mirrored onto `HotPrefixCache.ssd_first` +
-  `DiskTier.ssd_first`: RAM floors at ONE session, `--prefix-cache-mem` = the IDLE allowance.
+- `prefix_cache.ssdFirstActive` = a disk tier AND (capable arch OR RAM retention disabled), mirrored onto `HotPrefixCache.ssd_first` +
+  `DiskTier.ssd_first`: with RAM enabled it floors at ONE session, `--prefix-cache-mem` = the IDLE allowance.
+  SSD-only storage retains no idle RAM entry.
 - Spill and EVICT are two decisions (`PersistOutcome`: only `.persisted` + an agreeing index + landed files license
   discarding RAM); writes ride `kv_disk_writer.zig` (FIFO, `meta.json` last, epoch fence at the ONE removal site);
   per-chunk write-through; a diverging turn hard-links the donor's LANDED chunks; a full-prefix hit CHECKS the entry
