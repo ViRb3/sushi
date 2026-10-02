@@ -37,19 +37,38 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
     return switch (target.layers[index].ffn) {
         .dense => |layer| dense(layer, ops, x, target.cfg.glm_swiglu_limit),
         .moe => |layer| blk: {
-            var ids: [16]Arr = undefined;
-            var scores: [16]Arr = undefined;
-            for (0..@intCast(shape[1])) |row| {
-                var one = Ops{ .s = ops.s };
-                defer one.deinit();
-                const route = try target.routeLayer(index, &one, try one.slice(x, 1, @intCast(row), @intCast(row + 1)));
-                ids[row] = try ops.own(try one.result(route.indices));
-                scores[row] = try ops.own(try one.result(route.scores));
-            }
-            const count: usize = @intCast(shape[1]);
-            const routed = try ops.own(try api.moeClamped(ops.s, x, layer.bank, try ops.concat(ids[0..count], 1), try ops.concat(scores[0..count], 1), .{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window }, @intFromFloat(target.cfg.glm_swiglu_limit)));
+            var timer = @import("glm5_dflash_profile.zig").Timer.start(@intCast(shape[1]));
+            const routing: forward.Routed = if (try @import("glm5_router.zig").routeBatch(ops.s, x, layer.weight, layer.correction, @intCast(target.cfg.num_experts_per_tok), target.cfg.router_scaling_factor, target.cfg.moe_route_norm)) |candidate| blk_route: {
+                const ids = ops.own(candidate.indices) catch |err| {
+                    _ = mlx.mlx_array_free(candidate.scores);
+                    return err;
+                };
+                break :blk_route .{ .indices = ids, .scores = try ops.own(candidate.scores) };
+            } else blk_route: {
+                var ids: [16]Arr = undefined;
+                var scores: [16]Arr = undefined;
+                for (0..@intCast(shape[1])) |row| {
+                    var one = Ops{ .s = ops.s };
+                    defer one.deinit();
+                    const route = try target.routeLayer(index, &one, try one.slice(x, 1, @intCast(row), @intCast(row + 1)));
+                    ids[row] = try ops.own(try one.result(route.indices));
+                    scores[row] = try ops.own(try one.result(route.scores));
+                }
+                const count: usize = @intCast(shape[1]);
+                break :blk_route .{ .indices = try ops.concat(ids[0..count], 1), .scores = try ops.concat(scores[0..count], 1) };
+            };
+            try timer.finish("ffn_router", &.{ routing.indices, routing.scores });
+            const routed = try ops.own(try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, .{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window }, @intFromFloat(target.cfg.glm_swiglu_limit)));
+            try timer.finish("ffn_routed", &.{routed});
             routed_batches += 1;
-            break :blk if (layer.shared) |shared| try ops.binary(.add, routed, try dense(shared, ops, x, target.cfg.glm_swiglu_limit)) else routed;
+            if (layer.shared) |shared| {
+                const shared_output = try dense(shared, ops, x, target.cfg.glm_swiglu_limit);
+                try timer.finish("ffn_shared", &.{shared_output});
+                const combined = try ops.binary(.add, routed, shared_output);
+                try timer.finish("ffn_combine", &.{combined});
+                break :blk combined;
+            }
+            break :blk routed;
         },
     };
 }
@@ -155,5 +174,41 @@ test "GLM DFlash FFN batch matches each target FFN row" {
             const expected = try target.feedForwardLayer(layer, &one, try one.slice(x, 1, from, from + 1));
             try equal(expected, try one.slice(got, 1, from, from + 1), s);
         }
+    }
+}
+
+test "GLM DFlash FFN integrates production-width batched routing" {
+    const allocator = std.testing.allocator;
+    const stream = mlx.gpuStream();
+    var fixtures = Ops{ .s = stream };
+    defer fixtures.deinit();
+    var weights = @import("model.zig").Weights.init(allocator);
+    defer weights.deinit();
+    const cfg = try forward.completeFixture(&weights);
+    var target = try forward.Model.load(allocator, cfg, &weights, stream);
+    defer target.deinit();
+    target.cfg.hidden_size = 4096;
+    target.cfg.num_experts_per_tok = 8;
+    const w = try fixtures.zeros(&.{ 288, 4096 }, .bfloat16);
+    var correction: [288]f32 = @splat(-10);
+    for (correction[0..8]) |*value| value.* = 1;
+    const bias = try fixtures.own(mlx.mlx_array_new_data(&correction, &.{288}, 1, .float32));
+    target.layers[3].ffn.moe.weight = w;
+    target.layers[3].ffn.moe.correction = bias;
+    target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 128, 36);
+    target.layers[3].ffn.moe.shared = null;
+    try mlx.check(mlx.mlx_array_eval(w));
+    const x = try fixtures.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 4, 4096 }, 731, stream));
+    var ops = Ops{ .s = stream };
+    defer ops.deinit();
+    @import("glm5_router.zig").resetBatchCallCount();
+    const actual = try apply(&target, 3, &ops, x);
+    try std.testing.expectEqual(@as(usize, 1), @import("glm5_router.zig").batchCallCount());
+    for (0..4) |i| {
+        var one = Ops{ .s = stream };
+        defer one.deinit();
+        const row: c_int = @intCast(i);
+        const expected = try target.feedForwardLayer(3, &one, try one.slice(x, 1, row, row + 1));
+        try equal(expected, try one.slice(actual, 1, row, row + 1), stream);
     }
 }

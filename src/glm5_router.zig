@@ -134,6 +134,13 @@ pub const Result = struct { indices: Arr, scores: Arr };
 var logits_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var select_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var calls: usize = 0;
+var batch_calls: usize = 0;
+pub fn batchCallCount() usize {
+    return batch_calls;
+}
+pub fn resetBatchCallCount() void {
+    batch_calls = 0;
+}
 pub fn callCount() usize {
     return calls;
 }
@@ -152,7 +159,7 @@ fn kernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [
     return k;
 }
 const Configs = struct { logits: mlx.mlx_fast_metal_kernel_config, select: mlx.mlx_fast_metal_kernel_config, cached: bool };
-const Key = struct { width: c_int, experts: c_int, top: c_int, norm: bool, dtype: mlx.mlx_dtype, precise: bool };
+const Key = struct { rows: c_int, width: c_int, experts: c_int, top: c_int, norm: bool, dtype: mlx.mlx_dtype, precise: bool };
 const Entry = struct { key: Key, cfg: Configs };
 var cache: [8]?Entry = @splat(null);
 fn configs(key: Key) !Configs {
@@ -163,14 +170,14 @@ fn configs(key: Key) !Configs {
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(lc);
     const sc = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(sc);
-    for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(lc, &.{ 1, key.experts }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(lc, 128 * @divExact(key.experts, 4), 1, 1));
+    for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(lc, &.{ key.rows, key.experts }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(lc, 128 * @divExact(key.experts, 4), key.rows, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(lc, 128, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(lc, "T", key.dtype));
     inline for (.{ "K", "E", "ROWS_PER_SIMD", "PRECISE" }, .{ key.width, key.experts, @as(c_int, 1), @as(c_int, @intFromBool(key.precise)) }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(lc, name, value));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(sc, &.{ 1, 1, key.top }, 3, .uint32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(sc, &.{ 1, 1, key.top }, 3, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(sc, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(sc, &.{ 1, key.rows, key.top }, 3, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(sc, &.{ 1, key.rows, key.top }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(sc, 32 * key.rows, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(sc, 32, 1, 1));
     inline for (.{ "E", "TOPK", "NORM" }, .{ key.experts, key.top, @as(c_int, @intFromBool(key.norm)) }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(sc, name, value));
     for (&cache) |*entry| if (entry.* == null) {
@@ -194,10 +201,13 @@ fn apply(k: mlx.mlx_fast_metal_kernel, inputs: []const Arr, cfg: mlx.mlx_fast_me
     return out;
 }
 pub fn route(s: mlx.mlx_stream, x: Arr, weight: Arr, bias: Arr, top: c_int, scale: f32, norm: bool) !?Result {
+    return routeImpl(s, x, weight, bias, top, scale, norm, 1);
+}
+fn routeImpl(s: mlx.mlx_stream, x: Arr, weight: Arr, bias: Arr, top: c_int, scale: f32, norm: bool, max_rows: c_int) !?Result {
     if (!mlx.streamIsGpu(s) or x.ctx == null or weight.ctx == null or bias.ctx == null or !std.math.isFinite(scale) or scale <= 0) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(weight);
-    if (xs.len != 3 or xs[0] != 1 or xs[1] != 1 or ws.len != 2 or xs[2] != ws[1]) return null;
+    if (xs.len != 3 or xs[0] != 1 or xs[1] < 1 or xs[1] > max_rows or ws.len != 2 or xs[2] != ws[1]) return null;
     const width = ws[1];
     const experts = ws[0];
     const dtype = mlx.mlx_array_dtype(x);
@@ -208,7 +218,7 @@ pub fn route(s: mlx.mlx_stream, x: Arr, weight: Arr, bias: Arr, top: c_int, scal
     const strides = mlx.mlx_array_strides(weight);
     if (strides[1] != 1 or strides[0] != @as(usize, @intCast(width))) return null;
     const precise = (try @import("glm5_kda_fused.zig").sigmoidFloatMode(s)) orelse return null;
-    const cfg = try configs(.{ .width = width, .experts = experts, .top = top, .norm = norm, .dtype = dtype, .precise = precise });
+    const cfg = try configs(.{ .rows = xs[1], .width = width, .experts = experts, .top = top, .norm = norm, .dtype = dtype, .precise = precise });
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.logits);
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.select);
@@ -223,5 +233,143 @@ pub fn route(s: mlx.mlx_stream, x: Arr, weight: Arr, bias: Arr, top: c_int, scal
     const sk = try kernel(&select_kernel, "sushi_glm_router_select", &.{ "sig", "biased", "scaling" }, &.{ "indices", "scores" }, SELECT);
     const chosen = try apply(sk, &.{ values[0], values[1], scaling }, cfg.select, s);
     calls += 1;
+    if (xs[1] > 1) batch_calls += 1;
     return .{ .indices = chosen[0], .scores = chosen[1] };
+}
+
+pub fn routeBatch(s: mlx.mlx_stream, x: Arr, weight: Arr, bias: Arr, top: c_int, scale: f32, norm: bool) !?Result {
+    return routeImpl(s, x, weight, bias, top, scale, norm, 16);
+}
+
+test "GLM batched router preserves every serial index and score bit" {
+    const Ops = @import("glm5_model.zig").Ops;
+    const stream = mlx.gpuStream();
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| {
+        var ops = Ops{ .s = stream };
+        defer ops.deinit();
+        const key = try ops.slot();
+        try mlx.check(mlx.mlx_random_key(key, 842));
+        const weight = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(weight, &.{ 288, 4096 }, 2, dtype, 0, 0.01, key.*, stream));
+        const correction = try ops.zeros(&.{288}, .float32);
+        const input = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(input, &.{ 1, 16, 4096 }, 3, dtype, 0, 1, key.*, stream));
+        try mlx.check(mlx.mlx_array_eval(weight.*));
+        for ([_]c_int{ 2, 3, 4, 8, 16 }) |rows| {
+            for ([_]bool{ false, true }) |normalize| {
+                var scope = Ops{ .s = stream };
+                defer scope.deinit();
+                const x = try scope.slice(input.*, 1, 0, rows);
+                const got = (try routeBatch(stream, x, weight.*, correction, 8, 2.5, normalize)) orelse return error.TestExpectedBatchedRouter;
+                defer _ = mlx.mlx_array_free(got.indices);
+                defer _ = mlx.mlx_array_free(got.scores);
+                try mlx.check(mlx.mlx_array_eval(got.indices));
+                try mlx.check(mlx.mlx_array_eval(got.scores));
+                const gi = mlx.mlx_array_data_uint32(got.indices).?;
+                const gs = mlx.mlx_array_data_float32(got.scores).?;
+                for (0..@intCast(rows)) |row| {
+                    var one = Ops{ .s = stream };
+                    defer one.deinit();
+                    const from: c_int = @intCast(row);
+                    const expected = (try route(stream, try one.slice(x, 1, from, from + 1), weight.*, correction, 8, 2.5, normalize)).?;
+                    defer _ = mlx.mlx_array_free(expected.indices);
+                    defer _ = mlx.mlx_array_free(expected.scores);
+                    try mlx.check(mlx.mlx_array_eval(expected.indices));
+                    try mlx.check(mlx.mlx_array_eval(expected.scores));
+                    try std.testing.expectEqualSlices(u32, mlx.mlx_array_data_uint32(expected.indices).?[0..8], gi[row * 8 ..][0..8]);
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(expected.scores).?[0..8]), std.mem.sliceAsBytes(gs[row * 8 ..][0..8]));
+                }
+            }
+        }
+    }
+}
+
+test "GLM batched router stable ties and single-row contract" {
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const weight = try ops.zeros(&.{ 288, 4096 }, .bfloat16);
+    const x = try ops.zeros(&.{ 1, 4, 4096 }, .bfloat16);
+    const bias = try ops.zeros(&.{288}, .float32);
+    try mlx.check(mlx.mlx_array_eval(weight));
+    try std.testing.expect((try route(ops.s, x, weight, bias, 8, 2.5, true)) == null);
+    const got = (try routeBatch(ops.s, x, weight, bias, 8, 2.5, true)).?;
+    defer _ = mlx.mlx_array_free(got.indices);
+    defer _ = mlx.mlx_array_free(got.scores);
+    try mlx.check(mlx.mlx_array_eval(got.indices));
+    try mlx.check(mlx.mlx_array_eval(got.scores));
+    for (0..32) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i % 8)), mlx.mlx_array_data_uint32(got.indices).?[i]);
+        try std.testing.expectEqual(@as(f32, 0.3125), mlx.mlx_array_data_float32(got.scores).?[i]);
+    }
+    const too_many = try ops.zeros(&.{ 1, 17, 4096 }, .bfloat16);
+    try std.testing.expect((try routeBatch(ops.s, too_many, weight, bias, 8, 2.5, true)) == null);
+}
+
+fn timeBatchRouter(x: Arr, weight: Arr, bias: Arr, batch: bool) !u64 {
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    var timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
+    const rows: usize = @intCast(mlx.getShape(x)[1]);
+    var ids: [16]Arr = undefined;
+    var scores: [16]Arr = undefined;
+    if (batch) {
+        const result = (try routeBatch(ops.s, x, weight, bias, 8, 2.5, true)).?;
+        ids[0] = try ops.own(result.indices);
+        scores[0] = try ops.own(result.scores);
+    } else {
+        for (0..rows) |i| {
+            const row: c_int = @intCast(i);
+            const result = (try route(ops.s, try ops.slice(x, 1, row, row + 1), weight, bias, 8, 2.5, true)).?;
+            ids[i] = try ops.own(result.indices);
+            scores[i] = try ops.own(result.scores);
+        }
+        ids[0] = try ops.concat(ids[0..rows], 1);
+        scores[0] = try ops.concat(scores[0..rows], 1);
+    }
+    const evals = mlx.mlx_vector_array_new_data(&.{ ids[0], scores[0] }, 2);
+    defer _ = mlx.mlx_vector_array_free(evals);
+    try mlx.check(mlx.mlx_eval(evals));
+    return timer.read();
+}
+
+test "GLM batched router paired microbenchmark" {
+    const path = std.c.getenv("SUSHI_GLM_ROUTER_BATCH_BENCH_OUT") orelse return error.SkipZigTest;
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const key = try ops.slot();
+    try mlx.check(mlx.mlx_random_key(key, 731));
+    const weight = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(weight, &.{ 288, 4096 }, 2, .bfloat16, 0, 0.01, key.*, ops.s));
+    const input = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(input, &.{ 1, 16, 4096 }, 3, .bfloat16, 0, 1, key.*, ops.s));
+    const bias = try ops.zeros(&.{288}, .float32);
+    const evals = mlx.mlx_vector_array_new_data(&.{ weight.*, input.*, bias }, 3);
+    defer _ = mlx.mlx_vector_array_free(evals);
+    try mlx.check(mlx.mlx_eval(evals));
+    const Count = 100;
+    const Sample = struct { rows: c_int, serial_ns: [Count]u64, batch_ns: [Count]u64 };
+    var samples: [4]Sample = undefined;
+    for ([_]c_int{ 2, 4, 8, 16 }, &samples) |rows, *sample| {
+        const x = try ops.slice(input.*, 1, 0, rows);
+        for (0..16) |_| {
+            _ = try timeBatchRouter(x, weight.*, bias, false);
+            _ = try timeBatchRouter(x, weight.*, bias, true);
+        }
+        sample.rows = rows;
+        for (0..Count) |i| {
+            if (i % 2 == 0) {
+                sample.serial_ns[i] = try timeBatchRouter(x, weight.*, bias, false);
+                sample.batch_ns[i] = try timeBatchRouter(x, weight.*, bias, true);
+            } else {
+                sample.batch_ns[i] = try timeBatchRouter(x, weight.*, bias, true);
+                sample.serial_ns[i] = try timeBatchRouter(x, weight.*, bias, false);
+            }
+        }
+    }
+    const raw = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .samples = samples, .warmup_pairs = 16, .method = "AB/BA, graph construction and one evaluation for all routing rows" }, .{ .whitespace = .indent_2 });
+    defer std.testing.allocator.free(raw);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = raw });
 }

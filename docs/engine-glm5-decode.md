@@ -103,3 +103,17 @@ retains the staged path for unsupported geometry and independent tests/benchmark
 counts fused HC calls separately. It is off by default: the full-model attribution run
 measured 26.49 tok/s with HC alone versus 26.54 with both decode candidates disabled, so the
 queued component gain did not establish an end-to-end benefit. This fusion leaves Sinkhorn iterations and stream collapse unchanged.
+
+## Batched verification routing
+
+DFlash's short-row FFN path can route up to 16 rows using the same two kernels as serial
+routing. The logits grid adds a row dimension; selection/normalization stays independent
+and keeps the serial order for each row. Normal model routing remains one-row-only, and
+unsupported verification inputs retain the per-row fallback. Tests cover production
+288-expert/4096-wide geometry, BF16/FP32 inputs and weights, normalized/unnormalized scores,
+stable ties and integrated FFN output parity. The diagnostic reports router_batch_calls.
+
+A warmed 100-pair alternating AB/BA microbenchmark, with one evaluation for the whole routing
+set in both arms, measured four rows at 282.98 microseconds serial versus232.75 batched.
+This is a routing-component result, not end-to-end speculative speed. The timing-only binary
+avoids filling the configuration cache with unrelated correctness-test cases before measuring.
