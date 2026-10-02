@@ -229,3 +229,59 @@ IDs. The binary SHA-256 is
 The exclusive capture used interactive QoS, a max-fan request and ten seconds idle
 at 48.73°C before load; its GPU lock was released and fans restored afterward.
 No group-two kernel has been implemented or benchmarked by this capture step.
+
+## Standalone exact group-two candidate
+
+`src/exl3/glm_group2.zig` now contains an unintegrated cooperative candidate.
+Inline ballots pair occurrences in original slot order, including masks spanning
+slots 31/32/63/64/127. Followers return uniformly; singleton leaders execute the
+unchanged baseline body. Paired leaders decode each weight once, then update two
+independent FP32 accumulator sets with the original FMA sequence. Both epilogues
+preserve the original r-then-simdgroup addition order and F16 stores: parallel
+partials use 8 KiB, while sequential member reduction reuses a 4 KiB plane.
+The candidate has no production callsite, and incompatible shapes return no
+candidate. Its routed-chain guard validates all bank/scaling/score shapes and
+dtypes before preparing inputs, and checks output-width multiplication.
+
+Tests passed all seventeen 2–4bpw rates, 4096/2048 dimensions, sparse/odd/full
+sharing, singletons, ballot boundaries, noncontiguous inputs, and malformed input
+refusal. Actual checkpoint trellis/Suh/Svh slices were then loaded for three
+captured route sets; all four candidate chains matched every baseline BF16 output
+bit. Expert IDs were compactly remapped with their corresponding original weights.
+The real-weight subsets are exact copies; activations and scores are synthetic.
+This proves these component outputs, not full-model speculative parity.
+
+A quiet warm-bank comparison used the natural-layout baseline, with lane-pair
+and lane-down switches explicitly off. Five warmups per arm preceded eleven
+alternating forward/reverse rounds, three evaluations per sample. Times include
+host construction/evaluation/free and all routed-chain preparation/finish work.
+The gate/up-only arms retain the native fused middle/down. The all-projection
+arms use separate middle preparation followed by grouped down, so they include
+the cost of losing that fusion.
+
+| Captured layer / potential saved visits | Baseline µs | Gate/up parallel µs | Gate/up serial µs | All parallel µs | All serial µs |
+|---|---:|---:|---:|---:|---:|
+| 3 / 6.25% | 1073.63 | 1044.17 | 1045.04 | 1048.01 | 1042.99 |
+| 20 / 28.13% | 1151.21 | 1062.75 | 1063.06 | 1042.26 | 1045.64 |
+| 34 / 34.38% | 1126.65 | 1011.57 | 1040.00 | 994.58 | 990.18 |
+
+The best routed-chain medians improve by 2.85%, 9.46% and 12.11% respectively.
+Both all-projection arms won all eleven paired rounds in the middle-overlap
+case; the high-overlap case won ten or eleven. This is sufficient to retain the
+candidate for composition experiments. It does **not** establish a gain over the
+newer half4 lane paths, nor show that those gains add together. Compare a composed
+candidate directly against lane-pair plus lane-down before integration.
+
+Compacting selected banks changes physical address spacing/cache behavior, and
+only three route records were timed. Full-model confirmation remains required.
+The nine sampled expert shards (gate/up/down at these layers) in the newer
+Sushi-2.3bpw target have matching size and sampled SHA-256 data with the original
+Sushi-2.4bpw target; this is a sample check, not a whole-file hash proof. Its A6
+trunk can still change activation/routing distributions.
+
+Private artifact `glm53-group2-20261003` contains the exact source/build recipe,
+actual-weight fixture exporter/manifest, parity logs, samples and provenance.
+Timing binary SHA-256:
+`a38386598412ab7e1420196fb1f95bcd7c1f7c807cac3048fa4918e99abdb674`.
+The run held an exclusive GPU lock, used interactive QoS, requested maximum fans,
+and idled ten seconds at 49.84°C before timing; lock/fan cleanup completed.

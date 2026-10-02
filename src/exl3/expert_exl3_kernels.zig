@@ -10178,6 +10178,20 @@ pub fn lanePairCoop(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg:
     return result;
 }
 
+// GROUP2_SUPPORT: isolated research seam; no production callsites use the candidate.
+pub const Group2Support = struct {
+    pub const Slots = KernelSlots;
+    pub const empty = no_kernels;
+    pub const cooperative_source = INDEXED_COOP_SOURCE;
+    pub const prepare = pairPrepareFromTokens;
+    pub const middle = midSwigluPrepWithLimit;
+    pub const fused_middle_down = clampedMiddleDownCoop;
+    pub const pair_reference = indexedPairCoopF16;
+    pub fn makeKernel(storage: *Slots, comptime name: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+        return codebookKernel(storage, name, ins, outs, source);
+    }
+};
+
 var lane_pair_enabled: ?bool = null;
 var lane_pair_calls: usize = 0;
 var lane_chain_calls: usize = 0;

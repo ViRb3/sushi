@@ -6,6 +6,7 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 pub const format = @import("expert_exl3.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
+pub const glm_group2 = @import("glm_group2.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],
 /// `suh` F16 [E, in], `svh` F16 [E, out].
@@ -64,7 +65,7 @@ pub fn moeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx
     return moeOutputClamped(s, x, bank, inds, scores, dec, false, mlx.mlx_array_dtype(x), null, limit);
 }
 
-fn validateClampedProjection(p: Proj, experts: c_int, input: c_int, output: c_int) !void {
+pub fn validateClampedProjection(p: Proj, experts: c_int, input: c_int, output: c_int) !void {
     const sh = mlx.getShape(p.trellis);
     if (input <= 0 or output <= 0 or @mod(input, 128) != 0 or @mod(output, 128) != 0 or
         sh.len != 4 or sh[0] != experts or sh[1] != @divExact(input, 16) or sh[2] != @divExact(output, 16) or sh[3] < 0 or
@@ -536,3 +537,5 @@ test "GLM clamped EXL3 rejects malformed banks before kernel dispatch" {
         try std.testing.expectError(if (c.dtype_error) error.BadExl3Dtype else error.BadExl3Shape, moeClamped(s, xv, bank, iv, sv, .{ .codebook = .mcg, .window = .w12 }, 10));
     }
 }
+
+test { _ = glm_group2; }
