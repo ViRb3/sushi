@@ -86,3 +86,37 @@ comparison. Existing MTP implementations for other families are not a validated
 GLM substitute. DFlash2 already has measured acceptance and a callable verifier,
 so its scheduling experiment remains the immediate path; MTP is a plausible
 subsequent implementation experiment, not excluded by missing trained weights.
+
+## First async full-checkpoint qualification
+
+A fixed ReleaseFast binary at `50795e0c` ran separate locked async4 and async2
+processes with the settings above: prefix512, committed64, N3, chunk128, BF16
+assistant, default BF16 target cache, one warmup, component/route profiling off.
+Both passed independent serial-token and complete committed-state parity. Their
+64 output IDs were identical, and each used 23 rounds with 41 accepted drafts.
+
+| Schedule | Committed tokens/s | Matched serial tokens/s | Ratio | Async / final sync calls | Decode peak bytes |
+|---|---:|---:|---:|---:|---:|
+| async4 | 32.001 | 25.556 | 1.2522 | 253 / 23 | 98,534,128,928 |
+| async2 | 31.684 | 25.724 | 1.2317 | 506 / 23 | 98,534,129,440 |
+
+Total draft/verify/replay/commit times were 159.73/1766.71/44.33/28.05 ms for
+async4 and 161.07/1786.85/43.33/27.64 ms for async2. The one-percent difference
+between schedules is provisional. Both improve on the older synchronous sample,
+but a same-binary synchronous control is needed to isolate the scheduling effect
+from unrelated intervening changes or run variation. The 45 tokens/s goal is open;
+async4 remains opt-in pending policy selection.
+
+Focused tests compare nonzero four-layer verification decisions, every KDA/MLA
+tape array, captured assistant features, and all committed caches for budgets
+1/3/5. A three-layer view covers incomplete async2 groups and an async4 run with
+no intermediate dispatch; final settlement still produces identical state.
+Component profiling overrides both schedules to the synchronous path. The
+scoped binding rejects unsupported cadences and restores its previous setting.
+
+Each full run used interactive QoS, its own GPU lock, fan-max request and ten-second
+idle, restoring automatic fans afterward. Private artifact
+`glm53-dflash-async-20261003` retains binary hash, source/build state, prompt/model
+config hashes, controller telemetry, raw phase metrics and output/state results.
+The built-in full-checkpoint test was run directly to avoid build-cache reuse
+when changing only environment settings.
