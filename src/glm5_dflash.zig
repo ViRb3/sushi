@@ -440,7 +440,8 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     }
 }
 
-pub fn loadAssistantBf16(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, target: *const forward.Model) !draft.DflashModel {
+/// Stored assistant matrices are used directly: no load-time requantization.
+pub fn loadAssistantStored(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, target: *const forward.Model) !draft.DflashModel {
     var dir = try std.Io.Dir.openDirAbsolute(io, directory, .{});
     defer dir.close(io);
     const raw = try dir.readFileAlloc(io, "config.json", allocator, .limited(2 * 1024 * 1024));
@@ -454,13 +455,57 @@ pub fn loadAssistantBf16(io: std.Io, allocator: std.mem.Allocator, directory: []
     var assistant = try draft.loadDflashQuant(io, allocator, target.s, directory, 0);
     errdefer assistant.deinit();
     try validatePair(&assistant, target);
-    if (assistant.fc.bits != 0 or mlx.mlx_array_dtype(assistant.fc.w) != .bfloat16) return error.GlmDraftRequiresBf16;
-    for (assistant.layers) |*layer| {
-        for ([_]*const draft.DflashLinear{ &layer.q, &layer.k, &layer.v, &layer.o, &layer.gate, &layer.up, &layer.down }) |linear| {
-            if (linear.bits != 0 or mlx.mlx_array_dtype(linear.w) != .bfloat16) return error.GlmDraftRequiresBf16;
-        }
-    }
+    _ = try assistantStorage(&assistant);
     return assistant;
+}
+
+/// Retained for callers that explicitly require the original BF16 assistant.
+pub fn loadAssistantBf16(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, target: *const forward.Model) !draft.DflashModel {
+    var assistant = try loadAssistantStored(io, allocator, directory, target);
+    errdefer assistant.deinit();
+    if ((try assistantStorage(&assistant)).affine_linears != 0) return error.GlmDraftRequiresBf16;
+    return assistant;
+}
+
+pub const AssistantStorage = struct {
+    bits: u32,
+    group_size: u32,
+    dense_linears: usize = 0,
+    affine_linears: usize = 0,
+    pub fn label(self: AssistantStorage) []const u8 {
+        return if (self.affine_linears == 0) "BF16" else if (self.bits == 8) "A8g128" else "A6g128";
+    }
+    fn add(self: *AssistantStorage, linear: *const draft.DflashLinear) !void {
+        if (linear.w.ctx == null) return error.UnsupportedGlmDraftStorage;
+        const ws = mlx.getShape(linear.w);
+        if (ws.len != 2 or ws[0] <= 0 or ws[1] <= 0) return error.UnsupportedGlmDraftStorage;
+        if (linear.bits == 0) {
+            if (mlx.mlx_array_dtype(linear.w) != .bfloat16 or linear.scales.ctx != null or linear.biases.ctx != null) return error.UnsupportedGlmDraftStorage;
+            self.dense_linears += 1;
+            return;
+        }
+        if ((linear.bits != 6 and linear.bits != 8) or linear.bits != self.bits or linear.group_size != 128 or
+            mlx.mlx_array_dtype(linear.w) != .uint32 or linear.scales.ctx == null or linear.biases.ctx == null or
+            mlx.mlx_array_dtype(linear.scales) != .bfloat16 or mlx.mlx_array_dtype(linear.biases) != .bfloat16) return error.UnsupportedGlmDraftStorage;
+        const ss = mlx.getShape(linear.scales);
+        if (ss.len != 2 or ss[0] != ws[0] or ss[1] <= 0 or !std.mem.eql(c_int, ss, mlx.getShape(linear.biases)) or
+            @as(u64, @intCast(ws[1])) * 32 != @as(u64, @intCast(ss[1])) * 128 * linear.bits) return error.UnsupportedGlmDraftStorage;
+        self.affine_linears += 1;
+    }
+};
+
+/// Validate every contracted matrix, including dynamic convolutions and selector.
+/// Dense small matrices may be retained alongside one uniform stored affine rate.
+pub fn assistantStorage(assistant: *const draft.DflashModel) !AssistantStorage {
+    var result = AssistantStorage{ .bits = assistant.fc.bits, .group_size = assistant.fc.group_size };
+    try result.add(&assistant.fc);
+    for (assistant.layers) |*layer| {
+        for ([_]*const draft.DflashLinear{ &layer.q, &layer.k, &layer.v, &layer.o, &layer.gate, &layer.up, &layer.down }) |linear| try result.add(linear);
+        if (layer.attention_conv) |*conv| try result.add(&conv.kernel_projection);
+        if (layer.mlp_conv) |*conv| try result.add(&conv.kernel_projection);
+    }
+    if (assistant.selector) |*selector| try result.add(&selector.hidden_projection);
+    return result;
 }
 
 /// Context capture is evaluated per caller-selected prefill chunk, without retaining full hidden history.
@@ -580,4 +625,41 @@ test {
 
 test {
     _ = @import("glm5_dflash_ffn.zig");
+}
+
+test "GLM draft stored BF16 A6 and A8 validate packed geometry without changing arrays" {
+    const nil = mlx.mlx_array{ .ctx = null };
+    const codes: [32]u32 = @splat(0);
+    const scales: [2]u16 = .{ 0x3f80, 0 };
+    for ([_]u32{ 6, 8 }) |bits| {
+        const cols: c_int = @intCast(128 * bits / 32);
+        const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ 1, cols }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(w);
+        const scale = mlx.mlx_array_new_data(&scales, &[_]c_int{ 1, 1 }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(scale);
+        var linear = draft.DflashLinear{ .w = w, .scales = scale, .biases = scale, .bits = bits, .group_size = 128 };
+        var storage = AssistantStorage{ .bits = bits, .group_size = 128 };
+        try storage.add(&linear);
+        try std.testing.expectEqual(@as(usize, 1), storage.affine_linears);
+        try std.testing.expectEqual(w.ctx, linear.w.ctx);
+        linear.group_size = 64;
+        try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
+        linear.group_size = 128;
+        linear.biases = nil;
+        try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
+        const bad = mlx.mlx_array_new_data(&scales, &[_]c_int{ 1, 2 }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(bad);
+        linear.biases = bad;
+        try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
+        linear.biases = scale;
+        linear.bits = if (bits == 6) 8 else 6;
+        try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
+    }
+    const w = mlx.mlx_array_new_data(&scales, &[_]c_int{ 1, 2 }, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(w);
+    const dense = draft.DflashLinear{ .w = w, .scales = nil, .biases = nil };
+    var storage = AssistantStorage{ .bits = 0, .group_size = 0 };
+    try storage.add(&dense);
+    try std.testing.expectEqual(@as(usize, 1), storage.dense_linears);
+    try std.testing.expectEqualStrings("BF16", storage.label());
 }

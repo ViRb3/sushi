@@ -134,3 +134,22 @@ Both speculative and serial rates increased relative to async-only; this single
 run should not attribute every difference exclusively to the kernel. Private
 artifact `glm53-dflash-lane-async-20261003` preserves the fixed binary and raw data.
 It is the BF16-assistant baseline for the following stored A8/A6 comparison.
+
+
+## Stored affine assistants
+
+The GLM diagnostic accepts the original BF16 assistant or stored affine6/group128
+and affine8/group128 assistants. `loadAssistantStored` calls the existing loader
+with load-time quantization disabled: packed tensors stay packed, and retained
+small BF16 matrices stay BF16. Shape/dtype validation covers encoder, every
+attention/MLP projection, dynamic-convolution projections and selector projection.
+The packed weight/scales/biases must have compatible affine geometry; mixed
+packed widths are rejected. The strict `loadAssistantBf16` entry point remains
+available for callers that require the original precision.
+
+The report derives `assistant_precision` and `assistant_storage` from loaded
+matrices, rather than the directory name. The target keeps BF16 compressed MLA
+cache and FP32 KDA state. Assistant quantization can change proposals and
+acceptance; each arm must still match the target's greedy serial tokens and
+complete committed state. Compare draft time, acceptance, total decode and peak
+memory under the same verifier settings before choosing a default.
