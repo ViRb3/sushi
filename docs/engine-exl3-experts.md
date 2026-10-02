@@ -81,6 +81,13 @@ subsequent GEMV, clamp and reduction arithmetic are unchanged. This removes the 
 weight copies. Direct plane tests cover distinct signed gate/up scales, expert IDs through 287, widths
 128/4096 and rows 1/8/16; end-to-end rate coverage includes rows 1/2/8/16/17.
 
+Matching gate/up bank shapes and rates also share one cooperative GEMV dispatch. Grid Z selects the
+projection's original input and weight pointers; the original K split remains zero and the four-simdgroup
+reduction and F16 stores are unchanged. Mixed-rate banks retain the separate-call fallback. Direct tests
+check both output planes byte-for-byte at every supported 2–4 bpw rate with distinct inputs and banks,
+and at 4096/2048 widths with top-k eight and one/sixteen rows. The new path does not concatenate or
+repack weights. Prefill continues to use the existing sorted GEMM path.
+
 The optimized routing matches the staged path bit-for-bit at every even packed width n32–64 (2–4 bpw),
 with BF16 and FP32 inputs/outputs, top-k eight, and decode/prefill rows. A K2.25/W12 case also checks the
 GLM hidden/intermediate widths 4096/2048. These are arithmetic and dispatch-structure checks; they do not

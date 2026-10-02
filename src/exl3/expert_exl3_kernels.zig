@@ -1889,6 +1889,67 @@ fn getIndexedCoopKernel() !mlx.mlx_fast_metal_kernel {
     return codebookKernel(&indexed_coop_kernel, "sushi_exl3_k4_mul1_gemv_indexed", &ins, &outs, INDEXED_COOP_SOURCE);
 }
 
+const INDEXED_PAIR_COOP_SOURCE: [:0]const u8 = blk: {
+    const split = "uint split = uint(threadgroup_position_in_grid.z);";
+    const at = std.mem.indexOf(u8, INDEXED_COOP_SOURCE, split).?;
+    const pointers =
+        \\const bool upper = threadgroup_position_in_grid.z != 0u;
+        \\const device half* x = upper ? xu : xg;
+        \\const device ushort* trellis = upper ? tu : tg;
+        \\device half* y = upper ? yu : yg;
+        \\
+    ;
+    // Grid Z selects a projection, never a K split. Keep the original loop
+    // and four-simdgroup reduction exactly as the standalone kernel.
+    break :blk pointers ++ INDEXED_COOP_SOURCE[0..at] ++ "uint split = 0u;" ++ INDEXED_COOP_SOURCE[at + split.len ..];
+};
+var indexed_pair_coop_kernel: KernelSlots = no_kernels;
+var indexed_pair_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
+var indexed_pair_coop_engaged: bool = false;
+
+fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array) !?[2]mlx.mlx_array {
+    const xs = mlx.getShape(xg);
+    const ts = mlx.getShape(tg);
+    const ss = mlx.getShape(slots);
+    if (!mlx.streamIsGpu(s) or xs.len != 2 or ts.len != 4 or ss.len != 1 or
+        !std.mem.eql(c_int, xs, mlx.getShape(xu)) or !std.mem.eql(c_int, ts, mlx.getShape(tu)) or
+        xs[0] <= 0 or xs[1] <= 0 or ts[0] <= 0 or ts[1] <= 0 or ts[2] <= 0 or
+        ts[1] > std.math.maxInt(c_int) / 16 or ts[2] > std.math.maxInt(c_int) / 128 or
+        xs[0] != ss[0] or ts[1] * 16 != xs[1] or
+        mlx.mlx_array_dtype(xg) != .float16 or mlx.mlx_array_dtype(xu) != .float16 or
+        mlx.mlx_array_dtype(tg) != .uint16 or mlx.mlx_array_dtype(tu) != .uint16 or
+        (mlx.mlx_array_dtype(slots) != .uint32 and mlx.mlx_array_dtype(slots) != .int32)) return null;
+    const rate = try packedRate(ts[3]);
+    const output = ts[2] * 16;
+    const key = IndexedKey{ .in_dim = xs[1], .out_dim = output, .topk = ss[0], .n = rate.n };
+    const cfg = indexed_pair_coop_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const shape = [_]c_int{ ss[0], output };
+        for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &shape, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, ts[2] * 128, ss[0], 2));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", xs[1]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", output));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
+        indexed_pair_coop_cfgs.put(key, c);
+        break :blk c;
+    };
+    const kernel = try codebookKernel(&indexed_pair_coop_kernel, "sushi_exl3_indexed_pair_coop", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, INDEXED_PAIR_COOP_SOURCE);
+    const outputs = try applyOuts(s, kernel, &.{ xg, xu, tg, tu, slots }, cfg, 2);
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    var result = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (result) |value| {
+        _ = mlx.mlx_array_free(value);
+    };
+    for (&result, 0..) |*value, i| try mlx.check(mlx.mlx_vector_array_get(value, outputs, i));
+    if (!indexed_pair_coop_engaged) {
+        indexed_pair_coop_engaged = true;
+        if (!@import("builtin").is_test) log.info("[exl3-decode] paired cooperative gate/up engaged inner=f16 k_splits=1\n", .{});
+    }
+    return result;
+}
+
 pub fn indexedGemvCoopF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
     const tsh = mlx.getShape(trellis);
@@ -3152,10 +3213,16 @@ pub fn moeSwigluClamped(
         const prep_u = prep[1];
         defer _ = mlx.mlx_array_free(prep_g);
         defer _ = mlx.mlx_array_free(prep_u);
-        const gate = try indexedGemvCoopF16(s, prep_g, gate_t, slots);
-        defer _ = mlx.mlx_array_free(gate);
-        const up = try indexedGemvCoopF16(s, prep_u, up_t, slots);
-        defer _ = mlx.mlx_array_free(up);
+        const pair = (try indexedPairCoopF16(s, prep_g, prep_u, gate_t, up_t, slots)) orelse blk: {
+            const gate = try indexedGemvCoopF16(s, prep_g, gate_t, slots);
+            errdefer _ = mlx.mlx_array_free(gate);
+            break :blk [2]mlx.mlx_array{ gate, try indexedGemvCoopF16(s, prep_u, up_t, slots) };
+        };
+        const gate = pair[0];
+        const up = pair[1];
+        defer for (pair) |value| {
+            _ = mlx.mlx_array_free(value);
+        };
         const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
         defer _ = mlx.mlx_array_free(prepared);
         const down = try indexedGemvCoopF16(s, prepared, down_t, slots);
@@ -9611,4 +9678,105 @@ test "exl3 GLM GPU windows preserve 288 expert production width bytes" {
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     try clampedGpuWindowBytes(4096, 2048, 36);
+}
+
+test "exl3 paired cooperative projections preserve separate F16 bytes" {
+    const a = std.testing.allocator;
+    const stream = mlx.gpuStream();
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.{ .codebook = .mul1, .window = .w16 });
+    var random = std.Random.DefaultPrng.init(563891);
+    const rnd = random.random();
+    var rate: c_int = 32;
+    while (rate <= 64) : (rate += 2) {
+        const bits = try a.alloc(u16, 3 * 8 * 16 * @as(usize, @intCast(rate)));
+        defer a.free(bits);
+        var banks: [2]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (banks[0..made]) |v| {
+            _ = mlx.mlx_array_free(v);
+        };
+        for (&banks) |*bank| {
+            for (bits) |*v| v.* = rnd.int(u16);
+            bank.* = mlx.mlx_array_new_data(bits.ptr, &[_]c_int{ 3, 8, 16, rate }, 4, .uint16);
+            made += 1;
+        }
+        var g: [8 * 128]u16 = undefined;
+        var u: [8 * 128]u16 = undefined;
+        var ids: [8]u32 = undefined;
+        for (&g, &u) |*gv, *uv| {
+            gv.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 8);
+            uv.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 8);
+        }
+        for (&ids, 0..) |*id, i| id.* = @intCast((i * 7) % 3);
+        const xg = mlx.mlx_array_new_data(&g, &[_]c_int{ 8, 128 }, 2, .float16);
+        defer _ = mlx.mlx_array_free(xg);
+        const xu = mlx.mlx_array_new_data(&u, &[_]c_int{ 8, 128 }, 2, .float16);
+        defer _ = mlx.mlx_array_free(xu);
+        const slots = mlx.mlx_array_new_data(&ids, &[_]c_int{8}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(slots);
+        const expected = [_]mlx.mlx_array{ try indexedGemvCoopF16(stream, xg, banks[0], slots), try indexedGemvCoopF16(stream, xu, banks[1], slots) };
+        defer for (expected) |v| {
+            _ = mlx.mlx_array_free(v);
+        };
+        resetFusedDispatchCount();
+        const got = (try indexedPairCoopF16(stream, xg, xu, banks[0], banks[1], slots)) orelse return error.TestExpectedPairedProjection;
+        try std.testing.expectEqual(@as(u32, 1), fusedDispatchCount());
+        defer for (got) |v| {
+            _ = mlx.mlx_array_free(v);
+        };
+        for (got, expected) |value, reference| try std.testing.expectEqualSlices(u8, try gemvOutBytes(reference), try gemvOutBytes(value));
+    }
+}
+
+test "exl3 paired cooperative projections preserve GLM width and mixed rate fallback" {
+    const s = mlx.gpuStream();
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    for ([_]usize{ 1, 16 }) |rows| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var f = try mimoMoeFixture(a, .{ .hidden = 4096, .inter = 2048, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = 36 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 29632 + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+        defer f.deinit();
+        const v = f.arrays;
+        var random = std.Random.DefaultPrng.init(9762 + rows);
+        var planes: [2]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (planes[0..made]) |value| {
+            _ = mlx.mlx_array_free(value);
+        };
+        for (&planes) |*plane| {
+            const data = try a.alloc(u16, rows * 8 * 4096);
+            for (data) |*value| value.* = exl3.f32ToF16Bits((random.random().float(f32) - 0.5) * 8);
+            plane.* = mlx.mlx_array_new_data(data.ptr, &.{ @intCast(rows * 8), 4096 }, 2, .float16);
+            made += 1;
+        }
+        const pair = (try indexedPairCoopF16(s, planes[0], planes[1], v[0], v[1], v[7])) orelse return error.TestExpectedPairedProjection;
+        defer for (pair) |value| {
+            _ = mlx.mlx_array_free(value);
+        };
+        for (pair, planes, [_]mlx.mlx_array{ v[0], v[1] }) |actual, plane, bank| {
+            const expected = try indexedGemvCoopF16(s, plane, bank, v[7]);
+            defer _ = mlx.mlx_array_free(expected);
+            try std.testing.expectEqualSlices(u8, try gemvOutBytes(expected), try gemvOutBytes(actual));
+        }
+        const mixed_up = mlx.mlx_array_new_data(f.up_t.ptr, &.{ 8, 256, 128, 32 }, 4, .uint16);
+        defer _ = mlx.mlx_array_free(mixed_up);
+        try std.testing.expect((try indexedPairCoopF16(s, planes[0], planes[1], v[0], mixed_up, v[7])) == null);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, v[8], .bfloat16, s));
+        const expected = try clampedSortedReference(s, x, v[0], v[3], v[4], mixed_up, v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(expected);
+        const actual = try moeSwigluClamped(s, x, v[0], v[3], v[4], mixed_up, v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(actual);
+        var ef = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ef);
+        var af = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(af);
+        try mlx.check(mlx.mlx_astype(&ef, expected, .float32, s));
+        try mlx.check(mlx.mlx_astype(&af, actual, .float32, s));
+        try std.testing.expectEqualSlices(u8, try gemvOutBytes(ef), try gemvOutBytes(af));
+    }
 }
