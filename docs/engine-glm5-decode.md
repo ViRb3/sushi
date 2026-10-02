@@ -98,7 +98,8 @@ one/17 rows measured277.02/318.44 versus163.23/187.63 microseconds. One-token mo
 already has its own larger fusion; this separate helper is integrated only for multiple rows.
 
 
-Eligible one-token HC calls now use the validated normalization/mix fusion. `Hc.collapseReference`
+Eligible one-token HC calls can opt into the normalization/mix fusion with `SUSHI_GLM_HC_FUSED=1`. `Hc.collapseReference`
 retains the staged path for unsupported geometry and independent tests/benchmarks. The diagnostic
-counts fused HC calls separately; full-model timing remains necessary to assess the queued
-component gain. This fusion leaves Sinkhorn iterations and stream collapse unchanged.
+counts fused HC calls separately. It is off by default: the full-model attribution run
+measured 26.49 tok/s with HC alone versus 26.54 with both decode candidates disabled, so the
+queued component gain did not establish an end-to-end benefit. This fusion leaves Sinkhorn iterations and stream collapse unchanged.

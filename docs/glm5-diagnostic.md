@@ -119,6 +119,8 @@ when capturing a single set of layer histograms for a replay microbenchmark.
 
 For same-binary full-model attribution, `SUSHI_GLM_HC_FUSED=0` disables the one-token
 HC candidate, and `SUSHI_EXL3_CLAMPED_MIDDLE=0` disables the fused clamped middle/down
-candidate. Unset flags retain the current candidate defaults. These controls distinguish
+candidate. HC is off by default and can be enabled with `SUSHI_GLM_HC_FUSED=1`. The middle/down
+auto mode retains the original serial path and selects the candidate only for eligible short
+multirow calls; explicit1 permits serial experiments. These controls distinguish
 warm component results from full-model streaming behavior; check the respective engagement
 counters. The initial combined arm preserved output IDs but did not show a decode gain.
