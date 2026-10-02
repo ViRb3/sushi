@@ -152,6 +152,13 @@ oMLX, by jundot
 Copyright oMLX contributors
 Licensed under the Apache License, Version 2.0.
 
+Used in sushi (`src/glm5_hc_fused.zig`):
+
+  * The one-token HC RMS reduction maps virtual MLX normalization threads
+    as in `hc_mix1` from `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py`
+    at 6745c39c. The following projection retains Sushi's own four-SIMD-group
+    reduction order. The MLX-derived normalization arithmetic is MIT licensed.
+
 Used in sushi (`src/glm5_decode.zig`):
 
   * The copy-free three-bank affine QKV dispatch adapts `multi_qmv` from
@@ -385,6 +392,11 @@ The row-identical 8-bit projection kernel in `src/mtp_qmv.zig` adapts
 `backend/metal/kernels/quantized.h` (Copyright (c) 2023-2024 Apple Inc.).
 It shares packed weights across input rows while preserving each serial
 row's lane assignment, reduction order and output rounding.
+
+The HC kernel in `src/glm5_hc_fused.zig` adapts the four-value-per-thread
+`rms_looped` reduction from MLX `backend/metal/kernels/rms_norm.metal`
+(Copyright 2024 Apple Inc.), also reflected in oMLX's HC normalization helper.
+It reads BF16 residuals directly and retains FP32 normalization before the mix.
 
 The affine QKV kernel in `src/glm5_decode.zig` also adapts `qmv_fast_impl`,
 `load_vector` and `qdot` from MLX quantized.h through oMLX's multi_qmv wrapper.
