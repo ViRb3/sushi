@@ -357,6 +357,14 @@ pub const Model = struct {
         self.allocator.free(self.layers);
     }
 
+    pub fn feedForwardLayer(self: *const Model, index: usize, ops: *Ops, x: Arr) !Arr {
+        if (index >= self.layers.len) return error.InvalidGlmLayer;
+        return switch (self.layers[index].ffn) {
+            .dense => |dense| dense.apply(ops, x, self.cfg.glm_swiglu_limit),
+            .moe => |moe| moe.apply(ops, x, &self.cfg),
+        };
+    }
+
     pub fn rawEmbedding(self: *const Model, ids: Arr) !Arr {
         var ops = Ops{ .s = self.s };
         defer ops.deinit();
