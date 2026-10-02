@@ -65,3 +65,26 @@ measured. Parallelizing it requires preserving or separately validating the redu
 positions. A block/chunk prefill implementation may improve long-prompt throughput, but an existing GDN path
 is not a proven substitute for GLM's vector decay and FP32 state. Full native validation and profiling should
 precede that optimization.
+
+## Serial decode scheduling follow-up
+
+The first native model loop evaluated every layer synchronously, including one-token decode. The decode
+schedule now submits the residual and changed cache outputs asynchronously every four layers, then
+performs one checked evaluation of final logits and all live request cache arrays before advancing the
+offset. It preserves the arithmetic graph. Per-layer operation scopes can release their handles because
+the live residual, cache handles and submitted graph retain the required dependencies.
+
+`Request.decode_async` defaults to true. Multi-token calls retain synchronous layer boundaries, and
+`Request.profile` also forces that schedule so per-layer timers measure completed work. A caller can
+select synchronous decode explicitly for comparison. Async scheduling may temporarily retain an old
+and new cache generation; it must not be treated as a reduction in the cache memory bill.
+
+The scheduling regression uses a nonzero four-layer model with three KDA layers, one MLA layer, dense
+and routed/shared feed-forward paths. Prefill followed by seven one-token calls produces bit-identical
+logits and every recurrent, convolution, latent, pooled and raw-tail cache array under both schedules.
+The test verifies nonzero recurrent state, request offsets and reset, and counts the actual synchronous
+and asynchronous submissions. A second test completes 80 decode calls; active Metal memory after the
+80th remains within 64 KiB of the 16-token warm snapshot, with unchanged reserved cache capacities and
+both snapshots at complete pool boundaries. It also checks that profiling restores synchronous layers.
+The focused ReleaseFast tests passed. These checks establish scheduling parity and bounded retention
+in that fixture; throughput and full-model peak memory require the separate serial benchmark.

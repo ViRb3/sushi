@@ -235,6 +235,7 @@ pub const Request = struct {
     offset: usize = 0,
     failed: bool = false,
     profile: bool = false,
+    decode_async: bool = true,
     layer_ns: [128]u64 = @splat(0),
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
@@ -255,6 +256,19 @@ pub const Request = struct {
         self.layer_ns = @splat(0);
     }
 };
+
+var schedule_test_syncs: usize = 0;
+var schedule_test_asyncs: usize = 0;
+
+fn appendLayerState(evals: mlx.mlx_vector_array, state: *const LayerState) !void {
+    if (state.recurrent.initialized) {
+        try mlx.check(mlx.mlx_vector_array_append_value(evals, state.recurrent.conv_state));
+        try mlx.check(mlx.mlx_vector_array_append_value(evals, state.recurrent.ssm_state));
+    }
+    for (state.attention.arrays()) |cache| if (cache.ctx != null) {
+        try mlx.check(mlx.mlx_vector_array_append_value(evals, cache));
+    };
+}
 
 pub const Model = struct {
     allocator: std.mem.Allocator,
@@ -315,6 +329,7 @@ pub const Model = struct {
         if (request.failed) return error.GlmRequestNeedsReset;
         if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
         errdefer request.failed = true;
+        const staged_decode = ish[1] == 1 and request.decode_async and !request.profile;
         var h: Arr = undefined;
         {
             var ops = Ops{ .s = self.s };
@@ -345,16 +360,19 @@ pub const Model = struct {
                 .moe => |moe| try moe.apply(&ops, fx, &self.cfg),
             };
             const next = try ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
-            const evals = mlx.mlx_vector_array_new_value(next);
-            defer _ = mlx.mlx_vector_array_free(evals);
-            if (state.recurrent.initialized) {
-                try mlx.check(mlx.mlx_vector_array_append_value(evals, state.recurrent.conv_state));
-                try mlx.check(mlx.mlx_vector_array_append_value(evals, state.recurrent.ssm_state));
+            if (!staged_decode or (layer_index + 1) % 4 == 0) {
+                const evals = mlx.mlx_vector_array_new_value(next);
+                defer _ = mlx.mlx_vector_array_free(evals);
+                if (staged_decode) {
+                    for (request.layers[layer_index - 3 .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
+                    try mlx.check(mlx.mlx_async_eval(evals));
+                    if (@import("builtin").is_test) schedule_test_asyncs += 1;
+                } else {
+                    try appendLayerState(evals, state);
+                    try mlx.check(mlx.mlx_eval(evals));
+                    if (@import("builtin").is_test) schedule_test_syncs += 1;
+                }
             }
-            for (state.attention.arrays()) |cache| if (cache.ctx != null) {
-                try mlx.check(mlx.mlx_vector_array_append_value(evals, cache));
-            };
-            try mlx.check(mlx.mlx_eval(evals));
             try mlx.check(mlx.mlx_array_set(&h, next));
             if (timer) |clock| request.layer_ns[layer_index] += clock.read();
         }
@@ -364,6 +382,15 @@ pub const Model = struct {
         const normalized = try ops.rms(try ops.reduce(chosen, 2, true, false), self.norm, self.cfg.rms_norm_eps);
         const logits = try self.head.apply(&ops, normalized);
         const result = try ops.result(logits);
+        errdefer _ = mlx.mlx_array_free(result);
+        if (staged_decode) {
+            // Cache side outputs must settle even when they are not ancestors of logits.
+            const evals = mlx.mlx_vector_array_new_value(result);
+            defer _ = mlx.mlx_vector_array_free(evals);
+            for (request.layers) |*state| try appendLayerState(evals, state);
+            try mlx.check(mlx.mlx_eval(evals));
+            if (@import("builtin").is_test) schedule_test_syncs += 1;
+        }
         request.offset += @intCast(ish[1]);
         return result;
     }
@@ -383,10 +410,8 @@ fn fixtureMlp(weights: *model.Weights, prefix: []const u8) !void {
         try fixtureTensor(weights, prefix, leaf, &.{ 128, 128 }, .bfloat16, false);
 }
 
-test "GLM complete diagnostic forward advances and resets request state" {
+fn completeFixture(weights: *model.Weights) !model.ModelConfig {
     const a = std.testing.allocator;
-    var weights = model.Weights.init(a);
-    defer weights.deinit();
     const cfg = model.ModelConfig{
         .model_type = "glm5_next",
         .weight_prefix = "model.language_model",
@@ -427,50 +452,58 @@ test "GLM complete diagnostic forward advances and resets request state" {
         const key = try std.fmt.allocPrint(a, "{s}.weight", .{name});
         const code = mlx.mlx_array_new_data(&codes, &[_]c_int{ 4, 32 }, 2, .uint32);
         try weights.map.put(key, code);
-        try fixtureTensor(&weights, name, "scales", &.{ 4, 1 }, .bfloat16, true);
-        try fixtureTensor(&weights, name, "biases", &.{ 4, 1 }, .bfloat16, false);
+        try fixtureTensor(weights, name, "scales", &.{ 4, 1 }, .bfloat16, true);
+        try fixtureTensor(weights, name, "biases", &.{ 4, 1 }, .bfloat16, false);
     }
-    try fixtureTensor(&weights, cfg.weight_prefix, "norm.weight", &.{128}, .bfloat16, true);
+    try fixtureTensor(weights, cfg.weight_prefix, "norm.weight", &.{128}, .bfloat16, true);
 
     for (0..4) |i| {
         var buf: [128]u8 = undefined;
         const p = try std.fmt.bufPrint(&buf, "model.language_model.layers.{d}", .{i});
-        for ([_][]const u8{ "hc_attn_fn", "hc_ffn_fn" }) |k| try fixtureTensor(&weights, p, k, &.{ 24, 512 }, .float32, false);
-        for ([_][]const u8{ "hc_attn_scale", "hc_ffn_scale" }) |k| try fixtureTensor(&weights, p, k, &.{3}, .float32, false);
-        for ([_][]const u8{ "hc_attn_base", "hc_ffn_base" }) |k| try fixtureTensor(&weights, p, k, &.{24}, .float32, false);
-        for ([_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight" }) |k| try fixtureTensor(&weights, p, k, &.{128}, .bfloat16, true);
+        for ([_][]const u8{ "hc_attn_fn", "hc_ffn_fn" }) |k| try fixtureTensor(weights, p, k, &.{ 24, 512 }, .float32, false);
+        for ([_][]const u8{ "hc_attn_scale", "hc_ffn_scale" }) |k| try fixtureTensor(weights, p, k, &.{3}, .float32, false);
+        for ([_][]const u8{ "hc_attn_base", "hc_ffn_base" }) |k| try fixtureTensor(weights, p, k, &.{24}, .float32, false);
+        for ([_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight" }) |k| try fixtureTensor(weights, p, k, &.{128}, .bfloat16, true);
         var sb: [160]u8 = undefined;
         const ap = try std.fmt.bufPrint(&sb, "{s}.self_attn", .{p});
         if (i < 3) {
-            for ([_][]const u8{ "q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "f_b_proj.weight", "g_a_proj.weight", "g_b_proj.weight", "o_proj.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{ 128, 128 }, .bfloat16, false);
-            try fixtureTensor(&weights, ap, "b_proj.weight", &.{ 1, 128 }, .bfloat16, false);
-            for ([_][]const u8{ "q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{ 128, 1, 4 }, .bfloat16, false);
-            try fixtureTensor(&weights, ap, "A_log", &.{1}, .float32, false);
-            try fixtureTensor(&weights, ap, "dt_bias", &.{128}, .float32, false);
-            try fixtureTensor(&weights, ap, "o_norm.weight", &.{128}, .bfloat16, true);
+            for ([_][]const u8{ "q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "f_b_proj.weight", "g_a_proj.weight", "g_b_proj.weight", "o_proj.weight" }) |k| try fixtureTensor(weights, ap, k, &.{ 128, 128 }, .bfloat16, false);
+            try fixtureTensor(weights, ap, "b_proj.weight", &.{ 1, 128 }, .bfloat16, false);
+            for ([_][]const u8{ "q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight" }) |k| try fixtureTensor(weights, ap, k, &.{ 128, 1, 4 }, .bfloat16, false);
+            try fixtureTensor(weights, ap, "A_log", &.{1}, .float32, false);
+            try fixtureTensor(weights, ap, "dt_bias", &.{128}, .float32, false);
+            try fixtureTensor(weights, ap, "o_norm.weight", &.{128}, .bfloat16, true);
         } else {
-            for ([_][]const u8{ "q_a_proj.weight", "q_b_proj.weight", "kv_a_proj_with_mqa.weight", "o_proj.weight", "indexer.wq_b.weight", "indexer.wk.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{ 128, 128 }, .bfloat16, false);
-            try fixtureTensor(&weights, ap, "kv_b_proj.weight", &.{ 256, 128 }, .bfloat16, false);
-            for ([_][]const u8{ "q_a_layernorm.weight", "kv_a_layernorm.weight", "indexer.k_norm.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{128}, .bfloat16, true);
-            try fixtureTensor(&weights, ap, "indexer.k_norm.bias", &.{128}, .bfloat16, false);
-            try fixtureTensor(&weights, ap, "indexer.weights_proj.weight", &.{ 1, 128 }, .bfloat16, false);
-            try fixtureTensor(&weights, ap, "indexer.index_kpool_compress_gate", &.{ 128, 128 }, .bfloat16, false);
-            try fixtureTensor(&weights, ap, "indexer.index_kpool_compress_ape", &.{ 4, 128 }, .bfloat16, false);
+            for ([_][]const u8{ "q_a_proj.weight", "q_b_proj.weight", "kv_a_proj_with_mqa.weight", "o_proj.weight", "indexer.wq_b.weight", "indexer.wk.weight" }) |k| try fixtureTensor(weights, ap, k, &.{ 128, 128 }, .bfloat16, false);
+            try fixtureTensor(weights, ap, "kv_b_proj.weight", &.{ 256, 128 }, .bfloat16, false);
+            for ([_][]const u8{ "q_a_layernorm.weight", "kv_a_layernorm.weight", "indexer.k_norm.weight" }) |k| try fixtureTensor(weights, ap, k, &.{128}, .bfloat16, true);
+            try fixtureTensor(weights, ap, "indexer.k_norm.bias", &.{128}, .bfloat16, false);
+            try fixtureTensor(weights, ap, "indexer.weights_proj.weight", &.{ 1, 128 }, .bfloat16, false);
+            try fixtureTensor(weights, ap, "indexer.index_kpool_compress_gate", &.{ 128, 128 }, .bfloat16, false);
+            try fixtureTensor(weights, ap, "indexer.index_kpool_compress_ape", &.{ 4, 128 }, .bfloat16, false);
         }
         const mp = try std.fmt.bufPrint(&sb, "{s}.mlp", .{p});
-        if (i < 3) try fixtureMlp(&weights, mp) else {
-            try fixtureTensor(&weights, mp, "gate.weight", &.{ 2, 128 }, .float32, false);
-            try fixtureTensor(&weights, mp, "gate.e_score_correction_bias", &.{2}, .float32, false);
+        if (i < 3) try fixtureMlp(weights, mp) else {
+            try fixtureTensor(weights, mp, "gate.weight", &.{ 2, 128 }, .float32, false);
+            try fixtureTensor(weights, mp, "gate.e_score_correction_bias", &.{2}, .float32, false);
             var pb: [220]u8 = undefined;
             for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
                 const name = try std.fmt.bufPrint(&pb, "{s}.switch_mlp.{s}", .{ mp, proj });
-                try fixtureTensor(&weights, name, "trellis", &.{ 2, 8, 8, 36 }, .uint16, false);
-                try fixtureTensor(&weights, name, "suh", &.{ 2, 128 }, .float16, false);
-                try fixtureTensor(&weights, name, "svh", &.{ 2, 128 }, .float16, false);
+                try fixtureTensor(weights, name, "trellis", &.{ 2, 8, 8, 36 }, .uint16, false);
+                try fixtureTensor(weights, name, "suh", &.{ 2, 128 }, .float16, false);
+                try fixtureTensor(weights, name, "svh", &.{ 2, 128 }, .float16, false);
             }
-            try fixtureMlp(&weights, try std.fmt.bufPrint(&pb, "{s}.shared_experts", .{mp}));
+            try fixtureMlp(weights, try std.fmt.bufPrint(&pb, "{s}.shared_experts", .{mp}));
         }
     }
+    return cfg;
+}
+
+test "GLM complete diagnostic forward advances and resets request state" {
+    const a = std.testing.allocator;
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try completeFixture(&weights);
     var mdl = try Model.load(a, cfg, &weights, mlx.gpuStream());
     defer mdl.deinit();
     var req = try Request.init(a, 4);
@@ -572,4 +605,138 @@ test "GLM MLA stored affine kv rows preserve both projection orientations" {
     try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(value_dense).?[0..512], mlx.mlx_array_data_float32(value_quant).?[0..512]);
     try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(layer.wk));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(layer.sk));
+}
+
+fn nonzeroDecodeFixture(weights: *model.Weights) !model.ModelConfig {
+    var cfg = try completeFixture(weights);
+    cfg.max_position_embeddings = 512;
+    var iter = weights.map.iterator();
+    var seed: usize = 0;
+    while (iter.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const old = entry.value_ptr.*;
+        const dtype = mlx.mlx_array_dtype(old);
+        if (dtype != .bfloat16 and dtype != .float32 and dtype != .float16) continue;
+        if (std.mem.endsWith(u8, name, ".scales") or std.mem.endsWith(u8, name, ".biases") or std.mem.indexOf(u8, name, "norm.weight") != null) continue;
+        const count = mlx.mlx_array_size(old);
+        const host = try std.testing.allocator.alloc(f32, count);
+        defer std.testing.allocator.free(host);
+        for (host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt((i + seed) % 11)) - 5) / 256;
+        if (std.mem.endsWith(u8, name, ".suh") or std.mem.endsWith(u8, name, ".svh")) @memset(host, 0.125);
+        if (std.mem.endsWith(u8, name, "_scale")) @memset(host, 0.25);
+        const shape = mlx.getShape(old);
+        const f = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
+        defer _ = mlx.mlx_array_free(f);
+        var value = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(value);
+        try mlx.check(mlx.mlx_astype(&value, f, dtype, mlx.gpuStream()));
+        _ = mlx.mlx_array_free(old);
+        entry.value_ptr.* = value;
+        seed += 1;
+    }
+    return cfg;
+}
+
+fn expectArrayBits(a: Arr, b: Arr) !void {
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const av = try ops.cast(a, .float32);
+    const bv = try ops.cast(b, .float32);
+    try mlx.check(mlx.mlx_array_eval(av));
+    try mlx.check(mlx.mlx_array_eval(bv));
+    const count = mlx.mlx_array_size(av);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(av).?[0..count]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(bv).?[0..count]));
+}
+
+fn expectRequestBits(a: *Request, b: *Request) !void {
+    try std.testing.expectEqual(a.offset, b.offset);
+    for (a.layers, b.layers) |*left, *right| {
+        try std.testing.expectEqual(left.recurrent.initialized, right.recurrent.initialized);
+        if (left.recurrent.initialized) {
+            try expectArrayBits(left.recurrent.conv_state, right.recurrent.conv_state);
+            try expectArrayBits(left.recurrent.ssm_state, right.recurrent.ssm_state);
+        }
+        try std.testing.expectEqual(left.attention.processed, right.attention.processed);
+        for (left.attention.arrays(), right.attention.arrays()) |x, y| {
+            try std.testing.expectEqual(x.ctx == null, y.ctx == null);
+            if (x.ctx != null) try expectArrayBits(x, y);
+        }
+    }
+}
+
+test "GLM async decode preserves nonzero logits and every cache state" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(a, cfg, &weights, s);
+    defer net.deinit();
+    var sync = try Request.init(a, 4);
+    defer sync.deinit();
+    sync.decode_async = false;
+    var staged = try Request.init(a, 4);
+    defer staged.deinit();
+    staged.decode_async = true;
+    for ([_]usize{ 3, 1, 1, 1, 1, 1, 1, 1 }) |width| {
+        const tokens = [_]u32{ 1, 2, 3 };
+        const ids = mlx.mlx_array_new_data(&tokens, &[_]c_int{ 1, @intCast(width) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const x = try net.forward(&sync, ids);
+        defer _ = mlx.mlx_array_free(x);
+        schedule_test_syncs = 0;
+        schedule_test_asyncs = 0;
+        const y = try net.forward(&staged, ids);
+        defer _ = mlx.mlx_array_free(y);
+        try std.testing.expectEqual(@as(usize, if (width == 1) 1 else 4), schedule_test_syncs);
+        try std.testing.expectEqual(@as(usize, if (width == 1) 1 else 0), schedule_test_asyncs);
+        try expectArrayBits(x, y);
+        try expectRequestBits(&sync, &staged);
+    }
+    const state = sync.layers[0].recurrent.ssm_state;
+    try mlx.check(mlx.mlx_array_eval(state));
+    var nonzero: usize = 0;
+    for (mlx.mlx_array_data_float32(state).?[0..mlx.mlx_array_size(state)]) |v| {
+        if (v != 0) nonzero += 1;
+    }
+    try std.testing.expect(nonzero > 0);
+    sync.reset();
+    staged.reset();
+    try expectRequestBits(&sync, &staged);
+}
+
+test "GLM async decode settles graphs and profiling retains layer boundaries" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(a, cfg, &weights, s);
+    defer net.deinit();
+    var request = try Request.init(a, 4);
+    defer request.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]u32{1}, &[_]c_int{ 1, 1 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    var baseline: usize = 0;
+    for (0..80) |i| {
+        const result = try net.forwardLast(&request, ids, true);
+        _ = mlx.mlx_array_free(result);
+        if (i == 15) try mlx.check(mlx.mlx_get_active_memory(&baseline));
+    }
+    var active: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&active));
+    // Both snapshots end on a complete pool with the same reserved cache capacity.
+    try std.testing.expect(active <= baseline + 64 * 1024);
+    try std.testing.expectEqual(@as(usize, 80), request.offset);
+    request.profile = true;
+    schedule_test_syncs = 0;
+    schedule_test_asyncs = 0;
+    const result = try net.forwardLast(&request, ids, true);
+    defer _ = mlx.mlx_array_free(result);
+    try mlx.check(mlx.mlx_array_eval(result));
+    try std.testing.expectEqual(@as(usize, 4), schedule_test_syncs);
+    try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
+    for (request.layer_ns[0..4]) |ns| try std.testing.expect(ns > 0);
 }
