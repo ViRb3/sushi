@@ -124,3 +124,13 @@ idle, restoring automatic fans afterward. Private artifact
 config hashes, controller telemetry, raw phase metrics and output/state results.
 The built-in full-checkpoint test was run directly to avoid build-cache reuse
 when changing only environment settings.
+
+The subsequent opt-in lane-pair plus async4 composition measured **34.938 tokens/s**
+against matched serial **27.691** (1.2617×). It retained the same 64 IDs, complete
+state parity, 23 rounds/41 accepted drafts, and 98,534,128,928-byte decode peak.
+The pair and full-chain counters both recorded 966 calls; async/final-sync counts
+were 253/23. Verify time was 1596.68 ms, draft160.90, replay44.91 and commit28.26.
+Both speculative and serial rates increased relative to async-only; this single
+run should not attribute every difference exclusively to the kernel. Private
+artifact `glm53-dflash-lane-async-20261003` preserves the fixed binary and raw data.
+It is the BF16-assistant baseline for the following stored A8/A6 comparison.
