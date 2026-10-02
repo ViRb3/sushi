@@ -28,3 +28,25 @@ runner; they are used on the sole MLX inference thread and do not synchronize th
 Larger KDA convolution, normalization, gate and recurrence fusions remain separate work. They have more
 rounding boundaries and must preserve the established layer reference before integration. This module
 adds no speculative decoding path.
+
+
+## Fused one-token KDA body
+
+The mixed checkpoint retains BF16 low-rank gate and beta projections. The native path computes
+those projections in their stored format, then adapts oMLX's precomputed-gate KDA body. One Metal
+dispatch performs depthwise convolution, BF16 SiLU, query/key L2 normalization, per-channel forget
+gates, delta recurrence, and gated output normalization. The output projection remains separate.
+Prepared convolution weights and exp(A_log) are reused; recurrent state stays FP32.
+
+This path is restricted to the tested M5-class backend, one BF16 token, head width128, convolution
+width4 and lower bound-5. Unsupported shapes retain the reference implementation. Before first use,
+small probes select the unary-math variants matching this MLX build; unsupported math does not enable
+the fusion. Probe errors do not poison the capability cache. Input shapes/dtypes and launch products
+are checked, and immutable launch configurations are cached by head count.
+
+Strict regressions compare output, convolution history and every FP32 recurrent-state bit across
+five consecutive decode steps, cold and nonzero initial states, and1/3/64 heads with different head
+parameters. The complete GLM-filtered suite also passed with this path enabled, including the draft
+adapter's branch-state tests. The diagnostic records successful KDA-body dispatches independently
+from QKV dispatches. Full-checkpoint throughput is a separate measurement, not inferred from these
+fusion or parity results.

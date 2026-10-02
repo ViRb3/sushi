@@ -99,14 +99,6 @@ Reproduced from MTPLX's NOTICE file:
     (https://github.com/bstnxbt/dflash-mlx), Copyright dflash-mlx contributors,
     licensed under the Apache License 2.0. See mtplx/nax_verify.py for details.
 
-Used in sushi (`src/glm5_decode.zig`):
-
-  * The copy-free three-bank affine QKV dispatch adapts `multi_qmv` from
-    `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py` at 6745c39c.
-    It is restricted to one BF16 input row, 8-bit weights and group128;
-    each bank keeps its original packed weights, scales and biases.
-    Its MLX-derived qmv-fast arithmetic retains the MIT attribution below.
-
 Used in sushi (`src/transformer.zig`):
 
   * The verify-shaped quantized matmul kernel family (`verifyQmm`), ported from
@@ -159,6 +151,22 @@ through upstream mlx-serve's port and extended to separate key and value widths.
 oMLX, by jundot
 Copyright oMLX contributors
 Licensed under the Apache License, Version 2.0.
+
+Used in sushi (`src/glm5_decode.zig`):
+
+  * The copy-free three-bank affine QKV dispatch adapts `multi_qmv` from
+    `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py` at 6745c39c.
+    It is restricted to one BF16 input row, 8-bit weights and group128;
+    each bank keeps its original packed weights, scales and biases.
+    Its MLX-derived qmv-fast arithmetic retains the MIT attribution below.
+
+Used in sushi (`src/glm5_kda_fused.zig`):
+
+  * The one-token KDA body adapts `_KDA_SOURCE` from the same 6745c39c
+    GLM decode-kernel module. It uses externally projected BF16 gates,
+    prepared decay constants and runtime-matched unary math, while
+    retaining FP32 recurrent state. The sigmoid expressions derive from
+    MLX's MIT-licensed elementwise functors.
 
 Used in sushi (`src/transformer.zig`):
 

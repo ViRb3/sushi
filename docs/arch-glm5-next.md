@@ -7,7 +7,9 @@ remain open. See [diagnostic usage](glm5-diagnostic.md) and [attention/cache det
 
 Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-glm5-dflash2.md),
 [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),
-[copy-free QKV kernel](engine-glm5-decode.md). This document is the GLM documentation index.
+[serial decode kernels](engine-glm5-decode.md),
+[external runtime comparison](glm5-external-efficiency-comparison.md), and
+[internal reuse comparison](glm5-internal-efficiency-comparison.md). This document is the GLM documentation index.
 
 ## Checkpoint and implementation status (2026-10-02)
 
@@ -245,3 +247,13 @@ handles. Captures are the mean of the four post-layer residual streams, before f
 They are evaluated with layer/final cache outputs to avoid retaining an unevaluated full residual history.
 A regression checks shape, dtype, value, head-without-extra-normalization semantics and fail-closed
 layer selection. These hooks do not by themselves implement speculative verification or serving.
+
+
+The combined scheduling/QKV/metadata version (`b133d4ce`) measured747.83 tok/s prefill and24.57 tok/s
+serial decode on512/64, peak96.965 GB, with all64 output IDs equal to the prior dense-prefill arm.
+All2,142 timed KDA QKV calls used the new kernel. These extra changes did not demonstrate a material
+speed gain beyond the earlier async/dense-prefill improvements.
+
+A separate2048/64 context run (`ddcf219f`, chunk2048, eight warmup decode steps) measured863.10 tok/s
+prefill and20.23 tok/s decode, peak99.689 GB. It crossed the live sparse-selection boundary and produced
+coherent English. This is a different workload, not a same-length speedup or achievement of1,000/60.

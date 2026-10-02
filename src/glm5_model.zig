@@ -418,12 +418,7 @@ pub const KdaLayer = struct {
         return result;
     }
 
-    pub fn apply(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("transformer.zig").SSMCacheEntry) !Arr {
-        const sh = mlx.getShape(x);
-        const heads: c_int = @intCast(cfg.linear_num_value_heads);
-        const dim: c_int = @intCast(cfg.linear_key_head_dim);
-        const width = heads * dim;
-        const keep: c_int = @intCast(cfg.linear_conv_kernel_dim - 1);
+    fn projectQkv(self: KdaLayer, ops: *Ops, x: Arr) !Arr {
         const projections = if (try @import("glm5_decode.zig").qkv(ops.s, x, .{
             .{ .weight = self.q.w, .scales = self.q.scales, .biases = self.q.biases },
             .{ .weight = self.k.w, .scales = self.k.scales, .biases = self.k.biases },
@@ -440,7 +435,40 @@ pub const KdaLayer = struct {
             }
             break :blk result;
         } else [_]Arr{ try self.q.apply(ops, x), try self.k.apply(ops, x), try self.v.apply(ops, x) };
-        const joined = try ops.concat(&projections, -1);
+        return ops.concat(&projections, -1);
+    }
+
+    pub fn applyFused(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("transformer.zig").SSMCacheEntry) !?Arr {
+        const sh = mlx.getShape(x);
+        if (sh.len != 3 or sh[0] != 1 or sh[1] != 1 or mlx.mlx_array_dtype(x) != .bfloat16 or cfg.linear_key_head_dim != 128 or cfg.linear_conv_kernel_dim != 4 or cfg.kda_gate_lower_bound != -5 or self.prepared_conv.ctx == null or self.prepared_decay.ctx == null or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
+        const heads: c_int = @intCast(cfg.linear_num_value_heads);
+        const width = heads * 128;
+        const joined = try self.projectQkv(ops, x);
+        const previous = if (state.initialized) state.conv_state else try ops.zeros(&.{ 1, 3, width * 3 }, .bfloat16);
+        const recurrent = if (state.initialized) state.ssm_state else try ops.zeros(&.{ 1, heads, 128, 128 }, .float32);
+        const a = try self.fb.apply(ops, try self.fa.apply(ops, x));
+        const gate = try self.gb.apply(ops, try self.ga.apply(ops, x));
+        const beta = try self.beta.apply(ops, x);
+        const result = (try @import("glm5_kda_fused.zig").step(ops.s, .{ .qkv = joined, .beta = beta, .a = a, .gate = gate, .conv_weight = self.prepared_conv, .exp_a = self.prepared_decay, .dt_bias = self.dt_bias, .norm = self.out_norm, .conv_state = previous, .state = recurrent, .heads = heads, .norm_eps = cfg.rms_norm_eps, .lower = cfg.kda_gate_lower_bound })) orelse return null;
+        defer result.deinit();
+        try mlx.check(mlx.mlx_array_set(&state.conv_state, result.conv));
+        try mlx.check(mlx.mlx_array_set(&state.ssm_state, result.state));
+        state.initialized = true;
+        return try self.out.apply(ops, result.y);
+    }
+
+    pub fn apply(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("transformer.zig").SSMCacheEntry) !Arr {
+        if (try self.applyFused(ops, x, cfg, state)) |result| return result;
+        return self.applyReference(ops, x, cfg, state);
+    }
+
+    pub fn applyReference(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("transformer.zig").SSMCacheEntry) !Arr {
+        const sh = mlx.getShape(x);
+        const heads: c_int = @intCast(cfg.linear_num_value_heads);
+        const dim: c_int = @intCast(cfg.linear_key_head_dim);
+        const width = heads * dim;
+        const keep: c_int = @intCast(cfg.linear_conv_kernel_dim - 1);
+        const joined = try self.projectQkv(ops, x);
         const previous = if (state.initialized) state.conv_state else try ops.zeros(&.{ sh[0], keep, width * 3 }, mlx.mlx_array_dtype(x));
         const conv_input = try ops.concat(&.{ previous, joined }, 1);
         const conv_weight = if (self.prepared_conv.ctx != null) self.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
@@ -726,4 +754,96 @@ test "GLM prepared KDA constants preserve results and have idempotent ownership"
     layer.deinit();
     layer.deinit();
     try std.testing.expect(layer.prepared_conv.ctx == null and layer.prepared_decay.ctx == null);
+}
+
+fn expectLayerBits(actual: Arr, expected: Arr) !void {
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(expected), mlx.getShape(actual));
+    try std.testing.expectEqual(mlx.mlx_array_dtype(expected), mlx.mlx_array_dtype(actual));
+    try mlx.check(mlx.mlx_array_eval(actual));
+    try mlx.check(mlx.mlx_array_eval(expected));
+    const n = mlx.mlx_array_size(actual);
+    if (mlx.mlx_array_dtype(actual) == .bfloat16) {
+        for (mlx.mlx_array_data_bfloat16(actual).?[0..n], mlx.mlx_array_data_bfloat16(expected).?[0..n]) |x, y| try std.testing.expectEqual(y, x);
+    } else {
+        for (mlx.mlx_array_data_float32(actual).?[0..n], mlx.mlx_array_data_float32(expected).?[0..n]) |x, y| try std.testing.expectEqual(@as(u32, @bitCast(y)), @as(u32, @bitCast(x)));
+    }
+}
+
+test "GLM fused KDA decode preserves output and FP32 state exactly" {
+    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
+    for ([_]u32{ 1, 3, 64 }) |heads| {
+        var fixture = try loadLayerFixture();
+        defer fixture.deinit();
+        if (heads > 1) {
+            const Repeated = struct { key: []const u8, axis: c_int };
+            for ([_]Repeated{
+                .{ .key = "a.q_proj.weight", .axis = 0 },   .{ .key = "a.k_proj.weight", .axis = 0 },   .{ .key = "a.v_proj.weight", .axis = 0 },
+                .{ .key = "a.f_b_proj.weight", .axis = 0 }, .{ .key = "a.g_b_proj.weight", .axis = 0 }, .{ .key = "a.b_proj.weight", .axis = 0 },
+                .{ .key = "a.o_proj.weight", .axis = 1 },   .{ .key = "a.q_conv1d.weight", .axis = 0 }, .{ .key = "a.k_conv1d.weight", .axis = 0 },
+                .{ .key = "a.v_conv1d.weight", .axis = 0 }, .{ .key = "a.A_log", .axis = 0 },           .{ .key = "a.dt_bias", .axis = 0 },
+                .{ .key = "initial.conv", .axis = 2 },      .{ .key = "initial.state", .axis = 1 },
+            }) |spec| {
+                const value = fixture.map.getPtr(spec.key).?;
+                var repeated = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_repeat_axis(&repeated, value.*, @intCast(heads), spec.axis, mlx.gpuStream()));
+                _ = mlx.mlx_array_free(value.*);
+                value.* = repeated;
+            }
+        }
+        {
+            var setup = Ops{ .s = mlx.gpuStream() };
+            defer setup.deinit();
+            var head_scale: [64]f32 = undefined;
+            var logs: [64]f32 = undefined;
+            for (head_scale[0..heads], logs[0..heads], 0..) |*scale, *value, h| {
+                scale.* = 0.5 + @as(f32, @floatFromInt(h)) / 64;
+                value.* = -0.5 + @as(f32, @floatFromInt(h)) / 32;
+            }
+            const decay = fixture.map.getPtr("a.A_log").?;
+            const decay_new = mlx.mlx_array_new_data(&logs, &[_]c_int{@intCast(heads)}, 1, .float32);
+            _ = mlx.mlx_array_free(decay.*);
+            decay.* = decay_new;
+            const factors = try setup.own(mlx.mlx_array_new_data(&head_scale, &[_]c_int{ @intCast(heads), 1 }, 2, .float32));
+            const beta = fixture.map.getPtr("a.b_proj.weight").?;
+            const beta_new = try setup.result(try setup.cast(try setup.binary(.mul, beta.*, factors), .bfloat16));
+            _ = mlx.mlx_array_free(beta.*);
+            beta.* = beta_new;
+            const initial = fixture.map.getPtr("initial.state").?;
+            const initial_new = try setup.result(try setup.binary(.mul, initial.*, try setup.reshape(factors, &.{ 1, @intCast(heads), 1, 1 })));
+            _ = mlx.mlx_array_free(initial.*);
+            initial.* = initial_new;
+        }
+        const cfg = model.ModelConfig{ .hidden_size = 128, .linear_key_head_dim = 128, .linear_num_value_heads = heads, .linear_conv_kernel_dim = 4, .kda_gate_lower_bound = -5, .rms_norm_eps = 1e-5 };
+        var layer = try KdaLayer.load(&fixture, "a", &cfg);
+        try layer.prepare(mlx.gpuStream());
+        defer layer.deinit();
+        for ([_]bool{ false, true }) |initial| {
+            var reference = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = initial };
+            defer _ = mlx.mlx_array_free(reference.conv_state);
+            defer _ = mlx.mlx_array_free(reference.ssm_state);
+            var fused = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = initial };
+            defer _ = mlx.mlx_array_free(fused.conv_state);
+            defer _ = mlx.mlx_array_free(fused.ssm_state);
+            if (initial) {
+                var ops = Ops{ .s = mlx.gpuStream() };
+                defer ops.deinit();
+                const conv = try ops.slice(fixture.get("initial.conv").?, 0, 0, 1);
+                const recurrent = try ops.slice(fixture.get("initial.state").?, 0, 0, 1);
+                try mlx.check(mlx.mlx_array_set(&reference.conv_state, conv));
+                try mlx.check(mlx.mlx_array_set(&fused.conv_state, conv));
+                try mlx.check(mlx.mlx_array_set(&reference.ssm_state, recurrent));
+                try mlx.check(mlx.mlx_array_set(&fused.ssm_state, recurrent));
+            }
+            for (0..5) |i| {
+                var ops = Ops{ .s = mlx.gpuStream() };
+                defer ops.deinit();
+                const x = try ops.slice(try ops.slice(fixture.get("input").?, 0, 0, 1), 1, @intCast(i), @intCast(i + 1));
+                const expected = try layer.applyReference(&ops, x, &cfg, &reference);
+                const got = (try layer.applyFused(&ops, x, &cfg, &fused)) orelse return error.TestExpectedFusedKda;
+                try expectLayerBits(got, expected);
+                try expectLayerBits(fused.conv_state, reference.conv_state);
+                try expectLayerBits(fused.ssm_state, reference.ssm_state);
+            }
+        }
+    }
 }
