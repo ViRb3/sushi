@@ -1,6 +1,7 @@
 # Exact HC prefill projection experiment
 
-`glm5_hc_prefill.zig` is a standalone candidate, not a model policy. Serial and
+`Hc.collapse` uses the exact C24 RMS-fused candidate for eligible prefill inputs.
+`SUSHI_GLM_HC_PREFILL=0` restores the staged path for comparisons. Serial and
 small tree calls remain unchanged. The RMS-fused entry point declines fewer than
 128 rows, non-BF16 activations, unsupported geometry, invalid epsilon, or CPU
 streams. It accepts stored BF16 or FP32 HC weights without conversion copies.
@@ -21,7 +22,7 @@ times. The fused version removes the widened and normalized FP32 planes. Sinkhor
 collapse, checkpoint storage, and output types are unchanged.
 
 Shape validation uses wide arithmetic for index-product bounds. Public counters
-record candidate dispatches. Each call owns its output; kernel handles persist,
+record candidate dispatches; diagnostics report `hc_prefill_dispatches`. Each call owns its output; kernel handles persist,
 while per-call configuration and temporary scalar/vector handles are released.
 
 ## Validation
@@ -30,7 +31,12 @@ ReleaseFast synthetic dot tests cover widths 128, 512 and 16384; rows 17, 128 an
 512; BF16/FP32 weights; all output tiles; cancellation, zero and varied magnitudes.
 RMS tests compare staged native RMS plus original dot against C8/C24 at rows
 128/512, BF16/FP32 weights, four magnitudes and two epsilons. All comparisons use
-raw FP32 bytes, not tolerances.
+raw FP32 bytes, not tolerances. Integrated full HC tests additionally compare
+BF16 mixed outputs, FP32 post weights and Sinkhorn matrices at 128/512 rows.
+A nonzero four-layer model test compares logits and every cache array with the
+policy on/off across 128, 17 and one row; its hidden128 geometry intentionally
+tests fallback rather than candidate engagement. Production-width actual captures
+check engagement and all three HC outputs against captured native values.
 
 Actual checkpoint qualification uses prose and code captures at layers 0, 3, 23
 and 44, both attention and FFN HC. All 24 mixes match captured native outputs
@@ -60,8 +66,7 @@ cost by subtraction. C24 is the proposed combined prefill candidate.
 Fan-max was requested and a ten-second idle cooldown preceded each locked run;
 controller readback did not verify achieved max RPM. Fans returned to automatic.
 Raw paired arrays, controller status, hashes and fixture provenance are retained
-in the private measurement ledger. These are component results; full-model speed
-and complete output/state parity remain integration gates.
+in the private measurement ledger. These are component results; full-model speed remains a qualification gate.
 
 ## Rejected factored-RMS alternative
 

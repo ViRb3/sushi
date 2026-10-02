@@ -65,6 +65,18 @@ const REFERENCE: [:0]const u8 =
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if(tid==0)out[row*24u+output]=(partial[0]+partial[1])+(partial[2]+partial[3]);
 ;
+var enabled_cache: ?bool = null;
+pub fn enabled() bool {
+    if (enabled_cache) |v| return v;
+    const raw = std.c.getenv("SUSHI_GLM_HC_PREFILL");
+    const value = if (raw) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+    enabled_cache = value;
+    return value;
+}
+pub fn testSetEnabled(value: ?bool) void {
+    std.debug.assert(@import("builtin").is_test);
+    enabled_cache = value;
+}
 var calls: usize = 0;
 pub fn dispatchCount() usize {
     return calls;
@@ -137,7 +149,7 @@ fn expectBits(a: Arr, b: Arr) !void {
     try mlx.check(mlx.mlx_array_eval(b));
     const n = mlx.mlx_array_size(a);
     try std.testing.expectEqual(n, mlx.mlx_array_size(b));
-    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(a).?[0..n]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(b).?[0..n]));
+    try std.testing.expectEqualSlices(u8, if (mlx.mlx_array_dtype(a) == .bfloat16) std.mem.sliceAsBytes(mlx.mlx_array_data_bfloat16(a).?[0..n]) else std.mem.sliceAsBytes(mlx.mlx_array_data_float32(a).?[0..n]), if (mlx.mlx_array_dtype(b) == .bfloat16) std.mem.sliceAsBytes(mlx.mlx_array_data_bfloat16(b).?[0..n]) else std.mem.sliceAsBytes(mlx.mlx_array_data_float32(b).?[0..n]));
 }
 
 test "GLM HC multi-output dot preserves original FP32 reduction bits" {
@@ -311,6 +323,28 @@ test "GLM HC multi-output actual fixture parity and paired timing" {
             const check = if (rms_mode) (try experimentalRmsMix(s, x, w, eps, cols)).? else (try experimentalMix(s, normalized, w, cols)).?;
             defer _ = mlx.mlx_array_free(check);
             try expectBits(expected, check);
+            if (rms_mode and cols == 24) {
+                var ops = @import("glm5_model.zig").Ops{ .s = s };
+                defer ops.deinit();
+                var key: [80]u8 = undefined;
+                const scale = try ops.own(try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&key, "layer{d:0>2}.{s}.scale", .{ layer, kind }, 0)));
+                const base = try ops.own(try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&key, "layer{d:0>2}.{s}.base", .{ layer, kind }, 0)));
+                const hc = @import("glm5_model.zig").Hc{ .w = w, .scale = scale, .base = base };
+                const params_data = mlx.mlx_array_data_float32(params).?;
+                const cfg = @import("model.zig").ModelConfig{ .rms_norm_eps = eps, .glm_hc_eps = params_data[1], .glm_hc_sinkhorn_iters = @intFromFloat(params_data[2]) };
+                const previous = enabled_cache;
+                testSetEnabled(true);
+                defer testSetEnabled(previous);
+                const before = dispatchCount();
+                const collapsed = try hc.collapse(&ops, x, &cfg);
+                defer collapsed.deinit();
+                try std.testing.expectEqual(before + 1, dispatchCount());
+                for ([_][]const u8{ "mixed", "post", "comb" }, [_]Arr{ collapsed.mixed, collapsed.post, collapsed.comb }) |field, actual| {
+                    var saved = try ops.own(try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&key, "layer{d:0>2}.{s}.{s}", .{ layer, kind, field }, 0)));
+                    if (mlx.getShape(saved)[1] != rows) saved = try ops.slice(saved, 1, 0, rows);
+                    try expectBits(saved, actual);
+                }
+            }
             for (0..4) |_| {
                 _ = try timedMode(s, if (rms_mode) x else normalized, w, 1, if (rms_mode) eps else null);
                 _ = try timedMode(s, if (rms_mode) x else normalized, w, cols, if (rms_mode) eps else null);
@@ -371,4 +405,38 @@ test "GLM HC multi-output RMS preserves staged bits and rejects small rows" {
     }
     try std.testing.expect((try experimentalRmsMix(s, .{ .ctx = null }, wb, 1e-6, 24)) == null);
     try std.testing.expect((try experimentalRmsMix(s, wf, wb, 0, 24)) == null);
+}
+
+test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
+    testSetEnabled(true);
+    defer testSetEnabled(null);
+    const a = std.testing.allocator;
+    var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const cfg = @import("model.zig").ModelConfig{ .rms_norm_eps = 1e-5, .glm_hc_eps = 1e-6, .glm_hc_sinkhorn_iters = 20 };
+    const bits = try a.alloc(u16, 512 * 16384);
+    defer a.free(bits);
+    for (bits, 0..) |*v, i| {
+        const f = @as(f32, @floatFromInt(@as(i32, @intCast(i % 101)) - 50)) / 16;
+        v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
+    }
+    const w = try ops.own(mlx.mlx_array_new_data(bits.ptr, &.{ 24, 16384 }, 2, .bfloat16));
+    const scale = try ops.own(mlx.mlx_array_new_data(&[_]f32{ 0.5, 0.25, 0.125 }, &.{3}, 1, .float32));
+    var bases: [24]f32 = undefined;
+    for (&bases, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) / 128;
+    const base = try ops.own(mlx.mlx_array_new_data(&bases, &.{24}, 1, .float32));
+    const hc = @import("glm5_model.zig").Hc{ .w = w, .scale = scale, .base = base };
+    for ([_]c_int{ 128, 512 }) |rows| {
+        const x = try ops.own(mlx.mlx_array_new_data(bits.ptr, &.{ 1, rows, 4, 4096 }, 4, .bfloat16));
+        const before = dispatchCount();
+        const expected = try hc.collapseReference(&ops, x, &cfg);
+        defer expected.deinit();
+        try std.testing.expectEqual(before, dispatchCount());
+        const actual = try hc.collapse(&ops, x, &cfg);
+        defer actual.deinit();
+        try std.testing.expectEqual(before + 1, dispatchCount());
+        try expectBits(expected.mixed, actual.mixed);
+        try expectBits(expected.post, actual.post);
+        try expectBits(expected.comb, actual.comb);
+    }
 }

@@ -1159,3 +1159,33 @@ test "GLM HC capture retains reference fixtures without changing logits or state
         try expectRequestBits(&plain, &captured);
     }
 }
+
+test "GLM HC prefill policy preserves nonzero small model logits and every cache bit" {
+    const hc_prefill = @import("glm5_hc_prefill.zig");
+    defer hc_prefill.testSetEnabled(null);
+    var weights = model.Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(std.testing.allocator, cfg, &weights, mlx.gpuStream());
+    defer net.deinit();
+    var reference = try Request.init(std.testing.allocator, 4);
+    defer reference.deinit();
+    var candidate = try Request.init(std.testing.allocator, 4);
+    defer candidate.deinit();
+    const before = hc_prefill.dispatchCount();
+    for ([_]c_int{ 128, 17, 1 }) |rows| {
+        var ops = Ops{ .s = net.s };
+        defer ops.deinit();
+        var tokens: [128]u32 = undefined;
+        for (tokens[0..@intCast(rows)], 0..) |*v, i| v.* = @intCast(i % 4);
+        const ids = try ops.own(mlx.mlx_array_new_data(&tokens, &.{ 1, rows }, 2, .uint32));
+        hc_prefill.testSetEnabled(false);
+        const expected = try ops.own(try net.forwardLast(&reference, ids, true));
+        hc_prefill.testSetEnabled(true);
+        const actual = try ops.own(try net.forwardLast(&candidate, ids, true));
+        try expectArrayBits(expected, actual);
+        try expectRequestBits(&reference, &candidate);
+    }
+    // Hidden128 intentionally falls back. Production-width engagement is covered by HC fixtures.
+    try std.testing.expectEqual(before, hc_prefill.dispatchCount());
+}
