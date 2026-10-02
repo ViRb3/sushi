@@ -424,7 +424,7 @@ test "GLM native diagnostic real model" {
     };
     var decode_component_ns = request.component_ns;
     for (&decode_component_ns, prefill_component_ns) |*total, prefill| {
-        inline for (std.meta.fieldNames(@import("glm5_forward.zig").ComponentTimes)) |name| @field(total, name) -= @field(prefill, name);
+        inline for (comptime std.meta.fieldNames(@import("glm5_forward.zig").ComponentTimes)) |name| @field(total, name) -= @field(prefill, name);
     }
     var decode_layer_ns = request.layer_ns;
     for (&decode_layer_ns, prefill_layer_ns) |*total, prefill| total.* -= prefill;
