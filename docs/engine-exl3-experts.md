@@ -140,6 +140,41 @@ have overlapped another GPU test was discarded. Measurements were built from `06
 change; raw records include binary/source hashes. Real-checkpoint throughput and unchanged output IDs
 must be checked on the combined final build.
 
+### GLM 512-token window-height study: retain 32
+
+A separate untimed capture provided all 42 routed layers' 512-token/top-8 histograms. Every histogram
+had 4096 assignments, 288 possible experts and zero counts in the remaining diagnostic slots. Median
+active experts were 230 (range 197–250). The current kernel already skips its second 16-row matrix
+operation for runs of at most 16 rows, so a 32-row window does not imply 32 rows of computation.
+
+The real distributions required a median 287.5 live 32-row windows and 398.5 16-row matrix tiles.
+Minimum-tile padding was 35.76% (range 33.33–37.56%). Changing the window to 16 leaves that matrix-tile
+count unchanged while increasing weight-decode windows by a median 37.95% (range 31.49–43.38%).
+
+A rejected prototype retained one 16-row accumulator and split longer runs internally, preserving the
+per-output K order and inverse routing. Exact F16 parity passed all 17 rates on boundary-sized runs,
+and all production replay arms were byte-identical. The replay used captured layers 7, 15 and 32,
+synthetic 288-expert K2.25/W12 banks, production matrix dimensions and 4096 prepared rows. Metadata
+was precomputed. Twenty samples per arm were interleaved forward/backward after warmup, with an
+exclusive GPU lock, foreground QoS, max-fan request and ten-second cooldown. Other workers paused
+builds and GPU work. This measured individual GEMMs, not full-model throughput.
+
+| Layer | Projection | Current, window 32 | Current, window 16 | One accumulator, window 32 | One accumulator, window 16 |
+|---:|---|---:|---:|---:|---:|
+| 7 | 4096→2048 | 2.541 ms | 2.760 ms | 3.030 ms | 2.739 ms |
+| 15 | 4096→2048 | 2.620 ms | 2.840 ms | 3.072 ms | 2.820 ms |
+| 32 | 4096→2048 | 2.679 ms | 2.875 ms | 3.079 ms | 2.872 ms |
+| 7 | 2048→4096 | 2.379 ms | 2.650 ms | 2.781 ms | 2.630 ms |
+| 15 | 2048→4096 | 2.472 ms | 2.735 ms | 2.844 ms | 2.715 ms |
+| 32 | 2048→4096 | 2.533 ms | 2.769 ms | 2.868 ms | 2.743 ms |
+
+The existing 32-row implementation won every case; alternatives were approximately 7–19% slower.
+The occupancy hypothesis did not compensate for losing weight-decode reuse and two-tile scheduling.
+The prototype was archived and removed, and the validated production selector was left unchanged.
+The replay was built from `99107a48` plus the isolated prototype; raw records retain binary, source and
+histogram hashes. Reducing the actual padding would require a different minimum matrix tile or another
+validated short-run strategy, not simply changing the window-height setting.
+
 ## Kernels
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
