@@ -30,6 +30,84 @@ pub const Result = struct {
         }
     }
 };
+pub const TreeResult = struct {
+    q: Arr,
+    k: Arr,
+    v: Arr,
+    decay: Arr,
+    beta: Arr,
+    pub fn arrays(self: TreeResult) [5]Arr {
+        return .{ self.q, self.k, self.v, self.decay, self.beta };
+    }
+    pub fn deinit(self: TreeResult) void {
+        for (self.arrays()) |a| _ = mlx.mlx_array_free(a);
+    }
+};
+
+pub fn applyTree(s: mlx.mlx_stream, in: Inputs, parents: []const i32) !?TreeResult {
+    if (parents.len == 0 or parents.len > 16 or parents[0] != -1) return error.InvalidGlmDraftTree;
+    for (parents[1..], 1..) |parent, row| if (parent < 0 or parent >= row) return error.InvalidGlmDraftTree;
+    if (@import("builtin").is_test and force_reference_for_tests) return null;
+    if (!mlx.streamIsGpu(s) or in.heads < 1 or in.heads > @divTrunc(std.math.maxInt(c_int), 384) or in.lower != -5) return null;
+    for ([_]Arr{ in.qkv, in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias }) |a| if (a.ctx == null) return null;
+    const shape = mlx.getShape(in.qkv);
+    const width = in.heads * 128;
+    if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] != 3 * width or
+        @as(i64, shape[1]) * shape[2] > std.math.maxInt(c_int) or mlx.mlx_array_dtype(in.qkv) != .bfloat16) return null;
+    const rows = shape[1];
+    if (rows != parents.len) return error.InvalidGlmDraftTree;
+    if (!geometryFits(rows, in.heads)) return null;
+    for ([_]Arr{ in.a, in.beta, in.conv_weight }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16) return null;
+    if (!std.mem.eql(c_int, &.{ 1, rows, width }, mlx.getShape(in.a)) or !std.mem.eql(c_int, &.{ 1, rows, in.heads }, mlx.getShape(in.beta)) or
+        !std.mem.eql(c_int, &.{ 3 * width, 4, 1 }, mlx.getShape(in.conv_weight)) or
+        !std.mem.eql(c_int, &.{in.heads}, mlx.getShape(in.exp_a)) or mlx.mlx_array_dtype(in.exp_a) != .float32 or
+        !std.mem.eql(c_int, &.{width}, mlx.getShape(in.dt_bias)) or mlx.mlx_array_dtype(in.dt_bias) != .float32) return null;
+    if (in.conv_state) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16 or !std.mem.eql(c_int, &.{ 1, 3, 3 * width }, mlx.getShape(a))) return null;
+    var windows: [16 * 4]i32 = undefined;
+    for (0..parents.len) |row| for (0..4) |tap| {
+        var back = 3 - tap;
+        var at: i32 = @intCast(row);
+        while (back > 0 and at >= 0) {
+            at = parents[@intCast(at)];
+            back -= 1;
+        }
+        windows[row * 4 + tap] = if (at >= 0) 3 + at else 2 - @as(i32, @intCast(back));
+    };
+    const window_ids = mlx.mlx_array_new_data(&windows, &[_]c_int{rows * 4}, 1, .int32);
+    defer _ = mlx.mlx_array_free(window_ids);
+    const mode = (try unary.unaryModes(s)) orelse return null;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    for ([_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .bfloat16, .float32 }) |dtype| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, in.heads, 128 }, 4, dtype));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, in.heads }, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * in.heads, rows, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", in.heads));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HAS_CONV", @intFromBool(in.conv_state != null)));
+    inline for (.{ "SIG_B", "SIG_F", "EXP_F", "RSQ_F" }, .{ mode.sig_b, mode.sig_f, mode.exp_f, mode.rsq_f }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name, @intFromBool(value)));
+    const length = mlx.mlx_array_new_int(rows);
+    defer _ = mlx.mlx_array_free(length);
+    const constants = mlx.mlx_array_new_data(&[_]f32{ 1 / @sqrt(@as(f32, 128)), 1e-6, in.lower, 0 }, &[_]c_int{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(constants);
+    const iv = mlx.mlx_vector_array_new_data(&.{ in.qkv, in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias, in.conv_state orelse in.qkv, length, constants, window_ids }, 10);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try getTreeKernel(), iv, cfg, s));
+    var arrays: [5]Arr = undefined;
+    var made: usize = 0;
+    errdefer for (arrays[0..made]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&arrays, 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        made += 1;
+        try mlx.check(mlx.mlx_vector_array_get(a, ov, i));
+    }
+    tree_count += 1;
+    return .{ .q = arrays[0], .k = arrays[1], .v = arrays[2], .decay = arrays[3], .beta = arrays[4] };
+}
 var count: usize = 0;
 var force_reference_for_tests = false;
 pub fn forceReferenceForTest(on: bool) void {
@@ -103,6 +181,37 @@ const SOURCE: [:0]const u8 =
     \\decay_out[base+tid]=EXP_F?metal::precise::exp(gate):metal::exp(gate);
     \\if(tid==0u) beta_out[row*uint(H)+head]=sigmoid<T,SIG_B>(beta[row*uint(H)+head]);
 ;
+// Reuse the qualified arithmetic verbatim, changing only history lookup and
+// omitting the linear-prefill tail materialization. Tape replay owns raw tails.
+const TREE_SOURCE: [:0]const u8 = blk: {
+    @setEvalBranchQuota(100000);
+    const begin = std.mem.indexOf(u8, SOURCE, " if(row==0u) {").?;
+    const end = std.mem.indexOfPos(u8, SOURCE, begin, "\n }\n}\nthreadgroup_barrier").?;
+    const stripped = SOURCE[0..begin] ++ SOURCE[end + 3 ..];
+    const find = "const uint pos=row+tap;";
+    const at = std.mem.indexOf(u8, stripped, find).?;
+    break :blk stripped[0..at] ++ "const uint pos=uint(windows[row*4u+tap]);" ++ stripped[at + find.len ..];
+};
+var tree_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var tree_count: usize = 0;
+pub fn treeDispatchCount() usize {
+    return tree_count;
+}
+pub fn resetTreeDispatchCount() void {
+    tree_count = 0;
+}
+fn getTreeKernel() !mlx.mlx_fast_metal_kernel {
+    if (tree_kernel) |k| return k;
+    const iv = mlx.mlx_vector_string_new_data(&.{ "qkv", "a", "beta", "conv_w", "exp_a", "dt_bias", "previous", "length", "constants", "windows" }, 10);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&.{ "q_out", "k_out", "v_out", "decay_out", "beta_out" }, 5);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_kda_tree_prework", iv, ov, TREE_SOURCE, HEADER, true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    tree_kernel = k;
+    return k;
+}
+
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 fn getKernel() !mlx.mlx_fast_metal_kernel {
     if (kernel) |k| return k;
@@ -382,4 +491,82 @@ test "GLM KDA prework geometry guards every uint32 shader offset" {
     try std.testing.expect(!geometryFits(0, 64));
     try std.testing.expect(!geometryFits(1, 0));
     try std.testing.expect(!geometryFits(std.math.maxInt(c_int), std.math.maxInt(c_int)));
+}
+
+test "GLM KDA tree prework follows raw-bit serial ancestor windows" {
+    const Ops = @import("glm5_model.zig").Ops;
+    const s = mlx.gpuStream();
+    if (!unary.hardwareSupported()) return error.SkipZigTest;
+    for ([_]c_int{ 1, 3, 64 }) |heads| {
+        for ([_]usize{ 1, 3, 16 }) |rows| {
+            for (0..3) |topology| {
+                for ([_]bool{ false, true }) |hot| {
+                    var ops = Ops{ .s = s };
+                    defer ops.deinit();
+                    const width = heads * 128;
+                    const r: c_int = @intCast(rows);
+                    const in = Inputs{
+                        .qkv = try randomArray(&ops, &.{ 1, r, 3 * width }, .bfloat16, 353, 3),
+                        .a = try randomArray(&ops, &.{ 1, r, width }, .bfloat16, 375, 12),
+                        .beta = try randomArray(&ops, &.{ 1, r, heads }, .bfloat16, 393, 8),
+                        .conv_weight = try randomArray(&ops, &.{ 3 * width, 4, 1 }, .bfloat16, 445, 0.5),
+                        .exp_a = try ops.unary(.exp, try randomArray(&ops, &.{heads}, .float32, 355, 1)),
+                        .dt_bias = try randomArray(&ops, &.{width}, .float32, 467, 2),
+                        .conv_state = if (hot) try randomArray(&ops, &.{ 1, 3, 3 * width }, .bfloat16, 489, 2) else null,
+                        .heads = heads,
+                    };
+                    var parents: [16]i32 = @splat(-1);
+                    for (1..rows) |i| parents[i] = @intCast(switch (topology) {
+                        0 => i - 1,
+                        1 => (i - 1) / 2,
+                        else => 0,
+                    });
+                    const got = (try applyTree(s, in, parents[0..rows])) orelse return error.TestExpectedTreePrework;
+                    defer got.deinit();
+                    var tails: [16]Arr = undefined;
+                    for (0..rows) |i| {
+                        var one_ops = Ops{ .s = s };
+                        defer one_ops.deinit();
+                        var one = in;
+                        const row: c_int = @intCast(i);
+                        one.qkv = try one_ops.slice(in.qkv, 1, row, row + 1);
+                        one.a = try one_ops.slice(in.a, 1, row, row + 1);
+                        one.beta = try one_ops.slice(in.beta, 1, row, row + 1);
+                        one.conv_state = if (parents[i] < 0) in.conv_state else tails[@intCast(parents[i])];
+                        const want = try reference(&one_ops, one);
+                        tails[i] = try ops.own(try one_ops.result(want[5]));
+                        for (got.arrays(), want[0..5], 0..) |actual, expected, field| expectBits(expected, try one_ops.slice(actual, 1, row, row + 1)) catch |err| {
+                            std.debug.print("tree prework mismatch H={d} rows={d} topology={d} hot={} node={d} field={d}\n", .{ heads, rows, topology, hot, i, field });
+                            return err;
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "GLM KDA tree prework rejects malformed parents and checked geometry" {
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const in = Inputs{
+        .qkv = try ops.zeros(&.{ 1, 3, 384 }, .bfloat16),
+        .a = try ops.zeros(&.{ 1, 3, 128 }, .bfloat16),
+        .beta = try ops.zeros(&.{ 1, 3, 1 }, .bfloat16),
+        .conv_weight = try ops.zeros(&.{ 384, 4, 1 }, .bfloat16),
+        .exp_a = try ops.ones(&.{1}, .float32),
+        .dt_bias = try ops.zeros(&.{128}, .float32),
+        .heads = 1,
+    };
+    const before = treeDispatchCount();
+    for ([_][]const i32{ &.{}, &.{0}, &.{ -1, 1, 0 }, &.{ -1, -1, 0 }, &.{ -1, 2, 0 }, &.{-1} }) |parents|
+        try std.testing.expectError(error.InvalidGlmDraftTree, applyTree(ops.s, in, parents));
+    var bad = in;
+    bad.heads = std.math.maxInt(c_int);
+    try std.testing.expect((try applyTree(ops.s, bad, &.{ -1, 0, 1 })) == null);
+    bad = in;
+    bad.lower = -4;
+    try std.testing.expect((try applyTree(ops.s, bad, &.{ -1, 0, 1 })) == null);
+    try std.testing.expectEqual(before, treeDispatchCount());
 }

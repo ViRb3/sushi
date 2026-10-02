@@ -188,6 +188,10 @@ pub const Tape = struct {
 };
 
 pub const LayerResult = struct { output: Arr, tape: Tape };
+var force_staged_for_tests = false;
+pub fn forceStagedForTest(on: bool) void {
+    if (@import("builtin").is_test) force_staged_for_tests = on;
+}
 
 /// Projections may be tested in batches; the default mode preserves one-row projection geometry.
 pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const @import("transformer.zig").SSMCacheEntry, parents: []const i32, mode: ProjectionMode) !LayerResult {
@@ -205,43 +209,65 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     const raw = try ops.concat(&.{ qraw, kraw, vraw }, -1);
     const old = if (state.initialized) state.conv_state else try ops.zeros(&.{ 1, 3, width * 3 }, dtype);
     const conv_input = try ops.concat(&.{ old, raw }, 1);
-    var window: [16 * 4]i32 = undefined;
-    for (0..parents.len) |row| for (0..4) |j| {
-        var back = 3 - j;
-        var at: i32 = @intCast(row);
-        while (back > 0 and at >= 0) {
-            at = parents[@intCast(at)];
-            back -= 1;
-        }
-        window[row * 4 + j] = if (at >= 0) 3 + at else 2 - @as(i32, @intCast(back));
-    };
-    const indices = try ops.own(mlx.mlx_array_new_data(&window, &[_]c_int{@intCast(parents.len * 4)}, 1, .int32));
-    const conv_x = try ops.reshape(try ops.take(conv_input, indices, 1), &.{ sh[1], 4, width * 3 });
     const conv_w = if (layer.prepared_conv.ctx != null) layer.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ layer.conv_q, layer.conv_k, layer.conv_v }, 0), &.{ 0, 2, 1 }));
-    const convolved = try ops.reshape(try ops.silu(try ops.conv(conv_x, conv_w, width * 3)), &.{ 1, sh[1], width * 3 });
-    const dims = [_]c_int{ 1, sh[1], heads, dim };
-    const rq = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, 0, width), &dims), .float32);
-    const rk = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, width, 2 * width), &dims), .float32);
-    const values = try ops.reshape(try ops.slice(convolved, 2, 2 * width, 3 * width), &dims);
-    const eps = try ops.scalar(1e-6, .float32);
-    const qnorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, rq, rq), -1, false, true), eps));
-    const knorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, rk, rk), -1, false, true), eps));
-    const q = try ops.cast(try ops.binary(.mul, try ops.binary(.mul, rq, qnorm), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(dim))), .float32)), dtype);
-    const k = try ops.cast(try ops.binary(.mul, rk, knorm), dtype);
-    const a = try ops.reshape(try ops.cast(try linearRows(ops, layer.fb, try linearRows(ops, layer.fa, x, mode), mode), .float32), &dims);
-    const shift = try ops.reshape(try ops.cast(layer.dt_bias, .float32), &.{ 1, 1, heads, dim });
     const exp_decay = if (layer.prepared_decay.ctx != null) layer.prepared_decay else try ops.unary(.exp, layer.a_log);
-    const magnitude = try ops.reshape(exp_decay, &.{ 1, 1, heads, 1 });
-    const decay = try ops.unary(.exp, try ops.binary(.mul, try ops.unary(.sigmoid, try ops.binary(.mul, magnitude, try ops.binary(.add, a, shift))), try ops.scalar(cfg.kda_gate_lower_bound, .float32)));
-    const beta = try ops.unary(.sigmoid, try linearRows(ops, layer.beta, x, mode));
+    const dims = [_]c_int{ 1, sh[1], heads, dim };
+    const a_raw = try linearRows(ops, layer.fb, try linearRows(ops, layer.fa, x, mode), mode);
+    const beta_raw = try linearRows(ops, layer.beta, x, mode);
+    const fused = if (!force_staged_for_tests and dim == 128) try @import("glm5_kda_prework.zig").applyTree(ops.s, .{
+        .qkv = raw,
+        .a = a_raw,
+        .beta = beta_raw,
+        .conv_weight = conv_w,
+        .exp_a = exp_decay,
+        .dt_bias = layer.dt_bias,
+        .conv_state = if (state.initialized) state.conv_state else null,
+        .heads = heads,
+        .lower = cfg.kda_gate_lower_bound,
+    }, parents) else null;
+    defer if (fused) |value| value.deinit();
+    const work = if (fused) |value| value.arrays() else blk: {
+        var window: [16 * 4]i32 = undefined;
+        for (0..parents.len) |row| for (0..4) |j| {
+            var back = 3 - j;
+            var at: i32 = @intCast(row);
+            while (back > 0 and at >= 0) {
+                at = parents[@intCast(at)];
+                back -= 1;
+            }
+            window[row * 4 + j] = if (at >= 0) 3 + at else 2 - @as(i32, @intCast(back));
+        };
+        const indices = try ops.own(mlx.mlx_array_new_data(&window, &[_]c_int{@intCast(parents.len * 4)}, 1, .int32));
+        const conv_x = try ops.reshape(try ops.take(conv_input, indices, 1), &.{ sh[1], 4, width * 3 });
+        const convolved = try ops.reshape(try ops.silu(try ops.conv(conv_x, conv_w, width * 3)), &.{ 1, sh[1], width * 3 });
+        const rq = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, 0, width), &dims), .float32);
+        const rk = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, width, 2 * width), &dims), .float32);
+        const values = try ops.reshape(try ops.slice(convolved, 2, 2 * width, 3 * width), &dims);
+        const eps = try ops.scalar(1e-6, .float32);
+        const qnorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, rq, rq), -1, false, true), eps));
+        const knorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, rk, rk), -1, false, true), eps));
+        const q = try ops.cast(try ops.binary(.mul, try ops.binary(.mul, rq, qnorm), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(dim))), .float32)), dtype);
+        const k = try ops.cast(try ops.binary(.mul, rk, knorm), dtype);
+        const a = try ops.reshape(try ops.cast(a_raw, .float32), &dims);
+        const shift = try ops.reshape(try ops.cast(layer.dt_bias, .float32), &.{ 1, 1, heads, dim });
+        const magnitude = try ops.reshape(exp_decay, &.{ 1, 1, heads, 1 });
+        const decay = try ops.unary(.exp, try ops.binary(.mul, try ops.unary(.sigmoid, try ops.binary(.mul, magnitude, try ops.binary(.add, a, shift))), try ops.scalar(cfg.kda_gate_lower_bound, .float32)));
+        const beta = try ops.unary(.sigmoid, beta_raw);
+        break :blk [_]Arr{ q, k, values, decay, beta };
+    };
     const initial = if (state.initialized) state.ssm_state else try ops.zeros(&.{ 1, heads, dim, dim }, .float32);
-    const inputs = primitive.KdaInputs{ .q = q, .k = k, .v = values, .decay = decay, .beta = beta, .state = initial };
-    const y = try ops.cast(try ops.own(try recurrent(inputs, parents, ops.s)), .float32);
-    const variance = try ops.reduce(try ops.binary(.mul, y, y), -1, true, true);
-    const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(cfg.rms_norm_eps, .float32)));
-    const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(layer.out_norm, .float32));
-    const gate = try ops.reshape(try ops.cast(try linearRows(ops, layer.gb, try linearRows(ops, layer.ga, x, mode), mode), .float32), &dims);
-    const gated = try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, gate)), dtype);
+    const inputs = primitive.KdaInputs{ .q = work[0], .k = work[1], .v = work[2], .decay = work[3], .beta = work[4], .state = initial };
+    const y_bf = try ops.own(try recurrent(inputs, parents, ops.s));
+    const gate_bf = try ops.reshape(try linearRows(ops, layer.gb, try linearRows(ops, layer.ga, x, mode), mode), &dims);
+    const post = if (!force_staged_for_tests and sh[1] > 1) try @import("glm5_kda_fused.zig").post(ops.s, y_bf, gate_bf, layer.out_norm, cfg.rms_norm_eps) else null;
+    const gated = if (post) |value| try ops.own(value) else blk: {
+        const y = try ops.cast(y_bf, .float32);
+        const variance = try ops.reduce(try ops.binary(.mul, y, y), -1, true, true);
+        const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(cfg.rms_norm_eps, .float32)));
+        const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(layer.out_norm, .float32));
+        const gate = try ops.cast(gate_bf, .float32);
+        break :blk try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, gate)), dtype);
+    };
     const output = try linearRows(ops, layer.out, try ops.reshape(gated, &.{ 1, sh[1], width }), mode);
     var tape = Tape{ .inputs = .{ .q = .{ .ctx = null }, .k = .{ .ctx = null }, .v = .{ .ctx = null }, .decay = .{ .ctx = null }, .beta = .{ .ctx = null }, .state = .{ .ctx = null } }, .conv_input = .{ .ctx = null } };
     errdefer tape.deinit();
@@ -295,8 +321,24 @@ test "GLM DFlash KDA layer tree and replay equal serial ancestor forwards" {
         defer _ = mlx.mlx_array_free(initial.conv_state);
         defer _ = mlx.mlx_array_free(initial.ssm_state);
         const parents = [_]i32{ -1, 0, 0, 1, 2 };
+        const pre_before = @import("glm5_kda_prework.zig").treeDispatchCount();
+        const post_before = @import("glm5_kda_fused.zig").postDispatchCount();
         var all = try applyLayer(layer, &ops, x, &cfg, &initial, &parents, .serial_rows);
         defer all.tape.deinit();
+        try std.testing.expectEqual(pre_before + 1, @import("glm5_kda_prework.zig").treeDispatchCount());
+        try std.testing.expectEqual(post_before + 1, @import("glm5_kda_fused.zig").postDispatchCount());
+        {
+            var staged_ops = Ops{ .s = s };
+            defer staged_ops.deinit();
+            forceStagedForTest(true);
+            defer forceStagedForTest(false);
+            var staged = try applyLayer(layer, &staged_ops, x, &cfg, &initial, &parents, .serial_rows);
+            defer staged.tape.deinit();
+            try equalArray(staged.output, all.output, s);
+            inline for (.{ "q", "k", "v", "decay", "beta" }) |field|
+                try equalArray(@field(staged.tape.inputs, field), @field(all.tape.inputs, field), s);
+            try equalArray(staged.tape.conv_input, all.tape.conv_input, s);
+        }
         var states: [5]@import("transformer.zig").SSMCacheEntry = undefined;
         var made: usize = 0;
         defer for (states[0..made]) |state| {
@@ -313,19 +355,94 @@ test "GLM DFlash KDA layer tree and replay equal serial ancestor forwards" {
             const expected = try layer.apply(&ops, try ops.slice(x, 1, @intCast(row), @intCast(row + 1)), &cfg, &states[row]);
             try equalArray(expected, try ops.slice(all.output, 1, @intCast(row), @intCast(row + 1)), s);
         }
+        {
+            var single_ops = Ops{ .s = s };
+            defer single_ops.deinit();
+            const before_single = @import("glm5_kda_fused.zig").postDispatchCount();
+            var single = try applyLayer(layer, &single_ops, try single_ops.slice(x, 1, 0, 1), &cfg, &initial, &.{-1}, .serial_rows);
+            defer single.tape.deinit();
+            try std.testing.expectEqual(before_single, @import("glm5_kda_fused.zig").postDispatchCount());
+            try equalArray(single.output, try single_ops.slice(all.output, 1, 0, 1), s);
+            const one_state = try single.tape.replay(&.{0}, s);
+            defer _ = mlx.mlx_array_free(one_state.conv_state);
+            defer _ = mlx.mlx_array_free(one_state.ssm_state);
+            try equalArray(one_state.conv_state, states[0].conv_state, s);
+            try equalArray(one_state.ssm_state, states[0].ssm_state, s);
+        }
         try std.testing.expectError(error.InvalidGlmDraftTree, all.tape.replay(&.{ 0, 1, 4 }, s));
         const replay = try all.tape.replay(&.{ 0, 2, 4 }, s);
         defer _ = mlx.mlx_array_free(replay.conv_state);
         defer _ = mlx.mlx_array_free(replay.ssm_state);
         try equalArray(replay.conv_state, states[4].conv_state, s);
         try equalArray(replay.ssm_state, states[4].ssm_state, s);
+        var detached_tape = blk: {
+            var detached_ops = Ops{ .s = s };
+            defer detached_ops.deinit();
+            const detached = try applyLayer(layer, &detached_ops, x, &cfg, &initial, &parents, .serial_rows);
+            break :blk detached.tape;
+        };
+        defer detached_tape.deinit();
+        const detached_replay = try detached_tape.replay(&.{ 0, 2, 4 }, s);
+        defer _ = mlx.mlx_array_free(detached_replay.conv_state);
+        defer _ = mlx.mlx_array_free(detached_replay.ssm_state);
+        try equalArray(detached_replay.conv_state, states[4].conv_state, s);
+        try equalArray(detached_replay.ssm_state, states[4].ssm_state, s);
     }
 }
 
 fn equalArray(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
-    const x = try @import("dflash.zig").TinyFix.readF32(a, std.testing.allocator, s);
-    defer std.testing.allocator.free(x);
-    const y = try @import("dflash.zig").TinyFix.readF32(b, std.testing.allocator, s);
-    defer std.testing.allocator.free(y);
-    try std.testing.expectEqualSlices(f32, x, y);
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const ca = try ops.contiguous(a);
+    const cb = try ops.contiguous(b);
+    try mlx.check(mlx.mlx_array_eval(ca));
+    try mlx.check(mlx.mlx_array_eval(cb));
+    const n = mlx.mlx_array_size(ca);
+    if (mlx.mlx_array_dtype(ca) == .float32)
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(ca).?[0..n]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(cb).?[0..n]))
+    else
+        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(ca).?[0..n], mlx.mlx_array_data_bfloat16(cb).?[0..n]);
+}
+
+test "GLM DFlash KDA replay keeps raw BF16 one-token history bits" {
+    const s = mlx.gpuStream();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const parents = [_]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7 };
+    const bits = [_]u16{ 0x8000, 1, 0x8001, 0x3f80, 0x0080, 0xbf80, 0, 0x007f };
+    var raw: [19 * 384]u16 = undefined;
+    for (&raw, 0..) |*v, i| v.* = bits[(i + i / 384) % bits.len];
+    const source = try ops.own(mlx.mlx_array_new_data(&raw, &.{ 1, 19, 384 }, 3, .bfloat16));
+    const zeros = try ops.zeros(&.{ 1, 16, 1, 128 }, .bfloat16);
+    var tape = Tape{
+        .inputs = .{
+            .q = try ops.result(zeros),
+            .k = try ops.result(zeros),
+            .v = try ops.result(zeros),
+            .decay = try ops.result(try ops.ones(&.{ 1, 16, 1, 128 }, .float32)),
+            .beta = try ops.result(try ops.zeros(&.{ 1, 16, 1 }, .bfloat16)),
+            .state = try ops.result(try ops.zeros(&.{ 1, 1, 128, 128 }, .float32)),
+        },
+        .conv_input = try ops.result(source),
+        .parents = parents,
+        .count = 16,
+    };
+    defer tape.deinit();
+    for ([_][]const u32{ &.{0}, &.{ 0, 1 }, &.{ 0, 2, 6 }, &.{ 0, 1, 3, 7, 15 } }) |path| {
+        const state = try tape.replay(path, s);
+        defer _ = mlx.mlx_array_free(state.conv_state);
+        defer _ = mlx.mlx_array_free(state.ssm_state);
+        var history: [19]u32 = undefined;
+        history[0..3].* = .{ 0, 1, 2 };
+        for (path, 0..) |node, i| history[i + 3] = node + 3;
+        var expected: [3 * 384]u16 = undefined;
+        for (0..3) |j| {
+            const row = history[path.len + j];
+            @memcpy(expected[j * 384 ..][0..384], raw[row * 384 ..][0..384]);
+        }
+        try mlx.check(mlx.mlx_array_eval(state.conv_state));
+        try std.testing.expectEqualSlices(u16, &expected, mlx.mlx_array_data_bfloat16(state.conv_state).?[0..expected.len]);
+    }
 }

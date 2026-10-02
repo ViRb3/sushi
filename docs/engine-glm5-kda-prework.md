@@ -79,3 +79,30 @@ match bit-for-bit, with counters proving that only the candidate arm dispatched 
 prework kernel. Raw prework tests and the broader GLM-filtered ReleaseFast suite passed.
 The diagnostic resets and reports `kda_prework_dispatches` alongside the existing body
 and post-work counts. Full-model performance and output validation remain separate.
+
+## Parent-indexed DFlash prework
+
+`applyTree(stream, Inputs, parents)` reuses the qualified shader arithmetic with
+checked ancestor-window indices instead of linear token positions. The root reads
+from the pre-tree three-row history; descendants read their own ancestors' raw QKV.
+Parent indices must precede each child, and only the first node may have parent -1.
+The entrypoint accepts 1–16 nodes, retains the same checked offset bounds, and
+returns only Q/K/V, FP32 vector decay and BF16 beta. It does not apply the multirow
+prefill history-copy operation or allocate a tail/state plane per branch.
+
+`glm5_dflash_kda.applyLayer` retains `[old history; raw QKV rows]` in its tape. Replay
+selects the accepted path's last three raw BF16 rows, preserving subnormals and
+signed zeros exactly as single-token history. Recurrence remains the existing
+vector-gate FP32 parent-state kernel. Eligible multirow results use the already
+qualified fused output normalization/gate kernel; one-row output processing retains
+the staged fallback. Unsupported prework geometry also retains the staged adapter.
+
+Focused tests compare all five prework outputs bitwise with independent serial
+ancestor windows for chain, binary and star trees, rows 1/3/16, heads 1/3/64,
+and cold/hot history with subnormal/signed-zero inputs. Layer tests compare staged
+and fused results, independent serial branches, one-row fallback and accepted-path
+replay. A detached-tape test destroys the producing Ops scope before replay;
+a separate history test checks raw BF16 bytes for short and deep accepted paths.
+The native full-checkpoint diagnostic reports `tree_kda_prework_dispatches` and
+`tree_kda_post_dispatches`. These checks establish component correctness; full
+checkpoint throughput/parity results are recorded separately after measurement.
