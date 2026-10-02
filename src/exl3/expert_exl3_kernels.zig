@@ -3233,7 +3233,7 @@ pub fn moeSwigluClamped(
             const us = mlx.getShape(up_t);
             const ds = mlx.getShape(down_t);
             const eligible = hidden == 4096 and mlx.getShape(gate)[1] == 2048 and topk == 8 and out_dtype == .bfloat16 and
-                gs[3] == 36 and us[3] == gs[3] and ds[3] == gs[3] and active_decode.codebook == .mcg and active_decode.window == .w12 and clampedMiddleEnabled();
+                gs[3] == 36 and us[3] == gs[3] and ds[3] == gs[3] and active_decode.codebook == .mcg and active_decode.window == .w12 and clampedMiddleEnabled(rows);
             if (eligible) if (try clampedMiddleDownCoop(s, gate, up, down_t, gate_svh, up_svh, down_suh, slots, limit, if (rows == 1) 4 else 8)) |fused| break :blk fused;
             const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
             defer _ = mlx.mlx_array_free(prepared);
@@ -9506,6 +9506,9 @@ test "exl3 clamped routing preserves staged bytes at every 2 to 4 bpw rate" {
 }
 
 test "exl3 clamped routing preserves GLM production width bytes" {
+    const previous_mode = clamped_middle_enabled;
+    clamped_middle_enabled = .on;
+    defer clamped_middle_enabled = previous_mode;
     const s = mlx.gpuStream();
     const dec = exl3.Decode{ .codebook = .mcg, .window = .w12 };
     setDecodeParams(dec);
@@ -9861,15 +9864,29 @@ var clamped_middle_cfgs: CfgCache(ClampedMiddleKey, 8) = .{};
 var clamped_middle_kernels: KernelSlots = no_kernels;
 var clamped_middle_calls: usize = 0;
 var clamped_middle_engaged: bool = false;
-var clamped_middle_enabled: ?bool = null;
-fn clampedMiddleEnabledFor(raw: ?[*:0]const u8) bool {
-    return raw == null or !std.mem.eql(u8, std.mem.span(raw.?), "0");
+const ClampedMiddleMode = enum { auto, off, on };
+var clamped_middle_enabled: ?ClampedMiddleMode = null;
+fn clampedMiddleModeFor(raw: ?[*:0]const u8) ClampedMiddleMode {
+    const value = std.mem.span(raw orelse return .auto);
+    if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "on")) return .on;
+    return .auto;
 }
-fn clampedMiddleEnabled() bool {
-    if (clamped_middle_enabled) |enabled| return enabled;
-    const enabled = clampedMiddleEnabledFor(std.c.getenv("SUSHI_EXL3_CLAMPED_MIDDLE"));
-    clamped_middle_enabled = enabled;
-    return enabled;
+fn clampedMiddleModeAllows(mode: ClampedMiddleMode, rows: c_int) bool {
+    if (rows < 1 or rows > DECODE_ROWS_MAX) return false;
+    return switch (mode) {
+        .off => false,
+        .on => true,
+        .auto => rows > 1,
+    };
+}
+fn clampedMiddleEnabled(rows: c_int) bool {
+    const mode = clamped_middle_enabled orelse blk: {
+        const parsed = clampedMiddleModeFor(std.c.getenv("SUSHI_EXL3_CLAMPED_MIDDLE"));
+        clamped_middle_enabled = parsed;
+        break :blk parsed;
+    };
+    return clampedMiddleModeAllows(mode, rows);
 }
 pub fn clampedMiddleDispatchCount() usize {
     return clamped_middle_calls;
@@ -9979,9 +9996,20 @@ test "exl3 clamped middle down warmed microbenchmark" {
     for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| try clampedMiddleDownCase(4096, 2048, rows, 36, if (rows == 1) 4 else 8, true);
 }
 
-
-test "exl3 clamped middle diagnostic switch preserves default and explicit off" {
-    try std.testing.expect(clampedMiddleEnabledFor(null));
-    try std.testing.expect(clampedMiddleEnabledFor("1"));
-    try std.testing.expect(!clampedMiddleEnabledFor("0"));
+test "exl3 clamped middle diagnostic auto off on keep serial conservative" {
+    try std.testing.expectEqual(ClampedMiddleMode.auto, clampedMiddleModeFor(null));
+    try std.testing.expectEqual(ClampedMiddleMode.auto, clampedMiddleModeFor("auto"));
+    try std.testing.expectEqual(ClampedMiddleMode.off, clampedMiddleModeFor("0"));
+    try std.testing.expectEqual(ClampedMiddleMode.off, clampedMiddleModeFor("off"));
+    try std.testing.expectEqual(ClampedMiddleMode.on, clampedMiddleModeFor("1"));
+    try std.testing.expectEqual(ClampedMiddleMode.on, clampedMiddleModeFor("on"));
+    try std.testing.expect(!clampedMiddleModeAllows(.auto, 1));
+    for (2..17) |rows| try std.testing.expect(clampedMiddleModeAllows(.auto, @intCast(rows)));
+    for ([_]c_int{ 1, 2, 16 }) |rows| {
+        try std.testing.expect(clampedMiddleModeAllows(.on, rows));
+        try std.testing.expect(!clampedMiddleModeAllows(.off, rows));
+    }
+    try std.testing.expect(!clampedMiddleModeAllows(.auto, 17));
+    try std.testing.expect(!clampedMiddleModeAllows(.on, 0));
 }
+

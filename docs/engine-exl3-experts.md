@@ -107,11 +107,12 @@ memory, and then runs the original four-simdgroup cooperative reduction and F16 
 not substitute the normal EXL3 FP32 split-K chain. Four output tiles per group are used for one row;
 eight are used for two through sixteen rows.
 
-The cached diagnostic switch `SUSHI_EXL3_CLAMPED_MIDDLE=0` disables this candidate for attribution;
-absence preserves its current enabled default. This switch exists because the warm selected-bank
-microbenchmark cannot establish a benefit with full-model weight traffic. The first combined model
-run preserved all 64 output IDs but did not improve serial throughput, so isolated measurements are
-required before attributing that outcome or choosing the final default.
+The cached diagnostic switch `SUSHI_EXL3_CLAMPED_MIDDLE` accepts `auto` (also the absent/default
+setting), `0`/`off`, and `1`/`on`. Auto retains the separate one-row path and permits the validated
+2–16-row candidate. Off disables fusion; on explicitly permits the one-row research arm as well.
+Full-model attribution did not reproduce the warm-bank serial improvement, so one-row fusion is no
+longer enabled by default. The multirow component gains still require separate DFlash/full-model
+measurement before broader throughput claims.
 
 The served guard is BF16 output, hidden/intermediate widths 4096/2048, top-k eight and matching K2.25
 projection rates. Other widths, storage formats, codebooks and mixed rates retain the separate path.
