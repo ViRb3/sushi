@@ -359,6 +359,15 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
         try sameRequest(&serial, &verified.states[row].?, s);
         for (cap.hook.out, verified.captures[row].?.hook.out) |x, y| try sameArray(x, y, s);
     }
+    var layerwise = try @import("glm5_dflash_model.zig").verify(&target, &request, &tokens, &parents, &taps, .serial_rows);
+    defer layerwise.deinit();
+    try std.testing.expectEqualSlices(u32, verified.targets[0..verified.count], layerwise.targets[0..layerwise.count]);
+    var replayed = try layerwise.prepareCommit(&request, 3, &.{}, s);
+    defer replayed.deinit();
+    try sameRequest(&replayed.states[3].?, &verified.states[3].?, s);
+    for ([_]usize{ 0, 1, 3 }) |row| {
+        for (replayed.captures[row].?.hook.out, verified.captures[row].?.hook.out) |xcap, ycap| try sameArray(xcap, ycap, s);
+    }
     const accepted = try commitVerified(&assistant, &context, &request, &verified, 3, &.{});
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 3 }, accepted.rows[0..accepted.count]);
     try std.testing.expectEqual(@as(usize, 6), request.offset);
@@ -373,9 +382,34 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     try std.testing.expectEqual(@as(usize, 5), round.verified_rows);
     try std.testing.expectEqual(@as(usize, 3) + round.count, request.offset);
     try std.testing.expectEqual(request.offset, context.absLen());
-    const stopped = try roundTreeOracle(std.Io.Threaded.global_single_threaded.io(), &assistant, &context, &target, &request, 0, 4, 3, &.{0});
+    const stopped = try roundTreeLayerwise(std.Io.Threaded.global_single_threaded.io(), &assistant, &context, &target, &request, 0, 4, 3, &.{0});
     try std.testing.expect(stopped.stopped and stopped.pending == null);
     try std.testing.expectEqual(@as(usize, 1), stopped.verified_rows);
+    target.cfg.max_position_embeddings = 4096;
+    for ([_]usize{ 1, 2, 4, 255, 2051 }) |prefix_length| {
+        request.reset();
+        const prompt = try allocator.alloc(u32, prefix_length);
+        defer allocator.free(prompt);
+        for (prompt, 0..) |*token, i| token.* = @intCast(i % 4);
+        const inputs = mlx.mlx_array_new_data(prompt.ptr, &[_]c_int{ 1, @intCast(prefix_length) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(inputs);
+        const logits = try target.forwardLast(&request, inputs, true);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+        var reference = try verifyTreeOracle(&target, &request, &tokens, &parents, &taps);
+        defer reference.deinit();
+        var batch = try @import("glm5_dflash_model.zig").verify(&target, &request, &tokens, &parents, &taps, .serial_rows);
+        defer batch.deinit();
+        try std.testing.expectEqualSlices(u32, reference.targets[0..reference.count], batch.targets[0..batch.count]);
+        for ([_]usize{ 1, 2, 3 }) |budget| {
+            var committed = try batch.prepareCommit(&request, budget, &.{}, s);
+            defer committed.deinit();
+            const keep = try tree.accept(&tokens, &parents, reference.targets[0..reference.count], budget, &.{});
+            const last = keep.rows[keep.count - 1];
+            try sameRequest(&committed.states[last].?, &reference.states[last].?, s);
+            for (keep.rows[0..keep.count]) |row| for (committed.captures[row].?.hook.out, reference.captures[row].?.hook.out) |xcap, ycap| try sameArray(xcap, ycap, s);
+        }
+    }
 }
 
 pub fn loadAssistantBf16(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, target: *const forward.Model) !draft.DflashModel {
@@ -435,6 +469,7 @@ pub const RoundResult = struct {
     draft_ns: u64,
     verify_ns: u64,
     commit_ns: u64,
+    replay_ns: u64 = 0,
     verifier: []const u8 = "serial_branch_oracle",
 };
 
@@ -460,4 +495,42 @@ pub fn roundTreeOracle(io: std.Io, assistant: *draft.DflashModel, context: *draf
     var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .commit_ns = timer.read() };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
     return result;
+}
+
+test {
+    _ = @import("glm5_dflash_kda.zig");
+}
+
+test {
+    _ = @import("glm5_dflash_model.zig");
+}
+
+pub fn roundTreeLayerwise(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32) !RoundResult {
+    if (budget == 0) return error.InvalidGlmDraftBudget;
+    if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
+    var timer = @import("io_util.zig").Stopwatch.init(io);
+    const proposal = if (budget == 1 or std.mem.indexOfScalar(u32, eos, pending) != null) blk: {
+        var one = Proposal{ .count = 1 };
+        one.tokens[0] = pending;
+        one.parents[0] = -1;
+        break :blk one;
+    } else try proposeTree(assistant, context, target, pending, max_nodes);
+    const draft_ns = timer.read();
+    timer.reset();
+    var layerwise = try @import("glm5_dflash_model.zig").verify(target, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], assistant.config.target_layer_ids, .serial_rows);
+    defer layerwise.deinit();
+    const verify_ns = timer.read();
+    timer.reset();
+    var verified = try layerwise.prepareCommit(request, budget, eos, target.s);
+    defer verified.deinit();
+    const replay_ns = timer.read();
+    timer.reset();
+    const kept = try commitVerified(assistant, context, request, &verified, budget, eos);
+    var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = "layerwise_tree_serial_projections" };
+    for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
+    return result;
+}
+
+test {
+    _ = @import("glm5_dflash_diagnostic.zig");
 }

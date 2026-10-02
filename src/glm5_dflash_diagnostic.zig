@@ -1,0 +1,161 @@
+//! Explicit full-checkpoint DFlash2 correctness/timing diagnostic; never a serving gate.
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const adapter = @import("glm5_dflash.zig");
+const native = @import("glm5_diagnostic.zig");
+const forward = @import("glm5_forward.zig");
+const Arr = mlx.mlx_array;
+
+fn writeJson(io: std.Io, a: std.mem.Allocator, path: []const u8, value: anytype) !void {
+    const raw = try std.json.Stringify.valueAlloc(a, value, .{ .whitespace = .indent_2 });
+    defer a.free(raw);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = raw });
+}
+fn number(comptime name: [:0]const u8, fallback: usize) !usize {
+    return if (std.c.getenv(name)) |p| std.fmt.parseInt(usize, std.mem.span(p), 10) else fallback;
+}
+fn greedy(logits: Arr, stream: mlx.mlx_stream) !u32 {
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_argmax_axis(&out, logits, -1, false, stream));
+    try mlx.check(mlx.mlx_array_eval(out));
+    if (mlx.mlx_array_size(out) != 1) return error.InvalidGlmDraftLogits;
+    return (mlx.mlx_array_data_uint32(out) orelse return error.MlxArrayDataNull)[0];
+}
+fn arrayMatches(a: Arr, b: Arr, stream: mlx.mlx_stream) !bool {
+    if (a.ctx == null or b.ctx == null) return a.ctx == null and b.ctx == null;
+    if (mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(b) or !std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b))) return false;
+    var equal = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(equal);
+    try mlx.check(mlx.mlx_array_equal(&equal, a, b, false, stream));
+    try mlx.check(mlx.mlx_array_eval(equal));
+    return (mlx.mlx_array_data_bool(equal) orelse return error.MlxArrayDataNull)[0];
+}
+fn stateMatches(a: *const forward.Request, b: *const forward.Request, stream: mlx.mlx_stream) !bool {
+    if (a.offset != b.offset or a.layers.len != b.layers.len) return false;
+    for (a.layers, b.layers) |x, y| {
+        if (x.recurrent.initialized != y.recurrent.initialized or x.attention.processed != y.attention.processed) return false;
+        if (x.recurrent.initialized) {
+            if (!try arrayMatches(x.recurrent.ssm_state, y.recurrent.ssm_state, stream) or !try arrayMatches(x.recurrent.conv_state, y.recurrent.conv_state, stream)) return false;
+        }
+        for (x.attention.arrays(), y.attention.arrays()) |left, right| if (!try arrayMatches(left, right, stream)) return false;
+    }
+    return true;
+}
+const Round = struct { emitted: usize, accepted_drafts: usize, verified_rows: usize, draft_ns: u64, verify_ns: u64, replay_ns: u64, commit_ns: u64 };
+
+test "GLM DFlash real checkpoint diagnostic" {
+    const model_env = std.c.getenv("SUSHI_GLM_DFLASH_MODEL") orelse return error.SkipZigTest;
+    const assistant_env = std.c.getenv("SUSHI_GLM_DFLASH_ASSISTANT") orelse return error.MissingGlmDraftAssistant;
+    const tokens_env = std.c.getenv("SUSHI_GLM_DFLASH_TOKENS_FILE") orelse return error.MissingGlmDiagnosticPrompt;
+    const output_env = std.c.getenv("SUSHI_GLM_DFLASH_OUT") orelse return error.MissingGlmDiagnosticOutput;
+    const model_path = std.mem.span(model_env);
+    const assistant_path = std.mem.span(assistant_env);
+    const output_path = std.mem.span(output_env);
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const stream = mlx.gpuStream();
+    const progress = try std.fmt.allocPrint(a, "{s}.progress.json", .{output_path});
+    defer a.free(progress);
+    errdefer writeJson(io, a, progress, .{ .complete = false, .phase = "failed" }) catch {};
+    const count = try number("SUSHI_GLM_DFLASH_PREFILL", 32);
+    const steps = try number("SUSHI_GLM_DFLASH_DECODE", 8);
+    const nodes = try number("SUSHI_GLM_DFLASH_NODES", 3);
+    const chunk = try number("SUSHI_GLM_DFLASH_CHUNK", 128);
+    if (count == 0 or count > 65536 or steps == 0 or steps > 4096 or nodes == 0 or nodes > 15 or chunk == 0) return error.InvalidGlmDiagnosticBudget;
+    const memory = (try number("SUSHI_GLM_DFLASH_MEMORY_GIB", 110)) * 1024 * 1024 * 1024;
+    const wired = @min(memory, mlx.maxRecommendedWorkingSet());
+    var old_memory: usize = 0;
+    var old_cache: usize = 0;
+    var old_wired: usize = 0;
+    var ignored: usize = 0;
+    try mlx.check(mlx.mlx_set_memory_limit(&old_memory, memory));
+    defer _ = mlx.mlx_set_memory_limit(&ignored, old_memory);
+    try mlx.check(mlx.mlx_set_cache_limit(&old_cache, 2 * 1024 * 1024 * 1024));
+    defer _ = mlx.mlx_set_cache_limit(&ignored, old_cache);
+    try mlx.check(mlx.mlx_set_wired_limit(&old_wired, wired));
+    defer _ = mlx.mlx_set_wired_limit(&ignored, old_wired);
+    var cfg = try @import("model.zig").parseConfig(io, a, model_path);
+    defer cfg.deinit(a);
+    if (!cfg.isGlm5() or cfg.expert_layout != .exl3_k4) return error.UnsupportedGlmDiagnosticLayout;
+    try @import("mimo_source.zig").validateExl3Pack(io, a, model_path, &cfg);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(tokens_env), a, .limited(16 * 1024 * 1024));
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const ids_value = if (parsed.value == .object) parsed.value.object.get("ids") orelse return error.InvalidGlmPrompt else parsed.value;
+    if (ids_value != .array or ids_value.array.items.len < count) return error.InvalidGlmPrompt;
+    const ids = try a.alloc(u32, count);
+    defer a.free(ids);
+    for (ids, ids_value.array.items[0..count]) |*id, value| {
+        if (value != .integer or value.integer < 0 or value.integer >= cfg.vocab_size) return error.InvalidGlmPrompt;
+        id.* = @intCast(value.integer);
+    }
+    try writeJson(io, a, progress, .{ .complete = false, .phase = "loading_target" });
+    var weights = try native.loadWeights(io, a, model_path, stream);
+    defer weights.deinit();
+    var target = try forward.Model.load(a, cfg, &weights, stream);
+    defer target.deinit();
+    try writeJson(io, a, progress, .{ .complete = false, .phase = "loading_assistant" });
+    var assistant = try adapter.loadAssistantBf16(io, a, assistant_path, &target);
+    defer assistant.deinit();
+    var context = try @import("dflash.zig").DflashCtx.init(a, &assistant, 0);
+    defer context.deinit();
+    var request = try forward.Request.init(a, cfg.num_hidden_layers);
+    defer request.deinit();
+    var timer = @import("io_util.zig").Stopwatch.init(io);
+    var pending: u32 = 0;
+    var cursor: usize = 0;
+    var prefill_ns: u64 = 0;
+    while (cursor < count) {
+        const end = @min(count, cursor + chunk);
+        try writeJson(io, a, progress, .{ .complete = false, .phase = "prefill", .processed = cursor });
+        timer.reset();
+        const input = mlx.mlx_array_new_data(ids[cursor..end].ptr, &[_]c_int{ 1, @intCast(end - cursor) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(input);
+        pending = try adapter.prefill(&assistant, &context, &target, &request, input);
+        prefill_ns += timer.read();
+        cursor = end;
+    }
+    var serial = try adapter.cloneRequest(&request);
+    defer serial.deinit();
+    var serial_pending = pending;
+    var generated: std.ArrayList(u32) = .empty;
+    defer generated.deinit(a);
+    var rounds: std.ArrayList(Round) = .empty;
+    defer rounds.deinit(a);
+    try mlx.check(mlx.mlx_reset_peak_memory());
+    var decode_ns: u64 = 0;
+    while (generated.items.len < steps) {
+        try writeJson(io, a, progress, .{ .complete = false, .phase = "tree_decode", .generated = generated.items.len, .rounds = rounds.items.len });
+        timer.reset();
+        const round = try adapter.roundTreeLayerwise(io, &assistant, &context, &target, &request, pending, nodes, steps - generated.items.len, cfg.eosTokenSlice());
+        decode_ns += timer.read();
+        try generated.appendSlice(a, round.tokens[0..round.count]);
+        try rounds.append(a, .{ .emitted = round.count, .accepted_drafts = round.accepted_drafts, .verified_rows = round.verified_rows, .draft_ns = round.draft_ns, .verify_ns = round.verify_ns, .replay_ns = round.replay_ns, .commit_ns = round.commit_ns });
+        if (round.stopped) break;
+        pending = round.pending orelse return error.MissingGlmPendingToken;
+    }
+    var peak: usize = 0;
+    try mlx.check(mlx.mlx_get_peak_memory(&peak));
+    try writeJson(io, a, progress, .{ .complete = false, .phase = "serial_parity" });
+    const reference = try a.alloc(u32, generated.items.len);
+    defer a.free(reference);
+    for (reference) |*id| {
+        id.* = serial_pending;
+        const input = mlx.mlx_array_new_data(&serial_pending, &[_]c_int{ 1, 1 }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(input);
+        const logits = try target.forwardLast(&serial, input, true);
+        defer _ = mlx.mlx_array_free(logits);
+        serial_pending = try greedy(logits, stream);
+    }
+    const ids_match = std.mem.eql(u32, reference, generated.items);
+    const state_match = try stateMatches(&request, &serial, stream);
+    var tok = try @import("tokenizer.zig").loadTokenizer(io, a, model_path);
+    defer tok.deinit();
+    const text = try tok.decode(a, generated.items, false);
+    defer a.free(text);
+    try writeJson(io, a, output_path, .{ .complete = ids_match and state_match, .model = model_path, .assistant = assistant_path, .assistant_precision = "BF16", .verifier = "layerwise_tree_serial_projections", .sampling = "greedy", .warmup = false, .timing_provisional = true, .input_ids = ids, .output_ids = generated.items, .serial_output_ids = reference, .output_text = if (std.unicode.utf8ValidateSlice(text)) text else null, .token_parity = ids_match, .state_parity = state_match, .prefill_ns = prefill_ns, .decode_ns = decode_ns, .decode_tokens_per_second = @as(f64, @floatFromInt(generated.items.len)) * 1e9 / @as(f64, @floatFromInt(decode_ns)), .peak_bytes = peak, .memory_limit_bytes = memory, .wired_limit_bytes = wired, .nodes = nodes, .rounds = rounds.items, .public_serving_enabled = false });
+    if (!ids_match or !state_match) return error.GlmDflashSerialParityFailed;
+    try writeJson(io, a, progress, .{ .complete = true, .phase = "complete" });
+}

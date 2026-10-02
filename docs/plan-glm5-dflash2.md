@@ -25,16 +25,57 @@ publication leave the original request/context available; no silent serial fallb
 
 `roundTreeOracle` returns emitted IDs, the unprocessed pending token, acceptance, verified row count,
 and draft/verify/commit times. Its result explicitly names `serial_branch_oracle`. Sampling and
-production scheduling remain unsupported by this adapter. Branch-aware batched kernels, row-exact
-verification qualification, full-model parity, admission accounting and performance tuning remain
-required before a fast speculative path can be enabled.
+production scheduling remain unsupported by this adapter.
+
+`glm5_dflash_model.zig` also implements a layerwise tree verifier. Its KDA recurrence processes all
+nodes in one Metal dispatch, with per-key-channel decay and FP32 parent states retained locally;
+`glm5_dflash_kda.zig` stores projected prework and replays only the accepted ancestry on commit.
+It does not retain a full recurrent state for every node. MLA constructs each node's own completed
+pools and remainder from the committed prefix plus its ancestors. Branch views are evaluated and
+released one at a time to bound latent-cache copies. Commit appends only the accepted raw index and
+latent rows to the original state. mHC and captures operate across independent token rows.
+
+`roundTreeLayerwise` uses this verifier and separately reports replay time. Its strict projection mode
+preserves one-row trunk matrix geometry; the internal batched-projection experiment is not selected
+by this entry point. This reduces repeated model orchestration and recurrent work, but it still has
+per-row projection work and per-branch MLA evaluation. It is not the final performance endpoint.
+Real-checkpoint parity, broad row-exact qualification, admission accounting and tuning remain gates.
 
 Focused ReleaseFast tests cover tree validation, zero acceptance, sibling exclusion, pre-commit
 budget/EOS handling, immutable request forks, a complete tiny native assistant proposal/round, and
 every node's recurrent state, convolution window, latent cache, pooled history, remainder and captures
-against independent serial ancestry. The model fixture includes nonzero layers and token-dependent
-embeddings; sibling recurrent states must differ. These tests do not establish real-checkpoint
-acceptance or throughput. The shared target capture hook is independently tested in `glm5_forward.zig`.
+against independent serial ancestry. Layerwise replay is checked at all four pooling residues,
+capacity growth at prefix 255 and first sparse selection at prefix 2051, for zero, one and two
+accepted drafts. The model fixture includes nonzero layers and token-dependent embeddings; sibling
+recurrent states must differ. These tests do not establish real-checkpoint acceptance or throughput.
+The shared target capture hook is independently tested in `glm5_forward.zig`.
+
+### Full-checkpoint diagnostic
+
+Build with `zig build test -Doptimize=ReleaseFast -Dtest-filter='GLM DFlash real checkpoint diagnostic'`.
+With no model environment set, the real run skips. Run its generated test executable only in an
+exclusive GPU slot under [measurement policy](process-measurement.md). The diagnostic is separate
+from public serving and compares generated tokens and the final complete target state with serial
+execution from the same captured prefix. Failure writes a result with parity false and returns an
+error; it never labels a fallback as speculative success.
+
+| Environment variable | Meaning |
+|---|---|
+| `SUSHI_GLM_DFLASH_MODEL` | Required absolute target checkpoint directory |
+| `SUSHI_GLM_DFLASH_ASSISTANT` | Required absolute original BF16 DFlash2 directory |
+| `SUSHI_GLM_DFLASH_TOKENS_FILE` | Required JSON ID array, or object with `ids`; no token repetition |
+| `SUSHI_GLM_DFLASH_OUT` | Required result JSON path; parent directory must exist |
+| `SUSHI_GLM_DFLASH_PREFILL` | Prefix tokens, default 32 |
+| `SUSHI_GLM_DFLASH_DECODE` | Maximum generated tokens, default 8; EOS stops earlier |
+| `SUSHI_GLM_DFLASH_NODES` | Draft node budget, default 3, maximum 15; root is additional |
+| `SUSHI_GLM_DFLASH_CHUNK` | Prefill chunk, default 128 |
+| `SUSHI_GLM_DFLASH_MEMORY_GIB` | MLX limit, default 110; wired limit capped at recommended set |
+
+The JSON records exact input/output and serial-reference IDs, token/state parity, per-round accepted
+drafts and verified rows, draft/verify/replay/commit times, peak memory and decoded text. Progress is
+written beside it with `.progress.json`. Timing includes all round work and counts committed output
+tokens; this first-run diagnostic is explicitly unwarmed and provisional. Serial parity runs after
+the speculative timing and is not presented as a newly measured serial performance baseline.
 
 ## Sources and evidence
 
