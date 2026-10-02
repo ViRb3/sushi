@@ -15,6 +15,7 @@ pub fn apply(s: mlx.mlx_stream, gate: Arr, up: Arr, limit: f32) !?Arr {
     if (!mlx.streamIsGpu(s) or gate.ctx == null or up.ctx == null or limit != 10 or
         mlx.mlx_array_dtype(gate) != .bfloat16 or mlx.mlx_array_dtype(up) != .bfloat16 or
         !std.mem.eql(c_int, mlx.getShape(gate), mlx.getShape(up))) return null;
+    if (mlx.getShape(gate).len == 0) return null;
     const n = mlx.mlx_array_size(gate);
     if (n == 0 or n > std.math.maxInt(c_int)) return null;
     if (kernel == null) {
@@ -88,4 +89,39 @@ test "GLM fused dense activation exhaustive BF16 gates and clamp boundaries" {
         }
     }
     try std.testing.expect((try apply(ops.s, values, values, 9)) == null);
+}
+
+test "GLM fused dense activation rejects unsupported input shapes and dtypes" {
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const scalar = try ops.scalar(1, .bfloat16);
+    try std.testing.expect((try apply(ops.s, scalar, scalar, 10)) == null);
+    const fp = try ops.ones(&.{4}, .float32);
+    try std.testing.expect((try apply(ops.s, fp, fp, 10)) == null);
+    const bf = try ops.cast(fp, .bfloat16);
+    const matrix = try ops.reshape(bf, &.{ 2, 2 });
+    try std.testing.expect((try apply(ops.s, bf, matrix, 10)) == null);
+    try std.testing.expect((try apply(ops.s, bf, fp, 10)) == null);
+}
+
+test "GLM fused dense activation packs transposed inputs without changing values" {
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const data = [_]f32{ -11, -9.5, 2, 12, 0.25, -0.5, 1, 3 };
+    const raw = try ops.own(mlx.mlx_array_new_data(&data, &.{ 2, 4 }, 2, .float32));
+    const bf = try ops.cast(raw, .bfloat16);
+    const gate = try ops.transpose(bf, &.{ 1, 0 });
+    const up = try ops.binary(.mul, gate, try ops.scalar(-1, .bfloat16));
+    const hi = try ops.scalar(10, .bfloat16);
+    const lo = try ops.scalar(-10, .bfloat16);
+    const cg = try ops.binary(.min, gate, hi);
+    const cu = try ops.binary(.max, try ops.binary(.min, up, hi), lo);
+    const ref = try ops.binary(.mul, try ops.silu(cg), cu);
+    const got = try ops.own((try apply(ops.s, gate, up, 10)).?);
+    const equal = try ops.slot();
+    try mlx.check(mlx.mlx_array_equal(equal, ref, got, false, ops.s));
+    try mlx.check(mlx.mlx_array_eval(equal.*));
+    try std.testing.expect(mlx.mlx_array_data_bool(equal.*).?[0]);
 }
