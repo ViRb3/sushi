@@ -22,7 +22,7 @@ const LOGITS: [:0]const u8 =
     \\  if (out_row >= E) {
     \\    return;
     \\  }
-    \\  const device float* mat = w + size_t(out_row) * K;
+    \\  auto mat = w + size_t(out_row) * K;
     \\  const device T* xv = x + size_t(tok) * K;
     \\  float result[RPS];
     \\  for (int tm = 0; tm < RPS; tm++) {
@@ -201,7 +201,7 @@ pub fn route(s: mlx.mlx_stream, x: Arr, weight: Arr, bias: Arr, top: c_int, scal
     const width = ws[1];
     const experts = ws[0];
     const dtype = mlx.mlx_array_dtype(x);
-    if ((dtype != .bfloat16 and dtype != .float32) or mlx.mlx_array_dtype(weight) != .float32 or mlx.mlx_array_dtype(bias) != .float32 or !std.mem.eql(c_int, &.{experts}, mlx.getShape(bias)) or experts < 16 or experts > 1024 or @mod(experts, 16) != 0 or width <= 64 or width >= 16 * experts or @mod(width, 128) != 0 or top < 1 or top > experts or top > 32) return null;
+    if ((dtype != .bfloat16 and dtype != .float32) or (mlx.mlx_array_dtype(weight) != .float32 and mlx.mlx_array_dtype(weight) != .bfloat16) or mlx.mlx_array_dtype(bias) != .float32 or !std.mem.eql(c_int, &.{experts}, mlx.getShape(bias)) or experts < 16 or experts > 1024 or @mod(experts, 16) != 0 or width <= 64 or width >= 16 * experts or @mod(width, 128) != 0 or top < 1 or top > experts or top > 32) return null;
     var ready = false;
     try mlx.check(mlx._mlx_array_is_available(&ready, weight));
     if (!ready) return null;

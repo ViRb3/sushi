@@ -949,7 +949,7 @@ test "GLM fused router matches FP32 scores and selected order at production widt
     for (matrix) |*v| v.* = (rnd.float(f32) - 0.5) / 16;
     for (&vector) |*v| v.* = (rnd.float(f32) - 0.5) * 4;
     for (&bias) |*v| v.* = (rnd.float(f32) - 0.5) / 4;
-    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| for ([_]bool{ true, false }) |norm| for ([_]bool{ false, true }) |ties| {
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |weight_dtype| for ([_]bool{ true, false }) |norm| for ([_]bool{ false, true }) |ties| {
         if (ties) {
             @memset(matrix, 0);
             @memset(&bias, 0);
@@ -960,7 +960,8 @@ test "GLM fused router matches FP32 scores and selected order at production widt
         var ops = Ops{ .s = stream };
         defer ops.deinit();
         const x = try ops.cast(try ops.own(mlx.mlx_array_new_data(&vector, &[_]c_int{ 1, 1, 4096 }, 3, .float32)), dtype);
-        const w = try ops.own(mlx.mlx_array_new_data(matrix.ptr, &[_]c_int{ 288, 4096 }, 2, .float32));
+        const w = try ops.cast(try ops.own(mlx.mlx_array_new_data(matrix.ptr, &[_]c_int{ 288, 4096 }, 2, .float32)), weight_dtype);
+        try mlx.check(mlx.mlx_array_eval(w));
         const correction = try ops.own(mlx.mlx_array_new_data(&bias, &[_]c_int{288}, 1, .float32));
         const expected = try routeReference(&ops, x, w, correction, 8, 2.5, norm);
         const got = (try @import("glm5_router.zig").route(stream, x, w, correction, 8, 2.5, norm)) orelse return error.TestExpectedFusedRouter;

@@ -56,7 +56,12 @@ fusion or parity results.
 
 Eligible one-token routers use two dispatches: the source-aligned FP32 GEMV with sigmoid/correction,
 then stable selection and unbiased score normalization. The correction bias affects selection only.
-The existing path remains for other geometry, strides or storage. The fused path requires routers and correction
-biases in their original FP32 checkpoint format. Production288-expert/4096-input regressions compare
+The existing path remains for other geometry, strides or storage. The fused path accepts stored BF16 or FP32 router matrices and FP32 correction
+biases. BF16 weights widen locally during FP32 multiplication; no resident FP32 copy is created. Production288-expert/4096-input regressions compare
 selected order and every normalized score bit, including tied scores, normalized/unnormalized modes,
 and BF16/FP32 inputs. This optimization does not change prefill routing.
+
+A real-run engagement check found that the checkpoint stores its router matrices as BF16 despite
+requesting FP32 router arithmetic. The first FP32-storage-only prototype therefore did not engage.
+The corrected storage-aware path passes exact score/order tests for both stored dtypes and both
+activation dtypes; configuration compute precision must not be mistaken for checkpoint storage.
