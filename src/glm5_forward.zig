@@ -1189,3 +1189,66 @@ test "GLM HC prefill policy preserves nonzero small model logits and every cache
     // Hidden128 intentionally falls back. Production-width engagement is covered by HC fixtures.
     try std.testing.expectEqual(before, hc_prefill.dispatchCount());
 }
+
+test "GLM DFlash asynchronous schedules preserve nonzero tapes captures and committed state" {
+    const verifier = @import("glm5_dflash_model.zig");
+    var weights = model.Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(std.testing.allocator, cfg, &weights, mlx.gpuStream());
+    defer net.deinit();
+    var request = try Request.init(std.testing.allocator, 4);
+    defer request.deinit();
+    var ops = Ops{ .s = net.s };
+    defer ops.deinit();
+    const prefix = try ops.own(mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32));
+    _ = try ops.own(try net.forwardLast(&request, prefix, true));
+    const tokens = [_]u32{ 1, 0, 2, 0, 3 };
+    const parents = [_]i32{ -1, 0, 0, 1, 2 };
+    const taps = [_]u32{ 0, 3 };
+    const baseline_binding = try verifier.bindSchedule(0);
+    defer baseline_binding.restore();
+    var reference = try verifier.verify(&net, &request, &tokens, &parents, &taps, .affine_rows_ffn);
+    defer reference.deinit();
+    for ([_]usize{ 2, 4 }) |cadence| {
+        const binding = try verifier.bindSchedule(cadence);
+        defer binding.restore();
+        verifier.resetStats();
+        var candidate = try verifier.verify(&net, &request, &tokens, &parents, &taps, .affine_rows_ffn);
+        defer candidate.deinit();
+        try std.testing.expectEqual(@as(usize, 4) / cadence, verifier.asyncDispatchCount());
+        try std.testing.expectEqual(@as(usize, 1), verifier.syncDispatchCount());
+        try std.testing.expectEqualSlices(u32, reference.targets[0..reference.count], candidate.targets[0..candidate.count]);
+        for (reference.captures.hook.out, candidate.captures.hook.out) |x, y| try expectArrayBits(x, y);
+        for (reference.layers, candidate.layers) |x, y| switch (x.?) {
+            .kda => |left| {
+                const right = y.?.kda;
+                for ([_]Arr{ left.inputs.q, left.inputs.k, left.inputs.v, left.inputs.decay, left.inputs.beta, left.inputs.state, left.conv_input }, [_]Arr{ right.inputs.q, right.inputs.k, right.inputs.v, right.inputs.decay, right.inputs.beta, right.inputs.state, right.conv_input }) |a, b| try expectArrayBits(a, b);
+            },
+            .mla => |left| {
+                const right = y.?.mla;
+                for ([_]Arr{ left.latent, left.keys, left.gates }, [_]Arr{ right.latent, right.keys, right.gates }) |a, b| try expectArrayBits(a, b);
+            },
+        };
+        for ([_]usize{ 1, 3, 5 }) |budget| {
+            var expected = try reference.prepareCommit(&request, budget, &.{}, net.s);
+            defer expected.deinit();
+            var actual = try candidate.prepareCommit(&request, budget, &.{}, net.s);
+            defer actual.deinit();
+            for (&expected.states, &actual.states) |*a, *b| {
+                try std.testing.expectEqual(a.* != null, b.* != null);
+                if (a.*) |*left| try expectRequestBits(left, &b.*.?);
+            }
+        }
+        var profile: @import("glm5_dflash_profile.zig").Profile = .{};
+        const profile_binding = @import("glm5_dflash_profile.zig").bind(&profile);
+        defer profile_binding.restore();
+        verifier.resetStats();
+        var profiled = try verifier.verify(&net, &request, &tokens, &parents, &taps, .affine_rows_ffn);
+        defer profiled.deinit();
+        try std.testing.expectEqual(@as(usize, 0), verifier.asyncDispatchCount());
+        try std.testing.expectEqual(@as(usize, 5), verifier.syncDispatchCount());
+        try std.testing.expectEqualSlices(u32, reference.targets[0..reference.count], profiled.targets[0..profiled.count]);
+    }
+    try std.testing.expectError(error.InvalidGlmVerifySchedule, verifier.bindSchedule(3));
+}

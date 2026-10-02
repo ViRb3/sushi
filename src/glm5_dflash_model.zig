@@ -11,6 +11,38 @@ const adapter = @import("glm5_dflash.zig");
 const Arr = mlx.mlx_array;
 const profiling = @import("glm5_dflash_profile.zig");
 const Ops = base.Ops;
+// Scoped diagnostic policy; synchronous remains the default until full-model qualification.
+threadlocal var async_layers: usize = 0;
+var async_dispatches: usize = 0;
+var sync_dispatches: usize = 0;
+pub const ScheduleBinding = struct {
+    previous: usize,
+    pub fn restore(self: ScheduleBinding) void {
+        async_layers = self.previous;
+    }
+};
+pub fn bindSchedule(layers: usize) !ScheduleBinding {
+    if (layers != 0 and layers != 2 and layers != 4) return error.InvalidGlmVerifySchedule;
+    const old = ScheduleBinding{ .previous = async_layers };
+    async_layers = layers;
+    return old;
+}
+pub fn asyncDispatchCount() usize {
+    return async_dispatches;
+}
+pub fn syncDispatchCount() usize {
+    return sync_dispatches;
+}
+fn appendTape(evals: mlx.mlx_vector_array, tape: LayerTape) !void {
+    switch (tape) {
+        .kda => |t| for ([_]Arr{ t.inputs.q, t.inputs.k, t.inputs.v, t.inputs.decay, t.inputs.beta, t.inputs.state, t.conv_input }) |a| {
+            try mlx.check(mlx.mlx_vector_array_append_value(evals, a));
+        },
+        .mla => |t| for ([_]Arr{ t.latent, t.keys, t.gates }) |a| {
+            try mlx.check(mlx.mlx_vector_array_append_value(evals, a));
+        },
+    }
+}
 var mla_branch_flushes: usize = 0;
 var mla_scratch_bound: usize = 0;
 pub fn branchFlushCount() usize {
@@ -20,6 +52,8 @@ pub fn scratchBoundBytes() usize {
     return mla_scratch_bound;
 }
 pub fn resetStats() void {
+    async_dispatches = 0;
+    sync_dispatches = 0;
     mla_branch_flushes = 0;
     mla_scratch_bound = 0;
 }
@@ -223,6 +257,7 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     @memcpy(result.parents[0..tokens.len], parents);
     const rows: c_int = @intCast(tokens.len);
     var embedding_profile = profiling.Timer.start(tokens.len);
+    const cadence = if (embedding_profile.profile != null) 0 else async_layers;
     var h: Arr = undefined;
     {
         var ops = Ops{ .s = target.s };
@@ -281,21 +316,25 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
         try profile.finish("ffn_overall", &.{ffout});
         const next = try ops.own(try primitive.hcExpand(joined, ffout, ff.post, ff.comb, target.s));
         try profile.finish("expand_ffn", &.{next});
-        const evals = mlx.mlx_vector_array_new_value(next);
-        defer _ = mlx.mlx_vector_array_free(evals);
-        switch (result.layers[index].?) {
-            .kda => |tape| for ([_]Arr{ tape.inputs.q, tape.inputs.k, tape.inputs.v, tape.inputs.decay, tape.inputs.beta, tape.inputs.state, tape.conv_input }) |a| {
-                try mlx.check(mlx.mlx_vector_array_append_value(evals, a));
-            },
-            .mla => |tape| for ([_]Arr{ tape.latent, tape.keys, tape.gates }) |a| {
-                try mlx.check(mlx.mlx_vector_array_append_value(evals, a));
-            },
-        }
         for (taps, 0..) |id, tap| if (id == index) {
             try mlx.check(mlx.mlx_array_set(&result.captures.hook.out[tap], try ops.reduce(next, 2, true, false)));
-            try mlx.check(mlx.mlx_vector_array_append_value(evals, result.captures.hook.out[tap]));
         };
-        try mlx.check(mlx.mlx_eval(evals));
+        if (cadence == 0 or (index + 1) % cadence == 0) {
+            const evals = mlx.mlx_vector_array_new_value(next);
+            defer _ = mlx.mlx_vector_array_free(evals);
+            const first = if (cadence == 0) index else index + 1 - cadence;
+            for (result.layers[first .. index + 1]) |tape| try appendTape(evals, tape.?);
+            for (taps, 0..) |id, tap| if (id >= first and id <= index) {
+                try mlx.check(mlx.mlx_vector_array_append_value(evals, result.captures.hook.out[tap]));
+            };
+            if (cadence == 0) {
+                try mlx.check(mlx.mlx_eval(evals));
+                sync_dispatches += 1;
+            } else {
+                try mlx.check(mlx.mlx_async_eval(evals));
+                async_dispatches += 1;
+            }
+        }
         profile.record("layer_settle");
         try mlx.check(mlx.mlx_array_set(&h, next));
     }
@@ -307,7 +346,16 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     const decisions = try ops.slot();
     try mlx.check(mlx.mlx_argmax_axis(decisions, logits, -1, false, target.s));
     const u = try ops.cast(decisions.*, .uint32);
-    try mlx.check(mlx.mlx_array_eval(u));
+    // Head dependencies do not necessarily consume every replay/capture array.
+    // Settle them explicitly before returning ownership to commit/replay.
+    const final = mlx.mlx_vector_array_new_value(u);
+    defer _ = mlx.mlx_vector_array_free(final);
+    if (cadence != 0) {
+        for (result.layers) |tape| try appendTape(final, tape.?);
+        for (result.captures.hook.out) |value| try mlx.check(mlx.mlx_vector_array_append_value(final, value));
+    }
+    try mlx.check(mlx.mlx_eval(final));
+    sync_dispatches += 1;
     head_profile.record("head");
     @memcpy(result.targets[0..tokens.len], (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..tokens.len]);
     return result;
