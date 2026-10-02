@@ -292,3 +292,31 @@ verification rows, with the original BF16 assistant. The four-row arm measured27
 single-run gain does not establish a robust default or satisfy60 tok/s. The matched comparison
 commits all64 output tokens, unlike the native serial harness's63 timed forwards. Detailed rates,
 phase costs, precision and memory scope are recorded in [the DFlash2 document](plan-glm5-dflash2.md).
+
+
+### Prefill output fusion and decode attribution
+
+A subsequent 512/64 run preserved all output IDs and reduced peak active memory from
+97.020 to96.878 GB. The retained prefill output fusion measured783.03 tok/s with the
+original serial decode operations (26.54 tok/s). It engaged34 prefill epilogues. The full
+suite passed3,034 tests with108 skipped before the final policy-only default changes;
+focused HC and middle-mode tests passed afterward.
+
+| New prefill output fusion | HC decode fusion | Middle/down decode fusion | Prefill tok/s | Decode tok/s |
+|---|---|---|---:|---:|
+| On | On | On |782.27|26.11|
+| On | Off | On |782.16|26.18|
+| On | On | Off |782.33|26.49|
+| On | Off | Off |783.03|26.54|
+
+All four arms generated identical64 IDs. HC had no demonstrated end-to-end benefit and is
+now opt-in. The middle/down fusion regressed serial decode and auto mode now keeps the original
+one-row path; its short-multirow candidate remains available for separate verification tests.
+Warm component timing must not substitute for whole-model evidence. The1,000/60 target remains open.
+
+An untimed512-token routing capture covered all42 MoE layers:512 histogram entries each,
+4,096 assignments per layer, with224 trailing entries zero for the288-expert model. It shows
+that the existing NAX kernel already skips the unused second16-row operation in short windows.
+Changing all32-row windows to16 would preserve the MMA operation count while increasing weight
+redecode work; the next experiment targets accumulator register pressure instead of assuming
+that every short expert run computes32 rows.
