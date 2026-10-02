@@ -255,6 +255,8 @@ pub const DenseMlp = struct {
     pub fn apply(self: DenseMlp, ops: *Ops, x: Arr, limit: f32) !Arr {
         const gate = try self.gate.apply(ops, x);
         const up = try self.up.apply(ops, x);
+        if (try @import("glm5_activation.zig").apply(ops.s, gate, up, limit)) |middle|
+            return self.down.apply(ops, try ops.own(middle));
         const hi = try ops.scalar(limit, mlx.mlx_array_dtype(gate));
         const lo = try ops.scalar(-limit, mlx.mlx_array_dtype(up));
         const cg = try ops.binary(.min, gate, hi);

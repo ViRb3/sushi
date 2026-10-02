@@ -257,3 +257,12 @@ speed gain beyond the earlier async/dense-prefill improvements.
 A separate2048/64 context run (`ddcf219f`, chunk2048, eight warmup decode steps) measured863.10 tok/s
 prefill and20.23 tok/s decode, peak99.689 GB. It crossed the live sparse-selection boundary and produced
 coherent English. This is a different workload, not a same-length speedup or achievement of1,000/60.
+
+
+The BF16-storage router correction plus paired cooperative gate/up projections (`0188bb9d`)
+measured **749.28 tok/s prefill and 26.44 tok/s serial decode** on the same warmed512/64 workload,
+peak96.965 GB (90.306 GiB). All64 output IDs match the fused-KDA arm (25.50 tok/s decode).
+Both router and paired-expert counters recorded2,646 calls; QKV and KDA body recorded2,142 each.
+This combined change measured3.67% faster decode; it does not isolate either component's contribution.
+The earlier FP32-storage-only router arm recorded zero router calls and establishes no router gain.
+The1,000/60 targets and whole-model quality gate remain open.
