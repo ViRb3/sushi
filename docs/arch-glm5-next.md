@@ -200,3 +200,23 @@ Output began `</think>Rain forms through the water cycle. The sun heats water in
 and continued coherently to the fixed length. This is one workload, not a KLD result. These measurements
 are below the requested 1,000 tok/s prefill and 60 tok/s decode targets. Serial scheduling and memory
 residency are the next tuning steps. DFlash2 integration follows serial tuning; its design study is separate.
+
+
+### Serial tuning measurements
+
+The following follow-ups use the same512/64 prompt, warmup/reset, EXL3 checkpoint, BF16 attention
+cache and exclusive-run protocol. Scheduling code is `379ff876`; diagnostic controls are `bfb5931c`.
+The final two rows use the same binary and change only the named setting relative to async/chunk128.
+
+| Arm | Prefill chunk | Prefill tok/s | Serial decode tok/s | Peak active GB |
+| --- | ---: | ---: | ---: | ---: |
+| Synchronous layer profiling baseline | 128 | 342.67 | 18.44 | 96.067 |
+| Async4 decode, profiling off | 128 | 345.45 | 24.02 | 96.067 |
+| Async4 plus fit residency, zero slack | 128 | 344.39 | 24.12 | 96.067 |
+| Async4, original residency, larger prefill | 512 | 527.21 | 23.40 | 96.788 |
+
+Async4 and fit residency each retained all64 output IDs from the baseline. Fit has no demonstrated
+speed gain at this precision. Chunk512 produced coherent English but changed one word near the end;
+changing GEMM row shape changes rounding, so this is not a byte-equivalent scheduling improvement.
+It remains an explicit benchmark setting, not proof of full-model quality equivalence. The requested
+1,000/60 tok/s targets are still unmet; all measurements here are serial, without DFlash2.

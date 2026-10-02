@@ -77,3 +77,9 @@ one-token decode, with one final logits-and-cache evaluation. Set it to0 for the
 synchronous comparison. `PROFILE=1` forces synchronous evaluation so per-layer
 timings remain meaningful; the report names the effective schedule. Prefill keeps
 its per-layer memory boundary in either mode.
+
+`SUSHI_GLM_DIAGNOSTIC_DENSE_PREFILL=1` opts into the reference-style expanded-K/V
+short-prefill attention experiment. It is off by default and retains absorbed
+attention for decode and calls outside the dense-prefix eligibility boundary.
+Changing BF16 rounding boundaries requires independent reference and quality
+validation; it is not a byte-preserving scheduling change.
