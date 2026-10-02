@@ -135,13 +135,13 @@ test "GLM DFlash KDA tree follows per-channel parent state exactly" {
     }
 }
 
-pub const ProjectionMode = enum { serial_rows, affine_rows, batched };
+pub const ProjectionMode = enum { serial_rows, affine_rows, affine_rows_ffn, batched };
 
 pub fn linearRows(ops: *Ops, linear: @import("glm5_model.zig").Linear, x: Arr, mode: ProjectionMode) !Arr {
     const shape = mlx.getShape(x);
     if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > 16) return error.InvalidGlmDraftShape;
     if (mode == .batched or shape[1] == 1) return linear.apply(ops, x);
-    if (mode == .affine_rows) if (try @import("glm5_dflash_qmm.zig").project(ops.s, x, linear)) |output| return ops.own(output);
+    if (mode == .affine_rows or mode == .affine_rows_ffn) if (try @import("glm5_dflash_qmm.zig").project(ops.s, x, linear)) |output| return ops.own(output);
     var rows: [16]Arr = undefined;
     var made: usize = 0;
     defer for (rows[0..made]) |value| {

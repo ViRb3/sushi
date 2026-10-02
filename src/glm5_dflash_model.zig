@@ -10,6 +10,18 @@ const tree = @import("glm5_dflash_tree.zig");
 const adapter = @import("glm5_dflash.zig");
 const Arr = mlx.mlx_array;
 const Ops = base.Ops;
+var mla_branch_flushes: usize = 0;
+var mla_scratch_bound: usize = 0;
+pub fn branchFlushCount() usize {
+    return mla_branch_flushes;
+}
+pub fn scratchBoundBytes() usize {
+    return mla_scratch_bound;
+}
+pub fn resetStats() void {
+    mla_branch_flushes = 0;
+    mla_scratch_bound = 0;
+}
 
 fn ancestry(parents: []const i32, row: usize, out: *[16]u32) []const u32 {
     var count: usize = 0;
@@ -58,6 +70,10 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     const width: c_int = @intCast(cfg.mla_kv_lora_rank);
     const ih: c_int = @intCast(cfg.indexer_n_heads);
     const iw: c_int = @intCast(cfg.indexer_head_dim);
+    const latent_capacity: usize = if (state.latent.ctx != null) @intCast(mlx.getShape(state.latent)[0]) else 0;
+    const pool_capacity: usize = if (state.pooled.ctx != null) @intCast(mlx.getShape(state.pooled)[0]) else 0;
+    const scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(x));
+    mla_scratch_bound = @max(mla_scratch_bound, scratch.live_bytes);
     const qr = try ops.rms(try kda.linearRows(ops, layer.qa, x, mode), layer.qa_norm, cfg.rms_norm_eps);
     const q = try ops.reshape(try kda.linearRows(ops, layer.qb, qr, mode), &.{ t, heads, 1, kd });
     // Head-batched projections keep each node's serial [1,H,1,D] geometry.
@@ -80,6 +96,8 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     tape.gates = try ops.result(gates);
     tape.ape = try ops.result(layer.ape);
     var result_rows: [16]Arr = undefined;
+    var pending: [16]Arr = undefined;
+    var pending_count: usize = 0;
     for (0..parents.len) |row| {
         var branch = try forkAttention(state);
         defer branch.deinit();
@@ -88,8 +106,16 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         try tape.append(&branch, kept, ops.s);
         const from: c_int = @intCast(row);
         const y = try ops.own(try attention.attend(&branch, try ops.slice(qa, 0, from, from + 1), try ops.slice(index_q, 0, from, from + 1), try ops.slice(index_weights, 0, from, from + 1), state.processed + kept.len - 1, 1 / @sqrt(@as(f32, @floatFromInt(kd))), ops.s));
-        // Bound copies of the committed latent prefix to one branch at a time.
-        try mlx.check(mlx.mlx_array_eval(y));
+        pending[pending_count] = y;
+        pending_count += 1;
+        // The final group settles at the enclosing layer boundary.
+        if (pending_count == scratch.branches and row + 1 < parents.len) {
+            const group = mlx.mlx_vector_array_new_data(&pending, pending_count);
+            defer _ = mlx.mlx_vector_array_free(group);
+            try mlx.check(mlx.mlx_eval(group));
+            mla_branch_flushes += 1;
+            pending_count = 0;
+        }
         const y4 = try ops.reshape(y, &.{ 1, heads, 1, width });
         const values = if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
         result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
@@ -220,7 +246,7 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
         const ff = try layer.hc_ffn.collapse(&ops, joined, &target.cfg);
         defer ff.deinit();
         const fx = try ops.rms(ff.mixed, layer.norm_ffn, target.cfg.rms_norm_eps);
-        const ffout = if (mode == .batched) try target.feedForwardLayer(index, &ops, fx) else blk: {
+        const ffout = if (mode == .affine_rows_ffn) try @import("glm5_dflash_ffn.zig").apply(target, index, &ops, fx) else if (mode == .batched) try target.feedForwardLayer(index, &ops, fx) else blk: {
             var outputs: [16]Arr = undefined;
             var made: usize = 0;
             defer for (outputs[0..made]) |value| {
@@ -262,4 +288,8 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     try mlx.check(mlx.mlx_array_eval(u));
     @memcpy(result.targets[0..tokens.len], (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..tokens.len]);
     return result;
+}
+
+test {
+    _ = @import("glm5_dflash_memory.zig");
 }

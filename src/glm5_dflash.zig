@@ -359,12 +359,17 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
         try sameRequest(&serial, &verified.states[row].?, s);
         for (cap.hook.out, verified.captures[row].?.hook.out) |x, y| try sameArray(x, y, s);
     }
+    @import("glm5_dflash_model.zig").resetStats();
     var layerwise = try @import("glm5_dflash_model.zig").verify(&target, &request, &tokens, &parents, &taps, .serial_rows);
     defer layerwise.deinit();
+    try std.testing.expectEqual(@as(usize, 0), @import("glm5_dflash_model.zig").branchFlushCount());
+    try std.testing.expect(@import("glm5_dflash_model.zig").scratchBoundBytes() > 0);
     try std.testing.expectEqualSlices(u32, verified.targets[0..verified.count], layerwise.targets[0..layerwise.count]);
     const qmm_before = @import("glm5_dflash_qmm.zig").dispatchCount();
-    var affine = try @import("glm5_dflash_model.zig").verify(&target, &request, &tokens, &parents, &taps, .affine_rows);
+    const ffn_before = @import("glm5_dflash_ffn.zig").batchCount();
+    var affine = try @import("glm5_dflash_model.zig").verify(&target, &request, &tokens, &parents, &taps, .affine_rows_ffn);
     defer affine.deinit();
+    try std.testing.expectEqual(ffn_before + 1, @import("glm5_dflash_ffn.zig").batchCount());
     try std.testing.expectEqual(qmm_before, @import("glm5_dflash_qmm.zig").dispatchCount());
     try std.testing.expectEqualSlices(u32, layerwise.targets[0..layerwise.count], affine.targets[0..affine.count]);
     var affine_committed = try affine.prepareCommit(&request, 3, &.{}, s);
@@ -540,7 +545,7 @@ pub fn roundTreeLayerwiseMode(io: std.Io, assistant: *draft.DflashModel, context
     const replay_ns = timer.read();
     timer.reset();
     const kept = try commitVerified(assistant, context, request, &verified, budget, eos);
-    var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = if (mode == .affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections" };
+    var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = if (mode == .affine_rows_ffn) "layerwise_tree_affine_ffn_tiles" else if (mode == .affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections" };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
     return result;
 }
@@ -551,4 +556,8 @@ test {
 
 test {
     _ = @import("glm5_dflash_qmm.zig");
+}
+
+test {
+    _ = @import("glm5_dflash_ffn.zig");
 }

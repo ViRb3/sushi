@@ -1,0 +1,51 @@
+//! Conservative live scratch bounds for branch-local MLA views.
+const std = @import("std");
+pub const limit_bytes: usize = 256 * 1024 * 1024;
+pub const Plan = struct { branches: usize, common_bytes: usize, per_branch_bytes: usize, live_bytes: usize };
+fn add(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.GlmTreeScratchLimit;
+}
+fn mul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.GlmTreeScratchLimit;
+}
+fn capacity(needed: usize) !usize {
+    return mul((try add(needed, 255)) / 256, 256);
+}
+
+pub fn plan(processed: usize, latent_capacity: usize, pool_capacity: usize, width: usize, index_width: usize, heads: usize, rows: usize, bytes: usize) !Plan {
+    if (rows == 0 or rows > 16 or width == 0 or index_width == 0 or heads == 0 or (bytes != 2 and bytes != 4) or latent_capacity < processed or pool_capacity < processed / 4) return error.InvalidGlmDraftShape;
+    const needed = try add(processed, rows);
+    const pool_needed = needed / 4;
+    const latent_rows = @max(latent_capacity, try capacity(needed));
+    const pool_rows = @max(pool_capacity, try capacity(pool_needed));
+    // Growth can retain both concatenation storage and the slice-update copy.
+    const latent_copy = try mul(try mul(try mul(latent_rows, width), bytes), if (needed > latent_capacity) 2 else 1);
+    const pool_copy = try mul(try mul(try mul(pool_rows, index_width), bytes), if (pool_needed > pool_capacity) 2 else 1);
+    const partials = try mul(try mul(try mul(heads, 8), try add(width, 2)), 4);
+    const scores = try mul(pool_needed, 12);
+    const selected = try mul(try add(try mul(@min(pool_needed, 512), 4), 3), 4);
+    const compression = try mul(try mul(try mul(try add(rows, 3), index_width), bytes), 5);
+    const gathered = try mul(try mul(rows, width), bytes);
+    // Reserve both directions' potential eight-way qvm split-K intermediates.
+    const projections = try mul(try mul(try mul(heads, width), bytes), 16);
+    var per_branch = try add(latent_copy, pool_copy);
+    for ([_]usize{ partials, scores, selected, compression, gathered, projections }) |part| per_branch = try add(per_branch, part);
+    const common = try add(try mul(try mul(try mul(try mul(rows, heads), width), bytes), 4), try mul(try mul(try mul(rows, index_width), bytes), 2));
+    if (common >= limit_bytes or per_branch > limit_bytes - common) return error.GlmTreeScratchLimit;
+    const branches = @min(rows, (limit_bytes - common) / per_branch);
+    return .{ .branches = branches, .common_bytes = common, .per_branch_bytes = per_branch, .live_bytes = try add(common, try mul(branches, per_branch)) };
+}
+
+test "GLM DFlash MLA scratch covers cache copies and batches only what fits" {
+    const short = try plan(32, 256, 256, 512, 128, 64, 16, 2);
+    try std.testing.expectEqual(@as(usize, 16), short.branches);
+    const boundary = try plan(65536, 65536, 16384, 512, 128, 64, 16, 2);
+    try std.testing.expectEqual(@as(usize, 1), boundary.branches);
+    try std.testing.expect(boundary.per_branch_bytes >= 2 * (65792 * 512 * 2 + 16640 * 128 * 2));
+    try std.testing.expect(boundary.live_bytes <= limit_bytes);
+    const room = try plan(65400, 65536, 16384, 512, 128, 64, 16, 2);
+    try std.testing.expect(room.branches > boundary.branches);
+    try std.testing.expectError(error.GlmTreeScratchLimit, plan(131072, 131072, 32768, 512, 128, 64, 16, 2));
+    try std.testing.expectError(error.InvalidGlmDraftShape, plan(32, 16, 256, 512, 128, 64, 4, 2));
+    try std.testing.expectError(error.InvalidGlmDraftShape, plan(32, 256, 256, 512, 128, 64, 17, 2));
+}

@@ -1,8 +1,8 @@
 # GLM-5.3-Flash DFlash2 integration plan
 
-Status: source study and initial native correctness implementation, 2026-10-02. Serial GLM correctness
-and tuning continue separately. The implementation does not enable public serving, report a GLM
-DFlash benchmark, or establish that the Qwen verification kernels are compatible with GLM.
+Status: native tree verification and initial checkpoint parity, 2026-10-03. Serial GLM tuning
+continues separately. Public speculative serving and final performance qualification remain open.
+Qwen-specific verification kernels are not enabled for GLM by assumption.
 The target is the local Sushi 2.4bpw checkpoint;
 the independently supplied GLM DFlash2 assistant is a draft model, not the target's MTP layer.
 
@@ -31,15 +31,15 @@ production scheduling remain unsupported by this adapter.
 nodes in one Metal dispatch, with per-key-channel decay and FP32 parent states retained locally;
 `glm5_dflash_kda.zig` stores projected prework and replays only the accepted ancestry on commit.
 It does not retain a full recurrent state for every node. MLA constructs each node's own completed
-pools and remainder from the committed prefix plus its ancestors. Branch views are evaluated and
-released one at a time to bound latent-cache copies. Commit appends only the accepted raw index and
-latent rows to the original state. mHC and captures operate across independent token rows.
+pools and remainder from the committed prefix plus its ancestors. Branch views are evaluated in
+bounded groups, with the final group settled at the enclosing layer boundary. Commit appends only
+the accepted raw index and latent rows to the original state. mHC and captures operate across independent token rows.
 
 `roundTreeLayerwise` uses this verifier and separately reports replay time. Its strict projection mode
 preserves one-row trunk matrix geometry; the internal batched-projection experiment is not selected
 by this entry point. This reduces repeated model orchestration and recurrent work, but it still has
-per-row projection work and per-branch MLA evaluation. It is not the final performance endpoint.
-Real-checkpoint parity, broad row-exact qualification, admission accounting and tuning remain gates.
+per-row work for unsupported projection geometry. It is not the final performance endpoint.
+Broader checkpoint/context parity, admission accounting and tuning remain gates.
 
 `glm5_dflash_qmm.zig` contains a separate, opt-in affine8/group128 candidate. It reuses
 each weight group across up to four rows while preserving the serial qmv dot and reduction order.
@@ -48,8 +48,22 @@ Focused tests match every output bit for 1, 2, 3, 4, 5, 8 and 16 rows at input/o
 gated by `SUSHI_GLM_DFLASH_HEAD_FIXTURE=1`; it passed at 4096 input width in a direct test-executable
 run on 2026-10-03. `linearRows` uses the candidate only in explicit `.affine_rows` mode, and its test
 requires a real dispatch before checking bit equality. Dense BF16 projections, unsupported affine
-geometry, per-head MLA projections and the FFN path retain their serial geometry. The real-checkpoint
+geometry and per-head MLA projections retain their serial geometry. The real-checkpoint
 diagnostic still defaults to the original strict mode while the opt-in path is being timed.
+
+`glm5_dflash_ffn.zig` adds a separate FFN option. Routing is still computed per row through the native
+`routeLayer` API; routed experts use one decode-width EXL3 call for the whole tree. Shared/dense
+projections use eligible affine tiles and the native activation helper, preserving BF16 sigmoid,
+BF16 gate-product and BF16 up-product boundaries. Batch-versus-concatenated-serial outputs match
+raw BF16 bits at rows 2/4/8/16 for all seventeen supported 2–4bpw rates and at production 4096/2048,
+top-8, K2.25/W12 geometry. The complete tiny tree also checks its accepted-state replay.
+
+`glm5_dflash_memory.zig` caps planned live MLA transients at 256 MiB. The bill includes latent and
+pooled cache capacity copies, two copies on growth, partial attention outputs, index score planes,
+selection IDs, pooling work, gathered rows and projection scratch. Sixteen short-context branches fit;
+the exact 64K growth boundary admits one branch at a time, and a 128K growth boundary is refused.
+The estimate bounds explicit graph/copy storage; allocator cache and backend-private workspaces remain
+part of measured peak memory. Refusal returns `GlmTreeScratchLimit` without publishing target state.
 
 Focused ReleaseFast tests cover tree validation, zero acceptance, sibling exclusion, pre-commit
 budget/EOS handling, immutable request forks, a complete tiny native assistant proposal/round, and
@@ -57,7 +71,7 @@ every node's recurrent state, convolution window, latent cache, pooled history, 
 against independent serial ancestry. Layerwise replay is checked at all four pooling residues,
 capacity growth at prefix 255 and first sparse selection at prefix 2051, for zero, one and two
 accepted drafts. The model fixture includes nonzero layers and token-dependent embeddings; sibling
-recurrent states must differ. These tests do not establish real-checkpoint acceptance or throughput.
+recurrent states must differ. These unit tests alone do not establish real-checkpoint acceptance or throughput.
 The shared target capture hook is independently tested in `glm5_forward.zig`.
 The KDA tree recurrence also matches serial ancestor outputs byte-for-byte at 16 nodes with the
 production 64-head, 128-key/value geometry, for both BF16 and FP32 inputs and FP32 state.
@@ -85,12 +99,19 @@ error; it never labels a fallback as speculative success.
 | `SUSHI_GLM_DFLASH_CHUNK` | Prefill chunk, default 128 |
 | `SUSHI_GLM_DFLASH_MEMORY_GIB` | MLX limit, default 110; wired limit capped at recommended set |
 | `SUSHI_GLM_DFLASH_AFFINE_ROWS` | `1` opts into exact affine row tiles; unset/`0` keeps strict projections |
+| `SUSHI_GLM_DFLASH_BATCH_FFN` | `1` also batches decode-width experts/shared FFN; requires affine rows |
+| `SUSHI_GLM_DFLASH_WARMUP` | 0–4 warmup passes; each covers prefill, serial steps, full-tree and one-row shapes |
 
 The JSON records exact input/output and serial-reference IDs, token/state parity, per-round accepted
 drafts and verified rows, draft/verify/replay/commit times, peak memory and decoded text. Progress is
 written beside it with `.progress.json`. Timing includes all round work and counts committed output
-tokens; this first-run diagnostic is explicitly unwarmed and provisional. Serial parity runs after
-the speculative timing and is not presented as a newly measured serial performance baseline.
+tokens, including the final emitted token. Warmup resets request and assistant caches before timing;
+it preserves no prompt prefix. Serial parity runs afterward from the identical captured prefix and
+now records a matched serial rate for the same committed-token count, excluding comparison and
+logging. Native serial kernels are warmed as well. Serial decoding has no unused draft captures;
+that distinction, async4 scheduling, chunk size and prefill mode are recorded. Do not compare its
+rate directly with a native harness that generates 64 tokens from only 63 timed forwards. The JSON
+also records affine/FFN engagement counts, forced MLA branch flushes and the planned scratch bound.
 
 ### First real-checkpoint result
 

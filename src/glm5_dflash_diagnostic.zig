@@ -62,6 +62,11 @@ test "GLM DFlash real checkpoint diagnostic" {
     const steps = try number("SUSHI_GLM_DFLASH_DECODE", 8);
     const nodes = try number("SUSHI_GLM_DFLASH_NODES", 3);
     const affine_rows = @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_AFFINE_ROWS");
+    const batch_ffn = @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_BATCH_FFN");
+    if (batch_ffn and !affine_rows) return error.GlmFfnRequiresAffineRows;
+    const verify_mode: @import("glm5_dflash_kda.zig").ProjectionMode = if (batch_ffn) .affine_rows_ffn else if (affine_rows) .affine_rows else .serial_rows;
+    const warmup = try number("SUSHI_GLM_DFLASH_WARMUP", 0);
+    if (warmup > 4) return error.InvalidGlmDiagnosticBudget;
     const chunk = try number("SUSHI_GLM_DFLASH_CHUNK", 128);
     if (count == 0 or count > 65536 or steps == 0 or steps > 4096 or nodes == 0 or nodes > 15 or chunk == 0) return error.InvalidGlmDiagnosticBudget;
     const memory = (try number("SUSHI_GLM_DFLASH_MEMORY_GIB", 110)) * 1024 * 1024 * 1024;
@@ -104,6 +109,38 @@ test "GLM DFlash real checkpoint diagnostic" {
     defer context.deinit();
     var request = try forward.Request.init(a, cfg.num_hidden_layers);
     defer request.deinit();
+    const warm_start = @import("io_util.zig").Stopwatch.init(io);
+    for (0..warmup) |iteration| {
+        try writeJson(io, a, progress, .{ .complete = false, .phase = "warmup", .iteration = iteration });
+        var at: usize = 0;
+        var next: u32 = 0;
+        while (at < count) {
+            const end = @min(count, at + chunk);
+            const input = mlx.mlx_array_new_data(ids[at..end].ptr, &[_]c_int{ 1, @intCast(end - at) }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(input);
+            next = try adapter.prefill(&assistant, &context, &target, &request, input);
+            at = end;
+        }
+        {
+            var serial_warm = try adapter.cloneRequest(&request);
+            defer serial_warm.deinit();
+            var token = next;
+            for (0..2) |_| {
+                const input = mlx.mlx_array_new_data(&token, &[_]c_int{ 1, 1 }, 2, .uint32);
+                defer _ = mlx.mlx_array_free(input);
+                const logits = try target.forwardLast(&serial_warm, input, true);
+                defer _ = mlx.mlx_array_free(logits);
+                token = try greedy(logits, stream);
+            }
+        }
+        const warmed = try adapter.roundTreeLayerwiseMode(io, &assistant, &context, &target, &request, next, nodes, 32, cfg.eosTokenSlice(), verify_mode);
+        if (warmed.pending) |last| _ = try adapter.roundTreeLayerwiseMode(io, &assistant, &context, &target, &request, last, nodes, 1, cfg.eosTokenSlice(), verify_mode);
+        const empty = try @import("dflash.zig").DflashCtx.init(a, &assistant, 0);
+        context.deinit();
+        context = empty;
+        request.reset();
+    }
+    const warmup_ns = if (warmup > 0) warm_start.read() else 0;
     var timer = @import("io_util.zig").Stopwatch.init(io);
     var pending: u32 = 0;
     var cursor: usize = 0;
@@ -127,11 +164,13 @@ test "GLM DFlash real checkpoint diagnostic" {
     defer rounds.deinit(a);
     try mlx.check(mlx.mlx_reset_peak_memory());
     @import("glm5_dflash_qmm.zig").resetDispatchCount();
+    @import("glm5_dflash_ffn.zig").resetBatchCount();
+    @import("glm5_dflash_model.zig").resetStats();
     var decode_ns: u64 = 0;
     while (generated.items.len < steps) {
         try writeJson(io, a, progress, .{ .complete = false, .phase = "tree_decode", .generated = generated.items.len, .rounds = rounds.items.len });
         timer.reset();
-        const round = try adapter.roundTreeLayerwiseMode(io, &assistant, &context, &target, &request, pending, nodes, steps - generated.items.len, cfg.eosTokenSlice(), if (affine_rows) .affine_rows else .serial_rows);
+        const round = try adapter.roundTreeLayerwiseMode(io, &assistant, &context, &target, &request, pending, nodes, steps - generated.items.len, cfg.eosTokenSlice(), verify_mode);
         decode_ns += timer.read();
         try generated.appendSlice(a, round.tokens[0..round.count]);
         try rounds.append(a, .{ .emitted = round.count, .accepted_drafts = round.accepted_drafts, .verified_rows = round.verified_rows, .draft_ns = round.draft_ns, .verify_ns = round.verify_ns, .replay_ns = round.replay_ns, .commit_ns = round.commit_ns });
@@ -143,23 +182,29 @@ test "GLM DFlash real checkpoint diagnostic" {
     try writeJson(io, a, progress, .{ .complete = false, .phase = "serial_parity" });
     const reference = try a.alloc(u32, generated.items.len);
     defer a.free(reference);
+    var serial_decode_ns: u64 = 0;
     for (reference) |*id| {
+        timer.reset();
         id.* = serial_pending;
-        const input = mlx.mlx_array_new_data(&serial_pending, &[_]c_int{ 1, 1 }, 2, .uint32);
-        defer _ = mlx.mlx_array_free(input);
-        const logits = try target.forwardLast(&serial, input, true);
-        defer _ = mlx.mlx_array_free(logits);
-        serial_pending = try greedy(logits, stream);
+        {
+            const input = mlx.mlx_array_new_data(&serial_pending, &[_]c_int{ 1, 1 }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(input);
+            const logits = try target.forwardLast(&serial, input, true);
+            defer _ = mlx.mlx_array_free(logits);
+            serial_pending = try greedy(logits, stream);
+        }
+        serial_decode_ns += timer.read();
     }
     const ids_match = std.mem.eql(u32, reference, generated.items);
     const state_match = try stateMatches(&request, &serial, stream);
     const affine_dispatches = @import("glm5_dflash_qmm.zig").dispatchCount();
-    const engaged = !affine_rows or affine_dispatches > 0;
+    const ffn_batches = @import("glm5_dflash_ffn.zig").batchCount();
+    const engaged = (!affine_rows or affine_dispatches > 0) and (!batch_ffn or ffn_batches > 0);
     var tok = try @import("tokenizer.zig").loadTokenizer(io, a, model_path);
     defer tok.deinit();
     const text = try tok.decode(a, generated.items, false);
     defer a.free(text);
-    try writeJson(io, a, output_path, .{ .complete = ids_match and state_match and engaged, .model = model_path, .assistant = assistant_path, .assistant_precision = "BF16", .verifier = if (affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections", .affine_row_tiles = affine_rows, .affine_row_dispatches = affine_dispatches, .sampling = "greedy", .warmup = false, .timing_provisional = true, .input_ids = ids, .output_ids = generated.items, .serial_output_ids = reference, .output_text = if (std.unicode.utf8ValidateSlice(text)) text else null, .token_parity = ids_match, .state_parity = state_match, .prefill_ns = prefill_ns, .decode_ns = decode_ns, .decode_tokens_per_second = @as(f64, @floatFromInt(generated.items.len)) * 1e9 / @as(f64, @floatFromInt(decode_ns)), .peak_bytes = peak, .memory_limit_bytes = memory, .wired_limit_bytes = wired, .nodes = nodes, .rounds = rounds.items, .public_serving_enabled = false });
+    try writeJson(io, a, output_path, .{ .complete = ids_match and state_match and engaged, .model = model_path, .assistant = assistant_path, .assistant_precision = "BF16", .verifier = if (batch_ffn) "layerwise_tree_affine_ffn_tiles" else if (affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections", .affine_row_tiles = affine_rows, .affine_row_dispatches = affine_dispatches, .ffn_batches = ffn_batches, .batch_ffn = batch_ffn, .mla_branch_flushes = @import("glm5_dflash_model.zig").branchFlushCount(), .mla_scratch_bound_bytes = @import("glm5_dflash_model.zig").scratchBoundBytes(), .mla_scratch_cap_bytes = @import("glm5_dflash_memory.zig").limit_bytes, .sampling = "greedy", .warmup = warmup, .warmup_ns = warmup_ns, .timing_provisional = true, .prefill_tokens = count, .requested_output_tokens = steps, .generated_tokens = generated.items.len, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) * 1e9 / @as(f64, @floatFromInt(prefill_ns)), .input_ids = ids, .output_ids = generated.items, .serial_output_ids = reference, .output_text = if (std.unicode.utf8ValidateSlice(text)) text else null, .token_parity = ids_match, .state_parity = state_match, .prefill_ns = prefill_ns, .decode_ns = decode_ns, .rate_denominator = "committed_input_tokens_including_final_emitted_token", .serial_reference_ns = serial_decode_ns, .serial_reference_tokens_per_second = @as(f64, @floatFromInt(reference.len)) * 1e9 / @as(f64, @floatFromInt(serial_decode_ns)), .speedup_vs_matched_serial = if (ids_match and state_match) @as(f64, @floatFromInt(serial_decode_ns)) / @as(f64, @floatFromInt(decode_ns)) else @as(?f64, null), .serial_reference_prefill = "same captured prefix and target state", .serial_reference_decode_capture = false, .serial_reference_async4 = serial.decode_async, .dense_prefill = request.dense_prefill, .prefill_chunk = chunk, .warmup_serial_steps = 2 * warmup, .decode_tokens_per_second = @as(f64, @floatFromInt(generated.items.len)) * 1e9 / @as(f64, @floatFromInt(decode_ns)), .peak_bytes = peak, .memory_limit_bytes = memory, .wired_limit_bytes = wired, .nodes = nodes, .rounds = rounds.items, .public_serving_enabled = false });
     if (!ids_match or !state_match) return error.GlmDflashSerialParityFailed;
     if (!engaged) return error.GlmAffineRowsNotEngaged;
     try writeJson(io, a, progress, .{ .complete = true, .phase = "complete" });
