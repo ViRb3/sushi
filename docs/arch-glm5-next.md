@@ -266,3 +266,12 @@ Both router and paired-expert counters recorded2,646 calls; QKV and KDA body rec
 This combined change measured3.67% faster decode; it does not isolate either component's contribution.
 The earlier FP32-storage-only router arm recorded zero router calls and establishes no router gain.
 The1,000/60 targets and whole-model quality gate remain open.
+
+
+The subsequent activation/sorted-finish/selection-batching arm (`24b1437b`) measured
+765.94 tok/s prefill and26.54 tok/s decode on the same512/64 configuration. All64 output IDs
+remain equal;2,880 dense/shared activation calls engaged. Prefill was2.22% faster in this pair;
+the0.39% decode difference is not a robust isolated gain. Peak active memory was97.020 GB,
+55.15 MB above the preceding arm despite removal of the sorted-output scatter intermediate;
+do not infer a whole-model memory saving from the local buffer removal. Combined ReleaseFast
+validation passed3,028 tests with105 skipped. These results remain diagnostic, without public serving.
