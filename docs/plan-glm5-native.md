@@ -13,15 +13,18 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
 
 - Completed: KDA preparation, independent layer fixtures, bounded IndexPool/latent attention,
   stored-grid MLA comparisons, complete diagnostic forward, request reset and coherent 512/64 generation.
-- Latest warmed serial 512/64 result: 836.77 tok/s prefill,26.50 tok/s decode; peak 96.727 GB.
-  All 64 output IDs match the previous fused-KDA arm. The 2K workload separately measured 863.10/20.23.
+- Latest warmed serial 512/64 result: 881.07 tok/s prefill, 25.69 tok/s decode; peak 96.541 GB.
+  Exact C24 HC prefill fusion preserves all 64 output IDs. The 2K/64 workload separately measured
+  1,171.77/21.48 tok/s and 97.366 GB peak. These runs precede the cheap HC eligibility guard;
+  the 512 decode decrease from 26.50 remains unattributed pending a controlled follow-up.
 - Completed serial optimizations: async4 scheduling, copy-free QKV, fused KDA body, BF16-storage
   FP32 router and paired cooperative expert gate/up. Dense-prefill SDPA remains opt-in pending KLD.
 - DFlash2: BF16 assistant, layerwise tree verifier and transactional accepted-state commit are
   implemented. Warmed 512/64 runs at three tree widths preserve every serial output ID and final state.
-  Four verification rows were fastest at 27.03 tok/s versus matched serial 26.54, a small single-run gain;
+  The latest unprofiled four-row run measured 27.67 tok/s versus matched serial 26.27;
   target verification remains the dominant cost. See [the DFlash2 plan](plan-glm5-dflash2.md).
-- Remaining: optimize and measure toward 1,000/60; full-model lossless-teacher KLD;
+- Remaining: optimize toward at least 1,200 tok/s prefill and 45 tok/s speculative decode
+  using MTP or DFlash2; full-model lossless-teacher KLD;
   broader long-context coverage; production loader/lifecycle/server integration. The sections below
   retain the acceptance criteria, including completed foundations, rather than implying each is missing.
 
@@ -29,7 +32,8 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
 
 Text only, one request, resident affine8 group128 trunk and resident EXL3 experts,
 normal token embeddings resident, MTP off and speculative decoding off. Keep source
-BF16/FP32 small tensors unchanged. Do not load unused vision/MTP payload just because
+BF16/FP32 small tensors unchanged. Use BF16 compressed MLA cache by default and FP32 KDA
+state. GLM must not inherit generic KV8 defaults, including the `--fast` preset. Do not load unused vision/MTP payload just because
 it exists in the index. Keep lossless BF16 expert streaming available for validation.
 
 The first execution target is a native diagnostic generation harness with the full
@@ -77,9 +81,10 @@ contracts while optimizing or integrating the indexed GPU path.
 - Implement indexed latent attention without constructing a full long-context mask or
   a sequence-by-head-by-history score tensor. Chunk index scoring under an explicit
   scratch budget; account for its peak before choosing the full-model prefill chunk.
-- Connect compressed KV storage and its declared quantization mode. Start parity with
-  unquantized caches, then test KV8 separately so cache approximation is not confused
-  with a mathematical error. Billing must follow actual arrays and scratch ownership.
+- Preserve BF16 compressed MLA cache as the GLM default in diagnostics and future serving.
+  KV8 is not part of the performance target configuration; any later quantized-cache experiment
+  needs an explicit opt-in and separate parity/quality results. Keep KDA recurrent state FP32.
+  Billing must follow actual arrays and scratch ownership.
 
 Exit: compare selected token IDs, pooled state and attention outputs against the oracle
 at pool boundaries, 2048-token selection boundaries, nonzero offsets and irregular chunk

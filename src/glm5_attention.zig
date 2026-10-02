@@ -1,4 +1,6 @@
 //! Request-local IndexPool and NoPE latent attention. All caches are lossless.
+//! GLM production policy is BF16 compressed MLA cache; do not inherit generic KV8
+//! defaults when integrating this state into serving. KDA separately keeps FP32 state.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;

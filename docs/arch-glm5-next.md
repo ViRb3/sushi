@@ -18,7 +18,7 @@ The `GLM-5.3-Flash-Sushi-2.25bpw-A8g128-W12` checkpoint is complete: 129 routed 
 98,336,815,992 bytes (91.5833 GiB), including the optional MTP and vision weights. This is stored tensor size,
 not a measured runtime memory requirement. Large trunk matrices use affine8 group128; preserved small
 BF16/FP32 tensors keep their source precision. Creation details belong to the private Sashimi repository.
-The completed checkpoint has not passed native full-model generation or KLD.
+The completed checkpoint runs native full-model generation; lossless-teacher KLD remains open.
 
 `glm5_model.zig` provides stored-affine linear operations, clamped dense MLP, precise FP32 mHC mixing
 and KDA projection/convolution/decay/output assembly. KDA and mHC now have independent oMLX fixtures,
@@ -112,7 +112,8 @@ The ordered milestones remain in the [native execution plan](plan-glm5-native.md
 record the audited foundation; new complete-forward behavior needs its own review.
 
 - Run the full 512-token prompt and 64-token generation with warmup, explicit timing denominators,
-  actual memory and per-layer attribution. Targets are 1,000 tok/s prefill and 60 tok/s decode, not results.
+  actual memory and per-layer attribution. Current targets are at least 1,200 tok/s prefill and
+  45 tok/s speculative decode using MTP or DFlash2; these are goals, not measured results.
 - Compare full MLA/reference layer outputs and logits: absorbed latent attention and expanded dense
   attention have different BF16 rounding boundaries even when their projection algebra agrees.
 - Measure KLD against a lossless BF16 teacher and validate 4K/16K contexts before 64K. The identity-prior
@@ -120,9 +121,11 @@ record the audited foundation; new complete-forward behavior needs its own revie
 - Replace diagnostic per-layer synchronous evaluation only after proving bounded memory and state
   equivalence. Profile KDA, attention, routing and projection dispatch before choosing optimizations.
 - Integrate Transformer/server ownership, memory admission and tested capability checks. The diagnostic
-  cache currently uses lossless BF16 latents, not generic KV8; generic cache bills do not describe this
-  standalone request implementation's exact allocation. Add reset/rollback/prefix lifecycle integration
-  before enabling dependent features. Vision, MTP, batching and speculation remain unsupported.
+  cache uses BF16 compressed MLA latents. This is the required GLM default, including future serving
+  integration; do not inherit the generic KV8 or `--fast` KV8 preset. KDA recurrent state stays FP32.
+  Generic cache bills do not describe this standalone request implementation's exact allocation. Add reset/rollback/prefix lifecycle integration
+  before enabling dependent features. Vision, MTP, batching and public speculation remain unsupported;
+  DFlash2 runs through its separate validated diagnostic path.
 
 ## References and checks
 

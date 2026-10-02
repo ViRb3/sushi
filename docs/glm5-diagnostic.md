@@ -55,8 +55,9 @@ tokens entail 63 timed decode forwards; both counts and the rate denominator are
 explicit in JSON. Timing excludes progress-file writes and final text decoding.
 Generation is greedy and fixed length; it records the first EOS and whether the
 fixed-length diagnostic continued beyond it. This is a timing/coherence diagnostic,
-not a public chat completion. MTP is off. Attention cache is BF16 and recurrent
-KDA state is FP32. Active/peak MLX memory, stored tensor bytes, and applied limits
+not a public chat completion. MTP is off. Compressed MLA cache uses BF16 by default and recurrent
+KDA state is FP32. This is the GLM cache policy for future serving too; generic KV8
+and `--fast` KV8 defaults must not silently change it. Active/peak MLX memory, stored tensor bytes, and applied limits
 are recorded independently.
 
 Tiny regression tests cover dtype/value preservation, indexed ownership,
