@@ -11,7 +11,7 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [external runtime comparison](glm5-external-efficiency-comparison.md), and
 [internal reuse comparison](glm5-internal-efficiency-comparison.md). This document is the GLM documentation index.
 
-## Checkpoint and implementation status (2026-10-02)
+## Checkpoint and implementation status (2026-10-03)
 
 The `GLM-5.3-Flash-Sushi-2.25bpw-A8g128-W12` checkpoint is complete: 129 routed projection banks,
 37,152 expert projections, 449 affine trunk matrices and 1,169 retained tensors. Its indexed tensor payload is
@@ -37,6 +37,12 @@ processed an eight-token prefix and generated four tokens. This proves load/bind
 the truncated prompt and output do not establish coherent English, quality or steady throughput.
 The current local directory is named `GLM-5.3-Flash-Sushi-2.4bpw`; its stored expert metadata remains
 K2.25/W12. No conversion was repeated and no rate is inferred from the directory name.
+
+Subsequent 512/64 diagnostics produce coherent English. Native prefill reached 892.99 tok/s at
+512 tokens and 1,171.77 tok/s at 2K in separate runs. The opt-in async4 DFlash verifier measured
+32.00 tok/s with all 64 token IDs and complete cache state equal to its matched serial run.
+These use BF16 compressed MLA cache and FP32 KDA state. See the [current execution plan](plan-glm5-native.md)
+for workload distinctions and [DFlash scheduling results](glm5-dflash-scheduling.md) for provenance.
 
 ## Source layout
 

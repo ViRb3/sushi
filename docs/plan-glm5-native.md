@@ -13,16 +13,19 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
 
 - Completed: KDA preparation, independent layer fixtures, bounded IndexPool/latent attention,
   stored-grid MLA comparisons, complete diagnostic forward, request reset and coherent 512/64 generation.
-- Latest warmed serial 512/64 result: 881.07 tok/s prefill, 25.69 tok/s decode; peak 96.541 GB.
+- Latest warmed serial 512/64 result: 892.99 tok/s prefill, 25.97 tok/s decode; peak 96.541 GB.
   Exact C24 HC prefill fusion preserves all 64 output IDs. The 2K/64 workload separately measured
-  1,171.77/21.48 tok/s and 97.366 GB peak. These runs precede the cheap HC eligibility guard;
-  the 512 decode decrease from 26.50 remains unattributed pending a controlled follow-up.
+  1,171.77/21.48 tok/s and 97.366 GB peak before the cheap HC eligibility guard.
+  The new guard avoids unused prefill probes in decode; the small 512 change from
+  881.07/25.69 does not isolate the older decrease from 26.50 tok/s.
 - Completed serial optimizations: async4 scheduling, copy-free QKV, fused KDA body, BF16-storage
   FP32 router and paired cooperative expert gate/up. Dense-prefill SDPA remains opt-in pending KLD.
 - DFlash2: BF16 assistant, layerwise tree verifier and transactional accepted-state commit are
   implemented. Warmed 512/64 runs at three tree widths preserve every serial output ID and final state.
-  The latest unprofiled four-row run measured 27.67 tok/s versus matched serial 26.27;
-  target verification remains the dominant cost. See [the DFlash2 plan](plan-glm5-dflash2.md).
+  The latest async4 four-row run measured 32.00 tok/s versus matched serial 25.56;
+  target verification remains the dominant cost. Async2 measured 31.68 tok/s; the roughly 1%
+  difference does not establish a general winner. See [scheduling results](glm5-dflash-scheduling.md)
+  and [the DFlash2 plan](plan-glm5-dflash2.md).
 - Remaining: optimize toward at least 1,200 tok/s prefill and 45 tok/s speculative decode
   using MTP or DFlash2; full-model lossless-teacher KLD;
   broader long-context coverage; production loader/lifecycle/server integration. The sections below
