@@ -221,5 +221,49 @@ fully aligned dimensions. Any broader tail case needs an explicit out-of-range
 return before barriers. Measure same-body G1/G2/G4/G8 with identical geometry,
 fresh graph inputs, rotated banks and paired order, plus the unchanged library
 reference. A schedule-only win would not establish a benefit from larger M
-tiles or shared dequantization across threadgroups. No such experiment was run
-as part of this audit.
+tiles or shared dequantization across threadgroups.
+
+### Scheduling experiment result
+
+`src/glm5_qmm_prefill.zig` now contains the isolated implementation, with the
+required pinned MLX helpers in `src/kernels/glm5_qmm_prefill_header.metal` and MIT
+attribution in NOTICE. It is not imported into the engine or shared test root.
+The primitive declines unmaterialized, strided, wrong-dtype and unsupported-shape
+inputs; it does not silently add a contiguous copy. The G1 clone passed exact
+native BF16 parity at both real projection geometries before any remap was
+tested. G2/G4/G8 then passed the same raw-bit comparisons. Focused guard/parity
+tests passed (four tests including the temporary root, one gated timing skip).
+
+The subsequent exclusive timing run checked every arm against native on all
+four independent random banks, then measured one-bank and four-bank rotation.
+Each arm received twelve warmup evaluations. Eleven rounds alternated forward
+and reverse arm order, with eight apply/evaluate/free repetitions per sample.
+Inputs were evaluated before timing; this includes host orchestration and wait
+overhead and uses fresh output graphs on each repetition. Fans were requested
+at maximum, initial temperature was 39.18°C, ten seconds of idle preceded the run,
+and the process used interactive QoS. No full model was loaded.
+
+| Projection / bank rotation | Native ms | G1 ms | G2 ms | G4 ms | G8 ms |
+|---|---:|---:|---:|---:|---:|
+| Q/K/V / one | 0.870046 | 0.871718 | 0.885661 | 0.865364 | 0.874739 |
+| Q/K/V / four | 0.882921 | 0.883208 | 0.892979 | 0.882203 | 0.874291 |
+| Output / one | 0.897052 | 0.910270 | 0.931505 | 0.914369 | 0.907968 |
+| Output / four | 0.957546 | 0.941968 | 0.981072 | 0.952109 | 0.933562 |
+
+There is no compelling adoption result. Relative to the same-body G1 control,
+G8 improves median four-bank latency by only 1.01% for Q/K/V and 0.89% for output
+(10/11 and 8/11 paired wins). Warm-bank results are nearly flat. G2 is slower
+in every case, while G4 changes direction across shapes/bank conditions. The
+native-versus-G1 difference also changes sign for the output projection, so it
+would be misleading to attribute G8's 2.50% four-bank advantage over native
+entirely to scheduling. Keep this research path unintegrated; no full-model gain
+or reduced DRAM traffic has been demonstrated.
+
+Private artifact `glm53-qmm-prefill-20261003` retains the focused build commands,
+temporary test-root source, raw samples, summary and source hashes. The timing
+binary SHA-256 is `fd1a4bbea566f4f6dae3b1d91c4991b5ed4be9509c54333dc853adfde4954f86`;
+the base checkout was `0fe8ea710cf92f445d723b227bd5fd5faa4575d6` plus this isolated
+module/header. The gated test filter is `GLM QMM prefill isolated scheduling timing`,
+enabled by `SUSHI_GLM_QMM_PREFILL_BENCH_OUT` naming its JSON result file. A launcher
+path error occurred before the first attempted binary execution; no sample came
+from that attempt, and its lock/fan cleanup completed before the recorded run.
