@@ -1206,6 +1206,7 @@ const ScatterKey = struct { dim: c_int, nslots: c_int };
 var token_scatter_cfgs: CfgCache(ScatterKey, 8) = .{};
 var token_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_pair_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var token_pair_unsorted_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_scatter_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var token_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var fused_dispatches: u32 = 0;
@@ -2776,7 +2777,7 @@ fn tokenReduce(s: mlx.mlx_stream, d: mlx.mlx_array, inv: mlx.mlx_array, scores: 
     return a;
 }
 
-fn pairPrepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, slots: mlx.mlx_array, order: mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
+fn pairPrepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, slots: mlx.mlx_array, order: ?mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
     const key = PairPrepKey{ .in_dim = in_dim, .nslots = nslots, .topk = topk };
     const cfg = token_pair_prep_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
@@ -2794,8 +2795,14 @@ fn pairPrepareFromTokens(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_arra
     };
     const ins = [_][*:0]const u8{ "x", "suhg", "suhu", "slots", "order" };
     const outs = [_][*:0]const u8{ "yg", "yu" };
-    const kernel = try getNamedKernel(&token_pair_prepare_kernel, "sushi_exl3_token_pair_prepare", &ins, &outs, TOKEN_PAIR_PREPARE_SOURCE, "");
-    const ov = try applyOuts(s, kernel, &.{ x, suhg, suhu, slots, order }, cfg, 2);
+    const kernel = if (order != null)
+        try getNamedKernel(&token_pair_prepare_kernel, "sushi_exl3_token_pair_prepare", &ins, &outs, TOKEN_PAIR_PREPARE_SOURCE, "")
+    else
+        try getNamedKernel(&token_pair_unsorted_kernel, "sushi_exl3_token_pair_unsorted", ins[0..4], &outs, metalReplaceFound(TOKEN_PAIR_PREPARE_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;"), "");
+    const ov = if (order) |sorted|
+        try applyOuts(s, kernel, &.{ x, suhg, suhu, slots, sorted }, cfg, 2)
+    else
+        try applyOuts(s, kernel, &.{ x, suhg, suhu, slots }, cfg, 2);
     defer _ = mlx.mlx_vector_array_free(ov);
     var a = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(a);
@@ -3131,11 +3138,10 @@ pub fn moeSwigluClamped(
     const hidden = sh[1];
     const nslots = rows * topk;
     if (rows <= DECODE_ROWS_MAX) {
-        const repeated = try repeatRows(s, x, rows, topk);
-        defer _ = mlx.mlx_array_free(repeated);
-        const prep_g = try prepareIndexed(s, repeated, gate_suh, slots);
+        const prep = try pairPrepareFromTokens(s, x, gate_suh, up_suh, slots, null, hidden, nslots, topk);
+        const prep_g = prep[0];
+        const prep_u = prep[1];
         defer _ = mlx.mlx_array_free(prep_g);
-        const prep_u = try prepareIndexed(s, repeated, up_suh, slots);
         defer _ = mlx.mlx_array_free(prep_u);
         const gate = try indexedGemvCoopF16(s, prep_g, gate_t, slots);
         defer _ = mlx.mlx_array_free(gate);
@@ -9366,7 +9372,7 @@ test "exl3 clamped routing preserves staged bytes at every 2 to 4 bpw rate" {
         defer _ = mlx.mlx_array_free(tr);
         const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ experts, dim }, 2, .float16);
         defer _ = mlx.mlx_array_free(sc);
-        for ([_]usize{ 1, 17 }) |rows| {
+        for ([_]usize{ 1, 2, 8, 16, 17 }) |rows| {
             const x = try a.alloc(f32, rows * dim);
             defer a.free(x);
             for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 32;
@@ -9440,5 +9446,56 @@ test "exl3 clamped routing preserves GLM production width bytes" {
         try mlx.check(mlx.mlx_astype(&old32, old, .float32, s));
         try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
         try std.testing.expectEqualSlices(u8, try gemvOutBytes(old32), try gemvOutBytes(got32));
+    }
+}
+
+test "exl3 unsorted paired prepare preserves distinct scale planes at GLM widths" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const experts = 288;
+    const topk = 8;
+    var random = std.Random.DefaultPrng.init(235124);
+    const rnd = random.random();
+    for ([_]usize{ 128, 4096 }) |dim| {
+        const gate = try a.alloc(u16, experts * dim);
+        defer a.free(gate);
+        const up = try a.alloc(u16, experts * dim);
+        defer a.free(up);
+        for (gate, up) |*g, *u| {
+            g.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 2);
+            u.* = exl3.f32ToF16Bits((rnd.float(f32) - 0.5) * 3);
+        }
+        const ga = mlx.mlx_array_new_data(gate.ptr, &[_]c_int{ experts, @intCast(dim) }, 2, .float16);
+        defer _ = mlx.mlx_array_free(ga);
+        const ua = mlx.mlx_array_new_data(up.ptr, &[_]c_int{ experts, @intCast(dim) }, 2, .float16);
+        defer _ = mlx.mlx_array_free(ua);
+        for ([_]usize{ 1, 8, 16 }) |rows| {
+            const input = try a.alloc(f32, rows * dim);
+            defer a.free(input);
+            for (input) |*x| x.* = (rnd.float(f32) - 0.5) * 32;
+            const ids = try a.alloc(u32, rows * topk);
+            defer a.free(ids);
+            for (ids, 0..) |*id, i| id.* = if (i % topk == 0) 287 else @intCast((i * 37) % experts);
+            const xf = mlx.mlx_array_new_data(input.ptr, &[_]c_int{ @intCast(rows), @intCast(dim) }, 2, .float32);
+            defer _ = mlx.mlx_array_free(xf);
+            const sl = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(sl);
+            inline for (.{ mlx.mlx_dtype.float32, mlx.mlx_dtype.bfloat16 }) |dtype| {
+                var x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x);
+                try mlx.check(mlx.mlx_astype(&x, xf, dtype, s));
+                const repeated = try repeatRows(s, x, @intCast(rows), topk);
+                defer _ = mlx.mlx_array_free(repeated);
+                const oldg = try prepareIndexed(s, repeated, ga, sl);
+                defer _ = mlx.mlx_array_free(oldg);
+                const oldu = try prepareIndexed(s, repeated, ua, sl);
+                defer _ = mlx.mlx_array_free(oldu);
+                const new = try pairPrepareFromTokens(s, x, ga, ua, sl, null, @intCast(dim), @intCast(ids.len), topk);
+                defer _ = mlx.mlx_array_free(new[0]);
+                defer _ = mlx.mlx_array_free(new[1]);
+                try std.testing.expectEqualSlices(u8, try gemvOutBytes(oldg), try gemvOutBytes(new[0]));
+                try std.testing.expectEqualSlices(u8, try gemvOutBytes(oldu), try gemvOutBytes(new[1]));
+            }
+        }
     }
 }

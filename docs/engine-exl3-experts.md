@@ -74,6 +74,13 @@ slots in their original top-k order. Prefill prepares gate/up directly from toke
 table across all three projections, and scatters the down plane back before the existing top-k reduction.
 It does not materialize repeated and sorted token planes or sort the inverse permutation.
 
+Decode also prepares both natural-order input planes directly from token rows in one kernel. The two
+expert-specific Hadamards remain necessary because gate/up scales differ, and their F16 stores and all
+subsequent GEMV, clamp and reduction arithmetic are unchanged. This removes the repeated token plane
+(64 KiB for one GLM token, top-k eight) and replaces two prepare dispatches with one, without resident
+weight copies. Direct plane tests cover distinct signed gate/up scales, expert IDs through 287, widths
+128/4096 and rows 1/8/16; end-to-end rate coverage includes rows 1/2/8/16/17.
+
 The optimized routing matches the staged path bit-for-bit at every even packed width n32–64 (2–4 bpw),
 with BF16 and FP32 inputs/outputs, top-k eight, and decode/prefill rows. A K2.25/W12 case also checks the
 GLM hidden/intermediate widths 4096/2048. These are arithmetic and dispatch-structure checks; they do not
