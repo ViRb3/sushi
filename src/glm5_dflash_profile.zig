@@ -33,6 +33,106 @@ pub const Profile = struct {
     layers: [128]Totals = @splat(.{}),
     global: Totals = .{},
 };
+pub const max_route_records = 8192;
+pub const max_route_assignments = 128;
+pub const max_route_experts = 512;
+pub const RouteStats = struct {
+    counts: [max_route_experts]u16 = @splat(0),
+    unique: usize = 0,
+    groups2: usize = 0,
+};
+pub const RouteRecord = struct {
+    round_index: u32,
+    layer_index: u16,
+    rows: u8,
+    top_k: u8,
+    experts: u16,
+    ordered_ids: [max_route_assignments]u32,
+    pub fn stats(self: *const RouteRecord) RouteStats {
+        var result: RouteStats = .{};
+        for (self.ordered_ids[0 .. @as(usize, self.rows) * self.top_k]) |id| result.counts[id] += 1;
+        for (result.counts[0..self.experts]) |count| {
+            result.unique += @intFromBool(count != 0);
+            result.groups2 += (count + 1) / 2;
+        }
+        return result;
+    }
+    pub fn jsonStringify(self: RouteRecord, writer: anytype) !void {
+        const n = @as(usize, self.rows) * self.top_k;
+        const summary = self.stats();
+        try writer.write(.{
+            .round_index = self.round_index,
+            .layer_index = self.layer_index,
+            .rows = self.rows,
+            .top_k = self.top_k,
+            .experts = self.experts,
+            .ordered_ids = self.ordered_ids[0..n],
+            .multiplicities = summary.counts[0..self.experts],
+            .unique = summary.unique,
+            .repeated_slots = n - summary.unique,
+            .group2_groups = summary.groups2,
+            .group2_saved_slots = n - summary.groups2,
+        });
+    }
+};
+pub const RouteCapture = struct {
+    allocator: std.mem.Allocator,
+    records: []RouteRecord,
+    count: usize = 0,
+    round_index: ?u32 = null,
+    skipped_single_calls: usize = 0,
+    pub fn init(allocator: std.mem.Allocator, limit: usize) !RouteCapture {
+        if (limit == 0 or limit > max_route_records) return error.InvalidGlmRouteCapacity;
+        return .{ .allocator = allocator, .records = try allocator.alloc(RouteRecord, limit) };
+    }
+    pub fn deinit(self: *RouteCapture) void {
+        self.allocator.free(self.records);
+        self.* = undefined;
+    }
+};
+threadlocal var active_routes: ?*RouteCapture = null;
+pub const RouteBinding = struct {
+    previous: ?*RouteCapture,
+    pub fn restore(self: RouteBinding) void {
+        active_routes = self.previous;
+    }
+};
+pub fn bindRoutes(capture: ?*RouteCapture) RouteBinding {
+    const previous = active_routes;
+    active_routes = capture;
+    return .{ .previous = previous };
+}
+pub fn beginRouteRound(index: usize) !void {
+    const capture = active_routes orelse return;
+    if (index >= 4096) return error.InvalidGlmRouteRound;
+    capture.round_index = @intCast(index);
+}
+pub fn skipSingleRoute() void {
+    if (active_routes) |capture| capture.skipped_single_calls += 1;
+}
+pub fn captureRoutes(s: mlx.mlx_stream, layer: usize, rows: usize, top_k: usize, experts: usize, ids: Arr) !void {
+    const capture = active_routes orelse return;
+    const round = capture.round_index orelse return error.GlmRouteRoundMissing;
+    if (layer >= 128 or rows < 2 or rows > 16 or top_k == 0 or top_k > 8 or experts < top_k or experts > max_route_experts or ids.ctx == null) return error.InvalidGlmRouteCapture;
+    if (capture.count >= capture.records.len) return error.GlmRouteCaptureFull;
+    const shape = [_]c_int{ 1, @intCast(rows), @intCast(top_k) };
+    const dtype = mlx.mlx_array_dtype(ids);
+    if (!std.mem.eql(c_int, &shape, mlx.getShape(ids)) or (dtype != .uint32 and dtype != .int32)) return error.InvalidGlmRouteCapture;
+    var compact = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(compact);
+    try mlx.check(mlx.mlx_contiguous(&compact, ids, false, s));
+    try mlx.check(mlx.mlx_array_eval(compact));
+    var record = RouteRecord{ .round_index = round, .layer_index = @intCast(layer), .rows = @intCast(rows), .top_k = @intCast(top_k), .experts = @intCast(experts), .ordered_ids = undefined };
+    const raw: [*]const u32 = if (dtype == .uint32) mlx.mlx_array_data_uint32(compact) orelse return error.MlxArrayDataNull else @ptrCast(mlx.mlx_array_data_int32(compact) orelse return error.MlxArrayDataNull);
+    for (raw[0 .. rows * top_k], 0..) |id, i| {
+        if (id >= experts) return error.InvalidGlmRouteId;
+        // A top-k row must not list one expert twice. Repetition across rows is expected.
+        for (record.ordered_ids[i / top_k * top_k .. i]) |previous| if (previous == id) return error.DuplicateGlmRouteId;
+        record.ordered_ids[i] = id;
+    }
+    capture.records[capture.count] = record;
+    capture.count += 1;
+}
 threadlocal var active: ?*Profile = null;
 threadlocal var current_layer: ?usize = null;
 
@@ -129,4 +229,61 @@ test "GLM DFlash disabled profiler leaves lazy output unevaluated" {
     local.restore();
     try std.testing.expectEqual(@as(u64, 1), measured.layers[3].ffn_router.calls);
     try std.testing.expectEqual(@as(u64, 0), measured.global.ffn_router.calls);
+}
+
+test "GLM DFlash route capture is bounded ordered and disabled without evaluation" {
+    const s = mlx.gpuStream();
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const data = [_]u32{ 0, 287, 0, 1, 0, 287 };
+    const ids = try ops.own(mlx.mlx_array_new_data(&data, &.{ 1, 3, 2 }, 3, .uint32));
+    const lazy = try ops.binary(.add, ids, try ops.scalar(1, .uint32));
+    var available = true;
+    try mlx.check(mlx._mlx_array_is_available(&available, lazy));
+    try std.testing.expect(!available);
+    const disabled = bindRoutes(null);
+    defer disabled.restore();
+    try captureRoutes(s, std.math.maxInt(usize), 0, 0, 0, lazy);
+    try mlx.check(mlx._mlx_array_is_available(&available, lazy));
+    try std.testing.expect(!available);
+    try std.testing.expectError(error.InvalidGlmRouteCapacity, RouteCapture.init(std.testing.allocator, 0));
+    try std.testing.expectError(error.InvalidGlmRouteCapacity, RouteCapture.init(std.testing.allocator, max_route_records + 1));
+    var capture = try RouteCapture.init(std.testing.allocator, 2);
+    defer capture.deinit();
+    const enabled = bindRoutes(&capture);
+    defer enabled.restore();
+    try std.testing.expectError(error.GlmRouteRoundMissing, captureRoutes(s, 3, 3, 2, 288, ids));
+    try beginRouteRound(7);
+    try std.testing.expectError(error.InvalidGlmRouteRound, beginRouteRound(4096));
+    try captureRoutes(s, 3, 3, 2, 288, ids);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u32, 7), capture.records[0].round_index);
+    try std.testing.expectEqual(@as(u16, 3), capture.records[0].layer_index);
+    try std.testing.expectEqualSlices(u32, &data, capture.records[0].ordered_ids[0..6]);
+    const stats = capture.records[0].stats();
+    try std.testing.expectEqual(@as(usize, 3), stats.unique);
+    try std.testing.expectEqual(@as(usize, 4), stats.groups2);
+    try std.testing.expectEqual(@as(u16, 3), stats.counts[0]);
+    try std.testing.expectEqual(@as(u16, 2), stats.counts[287]);
+    try std.testing.expectError(error.InvalidGlmRouteId, captureRoutes(s, 3, 3, 2, 288, lazy));
+    const duplicate = try ops.own(mlx.mlx_array_new_data(&[_]u32{ 0, 0, 1, 2, 3, 4 }, &.{ 1, 3, 2 }, 3, .uint32));
+    try std.testing.expectError(error.DuplicateGlmRouteId, captureRoutes(s, 3, 3, 2, 288, duplicate));
+    const negative = try ops.own(mlx.mlx_array_new_data(&[_]i32{ -1, 0, 1, 2, 3, 4 }, &.{ 1, 3, 2 }, 3, .int32));
+    try std.testing.expectError(error.InvalidGlmRouteId, captureRoutes(s, 3, 3, 2, 288, negative));
+    try std.testing.expectError(error.InvalidGlmRouteCapture, captureRoutes(s, 3, 16, 9, 288, ids));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try beginRouteRound(8);
+    try captureRoutes(s, 4, 3, 2, 288, ids);
+    try std.testing.expectError(error.GlmRouteCaptureFull, captureRoutes(s, 5, 3, 2, 288, ids));
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    skipSingleRoute();
+    try std.testing.expectEqual(@as(usize, 1), capture.skipped_single_calls);
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, capture.records[0], .{});
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("group2_saved_slots").?.integer);
+    try std.testing.expectEqual(@as(usize, 6), parsed.value.object.get("ordered_ids").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 288), parsed.value.object.get("multiplicities").?.array.items.len);
 }

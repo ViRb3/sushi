@@ -33,7 +33,13 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
     if (index >= target.layers.len) return error.InvalidGlmLayer;
     const shape = mlx.getShape(x);
     if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > 16 or shape[2] != target.cfg.hidden_size) return error.InvalidGlmDraftShape;
-    if (shape[1] == 1) return target.feedForwardLayer(index, ops, x);
+    if (shape[1] == 1) {
+        switch (target.layers[index].ffn) {
+            .moe => @import("glm5_dflash_profile.zig").skipSingleRoute(),
+            .dense => {},
+        }
+        return target.feedForwardLayer(index, ops, x);
+    }
     return switch (target.layers[index].ffn) {
         .dense => |layer| dense(layer, ops, x, target.cfg.glm_swiglu_limit),
         .moe => |layer| blk: {
@@ -57,6 +63,7 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
                 const count: usize = @intCast(shape[1]);
                 break :blk_route .{ .indices = try ops.concat(ids[0..count], 1), .scores = try ops.concat(scores[0..count], 1) };
             };
+            try @import("glm5_dflash_profile.zig").captureRoutes(ops.s, index, @intCast(shape[1]), target.cfg.num_experts_per_tok, @intCast(mlx.getShape(layer.weight)[0]), routing.indices);
             try timer.finish("ffn_router", &.{ routing.indices, routing.scores });
             const routed = try ops.own(try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, .{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window }, @intFromFloat(target.cfg.glm_swiglu_limit)));
             try timer.finish("ffn_routed", &.{routed});

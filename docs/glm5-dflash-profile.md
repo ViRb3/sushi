@@ -127,3 +127,30 @@ own GPU lock, interactive QoS, max-fan request and ten-second idle, then restore
 fan auto and released the lock. Initial temperatures were 44.53°C and 48.78°C.
 The shared binary SHA-256 is
 `f9ee41a3d8b01375cc07a1b12084683521354c707143fc4dbc31ac10b29a9d3b`.
+
+## Bounded actual route capture
+
+`SUSHI_GLM_DFLASH_CAPTURE_ROUTES=1` records actual expert IDs consumed by eligible
+multirow routed FFNs, in original token-major/top-k order. It requires
+`SUSHI_GLM_DFLASH_BATCH_FFN=1`; component profiling may remain off. The collector
+is bound only around measured tree decode, and each record includes round index,
+layer index, rows, top-k and expert count. Terminal one-row FFNs keep their original
+execution path and are counted as skipped: group-two reuse cannot help those calls.
+
+Each record also serializes per-expert multiplicities, unique count, repeated
+slots (`S-unique`), group-two groups (`sum(ceil(c_e/2))`) and potentially eliminated
+slot visits (`S-G2`). Ordered IDs are retained for locality/replay experiments.
+These are logical reuse statistics, not measured bandwidth or latency savings.
+
+`SUSHI_GLM_DFLASH_ROUTE_CAPACITY` bounds preallocated records, default 4096 and hard
+maximum 8192. Each record has room for at most 16 rows ×8 experts; at most 512
+expert IDs and 128 layers are supported. Exhaustion, invalid IDs, duplicate IDs
+within one top-k row, missing round context or incompatible shapes fail closed
+without appending a partial record. Capture never silently truncates. A disabled
+capture call returns before validation, allocation or array evaluation.
+
+Capturing explicitly evaluates and reads route IDs, so JSON marks the entire run
+`synchronization_perturbed=true`, `throughput_comparable=false`, and suppresses its
+speedup ratio even if component profiling is off. The normal output/state oracle
+still runs. Capacity, ordering, odd multiplicities, bounds, disabled lazy behavior,
+serialization, one-row skipping and full-state parity pass focused tests.

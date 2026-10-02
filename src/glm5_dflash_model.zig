@@ -395,14 +395,43 @@ test "GLM DFlash component profiling preserves nonzero captures and complete com
         break;
     };
     try std.testing.expect(nonzero);
+    var routes = try profile.RouteCapture.init(a, 4);
+    defer routes.deinit();
+    var captured = blk: {
+        const binding = profile.bindRoutes(&routes);
+        defer binding.restore();
+        try profile.beginRouteRound(7);
+        var candidate = try verify(&target, &request, &tokens, &parents, &taps, .affine_rows_ffn);
+        errdefer candidate.deinit();
+        var single = try verify(&target, &request, tokens[0..1], parents[0..1], &taps, .affine_rows_ffn);
+        defer single.deinit();
+        try std.testing.expectEqual(@as(usize, 1), routes.count);
+        try std.testing.expectEqual(@as(usize, 1), routes.skipped_single_calls);
+        break :blk candidate;
+    };
+    defer captured.deinit();
+    try std.testing.expectEqualSlices(u32, ordinary.targets[0..ordinary.count], captured.targets[0..captured.count]);
+    for (ordinary.captures.hook.out, captured.captures.hook.out) |left_capture, right_capture| try profileArrayEqual(left_capture, right_capture, s);
+    try std.testing.expectEqual(@as(u32, 7), routes.records[0].round_index);
+    try std.testing.expectEqual(@as(u8, 5), routes.records[0].rows);
     var committed = try ordinary.prepareCommit(&request, 3, &.{}, s);
     defer committed.deinit();
     var profiled_commit = try measured.prepareCommit(&request, 3, &.{}, s);
     defer profiled_commit.deinit();
     const accepted = try tree.accept(&tokens, &parents, ordinary.targets[0..ordinary.count], 3, &.{});
     const last = accepted.rows[accepted.count - 1];
+    var captured_commit = try captured.prepareCommit(&request, 3, &.{}, s);
+    defer captured_commit.deinit();
     const left = committed.states[last].?;
     const right = profiled_commit.states[last].?;
+    const captured_state = captured_commit.states[last].?;
+    try std.testing.expectEqual(left.offset, captured_state.offset);
+    for (left.layers, captured_state.layers) |x, y| {
+        try profileArrayEqual(x.recurrent.conv_state, y.recurrent.conv_state, s);
+        try profileArrayEqual(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
+        try std.testing.expectEqual(x.attention.processed, y.attention.processed);
+        for (x.attention.arrays(), y.attention.arrays()) |xx, yy| try profileArrayEqual(xx, yy, s);
+    }
     try std.testing.expectEqual(left.offset, right.offset);
     for (left.layers, right.layers) |x, y| {
         try std.testing.expectEqual(x.recurrent.initialized, y.recurrent.initialized);
