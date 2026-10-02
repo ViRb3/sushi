@@ -35,6 +35,21 @@ The recurrence is checked against an independent scalar FP64 calculation with no
 multiple batches and heads. Serial and multi-token execution are bit-identical for BF16 and FP32 inputs,
 including their final FP32 states. This is primitive validation, not full-model parity.
 
+## mHC and clamped packed experts
+
+`glm5_next.hcCollapse` applies four-stream Sinkhorn mixing to precomputed FP32 mix projections; its
+mixed activation retains the input precision, and its post/combination coefficients remain FP32.
+`hcExpand` accumulates the residual contraction before adding the separately rounded FP32 branch
+product, then rounds once to the activation dtype. Adding the branch before the contraction can change
+BF16 results; a cancellation-sensitive independent regression covers that arithmetic boundary.
+
+`exl3.moeClamped` preserves GLM's gate upper clamp and symmetric up clamp before SwiGLU, and accepts
+packed expert rates from 2 through 4 bpw in eighth-bit increments. Its boundary checks require matching
+routed-input/score shapes, H128-aligned bank dimensions, compatible gate/up/down expert counts,
+U16 trellises and correctly shaped F16 scale banks before dispatch. Router-produced expert IDs must
+remain within the bank's expert range. Scalar host comparisons exercise every supported rate in decode
+and prefill. These are primitive checks, not full-model parity or quality measurements.
+
 ## Forward implementation still required
 
 - Parse the nested GLM configuration and load the resident BF16 trunk, excluding routed experts before any

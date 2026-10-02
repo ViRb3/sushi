@@ -36,6 +36,45 @@ pub fn moeWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.
 }
 
 fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array) !mlx.mlx_array {
+    return moeOutputClamped(s, x, bank, inds, scores, dec, verify_rows, out_dtype, shared, 0);
+}
+
+/// GLM's gate is upper-clamped and its up branch is symmetrically clamped,
+/// before SwiGLU and the down projection. Packed expert rates remain 2–4 bpw.
+pub fn moeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, limit: c_int) !mlx.mlx_array {
+    if (limit <= 0 or limit > 128) return error.InvalidExl3Clamp;
+    const sh = mlx.getShape(x);
+    const ix = mlx.getShape(inds);
+    if (sh.len != 3 or ix.len != 3 or sh[0] <= 0 or sh[1] <= 0 or sh[0] != ix[0] or sh[1] != ix[1] or ix[2] <= 0 or ix[2] > kernels.REDUCE_MAX_TOPK) return error.BadExl3Shape;
+    if (sh[2] <= 0 or @mod(sh[2], 128) != 0 or !std.mem.eql(c_int, ix, mlx.getShape(scores))) return error.BadExl3Shape;
+    const xd = mlx.mlx_array_dtype(x);
+    const id = mlx.mlx_array_dtype(inds);
+    const sd = mlx.mlx_array_dtype(scores);
+    if ((xd != .bfloat16 and xd != .float32 and xd != .float16) or
+        (id != .uint32 and id != .int32) or
+        (sd != .float32 and sd != .bfloat16 and sd != .float16)) return error.BadExl3Dtype;
+    const rows = std.math.mul(c_int, sh[0], sh[1]) catch return error.BadExl3Shape;
+    _ = std.math.mul(c_int, rows, ix[2]) catch return error.BadExl3Shape;
+    const gs = mlx.getShape(bank.gate.trellis);
+    if (gs.len != 4 or gs[0] <= 0 or gs[2] <= 0 or gs[2] > std.math.maxInt(c_int) / 16) return error.BadExl3Shape;
+    const width = gs[2] * 16;
+    try validateClampedProjection(bank.gate, gs[0], sh[2], width);
+    try validateClampedProjection(bank.up, gs[0], sh[2], width);
+    try validateClampedProjection(bank.down, gs[0], width, sh[2]);
+    return moeOutputClamped(s, x, bank, inds, scores, dec, false, mlx.mlx_array_dtype(x), null, limit);
+}
+
+fn validateClampedProjection(p: Proj, experts: c_int, input: c_int, output: c_int) !void {
+    const sh = mlx.getShape(p.trellis);
+    if (input <= 0 or output <= 0 or @mod(input, 128) != 0 or @mod(output, 128) != 0 or
+        sh.len != 4 or sh[0] != experts or sh[1] != @divExact(input, 16) or sh[2] != @divExact(output, 16) or sh[3] < 0 or
+        format.kFromPackedDim(@intCast(sh[3])) == null or
+        !std.mem.eql(c_int, &.{ experts, input }, mlx.getShape(p.suh)) or
+        !std.mem.eql(c_int, &.{ experts, output }, mlx.getShape(p.svh))) return error.BadExl3Shape;
+    if (mlx.mlx_array_dtype(p.trellis) != .uint16 or mlx.mlx_array_dtype(p.suh) != .float16 or mlx.mlx_array_dtype(p.svh) != .float16) return error.BadExl3Dtype;
+}
+
+fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, out_dtype: mlx.mlx_dtype, shared: ?mlx.mlx_array, limit: c_int) !mlx.mlx_array {
     // Which kernel a dispatch picks is read off ONE process-global codebook,
     // and several EXL3 packs can be resident at once: set it per call.
     kernels.setDecodeParams(dec);
@@ -65,7 +104,9 @@ fn moeOutput(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_arra
     const g = bank.gate;
     const u = bank.up;
     const d = bank.down;
-    const y = if (rows <= kernels.DECODE_ROWS_MAX or verify_rows)
+    const y = if (limit > 0)
+        try kernels.moeSwigluClamped(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, limit, xd)
+    else if (rows <= kernels.DECODE_ROWS_MAX or verify_rows)
         if (mlx.getShape(g.trellis)[3] == mlx.getShape(u.trellis)[3])
             try kernels.moeSwigluFusedWithShared(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, xd, shared)
         else
@@ -436,4 +477,62 @@ fn moeMixedDecode(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, slots: mlx.ml
     const inner = try kernels.downGemvFusedMid(s, gate[0], up[0], d.trellis, g.svh, u.svh, d.suh, slots, inter, hidden, nslots);
     defer _ = mlx.mlx_array_free(inner);
     return kernels.downFinishReduce(s, inner, d.svh, slots, scores, hidden, rows, topk, dtype);
+}
+
+fn validationZeros(shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_zeros(&out, shape.ptr, shape.len, dtype, mlx.gpuStream()));
+    return out;
+}
+
+test "GLM clamped EXL3 rejects malformed banks before kernel dispatch" {
+    const s = mlx.gpuStream();
+    const trellis = try validationZeros(&.{ 2, 8, 8, 36 }, .uint16);
+    defer _ = mlx.mlx_array_free(trellis);
+    const scales = try validationZeros(&.{ 2, 128 }, .float16);
+    defer _ = mlx.mlx_array_free(scales);
+    const x = try validationZeros(&.{ 1, 1, 128 }, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    const ids = try validationZeros(&.{ 1, 1, 1 }, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const scores = try validationZeros(&.{ 1, 1, 1 }, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const projection = Proj{ .trellis = trellis, .suh = scales, .svh = scales };
+    const valid = Bank{ .gate = projection, .up = projection, .down = projection };
+    const Case = struct { target: enum { x, ids, scores, gate, up, down, suh, svh }, shape: []const c_int, dtype: mlx.mlx_dtype, dtype_error: bool = false };
+    for ([_]Case{
+        .{ .target = .x, .shape = &.{ 1, 1, 127 }, .dtype = .bfloat16 },
+        .{ .target = .x, .shape = &.{ 1, 1, 128 }, .dtype = .int32, .dtype_error = true },
+        .{ .target = .ids, .shape = &.{ 1, 1, 1 }, .dtype = .float32, .dtype_error = true },
+        .{ .target = .scores, .shape = &.{ 1, 1, 2 }, .dtype = .float32 },
+        .{ .target = .scores, .shape = &.{ 1, 1, 1 }, .dtype = .uint32, .dtype_error = true },
+        .{ .target = .gate, .shape = &.{ 2, 16, 8, 36 }, .dtype = .uint16 },
+        .{ .target = .up, .shape = &.{ 2, 8, 16, 36 }, .dtype = .uint16 },
+        .{ .target = .down, .shape = &.{ 2, 8, 16, 36 }, .dtype = .uint16 },
+        .{ .target = .up, .shape = &.{ 3, 8, 8, 36 }, .dtype = .uint16 },
+        .{ .target = .gate, .shape = &.{ 2, 8, 8, 35 }, .dtype = .uint16 },
+        .{ .target = .gate, .shape = &.{ 2, 8, 8, 36 }, .dtype = .int16, .dtype_error = true },
+        .{ .target = .suh, .shape = &.{ 2, 129 }, .dtype = .float16 },
+        .{ .target = .svh, .shape = &.{ 2, 129 }, .dtype = .float16 },
+        .{ .target = .suh, .shape = &.{ 2, 128 }, .dtype = .bfloat16, .dtype_error = true },
+    }) |c| {
+        const bad = try validationZeros(c.shape, c.dtype);
+        defer _ = mlx.mlx_array_free(bad);
+        var bank = valid;
+        var xv = x;
+        var iv = ids;
+        var sv = scores;
+        switch (c.target) {
+            .x => xv = bad,
+            .ids => iv = bad,
+            .scores => sv = bad,
+            .gate => bank.gate.trellis = bad,
+            .up => bank.up.trellis = bad,
+            .down => bank.down.trellis = bad,
+            .suh => bank.gate.suh = bad,
+            .svh => bank.gate.svh = bad,
+        }
+        try std.testing.expectError(if (c.dtype_error) error.BadExl3Dtype else error.BadExl3Shape, moeClamped(s, xv, bank, iv, sv, .{ .codebook = .mcg, .window = .w12 }, 10));
+    }
 }
