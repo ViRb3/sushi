@@ -100,3 +100,12 @@ HC timer, and final head work remains outside the component totals. These timing
 host graph construction and synchronization; they are attribution evidence, not async
 throughput or pure GPU kernel duration. With this option off, no component barriers run.
 A nonzero fixture checks identical logits/cache state, synchronous dispatch and counter reset.
+
+
+The first component run (512 prefill, 63 decode forwards, unchanged 64 output IDs) found
+323.14 ms in routed experts, 203.46 ms in KDA attention, 37.33 ms in MLA attention,
+77.00 ms in the two HC collapse groups, and31.33 ms in shared experts during prefill.
+Decode contains a large per-evaluation floor: even the final FFN addition costs about
+0.14 ms under this method. Use these totals to prioritize experiments; use queued paired
+microbenchmarks and full-model runs to establish gains, rather than treating synchronized
+component totals as pure GPU times or subtracting an assumed universal barrier constant.

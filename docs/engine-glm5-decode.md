@@ -96,3 +96,9 @@ construction plus synchronous evaluation of 673.08 microseconds staged versus203
 at 512x64x128. This is an epilogue result, not whole-model throughput. The same experiment at
 one/17 rows measured277.02/318.44 versus163.23/187.63 microseconds. One-token model decode
 already has its own larger fusion; this separate helper is integrated only for multiple rows.
+
+
+Eligible one-token HC calls now use the validated normalization/mix fusion. `Hc.collapseReference`
+retains the staged path for unsupported geometry and independent tests/benchmarks. The diagnostic
+counts fused HC calls separately; full-model timing remains necessary to assess the queued
+component gain. This fusion leaves Sinkhorn iterations and stream collapse unchanged.

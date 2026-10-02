@@ -329,6 +329,14 @@ pub const Hc = struct {
     }
 
     pub fn collapse(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
+        if (try @import("glm5_hc_fused.zig").mix(ops.s, x, self.w, cfg.rms_norm_eps)) |candidate| {
+            const mixes = try ops.own(candidate);
+            return primitive.hcCollapse(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
+        }
+        return self.collapseReference(ops, x, cfg);
+    }
+
+    pub fn collapseReference(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
         const sh = mlx.getShape(x);
         const flat = try ops.reshape(try ops.cast(x, .float32), &.{ sh[0], sh[1], sh[2] * sh[3] });
         const normalized = try ops.rms(flat, .{ .ctx = null }, cfg.rms_norm_eps);
