@@ -27,6 +27,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   where the NAX gather serves (`qsaPrefillGatherMinKv`), 8192 elsewhere; decode and verify floors are unchanged.
 - **Verify gather kv floor is per KV SCHEME** (`qsaVerifyGatherMinKvFor`: dense 32768, quantized 16384).
 
+## Batched image and text streams
+
+M-RoPE slots use the same batched QSA gather as text slots. Queries are rotated before attention, cached keys
+already carry their positions, and batched RoPE offsets include each slot's M-RoPE delta. Keeping an image slot's
+selected blocks avoids forcing the whole group onto a dense mask over the full KV cache. The scheduler bills
+pad waste using the selected length whenever the gather for that query width is enabled; its existing switches
+and KV floors still apply.
+
+Ported from [mlx-serve #668](https://github.com/ddalcu/mlx-serve/pull/668). The regression test compares the same
+batched attention inputs with and without M-RoPE metadata and requires identical output. The scheduler test
+checks that a 300k/1k pair remains grouped under sparse billing. This does not change MTP-head batching's
+separate M-RoPE guard.
+
 ## Selection semantics
 
 - **The always-visible tail is PER QUERY** (tokens at/after `ratio·floor((p+1)/ratio)`), scores in f32 like the
