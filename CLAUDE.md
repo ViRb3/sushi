@@ -28,6 +28,9 @@ doc for the area before changing it, and update it in the same landing.
 |---|---|
 | [docs/arch-qwen4exp.md](docs/arch-qwen4exp.md) | Flash-Next trunk, hyper-connections, n-gram PLE table, oracle and ties, packs on this box |
 | [docs/arch-glm5-next.md](docs/arch-glm5-next.md) | GLM-5.3-Flash completed checkpoint, native primitives, partial forward and remaining integration (not served) |
+| [docs/plan-glm5-native.md](docs/plan-glm5-native.md) | Staged GLM native execution plan and validation gates |
+| [docs/glm5-correctness-audit.md](docs/glm5-correctness-audit.md) | GLM correctness audit findings, fixes and remaining coverage |
+| [docs/glm5-efficiency-audit.md](docs/glm5-efficiency-audit.md) | GLM efficiency audit findings, fixes and remaining ownership work |
 | [docs/arch-mimo-v2.md](docs/arch-mimo-v2.md) | MiMo checkpoint, FP8 trunk, rank-local QKV, routing/sinks, sliding ring, bills, product policy |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | mlx-serve's pin of `sushi_exl3`, the API it calls, handoff |

@@ -93,6 +93,10 @@ without retaining the parent allocation. Single-token decode keeps the inexpensi
 
 ## Forward implementation still required
 
+The ordered work and exit criteria are in the [native execution plan](plan-glm5-native.md).
+The [correctness report](glm5-correctness-audit.md) and
+[efficiency report](glm5-efficiency-audit.md) record each auditor's scope and findings.
+
 - Implement sparse MLA and IndexPool: absorbed 512-wide latent attention at scale 1/16, four-token pooled
   keys, selection of completed pools plus the incomplete tail, bounded prefill scratch and per-request state.
   Preserve the stored affine grids when splitting MLA key/value projections; do not re-quantize them.
