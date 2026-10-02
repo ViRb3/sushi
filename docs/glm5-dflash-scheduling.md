@@ -300,3 +300,19 @@ optimized native dense-prefix prefill configuration. Private artifact
 `glm53-target23-a6-20261003` preserves binary/source hashes, pack config provenance,
 raw counters, phase times, outputs, full-state checks and thermal records. Both
 runs had independent GPU locks, foreground QoS and cooldown, restoring auto fans.
+
+## MLA branch scheduling finding
+
+The measured512-prefix N3 target runs both reported zero MLA branch flushes.
+Their maximum declared branch scratch was16,075,936 bytes against the268,435,456
+byte cap. `mlaTree` only performs an intermediate synchronous flush when its
+planned branch batch is full before the final branch; all four rows fit here.
+`attention.attend` likewise skips its bounded-chunk evaluation for each singleton
+branch query. There is therefore no branch wait to remove on this workload.
+
+No asynchronous branch-flush policy was added. At longer prefixes a future
+pipelined policy must reserve space for both in-flight batches; replacing a wait
+with async evaluation at the existing full-cap batch size would invalidate the
+scratch bound. At64K cache-growth boundaries, the current conservative plan allows
+only one branch, so even two-way overlap may not fit. Acceptance-policy experiments
+are better grounded for the current512-token workload.
