@@ -426,7 +426,7 @@ test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
     for (&bases, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) / 128;
     const base = try ops.own(mlx.mlx_array_new_data(&bases, &.{24}, 1, .float32));
     const hc = @import("glm5_model.zig").Hc{ .w = w, .scale = scale, .base = base };
-    for ([_]c_int{ 128, 512 }) |rows| {
+    for ([_]c_int{ 1, 17, 127, 128, 512 }) |rows| {
         const x = try ops.own(mlx.mlx_array_new_data(bits.ptr, &.{ 1, rows, 4, 4096 }, 4, .bfloat16));
         const before = dispatchCount();
         const expected = try hc.collapseReference(&ops, x, &cfg);
@@ -434,7 +434,7 @@ test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
         try std.testing.expectEqual(before, dispatchCount());
         const actual = try hc.collapse(&ops, x, &cfg);
         defer actual.deinit();
-        try std.testing.expectEqual(before + 1, dispatchCount());
+        try std.testing.expectEqual(before + @as(usize, if (rows >= 128) 1 else 0), dispatchCount());
         try expectBits(expected.mixed, actual.mixed);
         try expectBits(expected.post, actual.post);
         try expectBits(expected.comb, actual.comb);

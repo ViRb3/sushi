@@ -329,7 +329,8 @@ pub const Hc = struct {
     }
 
     pub fn collapse(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
-        if (@import("glm5_hc_prefill.zig").enabled()) {
+        // Skip device/dtype eligibility probes for serial and short tree calls.
+        if (mlx.getShape(x)[1] >= 128 and @import("glm5_hc_prefill.zig").enabled()) {
             if (try @import("glm5_hc_prefill.zig").experimentalRmsMix(ops.s, x, self.w, cfg.rms_norm_eps, 24)) |candidate| {
                 const mixes = try ops.own(candidate);
                 return primitive.hcCollapse(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);

@@ -2,7 +2,9 @@
 
 `Hc.collapse` uses the exact C24 RMS-fused candidate for eligible prefill inputs.
 `SUSHI_GLM_HC_PREFILL=0` restores the staged path for comparisons. Serial and
-small tree calls remain unchanged. The RMS-fused entry point declines fewer than
+small tree calls remain unchanged. The caller checks the row count before the
+stream/device and dtype eligibility probes, avoiding device-handle creation on
+serial calls. The RMS-fused entry point declines fewer than
 128 rows, non-BF16 activations, unsupported geometry, invalid epsilon, or CPU
 streams. It accepts stored BF16 or FP32 HC weights without conversion copies.
 
@@ -32,7 +34,8 @@ ReleaseFast synthetic dot tests cover widths 128, 512 and 16384; rows 17, 128 an
 RMS tests compare staged native RMS plus original dot against C8/C24 at rows
 128/512, BF16/FP32 weights, four magnitudes and two epsilons. All comparisons use
 raw FP32 bytes, not tolerances. Integrated full HC tests additionally compare
-BF16 mixed outputs, FP32 post weights and Sinkhorn matrices at 128/512 rows.
+BF16 mixed outputs, FP32 post weights and Sinkhorn matrices at 1/17/127/128/512
+rows, with dispatch counts confirming fallback below 128 and engagement above.
 A nonzero four-layer model test compares logits and every cache array with the
 policy on/off across 128, 17 and one row; its hidden128 geometry intentionally
 tests fallback rather than candidate engagement. Production-width actual captures
