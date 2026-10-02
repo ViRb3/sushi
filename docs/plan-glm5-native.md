@@ -155,3 +155,11 @@ remaining items here, remove stale completion claims, and retain raw paths in th
 measurement ledger. Ask the two auditors to review the integrated state after stages 3
 and 5; their current reports cover the foundation only. No additional quantization,
 MTP/vision implementation or unrelated Qwen work is required to reach first generation.
+
+## DFlash2 follow-up after serial tuning
+
+The owner supplied a GLM DFlash2 draft checkpoint and requested that serial decode be tuned first.
+The [separate DFlash2 study](plan-glm5-dflash2.md) maps mlx-serve's Qwen27B verification tree to GLM.
+It identifies mHC feature capture, branch-local IndexPool and KDA replay requirements; tree support
+is not implied by the existence of a compatible draft checkpoint. No speculative implementation
+is part of the current serial optimization measurement.

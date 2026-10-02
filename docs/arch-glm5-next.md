@@ -180,3 +180,23 @@ coefficients `2e-5`. These tolerances were set before fixing the observed failur
 KDA `prepare` owns a combined convolution weight and `exp(A_log)` once per layer; `deinit` is idempotent.
 Prepared and unprepared execution must produce identical output and recurrent state. This is layer
 validation, not full-model or quantized-checkpoint quality evidence.
+
+
+## First native full-prompt measurement
+
+2026-10-02, integration `33c85349`: the resident text-only diagnostic completed the same official-template
+512-token prompt used by the BF16 sanity run and generated 64 tokens of coherent English about rain.
+MTP/speculation were off, BF16 attention cache and FP32 recurrent state were used, prefill chunk128,
+one same-shape warmup with reset, no prefix reuse, and synchronous per-layer profiling enabled.
+Foreground QoS, an exclusive GPU lock, max fans and a cool start were used.
+
+| Metric | Native diagnostic result |
+| --- | ---: |
+| Prefill | 342.6664 tok/s |
+| Serial decode, 63 forward steps after first prefill token | 18.4368 tok/s |
+| Peak active Metal bytes | 96,066,533,660 (89.47 GiB) |
+
+Output began `</think>Rain forms through the water cycle. The sun heats water in oceans, rivers, and lakes`
+and continued coherently to the fixed length. This is one workload, not a KLD result. These measurements
+are below the requested 1,000 tok/s prefill and 60 tok/s decode targets. Serial scheduling and memory
+residency are the next tuning steps. DFlash2 integration follows serial tuning; its design study is separate.

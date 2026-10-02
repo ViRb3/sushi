@@ -66,3 +66,14 @@ Decoded output is a JSON string when its bytes form valid UTF8. A fixed-length
 run can end inside a multi-byte character; in that case `output_text` is null,
 `output_text_utf8_valid` is false, and `output_bytes` preserves the exact bytes
 as a numeric JSON array. Valid output also includes the raw byte array.
+
+For serial tuning, the diagnostic also honors the existing `SUSHI_WIRED=fit|off|max`
+policy after warmup/reset and before timing. It records the actual timed wired limit
+and policy. An explicit diagnostic `WIRED_GIB` and `SUSHI_WIRED` cannot be combined.
+The default remains the explicit recommended-cap limit used by the first measurement.
+
+`SUSHI_GLM_DIAGNOSTIC_DECODE_ASYNC=1` selects async submissions every four layers for
+one-token decode, with one final logits-and-cache evaluation. Set it to0 for the
+synchronous comparison. `PROFILE=1` forces synchronous evaluation so per-layer
+timings remain meaningful; the report names the effective schedule. Prefill keeps
+its per-layer memory boundary in either mode.
