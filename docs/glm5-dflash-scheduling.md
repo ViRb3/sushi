@@ -316,3 +316,32 @@ with async evaluation at the existing full-cap batch size would invalidate the
 scratch bound. At64K cache-growth boundaries, the current conservative plan allows
 only one branch, so even two-way overlap may not fit. Acceptance-policy experiments
 are better grounded for the current512-token workload.
+
+## New-target node and branching sweep
+
+Using the same fixed binary and new A6-trunk target/A6 assistant with lane/down
+kernels enabled and async4, a zero-code sweep retained prefix512/committed64,
+chunk128, greedy sampling and one warmup. Every arm matched the same64 target
+IDs and complete committed state. Matched serial rates stayed31.24–31.27tokens/s.
+
+| Policy | Verify rows/round | Rounds | Accepted drafts | Total verified rows | Decode tokens/s |
+|---|---:|---:|---:|---:|---:|
+| N3, children4 baseline | 4 | 22 | 42 | 88 | 39.1121 |
+| N3, children1 chain | 4 | 22 | 42 | 88 | 38.2765 |
+| N2, children4 | 3 | 24 | 40 | 72 | **42.4344** |
+| N4, children4 | 5 | 20 | 44 | 100 | 31.4162 |
+
+The chain produced no acceptance gain. N2 traded slightly lower tokens/round for
+cheaper verification: total verifier time1295.72ms versus baseline1446.18ms, despite
+two extra rounds; draft150.44ms versus134.21ms. Its total throughput improved8.49%,
+with1.3571× matched serial and a94,979,400,224-byte decode peak. N4's additional
+acceptance did not justify1856.78ms of verification. The five-row verifier geometry
+also crosses the row-tile size4 boundary; this is a plausible contributor, not an
+isolated kernel attribution from these end-to-end measurements.
+
+N2/children4 is the recommended next composed benchmark baseline. The45tokens/s
+target remains approximately6.05% above this result. This fixed-prompt sweep does
+not establish an adaptive policy across workloads. Private artifact
+`glm53-target23-policy-20261003` contains each independently locked/cooled run,
+raw phase times, counters, provenance and an aggregate comparison. No model,
+assistant or public scheduler default was changed by the sweep scripts.
