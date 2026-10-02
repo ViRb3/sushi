@@ -107,3 +107,17 @@ and pass without widening those bounds. This quantifies rounding differences on 
 not establish real-model KLD, long-context quality, or bitwise equivalence. Decode/verify already use
 absorbed attention in the source implementation. The native engine arithmetic was not changed by this
 oracle test.
+
+## Experimental dense prefill path
+
+The opt-in MLA dense-prefill mode expands the valid cached latent rows into BF16 per-head K/V and
+uses fused causal SDPA for more than eight queries, 256-wide query/value heads and contexts ending
+at or before 2051 tokens. The valid-row slice is essential: cache allocation capacity can exceed its
+logical token count. Existing `apply` and request defaults keep this mode disabled; decode and
+ineligible calls retain the absorbed path.
+
+Independent source comparisons pass for the new mode at 33 tokens, cached 17/1/15 chunks, and
+17-token calls ending exactly at 2051 and 2052 tokens. The latter exercises the fallback. The same
+predeclared absolute/relative bounds apply; this is not a claim of equivalence to the absorbed arm.
+Pure eligibility checks also cover disabled mode, decode/verify widths, unsupported dtype/head width
+and the context boundary. Full-model quality and throughput must be measured before enabling it by default.

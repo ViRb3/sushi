@@ -153,7 +153,32 @@ pub const Mla = struct {
         self.prepared.deinit();
     }
 
+    pub fn densePrefillEligible(enabled: bool, rows: c_int, offset: usize, cfg: *const model.ModelConfig, dtype: mlx.mlx_dtype) bool {
+        return enabled and rows > 8 and offset <= 2051 and @as(usize, @intCast(rows)) <= 2051 - offset and
+            cfg.mla_qk_nope_head_dim == 256 and cfg.mla_v_head_dim == 256 and dtype == .bfloat16;
+    }
+
+    fn densePrefill(self: *const Mla, ops: *Ops, q: Arr, cfg: *const model.ModelConfig, state: anytype) !Arr {
+        const rows = mlx.getShape(q)[0];
+        const latent: c_int = @intCast(cfg.mla_kv_lora_rank);
+        const valid_cache = try ops.slice(state.latent, 0, 0, @intCast(state.processed));
+        const cached = try ops.reshape(valid_cache, &.{ 1, 1, @intCast(state.processed), latent });
+        const keys = if (self.quantized) try ops.qmm(cached, self.wk, self.sk, self.bk, true) else try ops.binary(.mm, cached, try ops.transpose(self.wk, &.{ 0, 2, 1 }));
+        const values = if (self.quantized) try ops.qmm(cached, self.wv, self.sv, self.bv, true) else try ops.binary(.mm, cached, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
+        const query = try ops.transpose(q, &.{ 2, 1, 0, 3 });
+        const attended = try ops.slot();
+        // Causal SDPA aligns the query's final row with the final cached key,
+        // so the same mask is valid for both cold and cached prefill chunks.
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(attended, query, try ops.cast(keys, .bfloat16), try ops.cast(values, .bfloat16), 1 / @sqrt(@as(f32, @floatFromInt(cfg.mla_qk_nope_head_dim))), "causal", .{ .ctx = null }, .{ .ctx = null }, true, ops.s));
+        const output = try ops.reshape(try ops.transpose(attended.*, &.{ 0, 2, 1, 3 }), &.{ 1, rows, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
+        return self.out.apply(ops, output);
+    }
+
     pub fn apply(self: *const Mla, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: anytype) !Arr {
+        return self.applyMode(ops, x, cfg, state, false);
+    }
+
+    pub fn applyMode(self: *const Mla, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: anytype, dense_prefill: bool) !Arr {
         const sh = mlx.getShape(x);
         if (sh[0] != 1) return error.GlmBatchUnsupported;
         const t = sh[1];
@@ -162,13 +187,15 @@ pub const Mla = struct {
         const latent: c_int = @intCast(cfg.mla_kv_lora_rank);
         const qr = try ops.rms(try self.qa.apply(ops, x), self.qa_norm, cfg.rms_norm_eps);
         const q = try ops.reshape(try self.qb.apply(ops, qr), &.{ t, h, 1, kd });
-        const absorbed = if (self.quantized) try ops.qmm(q, self.wk, self.sk, self.bk, false) else try ops.binary(.mm, q, self.wk);
+        const dense = densePrefillEligible(dense_prefill, t, state.processed, cfg, mlx.mlx_array_dtype(q));
+        const absorbed: Arr = if (dense) .{ .ctx = null } else if (self.quantized) try ops.qmm(q, self.wk, self.sk, self.bk, false) else try ops.binary(.mm, q, self.wk);
         const kv = try ops.rms(try self.kva.apply(ops, x), self.kv_norm, cfg.rms_norm_eps);
         const iq = try ops.reshape(try self.iq.apply(ops, qr), &.{ t, @intCast(cfg.indexer_n_heads), @intCast(cfg.indexer_head_dim) });
         const ik = try ops.layerNorm(try self.ik.apply(ops, x), self.ik_norm, self.ik_bias, 1e-6);
         const iw = try ops.cast(try ops.binary(.mul, try self.iw.apply(ops, x), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(cfg.indexer_n_heads * cfg.indexer_head_dim))), .float32)), mlx.mlx_array_dtype(iq));
         const gates = try ops.binary(.mm, x, try ops.transpose(self.compress, &.{ 1, 0 }));
         const offset = try state.append(try ops.reshape(kv, &.{ t, latent }), try ops.reshape(ik, &.{ t, @intCast(cfg.indexer_head_dim) }), try ops.reshape(gates, &.{ t, @intCast(cfg.indexer_head_dim) }), self.ape, ops.s);
+        if (dense) return self.densePrefill(ops, q, cfg, state);
         const y = try ops.own(try @import("glm5_attention.zig").attend(state, try ops.reshape(absorbed, &.{ t, h, latent }), iq, try ops.reshape(iw, &.{ t, @intCast(cfg.indexer_n_heads) }), offset, 1 / @sqrt(@as(f32, @floatFromInt(kd))), ops.s));
         const y4 = try ops.reshape(y, &.{ t, h, 1, latent });
         const values = if (self.quantized) try ops.qmm(y4, self.wv, self.sv, self.bv, true) else try ops.binary(.mm, y4, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
@@ -236,6 +263,7 @@ pub const Request = struct {
     failed: bool = false,
     profile: bool = false,
     decode_async: bool = true,
+    dense_prefill: bool = false,
     layer_ns: [128]u64 = @splat(0),
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
@@ -349,7 +377,7 @@ pub const Model = struct {
             const x = try ops.rms(pre.mixed, layer.norm_attn, self.cfg.rms_norm_eps);
             const a = switch (layer.attn) {
                 .kda => |kda| try kda.apply(&ops, x, &self.cfg, &state.recurrent),
-                .mla => |*mla| try mla.apply(&ops, x, &self.cfg, &state.attention),
+                .mla => |*mla| try mla.applyMode(&ops, x, &self.cfg, &state.attention, request.dense_prefill),
             };
             const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, self.s));
             const ff = try layer.hc_ffn.collapse(&ops, joined, &self.cfg);

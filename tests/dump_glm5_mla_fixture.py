@@ -88,6 +88,15 @@ def main():
             mx.eval(outputs[-1])
             start += n
         values[f'{label}.output'] = mx.concatenate(outputs, axis=1)
+    values['boundary.prefill.input'] = rand((1, 17, 128), .7)
+    for label, past in [('boundary.dense', 2034), ('boundary.fallback', 2035)]:
+        cache = language.CacheList(language.KVCache(), PoolingCache(4))
+        cache[0].update_and_fetch(prefix_latent[:, None, :past], mx.zeros((1, 1, past, 0), dtype=mx.bfloat16))
+        keys, gates, _ = cache[1].accumulate_windows(prefix_keys[:, :past], prefix_gates[:, :past], 0)
+        cache[1].update_and_fetch(layer.indexer._compress_windows(keys, gates))
+        mask = mx.arange(past+17)[None, None, None, :] <= (past+mx.arange(17))[None, None, :, None]
+        values[f'{label}.output'] = layer(values['boundary.prefill.input'], mask=mask, cache=cache)
+        mx.eval(values[f'{label}.output'])
     # Same source weights and operation primitives; only reassociate attention
     # into latent space, matching the native path's BF16 rounding boundaries.
     x = values['input']

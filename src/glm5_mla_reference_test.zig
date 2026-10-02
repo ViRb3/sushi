@@ -65,7 +65,7 @@ fn compare(ops: *base.Ops, actual: Arr, expected: Arr, label: []const u8) !void 
     try std.testing.expect(relative_l2 <= 0.01);
 }
 
-test "GLM MLA full source oracle covers prefill serial and cached irregular chunks" {
+fn runOracle(dense_prefill: bool) !void {
     var weights = try fixture();
     defer weights.deinit();
     const cfg = model.ModelConfig{
@@ -84,15 +84,16 @@ test "GLM MLA full source oracle covers prefill serial and cached irregular chun
     };
     var layer = try forward.Mla.load(&weights, "m", &cfg, mlx.gpuStream());
     defer layer.deinit();
-    const Case = struct { name: []const u8, chunks: []const c_int };
+    const Case = struct { name: []const u8, chunks: []const c_int, prefix: usize = 0, input: []const u8 = "input" };
     const ones: [33]c_int = @splat(1);
-    for ([_]Case{ .{ .name = "full", .chunks = &.{33} }, .{ .name = "irregular", .chunks = &.{ 17, 1, 15 } }, .{ .name = "serial", .chunks = &ones }, .{ .name = "boundary.serial", .chunks = &.{ 1, 1, 1, 1, 1, 1 } }, .{ .name = "boundary.chunk", .chunks = &.{ 3, 3 } } }) |case| {
+    for ([_]Case{ .{ .name = "full", .chunks = &.{33} }, .{ .name = "irregular", .chunks = &.{ 17, 1, 15 } }, .{ .name = "serial", .chunks = &ones }, .{ .name = "boundary.serial", .chunks = &.{ 1, 1, 1, 1, 1, 1 }, .prefix = 2047, .input = "boundary.input" }, .{ .name = "boundary.chunk", .chunks = &.{ 3, 3 }, .prefix = 2047, .input = "boundary.input" }, .{ .name = "boundary.dense", .chunks = &.{17}, .prefix = 2034, .input = "boundary.prefill.input" }, .{ .name = "boundary.fallback", .chunks = &.{17}, .prefix = 2035, .input = "boundary.prefill.input" } }) |case| {
         var state = attention.State.init();
         defer state.deinit();
-        const boundary = std.mem.startsWith(u8, case.name, "boundary.");
-        const prefix: usize = if (boundary) 2047 else 0;
-        if (boundary) {
-            _ = try state.append(weights.get("boundary.latent").?, weights.get("boundary.keys").?, weights.get("boundary.gates").?, weights.get("m.indexer.index_kpool_compress_ape").?, mlx.gpuStream());
+        const prefix = case.prefix;
+        if (prefix != 0) {
+            var prep = base.Ops{ .s = mlx.gpuStream() };
+            defer prep.deinit();
+            _ = try state.append(try prep.slice(weights.get("boundary.latent").?, 0, 0, @intCast(prefix)), try prep.slice(weights.get("boundary.keys").?, 0, 0, @intCast(prefix)), try prep.slice(weights.get("boundary.gates").?, 0, 0, @intCast(prefix)), weights.get("m.indexer.index_kpool_compress_ape").?, mlx.gpuStream());
             for (state.arrays()) |a| if (a.ctx != null) try mlx.check(mlx.mlx_array_eval(a));
         }
         var pos: c_int = 0;
@@ -101,12 +102,34 @@ test "GLM MLA full source oracle covers prefill serial and cached irregular chun
         for (case.chunks) |count| {
             var ops = base.Ops{ .s = mlx.gpuStream() };
             defer ops.deinit();
-            const x = try ops.slice(weights.get(if (boundary) "boundary.input" else "input").?, 1, pos, pos + count);
-            const y = try layer.apply(&ops, x, &cfg, &state);
+            const x = try ops.slice(weights.get(case.input).?, 1, pos, pos + count);
+            const y = try layer.applyMode(&ops, x, &cfg, &state, dense_prefill);
             try compare(&ops, y, try ops.slice(expected, 1, pos, pos + count), case.name);
             for (state.arrays()) |a| if (a.ctx != null) try mlx.check(mlx.mlx_array_eval(a));
             pos += count;
             try std.testing.expectEqual(prefix + @as(usize, @intCast(pos)), state.processed);
         }
     }
+}
+
+test "GLM MLA full source oracle covers prefill serial and cached irregular chunks" {
+    try runOracle(false);
+}
+
+test "GLM MLA dense prefill source oracle covers causal cached chunks" {
+    try runOracle(true);
+}
+
+test "GLM MLA dense prefill eligibility excludes decode and sparse boundary" {
+    const cfg = model.ModelConfig{ .mla_qk_nope_head_dim = 256, .mla_v_head_dim = 256 };
+    try std.testing.expect(forward.Mla.densePrefillEligible(true, 33, 0, &cfg, .bfloat16));
+    try std.testing.expect(forward.Mla.densePrefillEligible(true, 17, 2034, &cfg, .bfloat16));
+    try std.testing.expect(!forward.Mla.densePrefillEligible(true, 17, 2035, &cfg, .bfloat16));
+    try std.testing.expect(!forward.Mla.densePrefillEligible(true, 1, 0, &cfg, .bfloat16));
+    try std.testing.expect(!forward.Mla.densePrefillEligible(true, 8, 0, &cfg, .bfloat16));
+    try std.testing.expect(!forward.Mla.densePrefillEligible(false, 33, 0, &cfg, .bfloat16));
+    try std.testing.expect(!forward.Mla.densePrefillEligible(true, 33, 0, &cfg, .float32));
+    var unsupported = cfg;
+    unsupported.mla_qk_nope_head_dim = 512;
+    try std.testing.expect(!forward.Mla.densePrefillEligible(true, 33, 0, &unsupported, .bfloat16));
 }

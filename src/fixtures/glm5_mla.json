@@ -1,4 +1,9 @@
 {
+  "source_hashes": {
+    "omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py": "cca4d5f7604e3890170210ff5dba4416b6264e68e037531c46b688fd4d642245",
+    ".venv/lib/python3.14/site-packages/mlx_lm/models/mla.py": "22877b336255e58d949d982b6ac4730bd0ca1a1a6f40479f736570b3c9f35057",
+    ".venv/lib/python3.14/site-packages/mlx_lm/models/cache.py": "819ed95dcbf755652363cfdb15a639890447abb534a06dcefd52c7fff5055750"
+  },
   "omlx_commit": "6745c39cb66ba5ec130a761149fc1b8b832fcb07",
   "seed": 53256,
   "geometry": {
@@ -27,9 +32,5 @@
     "max_abs": 0.00390625,
     "relative_l2": 0.0038833909202367067
   },
-  "fixture_sha256": "32eb79bf10fa8b4a6fe1a68873167ba8963b96dbe271e9b0269c6072bdd409a5",
-  "source_hashes": {
-    "omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py": "cca4d5f7604e3890170210ff5dba4416b6264e68e037531c46b688fd4d642245",
-    ".venv/lib/python3.14/site-packages/mlx_lm/models/mla.py": "22877b336255e58d949d982b6ac4730bd0ca1a1a6f40479f736570b3c9f35057"
-  }
+  "fixture_sha256": "4fc09c68b971437a506132f4d7a259058d2148cae63104087ac755faca38a0c4"
 }
