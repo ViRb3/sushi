@@ -284,3 +284,11 @@ outside those layer timers. MLA layers average 1.235 ms versus 0.986 ms for KDA/
 These are complete-layer times, not component attribution, and must not be compared directly
 with async4 throughput. Further serial profiling should separate HC, projections and expert work
 inside representative layers before choosing another large fusion.
+
+
+DFlash2 now passes warmed full-checkpoint 512/64 token and final-state parity at 2, 4 and 8
+verification rows, with the original BF16 assistant. The four-row arm measured27.03 tok/s versus
+26.54 for its matched serial reference; the two-row and eight-row arms were slower. This small
+single-run gain does not establish a robust default or satisfy60 tok/s. The matched comparison
+commits all64 output tokens, unlike the native serial harness's63 timed forwards. Detailed rates,
+phase costs, precision and memory scope are recorded in [the DFlash2 document](plan-glm5-dflash2.md).
