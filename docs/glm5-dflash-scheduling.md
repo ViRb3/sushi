@@ -266,3 +266,37 @@ native single-row qmv and assert integrated row-tile engagement. Malformed grids
 dtypes and layouts still decline. These unit tests qualify projection arithmetic;
 full-checkpoint target token and state parity remains required before reporting
 new target throughput.
+
+### New A6-trunk target and exact down-projection composition
+
+After native6-bit trunk, copy-free QKV and verification-row projection tests passed,
+the2.3bpw directory was measured with the selected A6 assistant. Its experts remain
+K2.25/W12; its trunk is A6g128. This target can legitimately change decisions versus
+the old A8-trunk target, so correctness compares to its own serial reference.
+
+Both runs used one fixed binary, lane-pair enabled, async4, N3/children4,
+prefix512/committed64/chunk128, captured staged prefill, profiling off and one warmup.
+
+| Down kernel | Decode tokens/s | Matched serial | Verify total | Decode peak bytes |
+|---|---:|---:|---:|---:|
+| Original | 37.3434 | 29.3201 | 1522.62 ms | 94,983,104,800 |
+| Lane candidate | 39.1121 | 31.3934 | 1446.18 ms | 94,982,990,368 |
+
+Each passed64 target IDs and complete committed state against its own serial run.
+The down-on/off IDs were identical, with22 rounds and42 accepted drafts in both.
+Lane pair/chain counts were924 (22 rounds×42 routed layers); down count was0/924,
+and affine row dispatches7194. The lower count than the earlier966 reflects fewer
+rounds, not missing kernel engagement. Output was coherent English.
+
+Down-on increased measured speculative throughput4.74% and reduced total verify
+time5.02%; draft cost was unchanged at approximately134ms. Serial throughput also
+increased7.07%, so the speculative/serial ratio fell slightly1.274→1.246. These
+are single same-binary arms, not a confidence interval. Peak memory was effectively
+unchanged. The45tokens/s goal remains open.
+
+Captured prefill was363.3/366.6tokens/s with the intentionally unchanged chunk128
+staged prefix settings. It must not be compared as if it used the separately
+optimized native dense-prefix prefill configuration. Private artifact
+`glm53-target23-a6-20261003` preserves binary/source hashes, pack config provenance,
+raw counters, phase times, outputs, full-state checks and thermal records. Both
+runs had independent GPU locks, foreground QoS and cooldown, restoring auto fans.
