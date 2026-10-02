@@ -71,8 +71,10 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
 
 `moeClamped` applies the gate upper bound and symmetric up bound in FP32 before SwiGLU. Decode keeps
 slots in their original top-k order. Prefill prepares gate/up directly from token rows, shares one window
-table across all three projections, and scatters the down plane back before the existing top-k reduction.
-It does not materialize repeated and sorted token planes or sort the inverse permutation.
+table across all three projections, and uses its GPU inverse routing to finish directly from the sorted
+down plane. The reducer still visits the original top-k order; stride-table and unsupported-bank
+fallbacks retain scatter-plus-reduce. It does not materialize repeated and sorted token planes or sort
+the inverse permutation.
 
 Decode also prepares both natural-order input planes directly from token rows in one kernel. The two
 expert-specific Hadamards remain necessary because gate/up scales differ, and their F16 stores and all
@@ -92,6 +94,10 @@ The optimized routing matches the staged path bit-for-bit at every even packed w
 with BF16 and FP32 inputs/outputs, top-k eight, and decode/prefill rows. A K2.25/W12 case also checks the
 GLM hidden/intermediate widths 4096/2048. These are arithmetic and dispatch-structure checks; they do not
 establish a measured full-model speedup.
+
+Aligned GLM prefill also avoids the scattered F16 down intermediate (32 MiB at 512 rows, top-k eight
+and hidden width 4096) and one dispatch. Exact staged-output tests cover all 17 rates at 288 experts,
+real 4096/2048 projection widths, sparse/all-expert/skewed routing, and the retained stride fallback.
 
 ## Kernels
 

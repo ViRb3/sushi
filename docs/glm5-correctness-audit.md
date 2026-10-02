@@ -126,7 +126,7 @@ and the context boundary. Full-model quality and throughput must be measured bef
 
 Aligned clamped prefill now reuses the GPU expert-window builder for banks with at most 512 experts.
 It eliminates the host readback of sorted routing IDs; the stride fallback and final scatter/reduction
-order are unchanged. The extra inverse-routing output is not needed by this path and is released.
+order are unchanged. The initial implementation released the inverse-routing output; the follow-up below now consumes it.
 Unused window capacity has zero start/live entries, and GEMM skips those windows before indexing rows.
 The one-time runtime engagement message is suppressed in unit tests.
 
@@ -136,3 +136,13 @@ Padded entries are checked explicitly. End-to-end BF16 output bytes match the st
 reference at all 17 supported rates from 2 through 4 bpw with 288 experts, and at the real 4096/2048
 projection widths with K2.25/W12. Each end-to-end case exercises sparse, all-expert and skewed routes.
 This establishes unchanged arithmetic for those cases; any throughput gain requires a separate measurement.
+
+## Sorted prefill finish follow-up
+
+Aligned clamped prefill retains the GPU-produced inverse routing and reuses the existing sorted finisher.
+That kernel derives from the same reduction source, changing only the down-plane row lookup. It retains
+original route order, FP16 stored inner values, and the output cast. The stride fallback still scatters.
+The dispatch regression failed at five tracked auxiliary calls before the change and passes at four.
+All-rate 288-expert output-byte comparisons and production 4096/2048 K2.25 cases pass with sparse,
+all-expert and skewed routes. Existing staged BF16/FP32 comparisons and the stride fallback remain gates.
+No full-model speedup is inferred from these component checks.

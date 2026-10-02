@@ -3184,13 +3184,10 @@ pub fn moePrefill(
     return out;
 }
 
-fn clampedWindowTable(s: mlx.mlx_stream, ids: mlx.mlx_array, order: mlx.mlx_array, n: c_int, win: c_int, experts: c_int, aligned: bool) !WindowTable {
-    if (aligned and experts > 0 and experts <= MIMO_WINDOW_MAX_EXPERTS) {
-        const metadata = try buildMimoWindowTable(s, ids, order, n, win, experts);
-        _ = mlx.mlx_array_free(metadata.inverse);
-        return metadata.table;
-    }
-    return gemmWindowTable(s, ids, n, win, aligned);
+fn clampedWindowTable(s: mlx.mlx_stream, ids: mlx.mlx_array, order: mlx.mlx_array, n: c_int, win: c_int, experts: c_int, aligned: bool) !MimoWindowTable {
+    if (aligned and experts > 0 and experts <= MIMO_WINDOW_MAX_EXPERTS)
+        return buildMimoWindowTable(s, ids, order, n, win, experts);
+    return .{ .table = try gemmWindowTable(s, ids, n, win, aligned), .inverse = .{ .ctx = null } };
 }
 
 pub fn moeSwigluClamped(
@@ -3251,7 +3248,11 @@ pub fn moeSwigluClamped(
     defer _ = mlx.mlx_array_free(prep[1]);
     const win = gemmWindowRows();
     const aligned = gemmWindowAligned();
-    const tab = try clampedWindowTable(s, sorted_slots, order_i, nslots, win, mlx.getShape(gate_t)[0], aligned);
+    const metadata = try clampedWindowTable(s, sorted_slots, order_i, nslots, win, mlx.getShape(gate_t)[0], aligned);
+    defer if (metadata.inverse.ctx != null) {
+        _ = mlx.mlx_array_free(metadata.inverse);
+    };
+    const tab = metadata.table;
     defer _ = mlx.mlx_array_free(tab.starts);
     defer _ = mlx.mlx_array_free(tab.nlives);
     const gate = try innerGemmSortedTable(s, prep[0], gate_t, sorted_slots, win, aligned, tab);
@@ -3262,6 +3263,8 @@ pub fn moeSwigluClamped(
     defer _ = mlx.mlx_array_free(prepared);
     const down = try innerGemmSortedTable(s, prepared, down_t, sorted_slots, win, aligned, tab);
     defer _ = mlx.mlx_array_free(down);
+    if (metadata.inverse.ctx != null)
+        return finishMimoSorted(s, down, metadata.inverse, down_svh, slots, scores, hidden, rows, topk, out_dtype);
     const original_order = try scatterSorted(s, down, order_i, hidden, nslots);
     defer _ = mlx.mlx_array_free(original_order);
     return downFinishReduce(s, original_order, down_svh, slots, scores, hidden, rows, topk, out_dtype);
@@ -7999,7 +8002,7 @@ fn finishMimoSorted(s: mlx.mlx_stream, inner: mlx.mlx_array, inverse: mlx.mlx_ar
     try mlx.check(mlx.mlx_vector_array_get(&y, outputs, 0));
     if (!mimo_reduce_engaged) {
         mimo_reduce_engaged = true;
-        log.info("[exl3-prefill] sorted finish/reduce engaged dtype={s}\n", .{@tagName(dtype)});
+        if (!@import("builtin").is_test) log.info("[exl3-prefill] sorted finish/reduce engaged dtype={s}\n", .{@tagName(dtype)});
     }
     return y;
 }
@@ -9608,7 +9611,9 @@ test "exl3 GLM GPU windows match host metadata with zero padded windows" {
             const host = try buildWindowTableHost(s, sorted, @intCast(n), win);
             defer _ = mlx.mlx_array_free(host.starts);
             defer _ = mlx.mlx_array_free(host.nlives);
-            const gpu = try clampedWindowTable(s, sorted, order, @intCast(n), win, experts, true);
+            const metadata = try clampedWindowTable(s, sorted, order, @intCast(n), win, experts, true);
+            defer _ = mlx.mlx_array_free(metadata.inverse);
+            const gpu = metadata.table;
             defer _ = mlx.mlx_array_free(gpu.starts);
             defer _ = mlx.mlx_array_free(gpu.nlives);
             try std.testing.expectEqual(@as(c_int, @intCast((n + @as(usize, @intCast(win)) - 1) / @as(usize, @intCast(win)) + experts)), gpu.nwin);
@@ -9628,6 +9633,13 @@ test "exl3 GLM GPU windows match host metadata with zero padded windows" {
 }
 
 fn clampedGpuWindowBytes(hidden: usize, inter: usize, n: u32) !void {
+    return clampedWindowBytes(hidden, inter, n, true);
+}
+
+fn clampedWindowBytes(hidden: usize, inter: usize, n: u32, aligned: bool) !void {
+    const prior = gemm_align_cached;
+    gemm_align_cached = aligned;
+    defer gemm_align_cached = prior;
     const s = mlx.gpuStream();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9663,8 +9675,10 @@ fn clampedGpuWindowBytes(hidden: usize, inter: usize, n: u32) !void {
         defer _ = mlx.mlx_array_free(slots);
         const reference = try clampedSortedReference(s, x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], slots, v[9], topk, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(reference);
+        resetFusedDispatchCount();
         const actual = try moeSwigluClamped(s, x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], slots, v[9], topk, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(actual);
+        try std.testing.expectEqual(@as(u32, 4), fusedDispatchCount());
         var ref32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ref32);
         var got32 = mlx.mlx_array_new();
@@ -9787,4 +9801,10 @@ test "exl3 paired cooperative projections preserve GLM width and mixed rate fall
         try mlx.check(mlx.mlx_astype(&af, actual, .float32, s));
         try std.testing.expectEqualSlices(u8, try gemvOutBytes(ef), try gemvOutBytes(af));
     }
+}
+
+test "exl3 GLM sorted finish retains stride fallback bytes" {
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    try clampedWindowBytes(128, 128, 36, false);
 }
