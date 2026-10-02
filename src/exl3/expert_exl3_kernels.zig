@@ -3213,15 +3213,17 @@ pub fn moeSwigluClamped(
     const hidden = sh[1];
     const nslots = rows * topk;
     if (rows <= DECODE_ROWS_MAX) {
-        const prep = try pairPrepareFromTokens(s, x, gate_suh, up_suh, slots, null, hidden, nslots, topk);
-        const prep_g = prep[0];
-        const prep_u = prep[1];
-        defer _ = mlx.mlx_array_free(prep_g);
-        defer _ = mlx.mlx_array_free(prep_u);
-        const pair = (try indexedPairCoopF16(s, prep_g, prep_u, gate_t, up_t, slots)) orelse blk: {
-            const gate = try indexedGemvCoopF16(s, prep_g, gate_t, slots);
-            errdefer _ = mlx.mlx_array_free(gate);
-            break :blk [2]mlx.mlx_array{ gate, try indexedGemvCoopF16(s, prep_u, up_t, slots) };
+        const pair = (try laneClampedPair(s, x, gate_t, up_t, gate_suh, up_suh, slots, hidden, rows, topk)) orelse blk: {
+            const prep = try pairPrepareFromTokens(s, x, gate_suh, up_suh, slots, null, hidden, nslots, topk);
+            const prep_g = prep[0];
+            const prep_u = prep[1];
+            defer _ = mlx.mlx_array_free(prep_g);
+            defer _ = mlx.mlx_array_free(prep_u);
+            break :blk (try indexedPairCoopF16(s, prep_g, prep_u, gate_t, up_t, slots)) orelse fallback: {
+                const gate = try indexedGemvCoopF16(s, prep_g, gate_t, slots);
+                errdefer _ = mlx.mlx_array_free(gate);
+                break :fallback [2]mlx.mlx_array{ gate, try indexedGemvCoopF16(s, prep_u, up_t, slots) };
+            };
         };
         const gate = pair[0];
         const up = pair[1];
@@ -10013,3 +10015,224 @@ test "exl3 clamped middle diagnostic auto off on keep serial conservative" {
     try std.testing.expect(!clampedMiddleModeAllows(.on, 0));
 }
 
+// LANE_QUAD_CANDIDATE: opt-in exact layout; baseline remains the default.
+fn lanePairChain(s: mlx.mlx_stream, v: [10]mlx.mlx_array, x: mlx.mlx_array, hidden: c_int, rows: c_int, candidate: bool) ![2]mlx.mlx_array {
+    const prepared = if (candidate) try lanePairPrepare(s, x, v[3], v[4], v[7], null, hidden, rows * 8, 8) else try pairPrepareFromTokens(s, x, v[3], v[4], v[7], null, hidden, rows * 8, 8);
+    defer _ = mlx.mlx_array_free(prepared[0]);
+    defer _ = mlx.mlx_array_free(prepared[1]);
+    return (if (candidate) try lanePairCoop(s, prepared[0], prepared[1], v[0], v[1], v[7]) else try indexedPairCoopF16(s, prepared[0], prepared[1], v[0], v[1], v[7])) orelse error.TestExpectedLanePair;
+}
+fn lanePairCase(hidden: usize, inter: usize, rows: usize, rate: u32, timing: bool) !void {
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 78314 + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+    defer f.deinit();
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, f.arrays[8], .bfloat16, s));
+    var up_scale = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(up_scale);
+    try mlx.check(mlx.mlx_negative(&up_scale, f.arrays[3], s));
+    var banks = f.arrays;
+    banks[4] = up_scale;
+    const expected = try lanePairChain(s, banks, x, @intCast(hidden), @intCast(rows), false);
+    defer for (expected) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    const actual = try lanePairChain(s, banks, x, @intCast(hidden), @intCast(rows), true);
+    defer for (actual) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    for (expected, actual) |want, got| try std.testing.expectEqualSlices(u8, try gemvOutBytes(want), try gemvOutBytes(got));
+    if (!timing) return;
+    var samples: [2][40]u64 = undefined;
+    for (0..23) |round| for (0..4) |slot| {
+        const arm = if (slot < 2) slot else 3 - slot;
+        var timer = io_util.Stopwatch.init(std.testing.io);
+        const result = try lanePairChain(s, banks, x, @intCast(hidden), @intCast(rows), arm == 1);
+        const evals = mlx.mlx_vector_array_new_data(&result, 2);
+        try mlx.check(mlx.mlx_eval(evals));
+        if (round >= 3) samples[arm][2 * (round - 3) + @intFromBool(slot >= 2)] = timer.read();
+        _ = mlx.mlx_vector_array_free(evals);
+        for (result) |v| {
+            _ = mlx.mlx_array_free(v);
+        }
+    };
+    for (&samples) |*sample| std.mem.sort(u64, sample, {}, std.sort.asc(u64));
+    std.debug.print("[glm-lane-pair] rows={d} old_us={d:.3} half4_us={d:.3} exact=true\n", .{ rows, @as(f64, @floatFromInt(samples[0][20])) / 1000, @as(f64, @floatFromInt(samples[1][20])) / 1000 });
+}
+test "exl3 GLM lane half4 pair exact bytes" {
+    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR_TEST"))) return error.SkipZigTest;
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    for (0..17) |i| try lanePairCase(256, 128, 3, @intCast(32 + 2 * i), false);
+    for ([_]usize{ 1, 3, 7, 16 }) |rows| try lanePairCase(4096, 2048, rows, 36, false);
+}
+test "exl3 GLM lane half4 pair benchmark" {
+    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR_BENCH"))) return error.SkipZigTest;
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    for ([_]usize{ 1, 3, 7, 16 }) |rows| try lanePairCase(4096, 2048, rows, 36, true);
+}
+
+const LANE_PREP_SOURCE: [:0]const u8 = blk: {
+    @setEvalBranchQuota(1000000);
+    break :blk metalReplaceAll(TOKEN_PAIR_PREPARE_SOURCE, "[yb + lane", "[yb + " ++ LANE_ORDER_SLOT);
+};
+const LANE_PAIR_SOURCE: [:0]const u8 = blk: {
+    @setEvalBranchQuota(1000000);
+    var body = INDEXED_PAIR_COOP_SOURCE;
+    body = metalReplaceAll(body, "const float in0 = float(x[xb + tk * TILE + row0]);", "const float4 in4 = float4(*((const device half4 *)(x + xb + tk * TILE + (lane & 3u) * 4u)));\nconst float in0 = in4.x;");
+    body = metalReplaceAll(body, "const float in1 = float(x[xb + tk * TILE + row1]);", "const float in1 = in4.y;");
+    body = metalReplaceAll(body, "const float in2 = float(x[xb + tk * TILE + row2]);", "const float in2 = in4.z;");
+    body = metalReplaceAll(body, "const float in3 = float(x[xb + tk * TILE + row3]);", "const float in3 = in4.w;");
+    break :blk body;
+};
+var lane_prep_cfgs: CfgCache(PairPrepKey, 8) = .{};
+var lane_prep_sorted: ?mlx.mlx_fast_metal_kernel = null;
+var lane_prep_unsorted: ?mlx.mlx_fast_metal_kernel = null;
+var lane_pair_cfgs: CfgCache(IndexedKey, 8) = .{};
+var lane_pair_kernel: KernelSlots = no_kernels;
+pub fn lanePairPrepare(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: mlx.mlx_array, slots: mlx.mlx_array, order: ?mlx.mlx_array, in_dim: c_int, nslots: c_int, topk: c_int) !struct { mlx.mlx_array, mlx.mlx_array } {
+    const key = PairPrepKey{ .in_dim = in_dim, .nslots = nslots, .topk = topk };
+    const cfg = lane_prep_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const sh = [_]c_int{ nslots, in_dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
+        const blocks = @divExact(in_dim, 128);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * blocks, nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOPK", topk));
+        lane_prep_cfgs.put(key, c);
+        break :blk c;
+    };
+    const ins = [_][*:0]const u8{ "x", "suhg", "suhu", "slots", "order" };
+    const outs = [_][*:0]const u8{ "yg", "yu" };
+    const kernel = if (order != null)
+        try getNamedKernel(&lane_prep_sorted, "sushi_glm_lane_prepare", &ins, &outs, LANE_PREP_SOURCE, "")
+    else
+        try getNamedKernel(&lane_prep_unsorted, "sushi_glm_lane_unsorted", ins[0..4], &outs, metalReplaceFound(LANE_PREP_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;"), "");
+    const ov = if (order) |sorted|
+        try applyOuts(s, kernel, &.{ x, suhg, suhu, slots, sorted }, cfg, 2)
+    else
+        try applyOuts(s, kernel, &.{ x, suhg, suhu, slots }, cfg, 2);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var a = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(a);
+    var b = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_vector_array_get(&a, ov, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&b, ov, 1));
+    return .{ a, b };
+}
+pub fn lanePairCoop(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array) !?[2]mlx.mlx_array {
+    const xs = mlx.getShape(xg);
+    const ts = mlx.getShape(tg);
+    const ss = mlx.getShape(slots);
+    if (!mlx.streamIsGpu(s) or xs.len != 2 or ts.len != 4 or ss.len != 1 or
+        !std.mem.eql(c_int, xs, mlx.getShape(xu)) or !std.mem.eql(c_int, ts, mlx.getShape(tu)) or
+        xs[0] <= 0 or xs[1] <= 0 or ts[0] <= 0 or ts[1] <= 0 or ts[2] <= 0 or
+        ts[1] > std.math.maxInt(c_int) / 16 or ts[2] > std.math.maxInt(c_int) / 128 or
+        xs[0] != ss[0] or ts[1] * 16 != xs[1] or
+        mlx.mlx_array_dtype(xg) != .float16 or mlx.mlx_array_dtype(xu) != .float16 or
+        mlx.mlx_array_dtype(tg) != .uint16 or mlx.mlx_array_dtype(tu) != .uint16 or
+        (mlx.mlx_array_dtype(slots) != .uint32 and mlx.mlx_array_dtype(slots) != .int32)) return null;
+    const rate = try packedRate(ts[3]);
+    const output = ts[2] * 16;
+    const key = IndexedKey{ .in_dim = xs[1], .out_dim = output, .topk = ss[0], .n = rate.n };
+    const cfg = lane_pair_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const shape = [_]c_int{ ss[0], output };
+        for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &shape, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, ts[2] * 128, ss[0], 2));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", xs[1]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", output));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
+        lane_pair_cfgs.put(key, c);
+        break :blk c;
+    };
+    const kernel = try codebookKernel(&lane_pair_kernel, "sushi_glm_lane_pair", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_PAIR_SOURCE);
+    const outputs = try applyOuts(s, kernel, &.{ xg, xu, tg, tu, slots }, cfg, 2);
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    var result = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (result) |value| {
+        _ = mlx.mlx_array_free(value);
+    };
+    for (&result, 0..) |*value, i| try mlx.check(mlx.mlx_vector_array_get(value, outputs, i));
+    lane_pair_calls += 1;
+    return result;
+}
+
+var lane_pair_enabled: ?bool = null;
+var lane_pair_calls: usize = 0;
+var lane_chain_calls: usize = 0;
+pub fn lanePairCalls() usize {
+    return lane_pair_calls;
+}
+pub fn resetLanePairCalls() void {
+    lane_pair_calls = 0;
+}
+pub fn lanePairChainCalls() usize {
+    return lane_chain_calls;
+}
+pub fn resetLanePairChainCalls() void {
+    lane_chain_calls = 0;
+}
+fn lanePairEnabled() bool {
+    if (lane_pair_enabled == null) lane_pair_enabled = diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR"));
+    return lane_pair_enabled.?;
+}
+fn laneClampedPair(s: mlx.mlx_stream, x: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, sg: mlx.mlx_array, su: mlx.mlx_array, slots: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int) !?[2]mlx.mlx_array {
+    if (!lanePairEnabled() or !mlx.streamIsGpu(s) or active_decode.codebook != .mcg or active_decode.window != .w12 or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
+    const gs = mlx.getShape(tg);
+    if (gs.len != 4 or !std.mem.eql(c_int, gs, mlx.getShape(tu)) or gs[3] < 32 or gs[3] > 64 or @mod(gs[3], 2) != 0) return null;
+    const prepared = try lanePairPrepare(s, x, sg, su, slots, null, hidden, rows * topk, topk);
+    defer _ = mlx.mlx_array_free(prepared[0]);
+    defer _ = mlx.mlx_array_free(prepared[1]);
+    const pair = try lanePairCoop(s, prepared[0], prepared[1], tg, tu, slots);
+    if (pair != null) lane_chain_calls += 1;
+    return pair;
+}
+
+test "exl3 GLM lane half4 full clamped chain bytes and fallback" {
+    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR_TEST"))) return error.SkipZigTest;
+    const before = lane_pair_enabled;
+    defer lane_pair_enabled = before;
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    for (0..22) |case| {
+        const production = case >= 17;
+        const rows: usize = if (production) ([_]usize{ 1, 3, 4, 7, 16 })[case - 17] else 3;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = if (production) 4096 else 256, .inter = if (production) 2048 else 128, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = if (production) 36 else @intCast(32 + case * 2) }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 86314 + case, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+        defer f.deinit();
+        const v = f.arrays;
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, v[8], .bfloat16, mlx.gpuStream()));
+        lane_pair_enabled = false;
+        const expected = try moeSwigluClamped(mlx.gpuStream(), x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(expected);
+        lane_pair_enabled = true;
+        resetLanePairChainCalls();
+        const actual = try moeSwigluClamped(mlx.gpuStream(), x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(actual);
+        try std.testing.expectEqual(@as(usize, 1), lanePairChainCalls());
+        try mlx.check(mlx.mlx_array_eval(expected));
+        try mlx.check(mlx.mlx_array_eval(actual));
+        const size = mlx.mlx_array_size(expected);
+        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..size], mlx.mlx_array_data_bfloat16(actual).?[0..size]);
+        const mixed_data = if (case == 0) try arena.allocator().alloc(u16, 8 * 16 * 8 * 36) else f.up_t;
+        if (case == 0) @memset(mixed_data, 0);
+        const mixed = mlx.mlx_array_new_data(mixed_data.ptr, &.{ 8, @intCast((if (production) @as(usize, 4096) else 256) / 16), @intCast((if (production) @as(usize, 2048) else 128) / 16), if (production or case != 0) 32 else 36 }, 4, .uint16);
+        defer _ = mlx.mlx_array_free(mixed);
+        try std.testing.expect((try laneClampedPair(mlx.gpuStream(), x, v[0], mixed, v[3], v[3], v[7], if (production) 4096 else 256, @intCast(rows), 8)) == null);
+    }
+}

@@ -140,6 +140,33 @@ have overlapped another GPU test was discarded. Measurements were built from `06
 change; raw records include binary/source hashes. Real-checkpoint throughput and unchanged output IDs
 must be checked on the combined final build.
 
+### GLM opt-in lane-ordered gate/up input
+
+`SUSHI_GLM_LANE_PAIR=1` enables a separate exact gate/up layout for BF16-input GLM clamped decode,
+rows 1–16, equal-shaped MCG/W12 banks and all supported 2–4 bpw rates. The default is off. Unsupported
+or mixed-rate inputs retain the original path. The pair preparation stores each 16-element tile in
+four groups `(2q, 2q+1, 2q+8, 2q+9)`; each cooperative lane then loads one aligned `half4`. The
+Hadamard arithmetic, eight accumulators, K iteration order, final row/group reduction and F16 stores
+are unchanged. This does not substitute MiMo's different reduction tree or split-K arithmetic.
+
+The matched component experiment included both pair preparation and gate/up GEMV, with distinct
+scale planes and bank contents. All 17 rates passed exact F16 output parity, including production
+4096→2048 geometry. Three warmup ABBA rounds preceded forty samples per arm; the GPU lock, foreground
+QoS and paused workers isolated timing. Fan maximum was requested, but actual maximum RPM was not
+confirmed (reported RPM zero); initial maximum temperature was about 54°C, followed by ten seconds idle.
+
+| Rows | Original | Lane `half4` | Reduction |
+|---:|---:|---:|---:|
+| 1 | 437.459 µs | 361.791 µs | 17.3% |
+| 3 | 670.875 µs | 515.042 µs | 23.2% |
+| 7 | 1239.959 µs | 911.166 µs | 26.5% |
+| 16 | 2567.083 µs | 1824.833 µs | 28.9% |
+
+These are warm synthetic eight-expert component measurements, not full-checkpoint throughput.
+The gate remains off pending a real-model comparison. Pair-kernel and routed-chain engagement have
+separate `lanePairCalls` and `lanePairChainCalls` counters. The standalone parity and timing tests
+are gated by `SUSHI_GLM_LANE_PAIR_TEST` and `SUSHI_GLM_LANE_PAIR_BENCH` respectively.
+
 ### GLM 512-token window-height study: retain 32
 
 A separate untimed capture provided all 42 routed layers' 512-token/top-8 histograms. Every histogram
