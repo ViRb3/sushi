@@ -175,6 +175,34 @@ The replay was built from `99107a48` plus the isolated prototype; raw records re
 histogram hashes. Reducing the actual padding would require a different minimum matrix tile or another
 validated short-run strategy, not simply changing the window-height setting.
 
+### GLM narrower output groups: retain 128
+
+The served NAX body has four independent SIMD groups per 128-thread group. Each SIMD group computes
+16×32×16 matrix tiles and optionally a second 16-row tile. There is no explicit threadgroup weight or
+input tile in this body. Narrowing the output group therefore changes scheduling, not shared-memory
+allocation or the number of SIMD matrix operations. No per-core occupancy claim follows from it.
+
+An uncalled prototype used 64- or 32-thread groups, changing only the output-group base. Each output
+kept the original SIMD arithmetic, K order and F16 store. All 17 rates passed exact F16 parity across
+run lengths 1, 7, 15, 16, 17, 31, 32, 33 and 64. Production replay used the same captured routing
+histograms and synthetic 288-expert banks as the window-height study, with precomputed metadata,
+two warmup palindromes and twenty interleaved samples per arm under an exclusive quiet GPU window.
+
+| Layer | Projection | Group 128 | Group 64 | Group 32 |
+|---:|---|---:|---:|---:|
+| 7 | 4096→2048 | 2.537 ms | 2.494 ms | 2.536 ms |
+| 15 | 4096→2048 | 2.615 ms | 2.579 ms | 2.616 ms |
+| 32 | 4096→2048 | 2.678 ms | 2.629 ms | 2.675 ms |
+| 7 | 2048→4096 | 2.375 ms | 2.349 ms | 2.388 ms |
+| 15 | 2048→4096 | 2.476 ms | 2.457 ms | 2.490 ms |
+| 32 | 2048→4096 | 2.528 ms | 2.510 ms | 2.555 ms |
+
+All six production cases were byte-identical. Group 64 improved these isolated GEMMs by only
+0.71–1.81%; group 32 was effectively flat or slower. This single component run does not establish
+full-model benefit. The prototype and reproducibility hashes were archived, the prototype was removed,
+and production remains on group 128. The fan maximum was requested but spin-up was not confirmed;
+initial temperature was below 38°C, followed by ten seconds idle. No full-model arm was run.
+
 ## Kernels
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
