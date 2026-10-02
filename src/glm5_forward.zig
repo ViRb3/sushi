@@ -230,9 +230,21 @@ const Moe = struct {
         return .{ .weight = try tensor(weights, prefix, "gate.weight"), .correction = try tensor(weights, prefix, "gate.e_score_correction_bias"), .bank = .{ .gate = projs[0], .up = projs[1], .down = projs[2] }, .shared = if (cfg.shared_expert_intermediate_size > 0) try base.DenseMlp.load(weights, try std.fmt.bufPrint(&buf, "{s}.shared_experts", .{prefix}), cfg.hidden_size, cfg.shared_expert_intermediate_size) else null };
     }
     fn apply(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !Arr {
+        return self.applyTracked(ops, x, cfg, null);
+    }
+    fn applyTracked(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, component: ?*ComponentTimer) !Arr {
         const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
+        try ComponentTimer.mark(component, "router", &.{ routing.indices, routing.scores }, null);
         const routed = try ops.own(try exl3.moeClamped(ops.s, x, self.bank, routing.indices, routing.scores, .{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window }, @intFromFloat(cfg.glm_swiglu_limit)));
-        return if (self.shared) |shared| ops.binary(.add, routed, try shared.apply(ops, x, cfg.glm_swiglu_limit)) else routed;
+        try ComponentTimer.mark(component, "routed", &.{routed}, null);
+        if (self.shared) |shared| {
+            const y = try shared.apply(ops, x, cfg.glm_swiglu_limit);
+            try ComponentTimer.mark(component, "shared", &.{y}, null);
+            const combined = try ops.binary(.add, routed, y);
+            try ComponentTimer.mark(component, "combine_ffn", &.{combined}, null);
+            return combined;
+        }
+        return routed;
     }
 };
 
@@ -267,6 +279,36 @@ const LayerState = struct {
     }
 };
 
+pub const ComponentTimes = struct {
+    hc_attn: u64 = 0,
+    attn_norm: u64 = 0,
+    attention: u64 = 0,
+    expand_attn: u64 = 0,
+    hc_ffn: u64 = 0,
+    ffn_norm: u64 = 0,
+    router: u64 = 0,
+    routed: u64 = 0,
+    shared: u64 = 0,
+    combine_ffn: u64 = 0,
+    dense_ffn: u64 = 0,
+    expand_ffn: u64 = 0,
+};
+
+const ComponentTimer = struct {
+    totals: *ComponentTimes,
+    clock: @import("io_util.zig").Stopwatch,
+
+    fn mark(self: ?*ComponentTimer, comptime field: []const u8, outputs: []const Arr, state: ?*LayerState) !void {
+        const timer = self orelse return;
+        const values = mlx.mlx_vector_array_new_data(outputs.ptr, outputs.len);
+        defer _ = mlx.mlx_vector_array_free(values);
+        if (state) |st| try appendLayerState(values, st);
+        try mlx.check(mlx.mlx_eval(values));
+        @field(timer.totals, field) += timer.clock.read();
+        timer.clock.reset();
+    }
+};
+
 pub const Capture = struct { ids: []const u32, out: []Arr };
 
 pub const Request = struct {
@@ -275,6 +317,8 @@ pub const Request = struct {
     offset: usize = 0,
     failed: bool = false,
     profile: bool = false,
+    profile_components: bool = false,
+    component_ns: [128]ComponentTimes = @splat(.{}),
     decode_async: bool = true,
     dense_prefill: bool = false,
     prefill_async: bool = false,
@@ -297,6 +341,7 @@ pub const Request = struct {
         self.offset = 0;
         self.failed = false;
         self.layer_ns = @splat(0);
+        self.component_ns = @splat(.{});
     }
 };
 
@@ -419,8 +464,8 @@ pub const Model = struct {
         if (request.failed) return error.GlmRequestNeedsReset;
         if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
         errdefer request.failed = true;
-        const staged_decode = ish[1] == 1 and request.decode_async and !request.profile;
-        const staged_prefill = ish[1] > 1 and request.prefill_async and !request.profile;
+        const staged_decode = ish[1] == 1 and request.decode_async and !request.profile and !request.profile_components;
+        const staged_prefill = ish[1] > 1 and request.prefill_async and !request.profile and !request.profile_components;
         var h: Arr = undefined;
         {
             var ops = Ops{ .s = self.s };
@@ -435,22 +480,39 @@ pub const Model = struct {
             const timer = if (request.profile) @import("io_util.zig").Stopwatch.init(std.Io.Threaded.global_single_threaded.io()) else null;
             var ops = Ops{ .s = self.s };
             defer ops.deinit();
+            var component_clock: ComponentTimer = undefined;
+            const component: ?*ComponentTimer = if (request.profile_components) blk: {
+                try mlx.check(mlx.mlx_array_eval(h));
+                component_clock = .{ .totals = &request.component_ns[layer_index], .clock = .init(std.Io.Threaded.global_single_threaded.io()) };
+                break :blk &component_clock;
+            } else null;
             const pre = try layer.hc_attn.collapse(&ops, h, &self.cfg);
             defer pre.deinit();
+            try ComponentTimer.mark(component, "hc_attn", &.{ pre.mixed, pre.post, pre.comb }, null);
             const x = try ops.rms(pre.mixed, layer.norm_attn, self.cfg.rms_norm_eps);
+            try ComponentTimer.mark(component, "attn_norm", &.{x}, null);
             const a = switch (layer.attn) {
                 .kda => |kda| try kda.apply(&ops, x, &self.cfg, &state.recurrent),
                 .mla => |*mla| try mla.applyMode(&ops, x, &self.cfg, &state.attention, request.dense_prefill),
             };
+            try ComponentTimer.mark(component, "attention", &.{a}, state);
             const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, self.s));
+            try ComponentTimer.mark(component, "expand_attn", &.{joined}, null);
             const ff = try layer.hc_ffn.collapse(&ops, joined, &self.cfg);
             defer ff.deinit();
+            try ComponentTimer.mark(component, "hc_ffn", &.{ ff.mixed, ff.post, ff.comb }, null);
             const fx = try ops.rms(ff.mixed, layer.norm_ffn, self.cfg.rms_norm_eps);
+            try ComponentTimer.mark(component, "ffn_norm", &.{fx}, null);
             const y = switch (layer.ffn) {
-                .dense => |dense| try dense.apply(&ops, fx, self.cfg.glm_swiglu_limit),
-                .moe => |moe| try moe.apply(&ops, fx, &self.cfg),
+                .dense => |dense| blk: {
+                    const y = try dense.apply(&ops, fx, self.cfg.glm_swiglu_limit);
+                    try ComponentTimer.mark(component, "dense_ffn", &.{y}, null);
+                    break :blk y;
+                },
+                .moe => |moe| try moe.applyTracked(&ops, fx, &self.cfg, component),
             };
             const next = try ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
+            try ComponentTimer.mark(component, "expand_ffn", &.{next}, null);
             if (request.capture) |capture| {
                 for (capture.ids, 0..) |id, i| {
                     if (id == layer_index) try mlx.check(mlx.mlx_array_set(&capture.out[i], try ops.reduce(next, 2, true, false)));
@@ -970,4 +1032,43 @@ test "GLM fused router matches FP32 scores and selected order at production widt
         try expectArrayBits(got.indices, expected.indices);
         try expectArrayBits(got.scores, expected.scores);
     };
+}
+
+test "GLM component profiling preserves logits and cache state and resets counters" {
+    const allocator = std.testing.allocator;
+    const stream = mlx.gpuStream();
+    var weights = model.Weights.init(allocator);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(allocator, cfg, &weights, stream);
+    defer net.deinit();
+    var reference = try Request.init(allocator, 4);
+    defer reference.deinit();
+    var measured = try Request.init(allocator, 4);
+    defer measured.deinit();
+    measured.profile_components = true;
+    for ([_]usize{ 3, 1, 1 }) |width| {
+        const tokens = [_]u32{ 1, 2, 3 };
+        const ids = mlx.mlx_array_new_data(&tokens, &.{ 1, @intCast(width) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const x = try net.forward(&reference, ids);
+        defer _ = mlx.mlx_array_free(x);
+        schedule_test_asyncs = 0;
+        const y = try net.forward(&measured, ids);
+        defer _ = mlx.mlx_array_free(y);
+        try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
+        try expectArrayBits(x, y);
+        try expectRequestBits(&reference, &measured);
+    }
+    for (measured.component_ns[0..4]) |value| {
+        try std.testing.expect(value.hc_attn > 0);
+        try std.testing.expect(value.attention > 0);
+        try std.testing.expect(value.hc_ffn > 0);
+        try std.testing.expect(value.expand_ffn > 0);
+    }
+    try std.testing.expect(measured.component_ns[0].dense_ffn > 0);
+    try std.testing.expect(measured.component_ns[3].routed > 0);
+    measured.reset();
+    try std.testing.expectEqual(ComponentTimes{}, measured.component_ns[0]);
+    try std.testing.expectEqual(ComponentTimes{}, measured.component_ns[3]);
 }

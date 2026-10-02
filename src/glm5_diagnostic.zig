@@ -273,7 +273,8 @@ test "GLM native diagnostic real model" {
     const steps = try envNumber("SUSHI_GLM_DIAGNOSTIC_DECODE", 64);
     const chunk = try envNumber("SUSHI_GLM_DIAGNOSTIC_CHUNK", 128);
     const warmup = try envNumber("SUSHI_GLM_DIAGNOSTIC_WARMUP", 0);
-    const profile = (try envNumber("SUSHI_GLM_DIAGNOSTIC_PROFILE", 1)) != 0;
+    const components = (try envNumber("SUSHI_GLM_DIAGNOSTIC_COMPONENTS", 0)) != 0;
+    const profile = (try envNumber("SUSHI_GLM_DIAGNOSTIC_PROFILE", 1)) != 0 or components;
     const warmup_decode = try envNumber("SUSHI_GLM_DIAGNOSTIC_WARMUP_DECODE", 1);
     if (warmup_decode < 1 or warmup_decode > 4096) return error.InvalidGlmDiagnosticBudget;
     if (warmup > 8) return error.InvalidGlmDiagnosticBudget;
@@ -368,6 +369,7 @@ test "GLM native diagnostic real model" {
         timed_wired_limit = mlx.applyWiredPolicy().target orelse return error.InvalidGlmWiredLimit;
     }
     request.profile = profile;
+    request.profile_components = components;
     @import("glm5_decode.zig").resetDispatchCount();
     @import("glm5_kda_fused.zig").resetDispatchCount();
     @import("glm5_router.zig").resetCallCount();
@@ -392,6 +394,7 @@ test "GLM native diagnostic real model" {
         offset = end;
     }
     const prefill_layer_ns = request.layer_ns;
+    const prefill_component_ns = request.component_ns;
     const generated = try a.alloc(u32, steps);
     defer a.free(generated);
     generated[0] = try greedy(logits, s);
@@ -419,10 +422,14 @@ test "GLM native diagnostic real model" {
         eos_at = i;
         break;
     };
+    var decode_component_ns = request.component_ns;
+    for (&decode_component_ns, prefill_component_ns) |*total, prefill| {
+        inline for (@typeInfo(@import("glm5_forward.zig").ComponentTimes).@"struct".fields) |field| @field(total, field.name) -= @field(prefill, field.name);
+    }
     var decode_layer_ns = request.layer_ns;
     for (&decode_layer_ns, prefill_layer_ns) |*total, prefill| total.* -= prefill;
     const decoded = decodedOutput(text);
     var rate_buf: [32]u8 = undefined;
-    try writeJson(io, a, out, .{ .complete = true, .model = path, .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = timed_wired_limit, .wired_policy = wired_policy, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = decoded.output_text, .output_bytes = decoded.output_bytes, .output_text_utf8_valid = decoded.output_text_utf8_valid, .warmup_count = warmup, .warmup_decode_forwards_per_round = if (warmup > 0) warmup_decode else 0, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .profile_enabled = profile, .dense_prefill = request.dense_prefill, .prefill_schedule = if (request.prefill_async and !profile) "async2" else "synchronous", .qkv_dispatches = @import("glm5_decode.zig").dispatchCount(), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .router_calls = @import("glm5_router.zig").callCount(), .activation_calls = @import("glm5_activation.zig").callCount(), .paired_expert_calls = @import("sushi_exl3").kernels.pairedCooperativeCalls(), .decode_schedule = if (request.decode_async and !profile) "async4" else "synchronous", .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 attention cache; FP32 KDA state", .public_serving_enabled = false });
+    try writeJson(io, a, out, .{ .complete = true, .model = path, .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = timed_wired_limit, .wired_policy = wired_policy, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = decoded.output_text, .output_bytes = decoded.output_bytes, .output_text_utf8_valid = decoded.output_text_utf8_valid, .warmup_count = warmup, .warmup_decode_forwards_per_round = if (warmup > 0) warmup_decode else 0, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .profile_enabled = profile, .component_profile_enabled = components, .prefill_component_ns = prefill_component_ns[0..cfg.num_hidden_layers], .decode_component_ns = decode_component_ns[0..cfg.num_hidden_layers], .dense_prefill = request.dense_prefill, .prefill_schedule = if (request.prefill_async and !profile) "async2" else "synchronous", .qkv_dispatches = @import("glm5_decode.zig").dispatchCount(), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .router_calls = @import("glm5_router.zig").callCount(), .activation_calls = @import("glm5_activation.zig").callCount(), .paired_expert_calls = @import("sushi_exl3").kernels.pairedCooperativeCalls(), .decode_schedule = if (request.decode_async and !profile) "async4" else "synchronous", .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 attention cache; FP32 KDA state", .public_serving_enabled = false });
     try writeJson(io, a, progress, .{ .phase = "complete", .complete = true });
 }

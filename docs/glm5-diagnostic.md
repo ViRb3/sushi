@@ -90,3 +90,13 @@ flight during prefill. It is off by default; profiling keeps synchronous layer
 boundaries. The final logits and all cache outputs settle before return. The
 report records the effective prefill schedule and the successful copy-free QKV
 dispatch count during the timed phase, excluding warmup.
+
+`SUSHI_GLM_DIAGNOSTIC_COMPONENTS=1` adds synchronized per-component attribution and
+forces the synchronous schedule, even with `PROFILE=0`. It reports separate prefill/decode
+nanosecond totals for each layer's HC collapses, branch norms, attention, expansions,
+dense FFN, routing, routed experts, shared expert and final FFN addition. Attention
+measurements settle all cache side outputs. Input embedding work settles before the first
+HC timer, and final head work remains outside the component totals. These timings include
+host graph construction and synchronization; they are attribution evidence, not async
+throughput or pure GPU kernel duration. With this option off, no component barriers run.
+A nonzero fixture checks identical logits/cache state, synchronous dispatch and counter reset.
