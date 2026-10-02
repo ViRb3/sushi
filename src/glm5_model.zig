@@ -481,31 +481,49 @@ pub const KdaLayer = struct {
         const width = heads * dim;
         const keep: c_int = @intCast(cfg.linear_conv_kernel_dim - 1);
         const joined = try self.projectQkv(ops, x);
-        const previous = if (state.initialized) state.conv_state else try ops.zeros(&.{ sh[0], keep, width * 3 }, mlx.mlx_array_dtype(x));
-        const conv_input = try ops.concat(&.{ previous, joined }, 1);
-        const conv_weight = if (self.prepared_conv.ctx != null) self.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
-        const convolved = try ops.silu(try ops.conv(conv_input, conv_weight, width * 3));
         const dims = [_]c_int{ sh[0], sh[1], heads, dim };
-        const raw_q = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, 0, width), &dims), .float32);
-        const raw_k = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, width, width * 2), &dims), .float32);
-        const values = try ops.reshape(try ops.slice(convolved, 2, width * 2, width * 3), &dims);
-        const epsilon = try ops.scalar(1e-6, .float32);
-        const qnorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, raw_q, raw_q), -1, false, true), epsilon));
-        const knorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, raw_k, raw_k), -1, false, true), epsilon));
-        const q = try ops.cast(try ops.binary(.mul, try ops.binary(.mul, raw_q, qnorm), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(dim))), .float32)), mlx.mlx_array_dtype(x));
-        const k = try ops.cast(try ops.binary(.mul, raw_k, knorm), mlx.mlx_array_dtype(x));
-        const a = try ops.reshape(try ops.cast(try self.fb.apply(ops, try self.fa.apply(ops, x)), .float32), &dims);
-        const shift = try ops.reshape(try ops.cast(self.dt_bias, .float32), &.{ 1, 1, heads, dim });
+        const prework_mod = @import("glm5_kda_prework.zig");
+        const conv_weight = if (self.prepared_conv.ctx != null) self.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
         const exp_decay = if (self.prepared_decay.ctx != null) self.prepared_decay else try ops.unary(.exp, self.a_log);
-        const magnitude = try ops.reshape(exp_decay, &.{ 1, 1, heads, 1 });
-        const forget = try ops.unary(.sigmoid, try ops.binary(.mul, magnitude, try ops.binary(.add, a, shift)));
-        const decay = try ops.unary(.exp, try ops.binary(.mul, forget, try ops.scalar(cfg.kda_gate_lower_bound, .float32)));
-        const beta = try ops.unary(.sigmoid, try self.beta.apply(ops, x));
+        const raw_a = try self.fb.apply(ops, try self.fa.apply(ops, x));
+        const raw_beta = try self.beta.apply(ops, x);
+        const prework: ?prework_mod.Result = if (sh[1] > 1) try prework_mod.apply(ops.s, .{
+            .qkv = joined,
+            .a = raw_a,
+            .beta = raw_beta,
+            .conv_weight = conv_weight,
+            .exp_a = exp_decay,
+            .dt_bias = self.dt_bias,
+            .conv_state = if (state.initialized) state.conv_state else null,
+            .heads = heads,
+            .lower = cfg.kda_gate_lower_bound,
+        }) else null;
+        defer if (prework) |value| value.deinit();
+        const prepared = if (prework) |value| value else blk: {
+            const previous = if (state.initialized) state.conv_state else try ops.zeros(&.{ sh[0], keep, width * 3 }, mlx.mlx_array_dtype(x));
+            const conv_input = try ops.concat(&.{ previous, joined }, 1);
+            const convolved = try ops.silu(try ops.conv(conv_input, conv_weight, width * 3));
+            const raw_q = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, 0, width), &dims), .float32);
+            const raw_k = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, width, width * 2), &dims), .float32);
+            const values = try ops.reshape(try ops.slice(convolved, 2, width * 2, width * 3), &dims);
+            const epsilon = try ops.scalar(1e-6, .float32);
+            const qnorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, raw_q, raw_q), -1, false, true), epsilon));
+            const knorm = try ops.unary(.rsqrt, try ops.binary(.add, try ops.reduce(try ops.binary(.mul, raw_k, raw_k), -1, false, true), epsilon));
+            const q = try ops.cast(try ops.binary(.mul, try ops.binary(.mul, raw_q, qnorm), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(dim))), .float32)), mlx.mlx_array_dtype(x));
+            const k = try ops.cast(try ops.binary(.mul, raw_k, knorm), mlx.mlx_array_dtype(x));
+            const a = try ops.reshape(try ops.cast(raw_a, .float32), &dims);
+            const shift = try ops.reshape(try ops.cast(self.dt_bias, .float32), &.{ 1, 1, heads, dim });
+            const magnitude = try ops.reshape(exp_decay, &.{ 1, 1, heads, 1 });
+            const forget = try ops.unary(.sigmoid, try ops.binary(.mul, magnitude, try ops.binary(.add, a, shift)));
+            const decay = try ops.unary(.exp, try ops.binary(.mul, forget, try ops.scalar(cfg.kda_gate_lower_bound, .float32)));
+            const beta = try ops.unary(.sigmoid, raw_beta);
+            const conv_tail = try compactConvTail(ops, conv_input, sh[1], keep);
+            break :blk prework_mod.Result{ .q = q, .k = k, .v = values, .decay = decay, .beta = beta, .conv = conv_tail };
+        };
         const recurrent = if (state.initialized) state.ssm_state else try ops.zeros(&.{ sh[0], heads, dim, dim }, .float32);
-        const result = try primitive.kda(.{ .q = q, .k = k, .v = values, .decay = decay, .beta = beta, .state = recurrent }, ops.s);
+        const result = try primitive.kda(.{ .q = prepared.q, .k = prepared.k, .v = prepared.v, .decay = prepared.decay, .beta = prepared.beta, .state = recurrent }, ops.s);
         defer result.deinit();
-        const new_conv = try compactConvTail(ops, conv_input, sh[1], keep);
-        try mlx.check(mlx.mlx_array_set(&state.conv_state, new_conv));
+        try mlx.check(mlx.mlx_array_set(&state.conv_state, prepared.conv));
         try mlx.check(mlx.mlx_array_set(&state.ssm_state, result.state));
         state.initialized = true;
         const gate = try ops.reshape(try self.gb.apply(ops, try self.ga.apply(ops, x)), &dims);
@@ -859,6 +877,57 @@ test "GLM fused KDA decode preserves output and FP32 state exactly" {
                 try expectLayerBits(fused.conv_state, reference.conv_state);
                 try expectLayerBits(fused.ssm_state, reference.ssm_state);
             }
+        }
+    }
+}
+
+test "GLM KDA prework integration preserves whole layer and state bits" {
+    const prework = @import("glm5_kda_prework.zig");
+    defer prework.forceReferenceForTest(false);
+    var fixture = try loadLayerFixture();
+    defer fixture.deinit();
+    const cfg = model.ModelConfig{ .hidden_size = 128, .linear_key_head_dim = 128, .linear_num_value_heads = 1, .linear_conv_kernel_dim = 4, .kda_gate_lower_bound = -5, .rms_norm_eps = 1e-5 };
+    var layer = try KdaLayer.load(&fixture, "a", &cfg);
+    defer layer.deinit();
+    try layer.prepare(mlx.gpuStream());
+    for ([_]bool{ false, true }) |hot| {
+        var old = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
+        defer _ = mlx.mlx_array_free(old.conv_state);
+        defer _ = mlx.mlx_array_free(old.ssm_state);
+        var fused = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = hot };
+        defer _ = mlx.mlx_array_free(fused.conv_state);
+        defer _ = mlx.mlx_array_free(fused.ssm_state);
+        if (hot) {
+            var ops = Ops{ .s = mlx.gpuStream() };
+            defer ops.deinit();
+            const conv = try ops.slice(fixture.get("initial.conv").?, 0, 0, 1);
+            const state = try ops.slice(fixture.get("initial.state").?, 0, 0, 1);
+            try mlx.check(mlx.mlx_array_set(&old.conv_state, conv));
+            try mlx.check(mlx.mlx_array_set(&fused.conv_state, conv));
+            try mlx.check(mlx.mlx_array_set(&old.ssm_state, state));
+            try mlx.check(mlx.mlx_array_set(&fused.ssm_state, state));
+        }
+        var start: c_int = 0;
+        for ([_]c_int{ 2, 3 }) |rows| {
+            var ops = Ops{ .s = mlx.gpuStream() };
+            defer ops.deinit();
+            const x = try ops.slice(try ops.slice(fixture.get("input").?, 0, 0, 1), 1, start, start + rows);
+            const before = prework.dispatchCount();
+            prework.forceReferenceForTest(true);
+            const want = try layer.applyReference(&ops, x, &cfg, &old);
+            try std.testing.expectEqual(before, prework.dispatchCount());
+            prework.forceReferenceForTest(false);
+            const got = try layer.applyReference(&ops, x, &cfg, &fused);
+            try std.testing.expectEqual(before + 1, prework.dispatchCount());
+            for ([_]Arr{ want, old.conv_state, old.ssm_state }, [_]Arr{ got, fused.conv_state, fused.ssm_state }) |lhs, rhs| {
+                const a = try ops.contiguous(try ops.cast(lhs, .float32));
+                const b = try ops.contiguous(try ops.cast(rhs, .float32));
+                try mlx.check(mlx.mlx_array_eval(a));
+                try mlx.check(mlx.mlx_array_eval(b));
+                const size = mlx.mlx_array_size(a);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(a).?[0..size]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(b).?[0..size]));
+            }
+            start += rows;
         }
     }
 }

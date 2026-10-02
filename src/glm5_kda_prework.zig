@@ -31,6 +31,11 @@ pub const Result = struct {
     }
 };
 var count: usize = 0;
+var force_reference_for_tests = false;
+pub fn forceReferenceForTest(on: bool) void {
+    if (@import("builtin").is_test) force_reference_for_tests = on;
+}
+
 pub fn dispatchCount() usize {
     return count;
 }
@@ -111,6 +116,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 pub fn apply(s: mlx.mlx_stream, in: Inputs) !?Result {
+    if (@import("builtin").is_test and force_reference_for_tests) return null;
     if (!mlx.streamIsGpu(s) or in.heads < 1 or in.heads > @divTrunc(std.math.maxInt(c_int), 384) or in.lower != -5) return null;
     for ([_]Arr{ in.qkv, in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias }) |a| if (a.ctx == null) return null;
     const shape = mlx.getShape(in.qkv);

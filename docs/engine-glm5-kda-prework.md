@@ -62,3 +62,20 @@ is retained rather than assuming that a successful request proves achieved RPM.
 
 The arithmetic adapts the qualified one-token KDA body and oMLX's parallel prework
 mapping. Apache-2.0 and inherited MLX MIT provenance are recorded in `NOTICE`.
+
+## Layer integration
+
+Eligible multi-token calls in `KdaLayer.applyReference` now use this prework before
+the unchanged recurrence. The forget-gate and beta projection results are computed
+once and reused by either the fused path or the original staging fallback. Prepared
+convolution/decay constants are reused. The candidate result remains alive through
+recurrence construction; cache handles receive references to its compact history and
+the recurrence's state. The existing one-token fused body remains the first choice.
+
+A test-only switch forces the staged fallback for comparison; it has no production
+behavior. A nonzero whole-layer regression compares consecutive two- and three-token
+chunks from cold and warm histories. Output, compact history and FP32 recurrent state
+match bit-for-bit, with counters proving that only the candidate arm dispatched the
+prework kernel. Raw prework tests and the broader GLM-filtered ReleaseFast suite passed.
+The diagnostic resets and reports `kda_prework_dispatches` alongside the existing body
+and post-work counts. Full-model performance and output validation remain separate.
