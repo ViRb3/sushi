@@ -50,9 +50,22 @@ U16 trellises and correctly shaped F16 scale banks before dispatch. Router-produ
 remain within the bank's expert range. Scalar host comparisons exercise every supported rate in decode
 and prefill. These are primitive checks, not full-model parity or quality measurements.
 
+## Configuration and cache geometry
+
+The text-only parser requires the GLM core geometry and rejects contradictory mHC, routing, pooling,
+activation and projection-bias semantics. The dense/sparse MLP table and any redundant KDA/full-attention
+layer lists must agree with the supported layer layout. Zero or overflowing kernel dimensions are refused;
+the official vision metadata does not enable the unrelated generic vision forward.
+
+Compressed MLA caches two 512-wide latent buffers while attention scales by the original 256-wide query,
+so its scale is 1/16. For the official 45-layer geometry, the dense KV bill is 22,528 bytes/token; the generic
+KV quantization adjustment follows the actual cache format. The BF16 pooled indexer history is 704
+bytes/token, and the raw key-plus-gate ring is 180,224 bytes per slot. The recurrent-state plus convolution
+checkpoint is 147,619,840 bytes, including FP32 KDA states. No Qwen FP32 indexer score bank is billed.
+
 ## Forward implementation still required
 
-- Parse the nested GLM configuration and load the resident BF16 trunk, excluding routed experts before any
+- Load the resident BF16 trunk, excluding routed experts before any
   tensor materialization. Keep router, hyper-connection, decay and recurrent-state arithmetic at their required
   precision. No affine quantization belongs in the teacher path.
 - Wire KDA's per-key-channel recurrence to its decay prework and L2-normalized queries/keys. Qwen's scalar-per-head GDN gate is not
