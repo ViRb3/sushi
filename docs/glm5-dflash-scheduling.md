@@ -181,3 +181,31 @@ Private artifact `glm53-dflash-assistant-quant-20261003` contains separate locke
 runs, inferred storage, counters, raw phase times, output/state checks, provenance
 and binary hash. Both runs used the same foreground QoS and thermal protocol as
 the BF16 arm, with profiling and route capture off.
+
+### Same-binary BF16/A6 ABBA repeat
+
+Because the pilot gain was small, the same `606f5a57` binary repeated
+BF16–A6–A6–BF16 with a separate lock and cooldown for each arm. Settings and
+prompt were unchanged. All four runs again passed the identical64-ID and complete
+state checks, with23 rounds and41 accepted drafts.
+
+| Ordered arm | Decode tokens/s | Matched serial tokens/s | Draft time |
+|---|---:|---:|---:|
+| BF16-1 | 35.0867 | 27.3321 | 159.91 ms |
+| A6-1 | 35.5783 | 26.5219 | 143.63 ms |
+| A6-2 | 36.0893 | 27.6050 | 140.98 ms |
+| BF16-2 | 35.8335 | 27.9618 | 157.36 ms |
+
+Mean decode was35.4601 for BF16 and35.8338 for A6: a modest1.05% difference,
+with overlapping run ranges. Mean draft time fell10.3% (158.64→142.30ms), and
+commit time fell23.59→15.54ms; verifier means were similar1579.49 versus1583.97ms.
+A6 consistently saved approximately1.329GB of peak memory. This supports the
+memory saving and reduced assistant work more strongly than a substantial overall
+speed claim. A8/A6 speed remains effectively tied in the available measurements.
+Acceptance on other prompts still needs qualification.
+
+Private artifact `glm53-dflash-assistant-quant-abba-20261003` retains all four
+results and an aggregate comparison. Binary SHA-256:
+`62401b3a9d09b54d18be993f65df29ed4b6fb57f0e85734e00d24916efc427f0`.
+Starting temperatures ranged45.4–56.0°C; the same fan/cooldown protocol was used.
+No public cache or assistant default changed.
