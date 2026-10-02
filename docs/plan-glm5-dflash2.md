@@ -191,6 +191,53 @@ Candidate work includes exact kernel fusions, fewer layer-boundary synchronizati
 all saved prework, and measuring repeated-expert reuse. Retune tree policy only with measured
 verification cost and broader prompt coverage. Keep speculation opt-in until a useful gain is proven.
 
+### Exact tree KDA pre/post fusion follow-up
+
+At `3ab1c31a` (tree fusion implementation `bc13c378`), a fresh warmed N3 512/64 run
+passed all 64 output IDs and complete final target-state parity. Output IDs also
+matched the earlier N3 sample. The original BF16 assistant, chunk-128 captured
+prefix, affine row tiles, batched FFN, warmup and committed-token accounting were
+retained. HC fusion was explicitly off; clamped middle/down used current `auto`
+behavior, which permits the qualified multirow path.
+
+The new tree entrypoint shares the qualified prefill prework arithmetic while
+selecting each node's own ancestor convolution window. It retains raw BF16
+single-token history in the replay tape and full FP32 recurrent state. Multirow
+output normalization/gating reuses the qualified post kernel. Focused tests cover
+serial ancestor outputs, staged-versus-fused arrays, rejected sibling exclusion,
+one-row fallback, raw subnormal/signed-zero tails, and replay after destruction of
+the producing Ops scope. See [prework details](engine-glm5-kda-prework.md).
+
+| Measure | Result |
+|---|---:|
+| Speculative committed-token rate | 27.9314 tok/s |
+| Same-run matched serial rate | 26.5369 tok/s |
+| Speculative / matched serial | 1.05255 |
+| Rounds / accepted drafts / verified rows | 23 / 41 / 92 |
+| Outputs per round | 2.7826 |
+| Captured prefill rate | 365.858 tok/s |
+| Decode-phase peak | 98.534 GB |
+| Tree prework / post dispatches | 782 / 782 |
+| Affine dispatches / routed FFN batches | 7521 / 966 |
+
+Draft/verify/replay/commit totals were 155.59 / 2065.93 / 41.87 / 27.10 ms.
+Verification remains approximately 90.16% of total decode time. The 41 accepted
+drafts represent 59.42% of the 69 non-root verified draft nodes. This is an
+acceptance statistic for this tree and prompt, not a general model acceptance rate.
+
+The current run is 5.25% faster than its matched serial reference and about 3.35%
+faster than the earlier speculative N3 sample. Both are single-run observations.
+Intervening serial and expert-middle changes are also present, so the historical
+difference does not isolate the causal benefit of KDA fusion. No 60 tok/s decode
+or 1,000 tok/s captured-prefill claim follows from this result.
+
+The exclusive run used interactive QoS, max-fan request and ten seconds idle at
+38.78°C before launch; fans returned to auto and the GPU lock was released.
+Private artifact `glm53-dflash-kda-fused-20261003/warm512x64-n3` contains complete
+settings, phase records, token IDs and provenance. Binary SHA-256:
+`1fcb0166efe926ba8f68f5b5edddc3ddc0889a4a85386cae39f4d447f08f54ad`.
+The diagnostic explicitly labels peak scope as `decode_after_prefill_reset`.
+
 ## Sources and evidence
 
 The following revisions were inspected locally; no model was loaded and no GPU test was run for this
