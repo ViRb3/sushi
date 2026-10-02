@@ -51,6 +51,8 @@ recurrent states must differ. These tests do not establish real-checkpoint accep
 The shared target capture hook is independently tested in `glm5_forward.zig`.
 The KDA tree recurrence also matches serial ancestor outputs byte-for-byte at 16 nodes with the
 production 64-head, 128-key/value geometry, for both BF16 and FP32 inputs and FP32 state.
+The full KDA layer test covers 64 heads with an intentionally small 128-wide input, including
+parent-selected convolution windows, output normalization and accepted-path state replay.
 
 ### Full-checkpoint diagnostic
 

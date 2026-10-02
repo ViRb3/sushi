@@ -254,55 +254,71 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
 test "GLM DFlash KDA layer tree and replay equal serial ancestor forwards" {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
-    var weights = @import("model.zig").Weights.init(a);
-    defer weights.deinit();
-    const cfg = try @import("glm5_forward.zig").completeFixture(&weights);
-    var iter = weights.map.iterator();
-    var seed: usize = 75;
-    while (iter.next()) |entry| {
-        if (!std.mem.startsWith(u8, entry.key_ptr.*, "model.language_model.layers.0.self_attn.")) continue;
-        const value = entry.value_ptr;
-        const shape = mlx.getShape(value.*);
-        if (shape.len < 2) continue;
-        const replacement = try @import("dflash.zig").TinyFix.bf16ArrShaped(shape, seed, s);
-        _ = mlx.mlx_array_free(value.*);
-        value.* = replacement;
-        seed += 1;
-    }
-    var layer = try @import("glm5_model.zig").KdaLayer.load(&weights, "model.language_model.layers.0.self_attn", &cfg);
-    defer layer.deinit();
-    try layer.prepare(s);
-    var ops = Ops{ .s = s };
-    defer ops.deinit();
-    const x = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 5, 128 }, 37, s));
-    const initial = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-    defer _ = mlx.mlx_array_free(initial.conv_state);
-    defer _ = mlx.mlx_array_free(initial.ssm_state);
-    const parents = [_]i32{ -1, 0, 0, 1, 2 };
-    var all = try applyLayer(layer, &ops, x, &cfg, &initial, &parents, .serial_rows);
-    defer all.tape.deinit();
-    var states: [5]@import("transformer.zig").SSMCacheEntry = undefined;
-    var made: usize = 0;
-    defer for (states[0..made]) |state| {
-        _ = mlx.mlx_array_free(state.conv_state);
-        _ = mlx.mlx_array_free(state.ssm_state);
-    };
-    for (parents, 0..) |parent, row| {
-        states[row] = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = parent >= 0 };
-        made += 1;
-        if (parent >= 0) {
-            try mlx.check(mlx.mlx_array_set(&states[row].conv_state, states[@intCast(parent)].conv_state));
-            try mlx.check(mlx.mlx_array_set(&states[row].ssm_state, states[@intCast(parent)].ssm_state));
+    for ([_]u32{ 1, 64 }) |heads| {
+        var weights = @import("model.zig").Weights.init(a);
+        defer weights.deinit();
+        var cfg = try @import("glm5_forward.zig").completeFixture(&weights);
+        cfg.linear_num_value_heads = heads;
+        var iter = weights.map.iterator();
+        var seed: usize = 75;
+        while (iter.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, "model.language_model.layers.0.self_attn.")) continue;
+            const value = entry.value_ptr;
+            const original_shape = mlx.getShape(value.*);
+            const name = entry.key_ptr.*["model.language_model.layers.0.self_attn.".len..];
+            var dimensions: [3]c_int = undefined;
+            @memcpy(dimensions[0..original_shape.len], original_shape);
+            const width: c_int = @intCast(heads * 128);
+            if (std.mem.eql(u8, name, "A_log") or std.mem.eql(u8, name, "dt_bias")) {
+                const replacement = mlx.mlx_array_new();
+                var mutable = replacement;
+                try mlx.check(mlx.mlx_zeros(&mutable, &[_]c_int{if (std.mem.eql(u8, name, "A_log")) @intCast(heads) else width}, 1, .float32, s));
+                _ = mlx.mlx_array_free(value.*);
+                value.* = mutable;
+                continue;
+            }
+            if (original_shape.len < 2) continue;
+            if (std.mem.eql(u8, name, "o_proj.weight")) dimensions[1] = width else if (std.mem.eql(u8, name, "b_proj.weight")) dimensions[0] = @intCast(heads) else if (!std.mem.eql(u8, name, "f_a_proj.weight") and !std.mem.eql(u8, name, "g_a_proj.weight")) dimensions[0] = width;
+            const replacement = try @import("dflash.zig").TinyFix.bf16ArrShaped(dimensions[0..original_shape.len], seed, s);
+            _ = mlx.mlx_array_free(value.*);
+            value.* = replacement;
+            seed += 1;
         }
-        const expected = try layer.apply(&ops, try ops.slice(x, 1, @intCast(row), @intCast(row + 1)), &cfg, &states[row]);
-        try equalArray(expected, try ops.slice(all.output, 1, @intCast(row), @intCast(row + 1)), s);
+        var layer = try @import("glm5_model.zig").KdaLayer.load(&weights, "model.language_model.layers.0.self_attn", &cfg);
+        defer layer.deinit();
+        try layer.prepare(s);
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const x = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 5, 128 }, 37, s));
+        const initial = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        defer _ = mlx.mlx_array_free(initial.conv_state);
+        defer _ = mlx.mlx_array_free(initial.ssm_state);
+        const parents = [_]i32{ -1, 0, 0, 1, 2 };
+        var all = try applyLayer(layer, &ops, x, &cfg, &initial, &parents, .serial_rows);
+        defer all.tape.deinit();
+        var states: [5]@import("transformer.zig").SSMCacheEntry = undefined;
+        var made: usize = 0;
+        defer for (states[0..made]) |state| {
+            _ = mlx.mlx_array_free(state.conv_state);
+            _ = mlx.mlx_array_free(state.ssm_state);
+        };
+        for (parents, 0..) |parent, row| {
+            states[row] = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = parent >= 0 };
+            made += 1;
+            if (parent >= 0) {
+                try mlx.check(mlx.mlx_array_set(&states[row].conv_state, states[@intCast(parent)].conv_state));
+                try mlx.check(mlx.mlx_array_set(&states[row].ssm_state, states[@intCast(parent)].ssm_state));
+            }
+            const expected = try layer.apply(&ops, try ops.slice(x, 1, @intCast(row), @intCast(row + 1)), &cfg, &states[row]);
+            try equalArray(expected, try ops.slice(all.output, 1, @intCast(row), @intCast(row + 1)), s);
+        }
+        try std.testing.expectError(error.InvalidGlmDraftTree, all.tape.replay(&.{ 0, 1, 4 }, s));
+        const replay = try all.tape.replay(&.{ 0, 2, 4 }, s);
+        defer _ = mlx.mlx_array_free(replay.conv_state);
+        defer _ = mlx.mlx_array_free(replay.ssm_state);
+        try equalArray(replay.conv_state, states[4].conv_state, s);
+        try equalArray(replay.ssm_state, states[4].ssm_state, s);
     }
-    try std.testing.expectError(error.InvalidGlmDraftTree, all.tape.replay(&.{ 0, 1, 4 }, s));
-    const replay = try all.tape.replay(&.{ 0, 2, 4 }, s);
-    defer _ = mlx.mlx_array_free(replay.conv_state);
-    defer _ = mlx.mlx_array_free(replay.ssm_state);
-    try equalArray(replay.conv_state, states[4].conv_state, s);
-    try equalArray(replay.ssm_state, states[4].ssm_state, s);
 }
 
 fn equalArray(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
