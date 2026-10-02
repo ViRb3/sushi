@@ -1,20 +1,28 @@
 # GLM-5.3-Flash native execution plan
 
-Status: active implementation, 2026-10-02. Native full-checkpoint smoke now runs; full-prompt quality and performance remain open. The completed checkpoint is
-`GLM-5.3-Flash-Sushi-2.25bpw-A8g128-W12`. Quantization does not need restarting.
+Status: active implementation, 2026-10-03. The native diagnostic runs the full text checkpoint and
+produces coherent English. The active folder is `GLM-5.3-Flash-Sushi-2.4bpw`; its expert metadata is
+K2.25/W12, with affine8 group128 trunk. Quantization does not need restarting.
 The public served architecture remains unsupported until the integration gates below pass.
 Completed components and measurements are in [the architecture document](arch-glm5-next.md).
-The [correctness audit](glm5-correctness-audit.md) and
-[efficiency audit](glm5-efficiency-audit.md) distinguish fixed defects from open work.
+The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),
+[external comparison](glm5-external-efficiency-comparison.md) and
+[internal comparison](glm5-internal-efficiency-comparison.md) record the reviewed implementation.
 
 ## Progress
 
-- Implemented: KDA preparation/ownership and independent layer fixtures; bounded IndexPool/latent
-  attention; stored-grid MLA projection checks; the complete diagnostic text forward and request reset.
-- First real checkpoint smoke passed: eight-token prefix, four generated tokens. This is not the
-  requested full-prompt coherence/performance test and does not establish KLD.
-- Remaining: full MLA/reference comparison, 512/64 warm measurement, measured optimization toward
-  1,000/60 tok/s, long-context/quality validation and production lifecycle integration.
+- Completed: KDA preparation, independent layer fixtures, bounded IndexPool/latent attention,
+  stored-grid MLA comparisons, complete diagnostic forward, request reset and coherent512/64 generation.
+- Latest warmed serial512/64 result:749.28 tok/s prefill,26.44 tok/s decode; peak96.965 GB.
+  All64 output IDs match the previous fused-KDA arm. The2K workload separately measured863.10/20.23.
+- Completed serial optimizations: async4 scheduling, copy-free QKV, fused KDA body, BF16-storage
+  FP32 router and paired cooperative expert gate/up. Dense-prefill SDPA remains opt-in pending KLD.
+- DFlash2: BF16 assistant, layerwise tree verifier and transactional accepted-state commit are
+  implemented. Two short real-checkpoint tests preserve serial output IDs and full final state;
+  warmed full-prompt performance remains open. See [the DFlash2 plan](plan-glm5-dflash2.md).
+- Remaining: optimize and measure toward1,000/60; full-model lossless-teacher KLD;
+  broader long-context coverage; production loader/lifecycle/server integration. The sections below
+  retain the acceptance criteria, including completed foundations, rather than implying each is missing.
 
 ## Intended first runnable configuration
 
@@ -51,8 +59,8 @@ that all lazily compiled Zig forward branches compile: invoke each through these
 
 ## 2. Implement IndexPool and absorbed MLA
 
-This is the largest missing mathematical component. Build a simple small-shape oracle
-before optimizing the indexed GPU path.
+The native diagnostic implementation and small-shape oracle are complete. Retain these
+contracts while optimizing or integrating the indexed GPU path.
 
 - Implement source query/key/gate projections and normalization. Pool four tokens with
   the source positional bias and softmax over the pool axis. Maintain pooled keys and
