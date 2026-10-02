@@ -320,3 +320,13 @@ that the existing NAX kernel already skips the unused second16-row operation in 
 Changing all32-row windows to16 would preserve the MMA operation count while increasing weight
 redecode work; the next experiment targets accumulator register pressure instead of assuming
 that every short expert run computes32 rows.
+
+
+The retained parallel KDA prework fusion (`0f634491`) measured **836.77 tok/s prefill and
+26.50 tok/s decode** on the same warmed 512/64 workload, with every output ID unchanged.
+Both prework and output epilogues engaged34 times; experimental serial HC/middle fusions
+were off. Peak active memory was96.727 GB, another151.39 MB below the output-fusion-only
+control. Prefill improved6.86% from783.03 tok/s; decode is unchanged within this measurement's
+noise. Full ReleaseFast validation passed3,038 tests with109 skipped. The1,000/60 targets
+remain unachieved; current follow-up is quantized NAX tile locality, not a claimed missing
+NAX dispatch. Rejected recurrence/window variants are documented with their measured costs.
