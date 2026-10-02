@@ -369,3 +369,20 @@ before changing state, retains its own array handles, and settles captured tenso
 A nonzero synthetic model test compares logits and all cache arrays through prefill and decode and
 checks invalid selections leave request state unchanged. Actual full-checkpoint fixture generation
 requires a separate explicit run; implementing this hook does not establish factored-HC quality.
+
+### Affine6 copy-free serial QKV
+
+`glm5_decode.zig` accepts uniform affine6/group128 QKV banks as well as the existing affine8 banks.
+It infers stored bits from the packed row width, requires materialized contiguous uint32 weights and
+BF16 scale/bias grids, and declines mixed six/eight-bit banks. Unsupported geometry retains native
+MLX fallback. No weight concatenation or repacking is required.
+
+The six-bit kernel follows the pinned MLX `quantized.h` implementation: eight values and six packed
+bytes per lane, four-value input sums, scaled local inputs, and six cross-byte partial products per
+four coefficients. The order of those partial products, group accumulation and SIMD reduction is
+preserved; unpacking complete six-bit codes first would change floating-point rounding. Existing
+MLX MIT attribution applies. Dedicated kernel caches keep six/eight-bit source variants separate.
+
+Raw BF16 parity passed against MLX affine6/group128 for all three 4096→8192 projections and smaller
+unequal output banks. Existing affine8, dense/strided refusal tests and mixed-rate refusal also passed.
+These component results establish exact arithmetic; they do not establish full-checkpoint speed.
