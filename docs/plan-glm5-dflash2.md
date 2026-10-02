@@ -89,6 +89,23 @@ written beside it with `.progress.json`. Timing includes all round work and coun
 tokens; this first-run diagnostic is explicitly unwarmed and provisional. Serial parity runs after
 the speculative timing and is not presented as a newly measured serial performance baseline.
 
+### First real-checkpoint result
+
+At `ebeae9f9`, the 2026-10-03 diagnostic passed on the Sushi target and original BF16 assistant:
+32 prompt tokens, up to 8 generated tokens, 3 draft nodes plus root, greedy, strict serial projection
+geometry, BF16 latent cache and FP32 KDA state. All eight generated IDs and the complete final target
+state matched serial execution from the same prefix. The four rounds emitted 4, 1, 2 and 1 tokens;
+accepted draft counts were 3, 0, 1 and 0. This exercises partial rejection on the real checkpoint.
+
+The unwarmed run took 0.672 seconds for those eight committed outputs (11.91 tok/s), with peak MLX
+memory 98.50 GB. It ran in an exclusive GPU slot under `taskpolicy -a`, max fans and at least ten
+seconds idle; fans returned to auto afterward. These are smoke-test numbers, not a steady-state
+speedup. The first four-row verify took 248 ms; subsequent four-row verifies took about 122 ms, while
+assistant drafting took about 6.6 ms. The final budget-one round also paid first-use compilation for
+its one-row tree shape. This diagnostic commits every emitted input token, including the final one;
+its accounting differs from a serial harness that leaves the final emitted token unprocessed.
+The affine row-tile candidate was disconnected. Measurement key: `glm53-dflash-strict-32x8-20261003`.
+
 ## Sources and evidence
 
 The following revisions were inspected locally; no model was loaded and no GPU test was run for this
