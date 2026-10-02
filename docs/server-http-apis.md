@@ -68,6 +68,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
   escaped at the SINK.
 
+### Closing a streamed response
+
+`Conn.close` half-closes the write side of a close-delimited response, then holds the socket until the peer
+hangs up, server shutdown starts, or five minutes pass. This prevents macOS's orphaned FIN_WAIT_2 timeout from
+resetting a client that is still reading after the final SSE event. The request has already released its model
+slot; only the connection thread waits. Responses with `Content-Length` close immediately.
+
+Ported from [mlx-serve #673](https://github.com/ddalcu/mlx-serve/pull/673). Socket-pair tests cover peer closure,
+length-framed responses and shutdown; `tests/test_responses_streaming.sh` also waits past the TCP FIN timeout
+before reading a completed stream and requires clean EOF.
+
 ## Seeds, logprobs, sampling
 
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey`).
