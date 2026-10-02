@@ -171,3 +171,61 @@ same warmed 512/64 committed-token denominator and matched serial reference.
 Report grouping engagement, paired/singleton counts, draft/verify/replay times
 and acceptance. Keep this opt-in until whole-model measurements show a gain;
 the current evidence establishes only a plausible implementation path.
+
+## Actual N3 route capture
+
+A separate opt-in capture at `489c5832` on 2026-10-03 collected actual consumed
+routes for the same warmed 512-prefix/64-committed-token N3 workload. All output
+IDs and complete final state matched the serial oracle and earlier profile-off
+run. Capture is synchronization-perturbed and provides no throughput result.
+The collector recorded 966 eligible FFNs: 23 rounds ×42 routed layers, each with
+four verification rows and top-k eight. No one-row calls were skipped in this run.
+
+| Quantity | Measured route statistic |
+|---|---:|
+| Slot assignments S | 30,912 |
+| Unique expert visits, summed per call | 20,737 |
+| Repeated slots | 10,175 (32.92%) |
+| Group-two visits G2 | 23,466 |
+| Potentially eliminated visits S−G2 | 7,446 (24.09%) |
+| Two-member groups / singleton groups | 7,446 / 16,020 |
+| Mean original-slot distance within a pair | 9.43 |
+
+Multiplicity-one/two/three/four expert-call counts were
+14,684 / 3,324 / 1,336 / 1,393. Consequently 51.82% of assignments remain unpaired:
+a group-two shader must keep singleton work cheap, and its maximum register/shared
+memory footprint can still reduce occupancy even on a singleton branch.
+
+Reuse varies substantially by layer. The table below aggregates the 23 calls
+for each zero-based layer; every layer had 736 assignments.
+
+| Layer | Potential group-two eliminated visits | Fraction |
+|---:|---:|---:|
+| 3 | 49 | 6.66% |
+| 4 | 65 | 8.83% |
+| 5 | 65 | 8.83% |
+| 6 | 69 | 9.38% |
+| 24 | 189 | 25.68% |
+| 20 | 194 | 26.36% |
+| 27 | 244 | 33.15% |
+| 26 | 251 | 34.10% |
+| 25 | 253 | 34.38% |
+| 34 | 260 | 35.33% |
+
+This supports a controlled replay experiment covering low, median and high
+overlap. It does not justify enabling grouping everywhere or fixing a layer policy
+from one prompt. The 24.09% figure describes logical decoded-bank visits;
+unchanged per-member FMAs, existing cache reuse, membership overhead and occupancy
+can erase the theoretical benefit. The earlier negative Qwen result remains a
+relevant caution at a similar repeated-slot fraction.
+
+The [bounded collector](glm5-dflash-profile.md#bounded-actual-route-capture) is
+off by default, preserves original slot order, and fails rather than truncating.
+Private artifact `glm53-dflash-routecapture-20261003/capture` contains all ordered
+IDs, full per-expert multiplicities, per-layer summaries and provenance. Every
+serialized multiplicity/G2 count was independently recomputed from the ordered
+IDs. The binary SHA-256 is
+`ee78945e31ac04f08b01418d5730b6494b333acd294653f63c4af2236a9f7314`.
+The exclusive capture used interactive QoS, a max-fan request and ten seconds idle
+at 48.73°C before load; its GPU lock was released and fans restored afterward.
+No group-two kernel has been implemented or benchmarked by this capture step.
