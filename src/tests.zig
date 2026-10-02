@@ -73,6 +73,7 @@ test {
     _ = @import("glm5_hc_fused.zig");
     _ = @import("glm5_decode.zig");
     _ = @import("glm5_kda_fused.zig");
+    _ = @import("glm5_kda_prework.zig");
     _ = @import("glm5_router.zig");
     _ = @import("glm5_activation.zig");
     _ = @import("glm5_dflash_tree.zig");

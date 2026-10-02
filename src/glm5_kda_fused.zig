@@ -184,7 +184,7 @@ const SOURCE: [:0]const u8 =
     \\  }
 ;
 
-const Modes = struct { sig_b: bool, sig_f: bool, exp_f: bool, rsq_f: bool };
+pub const Modes = struct { sig_b: bool, sig_f: bool, exp_f: bool, rsq_f: bool };
 var modes_checked = false;
 var modes_cached: ?Modes = null;
 var kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -297,6 +297,11 @@ fn modes(s: mlx.mlx_stream) !?Modes {
     modes_cached = result;
     modes_checked = true;
     return result;
+}
+
+pub fn unaryModes(s: mlx.mlx_stream) !?Modes {
+    if (!hardwareSupported()) return null;
+    return modes(s);
 }
 
 pub fn sigmoidFloatMode(s: mlx.mlx_stream) !?bool {

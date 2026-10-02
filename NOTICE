@@ -179,6 +179,14 @@ Used in sushi (`src/glm5_kda_fused.zig`):
     retaining FP32 recurrent state. The sigmoid expressions derive from
     MLX's MIT-licensed elementwise functors.
 
+Used in sushi (`src/glm5_kda_prework.zig`):
+
+  * Parallel token/head prework adapts the KDA decode arithmetic above and
+    `_PREWORK_SOURCE` in `omlx/patches/glm53_kda_prework.py` at 6745c39c.
+    It keeps BF16 convolution/SiLU boundaries, reuses qualified unary math,
+    adds vector decay and beta outputs, and preserves the compact tail's
+    existing bit semantics. MLX-derived sigmoid expressions remain MIT licensed.
+
 Used in sushi (`src/glm5_router.zig`):
 
   * The FP32 router GEMV/sigmoid and stable top-k selection adapt
