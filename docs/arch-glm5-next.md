@@ -1,9 +1,9 @@
 # GLM-5.3-Flash: native engine foundation
 
-The `glm5_next` source adapter reads the official BF16 checkpoint's individual routed-expert tensors through
-Sushi's existing SSD fill pool, per-layer LRU and zero-copy Metal slabs. Native configuration, packed-expert
-loading, KDA/mHC primitives and partial layer assembly are implemented. The complete model forward is still
-unfinished: `glm5_next` is not in `model.served_model_types`, and cannot yet serve or capture a teacher.
+The `glm5_next` source adapter preserves official BF16 expert tensors for streaming tests. The native
+text forward now runs the completed EXL3 checkpoint through an opt-in diagnostic harness. It is not
+registered in `model.served_model_types`: production serving, full reference parity and quality gates
+remain open. See [diagnostic usage](glm5-diagnostic.md) and [attention/cache details](engine-glm5-attention.md).
 
 ## Checkpoint and implementation status (2026-10-02)
 
@@ -14,15 +14,23 @@ not a measured runtime memory requirement. Large trunk matrices use affine8 grou
 BF16/FP32 tensors keep their source precision. Creation details belong to the private Sashimi repository.
 The completed checkpoint has not passed native full-model generation or KLD.
 
-`glm5_model.zig` contains the partial forward foundation: scoped MLX handle ownership, dense/stored-affine
-linear operations, clamped dense MLP, mHC binding, and KDA projection/convolution/decay/output assembly.
-The affine regression exercises both matrix orientations without changing the stored grids. The KDA binder
-and mHC binder refuse malformed preserved tensors. These helpers are not yet wired into Transformer;
-whole-layer numerical parity remains unproven even though their component tests pass.
+`glm5_model.zig` provides stored-affine linear operations, clamped dense MLP, precise FP32 mHC mixing
+and KDA projection/convolution/decay/output assembly. KDA and mHC now have independent oMLX fixtures,
+including irregular chunks and nonzero initial recurrent state. Preparation owns static convolution and
+decay constants; it has explicit cleanup. The checkpoint's mHC matrices remain BF16, while scale/base
+and mixing arithmetic are FP32.
 
-The efficiency and correctness audits fixed convolution-tail parent retention, mHC arithmetic ordering,
-invalid expert-bank nesting and incomplete optional MTP detection. The GLM-filtered and full ReleaseFast
-unit suites passed after the current foundation and auditor fixes. No native throughput result is available.
+`glm5_forward.zig` composes all layers, resident affine embeddings/head, sigmoid top-k routing, shared
+experts and request-local state. It evaluates each layer and its state before releasing temporaries.
+A tiny four-layer model exercises KDA, MLA, routed/shared experts, affine embedding/head, reset and
+last-row logits. Nonzero stored-affine MLA tests cover both projection orientations. The diagnostic
+loader preserves stored dtypes and index ownership, and excludes unused vision and MTP tensors.
+
+The first real-checkpoint diagnostic loaded 2,302 text tensors (95,471,433,976 bytes, 88.9147 GiB),
+processed an eight-token prefix and generated four tokens. This proves load/bind/forward execution;
+the truncated prompt and output do not establish coherent English, quality or steady throughput.
+The current local directory is named `GLM-5.3-Flash-Sushi-2.4bpw`; its stored expert metadata remains
+K2.25/W12. No conversion was repeated and no rate is inferred from the directory name.
 
 ## Source layout
 
@@ -91,30 +99,24 @@ The copy stays lazy; the enclosing forward must evaluate the cache with its norm
 release its operation scope. A pointer-alias regression checks that the evaluated tail retains its values
 without retaining the parent allocation. Single-token decode keeps the inexpensive contiguous view.
 
-## Forward implementation still required
+## Remaining validation and optimization
 
-The ordered work and exit criteria are in the [native execution plan](plan-glm5-native.md).
-The [correctness report](glm5-correctness-audit.md) and
-[efficiency report](glm5-efficiency-audit.md) record each auditor's scope and findings.
+The ordered milestones remain in the [native execution plan](plan-glm5-native.md). The
+[correctness report](glm5-correctness-audit.md) and [efficiency report](glm5-efficiency-audit.md)
+record the audited foundation; new complete-forward behavior needs its own review.
 
-- Implement sparse MLA and IndexPool: absorbed 512-wide latent attention at scale 1/16, four-token pooled
-  keys, selection of completed pools plus the incomplete tail, bounded prefill scratch and per-request state.
-  Preserve the stored affine grids when splitting MLA key/value projections; do not re-quantize them.
-- Wire the 34 KDA and 11 MLA layers into Transformer initialization, forward, cleanup and cache ownership.
-  Use a fresh operation scope per layer; retaining all 45 layers' temporaries exceeds the current handle budget
-  and pins activations. Evaluate compact cache state at the normal layer boundary.
-- Prepare immutable convolution weights and decay constants once, with an explicit owned-cache destructor.
-  The partial KDA helper currently repeats these transforms on every call; no timing gain is claimed yet.
-- Complete resident embedding lookup, mHC residual branches, final stream reduction/norm/head, and routed
-  MoE assembly. The router uses sigmoid scores, correction bias only for selection, unbiased normalized
-  weights scaled by 2.5, and one shared clamped expert. Normal token embeddings stay resident.
-- Implement resident trunk loading independently of routed-expert materialization. Preserve FP32 router,
-  hyper-connection and decay math and FP32 recurrent state. The BF16 teacher path must remain lossless.
-- Validate full KDA/MLA layers and a tiny model against the reference, including serial/chunk execution,
-  streamed/resident equivalence and cache restoration. Then run full-model coherent generation, the requested
-  512-token prefill/64-token decode measurement, and lossless-teacher KLD before opening the architecture gate.
-- Vision, MTP, batching and speculative state need explicit support or refusal; retaining their checkpoint
-  tensors is not runtime support. No Qwen n-gram table or MLA RoPE channels belong in this architecture.
+- Run the full 512-token prompt and 64-token generation with warmup, explicit timing denominators,
+  actual memory and per-layer attribution. Targets are 1,000 tok/s prefill and 60 tok/s decode, not results.
+- Compare full MLA/reference layer outputs and logits: absorbed latent attention and expanded dense
+  attention have different BF16 rounding boundaries even when their projection algebra agrees.
+- Measure KLD against a lossless BF16 teacher and validate 4K/16K contexts before 64K. The identity-prior
+  quantized checkpoint has no accepted full-model quality result yet.
+- Replace diagnostic per-layer synchronous evaluation only after proving bounded memory and state
+  equivalence. Profile KDA, attention, routing and projection dispatch before choosing optimizations.
+- Integrate Transformer/server ownership, memory admission and tested capability checks. The diagnostic
+  cache currently uses lossless BF16 latents, not generic KV8; generic cache bills do not describe this
+  standalone request implementation's exact allocation. Add reset/rollback/prefix lifecycle integration
+  before enabling dependent features. Vision, MTP, batching and speculation remain unsupported.
 
 ## References and checks
 

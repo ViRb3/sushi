@@ -1,0 +1,575 @@
+//! Diagnostic GLM model composition, kept separate from served architecture dispatch.
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const model = @import("model.zig");
+const base = @import("glm5_model.zig");
+const primitive = @import("glm5_next.zig");
+const exl3 = @import("sushi_exl3");
+const Arr = mlx.mlx_array;
+const Ops = base.Ops;
+const Linear = base.Linear;
+
+const Routed = struct { indices: Arr, scores: Arr };
+
+fn route(ops: *Ops, x: Arr, weight: Arr, correction: Arr, top: c_int, scale: f32, normalize: bool) !Routed {
+    const logits = try ops.binary(.mm, try ops.cast(x, .float32), try ops.transpose(weight, &.{ 1, 0 }));
+    const scores = try ops.unary(.sigmoid, logits);
+    const selection = try ops.binary(.add, scores, correction);
+    const count = mlx.getShape(scores)[2];
+    if (top <= 0 or top > count) return error.InvalidGlmRouter;
+    const order = try ops.slot();
+    try mlx.check(mlx.mlx_argpartition_axis(order, try ops.unary(.negative, selection), top - 1, -1, ops.s));
+    const ids = try ops.slice(order.*, 2, 0, top);
+    const picked = try ops.slot();
+    try mlx.check(mlx.mlx_take_along_axis(picked, scores, ids, -1, ops.s));
+    const probs = if (normalize) try ops.binary(.div, picked.*, try ops.reduce(picked.*, -1, false, true)) else picked.*;
+    return .{ .indices = try ops.cast(ids, .uint32), .scores = try ops.binary(.mul, probs, try ops.scalar(scale, .float32)) };
+}
+
+test "GLM router correction changes selection but not normalized weights" {
+    const s = mlx.gpuStream();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const x = try ops.ones(&.{ 1, 1, 2 }, .float32);
+    const w = try ops.own(mlx.mlx_array_new_data(&[_]f32{ 0, 0, 1, 0, -1, 0 }, &[_]c_int{ 3, 2 }, 2, .float32));
+    const bias = try ops.own(mlx.mlx_array_new_data(&[_]f32{ 0, 0, 2 }, &[_]c_int{3}, 1, .float32));
+    const r = try route(&ops, x, w, bias, 2, 2.5, true);
+    try mlx.check(mlx.mlx_array_eval(r.indices));
+    try mlx.check(mlx.mlx_array_eval(r.scores));
+    const ids = mlx.mlx_array_data_uint32(r.indices).?;
+    const scores = mlx.mlx_array_data_float32(r.scores).?;
+    var sum: f32 = 0;
+    for (0..2) |i| {
+        try std.testing.expect(ids[i] == 1 or ids[i] == 2);
+        const expected: f32 = if (ids[i] == 1) 2.5 / (1 + @exp(@as(f32, -1))) else 2.5 / (1 + @exp(@as(f32, 1)));
+        try std.testing.expectApproxEqAbs(expected, scores[i], 1e-5);
+        sum += scores[i];
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), sum, 1e-5);
+}
+
+fn tensor(weights: *const model.Weights, prefix: []const u8, suffix: []const u8) !Arr {
+    var buf: [256]u8 = undefined;
+    return weights.get(try std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, suffix })) orelse error.MissingGlmWeight;
+}
+
+fn linear(weights: *const model.Weights, prefix: []const u8, suffix: []const u8, input: u32) !Linear {
+    var buf: [256]u8 = undefined;
+    return Linear.load(weights, try std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, suffix }), input);
+}
+
+const Mla = struct {
+    qa: Linear,
+    qb: Linear,
+    kva: Linear,
+    out: Linear,
+    qa_norm: Arr,
+    kv_norm: Arr,
+    iq: Linear,
+    ik: Linear,
+    iw: Linear,
+    ik_norm: Arr,
+    ik_bias: Arr,
+    compress: Arr,
+    ape: Arr,
+    wk: Arr,
+    wv: Arr,
+    sk: Arr,
+    sv: Arr,
+    bk: Arr,
+    bv: Arr,
+    quantized: bool,
+    prepared: Ops,
+
+    fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig, s: mlx.mlx_stream) !Mla {
+        var prep = Ops{ .s = s };
+        errdefer prep.deinit();
+        const kvb = try linear(weights, prefix, "kv_b_proj", cfg.mla_kv_lora_rank);
+        const h: c_int = @intCast(cfg.num_attention_heads);
+        const kd: c_int = @intCast(cfg.mla_qk_nope_head_dim);
+        const vd: c_int = @intCast(cfg.mla_v_head_dim);
+        const latent: c_int = @intCast(cfg.mla_kv_lora_rank);
+        if (kvb.output != h * (kd + vd)) return error.InvalidGlmMlaWeight;
+        const quant = kvb.scales.ctx != null;
+        const w = try prep.reshape(kvb.w, &.{ h, kd + vd, if (quant) @divExact(latent, 4) else latent });
+        const wk = try prep.contiguous(try prep.slice(w, 1, 0, kd));
+        const wv = try prep.contiguous(try prep.slice(w, 1, kd, kd + vd));
+        var sk: Arr = .{ .ctx = null };
+        var sv: Arr = .{ .ctx = null };
+        var bk: Arr = .{ .ctx = null };
+        var bv: Arr = .{ .ctx = null };
+        if (quant) {
+            const scales = try prep.reshape(kvb.scales, &.{ h, kd + vd, @divExact(latent, 128) });
+            const biases = try prep.reshape(kvb.biases, &.{ h, kd + vd, @divExact(latent, 128) });
+            sk = try prep.contiguous(try prep.slice(scales, 1, 0, kd));
+            sv = try prep.contiguous(try prep.slice(scales, 1, kd, kd + vd));
+            bk = try prep.contiguous(try prep.slice(biases, 1, 0, kd));
+            bv = try prep.contiguous(try prep.slice(biases, 1, kd, kd + vd));
+        }
+        const result = Mla{
+            .qa = try linear(weights, prefix, "q_a_proj", cfg.hidden_size),
+            .qb = try linear(weights, prefix, "q_b_proj", cfg.mla_q_lora_rank),
+            .kva = try linear(weights, prefix, "kv_a_proj_with_mqa", cfg.hidden_size),
+            .out = try linear(weights, prefix, "o_proj", cfg.num_attention_heads * cfg.mla_v_head_dim),
+            .qa_norm = try tensor(weights, prefix, "q_a_layernorm.weight"),
+            .kv_norm = try tensor(weights, prefix, "kv_a_layernorm.weight"),
+            .iq = try linear(weights, prefix, "indexer.wq_b", cfg.mla_q_lora_rank),
+            .ik = try linear(weights, prefix, "indexer.wk", cfg.hidden_size),
+            .iw = try linear(weights, prefix, "indexer.weights_proj", cfg.hidden_size),
+            .ik_norm = try tensor(weights, prefix, "indexer.k_norm.weight"),
+            .ik_bias = try tensor(weights, prefix, "indexer.k_norm.bias"),
+            .compress = try tensor(weights, prefix, "indexer.index_kpool_compress_gate"),
+            .ape = try tensor(weights, prefix, "indexer.index_kpool_compress_ape"),
+            .wk = wk,
+            .wv = wv,
+            .sk = sk,
+            .sv = sv,
+            .bk = bk,
+            .bv = bv,
+            .quantized = quant,
+            .prepared = prep,
+        };
+        const expected_outputs = [_]u32{ cfg.mla_q_lora_rank, cfg.num_attention_heads * cfg.mla_qk_nope_head_dim, cfg.mla_kv_lora_rank, cfg.hidden_size, cfg.indexer_n_heads * cfg.indexer_head_dim, cfg.indexer_head_dim, cfg.indexer_n_heads };
+        for ([_]Linear{ result.qa, result.qb, result.kva, result.out, result.iq, result.ik, result.iw }, expected_outputs) |proj, expected| {
+            if (proj.output != @as(c_int, @intCast(expected))) return error.InvalidGlmMlaWeight;
+        }
+        for ([_]Arr{ result.qa_norm, result.kv_norm, result.ik_norm, result.ik_bias }, [_]u32{ cfg.mla_q_lora_rank, cfg.mla_kv_lora_rank, cfg.indexer_head_dim, cfg.indexer_head_dim }) |value, width| {
+            const dtype = mlx.mlx_array_dtype(value);
+            if (!std.mem.eql(c_int, &.{@intCast(width)}, mlx.getShape(value)) or (dtype != .bfloat16 and dtype != .float32)) return error.InvalidGlmMlaWeight;
+        }
+        if (!std.mem.eql(c_int, &.{ @intCast(cfg.indexer_head_dim), @intCast(cfg.hidden_size) }, mlx.getShape(result.compress)) or
+            !std.mem.eql(c_int, &.{ 4, @intCast(cfg.indexer_head_dim) }, mlx.getShape(result.ape))) return error.InvalidGlmMlaWeight;
+        for ([_]Arr{ result.compress, result.ape }) |value| {
+            const dtype = mlx.mlx_array_dtype(value);
+            if (dtype != .bfloat16 and dtype != .float32) return error.InvalidGlmMlaWeight;
+        }
+        const evals = mlx.mlx_vector_array_new_data(prep.values[0..prep.count].ptr, prep.count);
+        defer _ = mlx.mlx_vector_array_free(evals);
+        try mlx.check(mlx.mlx_eval(evals));
+        return result;
+    }
+
+    fn deinit(self: *Mla) void {
+        self.prepared.deinit();
+    }
+
+    fn apply(self: *const Mla, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: anytype) !Arr {
+        const sh = mlx.getShape(x);
+        if (sh[0] != 1) return error.GlmBatchUnsupported;
+        const t = sh[1];
+        const h: c_int = @intCast(cfg.num_attention_heads);
+        const kd: c_int = @intCast(cfg.mla_qk_nope_head_dim);
+        const latent: c_int = @intCast(cfg.mla_kv_lora_rank);
+        const qr = try ops.rms(try self.qa.apply(ops, x), self.qa_norm, cfg.rms_norm_eps);
+        const q = try ops.reshape(try self.qb.apply(ops, qr), &.{ t, h, 1, kd });
+        const absorbed = if (self.quantized) try ops.qmm(q, self.wk, self.sk, self.bk, false) else try ops.binary(.mm, q, self.wk);
+        const kv = try ops.rms(try self.kva.apply(ops, x), self.kv_norm, cfg.rms_norm_eps);
+        const iq = try ops.reshape(try self.iq.apply(ops, qr), &.{ t, @intCast(cfg.indexer_n_heads), @intCast(cfg.indexer_head_dim) });
+        const ik = try ops.layerNorm(try self.ik.apply(ops, x), self.ik_norm, self.ik_bias, 1e-6);
+        const iw = try ops.cast(try ops.binary(.mul, try self.iw.apply(ops, x), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(cfg.indexer_n_heads * cfg.indexer_head_dim))), .float32)), mlx.mlx_array_dtype(iq));
+        const gates = try ops.binary(.mm, x, try ops.transpose(self.compress, &.{ 1, 0 }));
+        const offset = try state.append(try ops.reshape(kv, &.{ t, latent }), try ops.reshape(ik, &.{ t, @intCast(cfg.indexer_head_dim) }), try ops.reshape(gates, &.{ t, @intCast(cfg.indexer_head_dim) }), self.ape, ops.s);
+        const y = try ops.own(try @import("glm5_attention.zig").attend(state, try ops.reshape(absorbed, &.{ t, h, latent }), iq, try ops.reshape(iw, &.{ t, @intCast(cfg.indexer_n_heads) }), offset, 1 / @sqrt(@as(f32, @floatFromInt(kd))), ops.s));
+        const y4 = try ops.reshape(y, &.{ t, h, 1, latent });
+        const values = if (self.quantized) try ops.qmm(y4, self.wv, self.sv, self.bv, true) else try ops.binary(.mm, y4, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
+        return self.out.apply(ops, try ops.reshape(values, &.{ 1, t, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) }));
+    }
+};
+
+const Moe = struct {
+    weight: Arr,
+    correction: Arr,
+    bank: exl3.Bank,
+    shared: ?base.DenseMlp,
+    fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig) !Moe {
+        var projs: [3]exl3.Proj = undefined;
+        for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |p, i| {
+            var buf: [256]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "{s}.switch_mlp.{s}", .{ prefix, p });
+            projs[i] = .{ .trellis = try tensor(weights, name, "trellis"), .suh = try tensor(weights, name, "suh"), .svh = try tensor(weights, name, "svh") };
+        }
+        var buf: [256]u8 = undefined;
+        return .{ .weight = try tensor(weights, prefix, "gate.weight"), .correction = try tensor(weights, prefix, "gate.e_score_correction_bias"), .bank = .{ .gate = projs[0], .up = projs[1], .down = projs[2] }, .shared = if (cfg.shared_expert_intermediate_size > 0) try base.DenseMlp.load(weights, try std.fmt.bufPrint(&buf, "{s}.shared_experts", .{prefix}), cfg.hidden_size, cfg.shared_expert_intermediate_size) else null };
+    }
+    fn apply(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !Arr {
+        const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
+        const routed = try ops.own(try exl3.moeClamped(ops.s, x, self.bank, routing.indices, routing.scores, .{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window }, @intFromFloat(cfg.glm_swiglu_limit)));
+        return if (self.shared) |shared| ops.binary(.add, routed, try shared.apply(ops, x, cfg.glm_swiglu_limit)) else routed;
+    }
+};
+
+const Attention = union(enum) { kda: base.KdaLayer, mla: Mla };
+const Ffn = union(enum) { dense: base.DenseMlp, moe: Moe };
+const Layer = struct {
+    attn: Attention,
+    ffn: Ffn,
+    hc_attn: base.Hc,
+    hc_ffn: base.Hc,
+    norm_attn: Arr,
+    norm_ffn: Arr,
+    fn deinit(self: *Layer) void {
+        switch (self.attn) {
+            .mla => |*a| a.deinit(),
+            .kda => |*a| {
+                if (@hasDecl(base.KdaLayer, "deinit")) a.deinit();
+            },
+        }
+    }
+};
+const LayerState = struct {
+    recurrent: @import("transformer.zig").SSMCacheEntry,
+    attention: @import("glm5_attention.zig").State,
+    fn init() LayerState {
+        return .{ .recurrent = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false }, .attention = .init() };
+    }
+    fn deinit(self: *LayerState) void {
+        _ = mlx.mlx_array_free(self.recurrent.conv_state);
+        _ = mlx.mlx_array_free(self.recurrent.ssm_state);
+        self.attention.deinit();
+    }
+};
+
+pub const Request = struct {
+    allocator: std.mem.Allocator,
+    layers: []LayerState,
+    offset: usize = 0,
+    failed: bool = false,
+    profile: bool = false,
+    layer_ns: [128]u64 = @splat(0),
+    pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
+        const layers = try allocator.alloc(LayerState, count);
+        for (layers) |*layer| layer.* = .init();
+        return .{ .allocator = allocator, .layers = layers };
+    }
+    pub fn deinit(self: *Request) void {
+        for (self.layers) |*layer| layer.deinit();
+        self.allocator.free(self.layers);
+    }
+    pub fn reset(self: *Request) void {
+        for (self.layers) |*layer| {
+            layer.deinit();
+            layer.* = .init();
+        }
+        self.offset = 0;
+        self.failed = false;
+        self.layer_ns = @splat(0);
+    }
+};
+
+pub const Model = struct {
+    allocator: std.mem.Allocator,
+    cfg: model.ModelConfig,
+    layers: []Layer,
+    embedding: Linear,
+    head: Linear,
+    norm: Arr,
+    s: mlx.mlx_stream,
+
+    pub fn load(allocator: std.mem.Allocator, cfg: model.ModelConfig, weights: *const model.Weights, s: mlx.mlx_stream) !Model {
+        if (!cfg.isGlm5()) return error.InvalidGlmConfig;
+        const layers = try allocator.alloc(Layer, cfg.num_hidden_layers);
+        var loaded: usize = 0;
+        errdefer {
+            for (layers[0..loaded]) |*layer| layer.deinit();
+            allocator.free(layers);
+        }
+        const emb = try linear(weights, cfg.weight_prefix, "embed_tokens", cfg.hidden_size);
+        const head = try Linear.load(weights, "lm_head", cfg.hidden_size);
+        if (emb.output != cfg.vocab_size or head.output != cfg.vocab_size) return error.InvalidGlmVocabulary;
+        for (layers, 0..) |*layer, i| {
+            var prefix_buf: [256]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&prefix_buf, "{s}.layers.{d}", .{ cfg.weight_prefix, i });
+            const hc_attn = try base.Hc.load(weights, prefix, "hc_attn", cfg.hidden_size);
+            const hc_ffn = try base.Hc.load(weights, prefix, "hc_ffn", cfg.hidden_size);
+            const norm_attn = try tensor(weights, prefix, "input_layernorm.weight");
+            const norm_ffn = try tensor(weights, prefix, "post_attention_layernorm.weight");
+            var buf: [256]u8 = undefined;
+            const ffn: Ffn = if (i < cfg.first_k_dense_replace)
+                .{ .dense = try base.DenseMlp.load(weights, try std.fmt.bufPrint(&buf, "{s}.mlp", .{prefix}), cfg.hidden_size, cfg.intermediate_size) }
+            else
+                .{ .moe = try Moe.load(weights, try std.fmt.bufPrint(&buf, "{s}.mlp", .{prefix}), &cfg) };
+            const name = try std.fmt.bufPrint(&buf, "{s}.self_attn", .{prefix});
+            const attn: Attention = if ((i + 1) % cfg.full_attention_interval == 0) .{ .mla = try Mla.load(weights, name, &cfg, s) } else blk: {
+                var kda = try base.KdaLayer.load(weights, name, &cfg);
+                if (@hasDecl(base.KdaLayer, "prepare")) try kda.prepare(s);
+                break :blk .{ .kda = kda };
+            };
+            layer.* = .{ .attn = attn, .ffn = ffn, .hc_attn = hc_attn, .hc_ffn = hc_ffn, .norm_attn = norm_attn, .norm_ffn = norm_ffn };
+            loaded += 1;
+        }
+        return .{ .allocator = allocator, .cfg = cfg, .layers = layers, .embedding = emb, .head = head, .norm = try tensor(weights, cfg.weight_prefix, "norm.weight"), .s = s };
+    }
+
+    pub fn deinit(self: *Model) void {
+        for (self.layers) |*layer| layer.deinit();
+        self.allocator.free(self.layers);
+    }
+
+    pub fn forward(self: *const Model, request: *Request, ids: Arr) !Arr {
+        return self.forwardLast(request, ids, false);
+    }
+
+    pub fn forwardLast(self: *const Model, request: *Request, ids: Arr, last_only: bool) !Arr {
+        const ish = mlx.getShape(ids);
+        if (ish.len != 2 or ish[0] != 1 or ish[1] < 1 or request.layers.len != self.layers.len) return error.InvalidGlmInput;
+        if (request.failed) return error.GlmRequestNeedsReset;
+        if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
+        errdefer request.failed = true;
+        var h: Arr = undefined;
+        {
+            var ops = Ops{ .s = self.s };
+            defer ops.deinit();
+            const e = self.embedding;
+            const code = try ops.take(e.w, ids, 0);
+            const hidden = if (e.scales.ctx != null) try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0)) else code;
+            h = try ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(hidden, &.{ 1, ish[1], 1, @intCast(self.cfg.hidden_size) }), &.{ 1, ish[1], 4, @intCast(self.cfg.hidden_size) })));
+        }
+        defer _ = mlx.mlx_array_free(h);
+        for (self.layers, request.layers, 0..) |*layer, *state, layer_index| {
+            const timer = if (request.profile) @import("io_util.zig").Stopwatch.init(std.Io.Threaded.global_single_threaded.io()) else null;
+            var ops = Ops{ .s = self.s };
+            defer ops.deinit();
+            const pre = try layer.hc_attn.collapse(&ops, h, &self.cfg);
+            defer pre.deinit();
+            const x = try ops.rms(pre.mixed, layer.norm_attn, self.cfg.rms_norm_eps);
+            const a = switch (layer.attn) {
+                .kda => |kda| try kda.apply(&ops, x, &self.cfg, &state.recurrent),
+                .mla => |*mla| try mla.apply(&ops, x, &self.cfg, &state.attention),
+            };
+            const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, self.s));
+            const ff = try layer.hc_ffn.collapse(&ops, joined, &self.cfg);
+            defer ff.deinit();
+            const fx = try ops.rms(ff.mixed, layer.norm_ffn, self.cfg.rms_norm_eps);
+            const y = switch (layer.ffn) {
+                .dense => |dense| try dense.apply(&ops, fx, self.cfg.glm_swiglu_limit),
+                .moe => |moe| try moe.apply(&ops, fx, &self.cfg),
+            };
+            const next = try ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
+            const evals = mlx.mlx_vector_array_new_value(next);
+            defer _ = mlx.mlx_vector_array_free(evals);
+            if (state.recurrent.initialized) {
+                try mlx.check(mlx.mlx_vector_array_append_value(evals, state.recurrent.conv_state));
+                try mlx.check(mlx.mlx_vector_array_append_value(evals, state.recurrent.ssm_state));
+            }
+            for (state.attention.arrays()) |cache| if (cache.ctx != null) {
+                try mlx.check(mlx.mlx_vector_array_append_value(evals, cache));
+            };
+            try mlx.check(mlx.mlx_eval(evals));
+            try mlx.check(mlx.mlx_array_set(&h, next));
+            if (timer) |clock| request.layer_ns[layer_index] += clock.read();
+        }
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        const chosen = if (last_only) try ops.slice(h, 1, ish[1] - 1, ish[1]) else h;
+        const normalized = try ops.rms(try ops.reduce(chosen, 2, true, false), self.norm, self.cfg.rms_norm_eps);
+        const logits = try self.head.apply(&ops, normalized);
+        const result = try ops.result(logits);
+        request.offset += @intCast(ish[1]);
+        return result;
+    }
+};
+
+fn fixtureTensor(weights: *model.Weights, prefix: []const u8, suffix: []const u8, shape: []const c_int, dtype: mlx.mlx_dtype, ones: bool) !void {
+    const key = try std.fmt.allocPrint(std.testing.allocator, "{s}.{s}", .{ prefix, suffix });
+    errdefer std.testing.allocator.free(key);
+    var arr = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(arr);
+    if (ones) try mlx.check(mlx.mlx_ones(&arr, shape.ptr, shape.len, dtype, mlx.gpuStream())) else try mlx.check(mlx.mlx_zeros(&arr, shape.ptr, shape.len, dtype, mlx.gpuStream()));
+    try weights.map.put(key, arr);
+}
+
+fn fixtureMlp(weights: *model.Weights, prefix: []const u8) !void {
+    for ([_][]const u8{ "gate_proj.weight", "up_proj.weight", "down_proj.weight" }) |leaf|
+        try fixtureTensor(weights, prefix, leaf, &.{ 128, 128 }, .bfloat16, false);
+}
+
+test "GLM complete diagnostic forward advances and resets request state" {
+    const a = std.testing.allocator;
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = model.ModelConfig{
+        .model_type = "glm5_next",
+        .weight_prefix = "model.language_model",
+        .hidden_size = 128,
+        .vocab_size = 4,
+        .num_hidden_layers = 4,
+        .first_k_dense_replace = 3,
+        .intermediate_size = 128,
+        .moe_intermediate_size = 128,
+        .full_attention_interval = 4,
+        .num_experts = 2,
+        .num_experts_per_tok = 1,
+        .shared_expert_intermediate_size = 128,
+        .linear_num_value_heads = 1,
+        .linear_key_head_dim = 128,
+        .linear_conv_kernel_dim = 4,
+        .kda_gate_lower_bound = -5,
+        .hc_count = 4,
+        .glm_hc_sinkhorn_iters = 20,
+        .glm_hc_eps = 1e-6,
+        .glm_swiglu_limit = 10,
+        .mla_q_lora_rank = 128,
+        .mla_kv_lora_rank = 128,
+        .mla_qk_nope_head_dim = 128,
+        .mla_v_head_dim = 128,
+        .num_attention_heads = 1,
+        .indexer_n_heads = 1,
+        .indexer_head_dim = 128,
+        .indexer_compress_ratio = 4,
+        .indexer_budget = 2048,
+        .max_position_embeddings = 16,
+        .rms_norm_eps = 1e-5,
+        .expert_quant_codebook = .mcg,
+        .expert_quant_window = .w12,
+    };
+    const codes: [4 * 32]u32 = @splat(0x01010101);
+    for ([_][]const u8{ "model.language_model.embed_tokens", "lm_head" }) |name| {
+        const key = try std.fmt.allocPrint(a, "{s}.weight", .{name});
+        const code = mlx.mlx_array_new_data(&codes, &[_]c_int{ 4, 32 }, 2, .uint32);
+        try weights.map.put(key, code);
+        try fixtureTensor(&weights, name, "scales", &.{ 4, 1 }, .bfloat16, true);
+        try fixtureTensor(&weights, name, "biases", &.{ 4, 1 }, .bfloat16, false);
+    }
+    try fixtureTensor(&weights, cfg.weight_prefix, "norm.weight", &.{128}, .bfloat16, true);
+
+    for (0..4) |i| {
+        var buf: [128]u8 = undefined;
+        const p = try std.fmt.bufPrint(&buf, "model.language_model.layers.{d}", .{i});
+        for ([_][]const u8{ "hc_attn_fn", "hc_ffn_fn" }) |k| try fixtureTensor(&weights, p, k, &.{ 24, 512 }, .float32, false);
+        for ([_][]const u8{ "hc_attn_scale", "hc_ffn_scale" }) |k| try fixtureTensor(&weights, p, k, &.{3}, .float32, false);
+        for ([_][]const u8{ "hc_attn_base", "hc_ffn_base" }) |k| try fixtureTensor(&weights, p, k, &.{24}, .float32, false);
+        for ([_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight" }) |k| try fixtureTensor(&weights, p, k, &.{128}, .bfloat16, true);
+        var sb: [160]u8 = undefined;
+        const ap = try std.fmt.bufPrint(&sb, "{s}.self_attn", .{p});
+        if (i < 3) {
+            for ([_][]const u8{ "q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "f_b_proj.weight", "g_a_proj.weight", "g_b_proj.weight", "o_proj.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{ 128, 128 }, .bfloat16, false);
+            try fixtureTensor(&weights, ap, "b_proj.weight", &.{ 1, 128 }, .bfloat16, false);
+            for ([_][]const u8{ "q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{ 128, 1, 4 }, .bfloat16, false);
+            try fixtureTensor(&weights, ap, "A_log", &.{1}, .float32, false);
+            try fixtureTensor(&weights, ap, "dt_bias", &.{128}, .float32, false);
+            try fixtureTensor(&weights, ap, "o_norm.weight", &.{128}, .bfloat16, true);
+        } else {
+            for ([_][]const u8{ "q_a_proj.weight", "q_b_proj.weight", "kv_a_proj_with_mqa.weight", "o_proj.weight", "indexer.wq_b.weight", "indexer.wk.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{ 128, 128 }, .bfloat16, false);
+            try fixtureTensor(&weights, ap, "kv_b_proj.weight", &.{ 256, 128 }, .bfloat16, false);
+            for ([_][]const u8{ "q_a_layernorm.weight", "kv_a_layernorm.weight", "indexer.k_norm.weight" }) |k| try fixtureTensor(&weights, ap, k, &.{128}, .bfloat16, true);
+            try fixtureTensor(&weights, ap, "indexer.k_norm.bias", &.{128}, .bfloat16, false);
+            try fixtureTensor(&weights, ap, "indexer.weights_proj.weight", &.{ 1, 128 }, .bfloat16, false);
+            try fixtureTensor(&weights, ap, "indexer.index_kpool_compress_gate", &.{ 128, 128 }, .bfloat16, false);
+            try fixtureTensor(&weights, ap, "indexer.index_kpool_compress_ape", &.{ 4, 128 }, .bfloat16, false);
+        }
+        const mp = try std.fmt.bufPrint(&sb, "{s}.mlp", .{p});
+        if (i < 3) try fixtureMlp(&weights, mp) else {
+            try fixtureTensor(&weights, mp, "gate.weight", &.{ 2, 128 }, .float32, false);
+            try fixtureTensor(&weights, mp, "gate.e_score_correction_bias", &.{2}, .float32, false);
+            var pb: [220]u8 = undefined;
+            for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
+                const name = try std.fmt.bufPrint(&pb, "{s}.switch_mlp.{s}", .{ mp, proj });
+                try fixtureTensor(&weights, name, "trellis", &.{ 2, 8, 8, 36 }, .uint16, false);
+                try fixtureTensor(&weights, name, "suh", &.{ 2, 128 }, .float16, false);
+                try fixtureTensor(&weights, name, "svh", &.{ 2, 128 }, .float16, false);
+            }
+            try fixtureMlp(&weights, try std.fmt.bufPrint(&pb, "{s}.shared_experts", .{mp}));
+        }
+    }
+    var mdl = try Model.load(a, cfg, &weights, mlx.gpuStream());
+    defer mdl.deinit();
+    var req = try Request.init(a, 4);
+    defer req.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &[_]c_int{ 1, 3 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const out = try mdl.forward(&req, ids);
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    try std.testing.expectEqualSlices(c_int, &.{ 1, 3, 4 }, mlx.getShape(out));
+    try std.testing.expectEqual(@as(usize, 3), req.offset);
+    try std.testing.expectEqual(@as(usize, 3), req.layers[3].attention.processed);
+    req.reset();
+    try std.testing.expectEqual(@as(usize, 0), req.offset);
+    const again = try mdl.forwardLast(&req, ids, true);
+    defer _ = mlx.mlx_array_free(again);
+    try mlx.check(mlx.mlx_array_eval(again));
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const fp = try ops.cast(again, .float32);
+    try mlx.check(mlx.mlx_array_eval(fp));
+    for (mlx.mlx_array_data_float32(fp).?[0..4]) |v| try std.testing.expectApproxEqAbs(@as(f32, 128), v, 0.01);
+}
+
+fn mlaOrientationFixture(weights: *model.Weights) !model.ModelConfig {
+    const cfg = model.ModelConfig{ .hidden_size = 128, .mla_q_lora_rank = 128, .mla_kv_lora_rank = 128, .mla_qk_nope_head_dim = 128, .mla_v_head_dim = 128, .num_attention_heads = 2, .indexer_n_heads = 2, .indexer_head_dim = 128 };
+    for ([_][]const u8{ "q_a_proj.weight", "kv_a_proj_with_mqa.weight", "indexer.wk.weight" }) |name| try fixtureTensor(weights, "mla", name, &.{ 128, 128 }, .bfloat16, false);
+    for ([_][]const u8{ "q_b_proj.weight", "indexer.wq_b.weight" }) |name| try fixtureTensor(weights, "mla", name, &.{ 256, 128 }, .bfloat16, false);
+    try fixtureTensor(weights, "mla", "o_proj.weight", &.{ 128, 256 }, .bfloat16, false);
+    try fixtureTensor(weights, "mla", "indexer.weights_proj.weight", &.{ 2, 128 }, .bfloat16, false);
+    for ([_][]const u8{ "q_a_layernorm.weight", "kv_a_layernorm.weight", "indexer.k_norm.weight" }) |name| try fixtureTensor(weights, "mla", name, &.{128}, .bfloat16, true);
+    try fixtureTensor(weights, "mla", "indexer.k_norm.bias", &.{128}, .bfloat16, false);
+    try fixtureTensor(weights, "mla", "indexer.index_kpool_compress_gate", &.{ 128, 128 }, .bfloat16, false);
+    try fixtureTensor(weights, "mla", "indexer.index_kpool_compress_ape", &.{ 4, 128 }, .bfloat16, false);
+    var codes: [512 * 32]u32 = undefined;
+    var scales: [512]u16 = undefined;
+    var biases: [512]u16 = undefined;
+    for (&codes, 0..) |*v, i| {
+        const b: @TypeOf(v.*) = @intCast(1 + (i % 7));
+        v.* = b | (b + 1) << 8 | (b + 2) << 16 | (b + 3) << 24;
+    }
+    for (&scales, &biases, 0..) |*sc, *bias, i| {
+        const f: f32 = @as(f32, @floatFromInt(1 + i % 3)) / 128;
+        sc.* = @truncate(@as(u32, @bitCast(f)) >> 16);
+        const b: f32 = -@as(f32, @floatFromInt(i % 3)) / 64;
+        bias.* = @truncate(@as(u32, @bitCast(b)) >> 16);
+    }
+    const a = std.testing.allocator;
+    try weights.map.put(try a.dupe(u8, "mla.kv_b_proj.weight"), mlx.mlx_array_new_data(&codes, &[_]c_int{ 512, 32 }, 2, .uint32));
+    try weights.map.put(try a.dupe(u8, "mla.kv_b_proj.scales"), mlx.mlx_array_new_data(&scales, &[_]c_int{ 512, 1 }, 2, .bfloat16));
+    try weights.map.put(try a.dupe(u8, "mla.kv_b_proj.biases"), mlx.mlx_array_new_data(&biases, &[_]c_int{ 512, 1 }, 2, .bfloat16));
+    return cfg;
+}
+
+test "GLM MLA loader refuses invalid projection and norm geometry" {
+    var weights = model.Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    const cfg = try mlaOrientationFixture(&weights);
+    const Case = struct { name: []const u8, shape: []const c_int };
+    for ([_]Case{ .{ .name = "mla.q_a_layernorm.weight", .shape = &.{1} }, .{ .name = "mla.q_b_proj.weight", .shape = &.{ 128, 128 } } }) |case| {
+        const slot = weights.map.getPtr(case.name).?;
+        const original = slot.*;
+        slot.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&slot.*, case.shape.ptr, case.shape.len, .bfloat16, mlx.gpuStream()));
+        defer {
+            _ = mlx.mlx_array_free(slot.*);
+            slot.* = original;
+        }
+        if (Mla.load(&weights, "mla", &cfg, mlx.gpuStream())) |loaded| {
+            var bad = loaded;
+            bad.deinit();
+            return error.TestExpectedError;
+        } else |err| try std.testing.expectEqual(error.InvalidGlmMlaWeight, err);
+    }
+}
+
+test "GLM MLA stored affine kv rows preserve both projection orientations" {
+    const s = mlx.gpuStream();
+    var weights = model.Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    const cfg = try mlaOrientationFixture(&weights);
+    var layer = try Mla.load(&weights, "mla", &cfg, s);
+    defer layer.deinit();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const kvb = try linear(&weights, "mla", "kv_b_proj", 128);
+    const dense = try ops.reshape(try ops.dequant(kvb.w, kvb.scales, kvb.biases), &.{ 2, 256, 128 });
+    const dk = try ops.slice(dense, 1, 0, 128);
+    const dv = try ops.slice(dense, 1, 128, 256);
+    var input: [2 * 2 * 128]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i % 9)) - 4) / 32;
+    const x = try ops.cast(try ops.own(mlx.mlx_array_new_data(&input, &[_]c_int{ 2, 2, 1, 128 }, 4, .float32)), .bfloat16);
+    const key_quant = try ops.cast(try ops.qmm(x, layer.wk, layer.sk, layer.bk, false), .float32);
+    const key_dense = try ops.cast(try ops.binary(.mm, x, dk), .float32);
+    const value_quant = try ops.cast(try ops.qmm(x, layer.wv, layer.sv, layer.bv, true), .float32);
+    const value_dense = try ops.cast(try ops.binary(.mm, x, try ops.transpose(dv, &.{ 0, 2, 1 })), .float32);
+    for ([_]Arr{ key_quant, key_dense, value_quant, value_dense }) |v| try mlx.check(mlx.mlx_array_eval(v));
+    try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(key_dense).?[0..512], mlx.mlx_array_data_float32(key_quant).?[0..512]);
+    try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(value_dense).?[0..512], mlx.mlx_array_data_float32(value_quant).?[0..512]);
+    try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(layer.wk));
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(layer.sk));
+}

@@ -1,11 +1,20 @@
 # GLM-5.3-Flash native execution plan
 
-Status: planned continuation from `f352c5d6`, 2026-10-02. The completed checkpoint is
+Status: active implementation, 2026-10-02. Native full-checkpoint smoke now runs; full-prompt quality and performance remain open. The completed checkpoint is
 `GLM-5.3-Flash-Sushi-2.25bpw-A8g128-W12`. Quantization does not need restarting.
-The native architecture remains unsupported until the integration gates below pass.
+The public served architecture remains unsupported until the integration gates below pass.
 Completed components and measurements are in [the architecture document](arch-glm5-next.md).
 The [correctness audit](glm5-correctness-audit.md) and
 [efficiency audit](glm5-efficiency-audit.md) distinguish fixed defects from open work.
+
+## Progress
+
+- Implemented: KDA preparation/ownership and independent layer fixtures; bounded IndexPool/latent
+  attention; stored-grid MLA projection checks; the complete diagnostic text forward and request reset.
+- First real checkpoint smoke passed: eight-token prefix, four generated tokens. This is not the
+  requested full-prompt coherence/performance test and does not establish KLD.
+- Remaining: full MLA/reference comparison, 512/64 warm measurement, measured optimization toward
+  1,000/60 tok/s, long-context/quality validation and production lifecycle integration.
 
 ## Intended first runnable configuration
 
