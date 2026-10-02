@@ -3115,6 +3115,15 @@ pub fn moePrefill(
     return out;
 }
 
+fn clampedWindowTable(s: mlx.mlx_stream, ids: mlx.mlx_array, order: mlx.mlx_array, n: c_int, win: c_int, experts: c_int, aligned: bool) !WindowTable {
+    if (aligned and experts > 0 and experts <= MIMO_WINDOW_MAX_EXPERTS) {
+        const metadata = try buildMimoWindowTable(s, ids, order, n, win, experts);
+        _ = mlx.mlx_array_free(metadata.inverse);
+        return metadata.table;
+    }
+    return gemmWindowTable(s, ids, n, win, aligned);
+}
+
 pub fn moeSwigluClamped(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -3167,7 +3176,7 @@ pub fn moeSwigluClamped(
     defer _ = mlx.mlx_array_free(prep[1]);
     const win = gemmWindowRows();
     const aligned = gemmWindowAligned();
-    const tab = try gemmWindowTable(s, sorted_slots, nslots, win, aligned);
+    const tab = try clampedWindowTable(s, sorted_slots, order_i, nslots, win, mlx.getShape(gate_t)[0], aligned);
     defer _ = mlx.mlx_array_free(tab.starts);
     defer _ = mlx.mlx_array_free(tab.nlives);
     const gate = try innerGemmSortedTable(s, prep[0], gate_t, sorted_slots, win, aligned, tab);
@@ -7831,7 +7840,7 @@ fn buildMimoWindowTable(s: mlx.mlx_stream, eids: mlx.mlx_array, order: mlx.mlx_a
     try mlx.check(mlx.mlx_vector_array_get(&inverse, outputs, 2));
     if (!mimo_window_engaged) {
         mimo_window_engaged = true;
-        log.info("[exl3-prefill] GPU window metadata engaged experts={d} win={d}\n", .{ experts, win });
+        if (!@import("builtin").is_test) log.info("[exl3-prefill] GPU window metadata engaged experts={d} win={d}\n", .{ experts, win });
     }
     return .{ .table = .{ .starts = starts, .nlives = nlives, .nwin = capacity }, .inverse = inverse };
 }
@@ -9498,4 +9507,108 @@ test "exl3 unsorted paired prepare preserves distinct scale planes at GLM widths
             }
         }
     }
+}
+
+test "exl3 GLM GPU windows match host metadata with zero padded windows" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const experts = 288;
+    for ([_]usize{ 1, 31, 32, 33, 296, 1024 }) |n| for (0..3) |pattern| {
+        const ids = try a.alloc(u32, n);
+        defer a.free(ids);
+        for (ids, 0..) |*id, i| id.* = @intCast(switch (pattern) {
+            0 => (i % 5) * 47,
+            1 => i % experts,
+            else => if (i % 101 == 0) @as(usize, experts - 1) else 7,
+        });
+        const raw = mlx.mlx_array_new_data(ids.ptr, &.{@intCast(n)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(raw);
+        var order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(order);
+        var sorted = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sorted);
+        try mlx.check(mlx.mlx_argsort_axis(&order, raw, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&sorted, raw, order, 0, s));
+        for ([_]c_int{ 16, 32 }) |win| {
+            const host = try buildWindowTableHost(s, sorted, @intCast(n), win);
+            defer _ = mlx.mlx_array_free(host.starts);
+            defer _ = mlx.mlx_array_free(host.nlives);
+            const gpu = try clampedWindowTable(s, sorted, order, @intCast(n), win, experts, true);
+            defer _ = mlx.mlx_array_free(gpu.starts);
+            defer _ = mlx.mlx_array_free(gpu.nlives);
+            try std.testing.expectEqual(@as(c_int, @intCast((n + @as(usize, @intCast(win)) - 1) / @as(usize, @intCast(win)) + experts)), gpu.nwin);
+            try mlx.check(mlx.mlx_array_eval(gpu.starts));
+            try mlx.check(mlx.mlx_array_eval(gpu.nlives));
+            const starts = mlx.mlx_array_data_uint32(gpu.starts).?[0..@intCast(gpu.nwin)];
+            const lives = mlx.mlx_array_data_uint32(gpu.nlives).?[0..@intCast(gpu.nwin)];
+            const used: usize = @intCast(host.nwin);
+            try std.testing.expectEqualSlices(u32, mlx.mlx_array_data_uint32(host.starts).?[0..used], starts[0..used]);
+            try std.testing.expectEqualSlices(u32, mlx.mlx_array_data_uint32(host.nlives).?[0..used], lives[0..used]);
+            for (starts[used..], lives[used..]) |begin, live| {
+                try std.testing.expectEqual(@as(u32, 0), begin);
+                try std.testing.expectEqual(@as(u32, 0), live);
+            }
+        }
+    };
+}
+
+fn clampedGpuWindowBytes(hidden: usize, inter: usize, n: u32) !void {
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const experts = 288;
+    const rows = 37;
+    const topk = 8;
+    var f = try mimoMoeFixture(a, .{
+        .hidden = hidden,
+        .inter = inter,
+        .e = experts,
+        .rows = rows,
+        .topk = topk,
+        .rate = .{ .n = n },
+        .dec = .{ .codebook = .mcg, .window = .w12 },
+        .seed = 8320 + n,
+        .banks = .{ 0.125, 0.25, 0.125, 0.25 },
+        .x_scale = 8,
+    });
+    defer f.deinit();
+    const v = f.arrays;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, v[8], .bfloat16, s));
+    for (0..3) |pattern| {
+        var ids: [rows * topk]u32 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(switch (pattern) {
+            0 => (i % topk) * 35,
+            1 => (i * 17) % experts,
+            else => if ((i / topk) % 11 == 0) 280 + i % topk else i % topk,
+        });
+        const slots = mlx.mlx_array_new_data(&ids, &.{rows * topk}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(slots);
+        const reference = try clampedSortedReference(s, x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], slots, v[9], topk, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(reference);
+        const actual = try moeSwigluClamped(s, x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], slots, v[9], topk, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(actual);
+        var ref32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref32);
+        var got32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got32);
+        try mlx.check(mlx.mlx_astype(&ref32, reference, .float32, s));
+        try mlx.check(mlx.mlx_astype(&got32, actual, .float32, s));
+        try std.testing.expectEqualSlices(u8, try gemvOutBytes(ref32), try gemvOutBytes(got32));
+    }
+}
+
+test "exl3 GLM GPU windows preserve 288 expert bytes at all 2 to 4 bpw rates" {
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    var n: u32 = 32;
+    while (n <= 64) : (n += 2) try clampedGpuWindowBytes(128, 128, n);
+}
+
+test "exl3 GLM GPU windows preserve 288 expert production width bytes" {
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    try clampedGpuWindowBytes(4096, 2048, 36);
 }

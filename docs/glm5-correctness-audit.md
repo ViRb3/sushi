@@ -121,3 +121,18 @@ Independent source comparisons pass for the new mode at 33 tokens, cached 17/1/1
 predeclared absolute/relative bounds apply; this is not a claim of equivalence to the absorbed arm.
 Pure eligibility checks also cover disabled mode, decode/verify widths, unsupported dtype/head width
 and the context boundary. Full-model quality and throughput must be measured before enabling it by default.
+
+## Clamped EXL3 prefill metadata
+
+Aligned clamped prefill now reuses the GPU expert-window builder for banks with at most 512 experts.
+It eliminates the host readback of sorted routing IDs; the stride fallback and final scatter/reduction
+order are unchanged. The extra inverse-routing output is not needed by this path and is released.
+Unused window capacity has zero start/live entries, and GEMM skips those windows before indexing rows.
+The one-time runtime engagement message is suppressed in unit tests.
+
+Regression evidence compares valid window starts and live counts exactly against the previous host
+builder for 288 experts, sparse/all-expert/skewed routing, boundary row counts and two window sizes.
+Padded entries are checked explicitly. End-to-end BF16 output bytes match the staged host-table
+reference at all 17 supported rates from 2 through 4 bpw with 288 experts, and at the real 4096/2048
+projection widths with K2.25/W12. Each end-to-end case exercises sparse, all-expert and skewed routes.
+This establishes unchanged arithmetic for those cases; any throughput gain requires a separate measurement.
