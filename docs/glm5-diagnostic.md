@@ -5,8 +5,8 @@ It does not register GLM with the public server. The test is skipped unless
 `SUSHI_GLM_DIAGNOSTIC_MODEL` is set. Run a full model only in an exclusive GPU slot,
 after the tiny native layer and model lifecycle fixtures pass.
 
-The dedicated loader requires the checkpoint's index and config. It loads only
-index-owned text tensors, excludes vision and MTP (including layer indices beyond
+The dedicated loader requires the checkpoint's index and config. The gated runner validates EXL3 shard stamps and complete bank geometry before
+loading arrays. The loader reads only index-owned text tensors, excludes vision and MTP (including layer indices beyond
 `num_hidden_layers`), and preserves BF16, FP32, F16 and integer storage exactly.
 Filtering occurs before tensor evaluation. The report counts actual retained
 array bytes and records the configured expert rate/window; the directory name is
@@ -61,3 +61,8 @@ are recorded independently.
 Tiny regression tests cover dtype/value preservation, indexed ownership,
 vision/MTP exclusion, missing indexed tensors, and exact prompt-ID selection.
 The full-model test is a separate gated run, not part of those fixture results.
+
+Decoded output is a JSON string when its bytes form valid UTF8. A fixed-length
+run can end inside a multi-byte character; in that case `output_text` is null,
+`output_text_utf8_valid` is false, and `output_bytes` preserves the exact bytes
+as a numeric JSON array. Valid output also includes the raw byte array.

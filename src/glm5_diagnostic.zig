@@ -193,6 +193,38 @@ test "GLM diagnostic prompt keeps exact supplied prefix and rejects invalid IDs"
     try std.testing.expectError(error.InvalidGlmPrompt, readPromptIds(a, "[10]", 1, 10));
 }
 
+const ByteArray = struct {
+    bytes: []const u8,
+    pub fn jsonStringify(self: ByteArray, writer: anytype) !void {
+        try writer.beginArray();
+        for (self.bytes) |byte| try writer.write(byte);
+        try writer.endArray();
+    }
+};
+const DecodedOutput = struct { output_text: ?[]const u8, output_bytes: ByteArray, output_text_utf8_valid: bool };
+fn decodedOutput(bytes: []const u8) DecodedOutput {
+    const valid = std.unicode.utf8ValidateSlice(bytes);
+    return .{ .output_text = if (valid) bytes else null, .output_bytes = .{ .bytes = bytes }, .output_text_utf8_valid = valid };
+}
+
+test "GLM diagnostic output JSON text is a string with byte fallback" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "hi", &.{ 0xe4, 0xb8 } }) |bytes| {
+        const raw = try std.json.Stringify.valueAlloc(a, decodedOutput(bytes), .{});
+        defer a.free(raw);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        const text = parsed.value.object.get("output_text").?;
+        if (std.unicode.utf8ValidateSlice(bytes)) {
+            try std.testing.expect(text == .string);
+            try std.testing.expectEqualStrings(bytes, text.string);
+        } else try std.testing.expect(text == .null);
+        const raw_bytes = parsed.value.object.get("output_bytes").?;
+        try std.testing.expect(raw_bytes == .array);
+        for (raw_bytes.array.items, bytes) |item, byte| try std.testing.expectEqual(@as(i64, byte), item.integer);
+    }
+}
+
 fn greedy(logits: Arr, s: mlx.mlx_stream) !u32 {
     var finite = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(finite);
@@ -254,6 +286,9 @@ test "GLM native diagnostic real model" {
     var cfg = try model.parseConfig(io, a, path);
     defer cfg.deinit(a);
     if (!cfg.isGlm5()) return error.InvalidGlmConfig;
+    if (cfg.expert_layout != .exl3_k4) return error.UnsupportedGlmDiagnosticLayout;
+    try writeJson(io, a, progress, .{ .phase = "preflight", .complete = false });
+    try @import("mimo_source.zig").validateExl3Pack(io, a, path, &cfg);
     const tokenizer = @import("tokenizer.zig");
     var tok = try tokenizer.loadTokenizer(io, a, path);
     defer tok.deinit();
@@ -355,7 +390,8 @@ test "GLM native diagnostic real model" {
     };
     var decode_layer_ns = request.layer_ns;
     for (&decode_layer_ns, prefill_layer_ns) |*total, prefill| total.* -= prefill;
+    const decoded = decodedOutput(text);
     var rate_buf: [32]u8 = undefined;
-    try writeJson(io, a, out, .{ .complete = true, .model = path, .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = wired_limit, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = text, .warmup_count = warmup, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .profile_enabled = profile, .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 attention cache; FP32 KDA state", .public_serving_enabled = false });
+    try writeJson(io, a, out, .{ .complete = true, .model = path, .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = wired_limit, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = decoded.output_text, .output_bytes = decoded.output_bytes, .output_text_utf8_valid = decoded.output_text_utf8_valid, .warmup_count = warmup, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .profile_enabled = profile, .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 attention cache; FP32 KDA state", .public_serving_enabled = false });
     try writeJson(io, a, progress, .{ .phase = "complete", .complete = true });
 }
