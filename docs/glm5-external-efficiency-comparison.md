@@ -7,7 +7,7 @@ guards prevent treating them as drop-in faster versions of this engine.
 
 ## Scope and provenance
 
-Read-only source study on 2026-10-02. No external engine was executed, no model was loaded, and no GPU
+Read-only source study on 2026-10-02; storage/loading clarification on 2026-10-03. No external engine was executed, no model was loaded, and no GPU
 benchmark was run for this report. Reachability below means that the caller and eligibility checks were
 inspected; it is not an assertion that a particular external deployment logged kernel engagement.
 The actual target's tensor headers were inspected to resolve format-dependent guards.
@@ -33,10 +33,23 @@ mixed dense/quantized modules, and `_build_decode_groups` requires every input p
 The lower-level `decode_kernels.kda_decode_step` can accept precomputed `a_pre` and `gate_pre`; adapting
 that primitive to separate input buffers avoids both requantization and large resident copies.
 
-**HC has another guard.** oMLX's `hc_mix` and `hc_defer_supported` require FP32 HC projection weights.
-The target retains BF16 `hc_attn_fn`/`hc_ffn_fn`, while their scales and bases are FP32. Its deferred path
-also requires the NAX relaxed-FP32-matmul policy. A port must support BF16 weight reads with explicit
-FP32 widening and match Sushi's current HC arithmetic; simply enabling the upstream wrapper is insufficient.
+**Stored dtype and loaded dtype differ.** The target stores routed `mlp.gate.weight` as BF16
+`[288,4096]` and `e_score_correction_bias` as FP32 `[288]`; `moe_router_dtype=float32` describes compute,
+not checkpoint storage. oMLX's `moe_router_logits` requires FP32 weight and bias, but its normal loading
+path can satisfy that guard: container `Model.sanitize` calls `LanguageModel.sanitize`, which explicitly
+upcasts router weights and correction biases to FP32. `glm5_next_cast_predicate` protects them from later
+downcasting. Therefore the raw BF16 checkpoint does not by itself establish an oMLX router fallback.
+Sushi preserves storage and must read BF16 weights with FP32 products/accumulation to reuse this fusion
+without introducing a persistent widened weight array. A real diagnostic engagement counter caught the
+initial FP32-storage-only adaptation doing zero fused router calls; successful numerical fallback alone
+was not evidence of engagement.
+
+**HC needs the same storage distinction.** `hc_mix` and `hc_defer_supported` require FP32 HC projection
+weights. The target stores BF16 `hc_attn_fn`/`hc_ffn_fn`, with FP32 scales/bases, but oMLX's same sanitizer
+upcasts both remapped HC namespaces before execution. Its deferred path also requires the NAX
+relaxed-FP32-matmul policy. Direct reuse under Sushi's storage-preserving loader still needs BF16 reads
+with explicit FP32 widening and parity with the current HC arithmetic; the guard is not evidence that
+normal oMLX loading leaves this path disabled.
 
 **Expert kernels are format-specific.** oMLX's two-dispatch MoE path accepts affine `SwitchGLU` weights,
 including a compatible shared expert. It cannot decode this EXL3 bitstream. ds4's documented GLM Q2 pack
@@ -149,12 +162,15 @@ just to reproduce a CUDA path: at equal precision the K/V storage ratio is
 
 ### 4. Fuse routing arithmetic and the shared-expert finish without changing EXL3 math
 
-Current `glm5_forward.route` has separate FP32 logits, sigmoid, correction bias, partition, gather,
-normalization and scale operations. oMLX has a fused logits/sigmoid/bias primitive, then optional selection
-inside its affine gate/up kernel. The latter is not applicable to EXL3 without a new reader. Its selected
-route order must also not be assumed identical to Sushi's `argpartition` order.
+The reviewed `glm5_forward.route` has separate FP32 logits, sigmoid, correction bias, partition, gather,
+normalization and scale operations; the router weight itself is stored BF16. oMLX has a fused
+logits/sigmoid/bias primitive whose FP32-weight guard is reached after its sanitizer widens that tensor,
+then optional selection inside its affine gate/up kernel. The latter is not applicable to EXL3 without a
+new reader. Its selected route order must also not be assumed identical to Sushi's `argpartition` order.
 
-Start by fusing only logits/sigmoid/bias while retaining current selection and normalization. Validate
+Fuse only logits/sigmoid/bias initially, reading retained BF16 weights and widening products to FP32,
+while retaining current selection and normalization. Record actual fused-call counts: a zero count can
+hide a storage-dtype rejection behind a correct fallback. Validate
 selected IDs, their order and normalized scores, including ties. Different slot order changes the final
 floating-point expert reduction even when the expert set is identical.
 
@@ -215,7 +231,7 @@ All paths below are repository-relative at the revisions above.
 | Repository | Symbols and files inspected |
 |---|---|
 | Sushi | `KdaLayer.apply`, `Hc.collapse` in `src/glm5_model.zig`; `Mla.applyMode`, `route`, `Model.forwardLast` in `src/glm5_forward.zig`; `indexScores`, `attentionChunk`, `attend` in `src/glm5_attention.zig`; `qkv` in `src/glm5_decode.zig`; clamped decode/prefill in `src/exl3/expert_exl3_kernels.zig` |
-| oMLX model | `Glm5NextLinearAttention._fused_in_proj`, `_build_decode_groups`, `_decode_step`, `__call__`; `Glm5NextSparseAttention._forward`; `Glm5NextIndexer.__call__`; `Glm5NextMoE._decode_select`, `_decode_experts`; `Glm5NextDecoderLayer._decode_deferred`; `Glm5NextModel.__call__`, all in `omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py` |
+| oMLX model | `Glm5NextLinearAttention._fused_in_proj`, `_build_decode_groups`, `_decode_step`, `__call__`; `Glm5NextSparseAttention._forward`; `Glm5NextIndexer.__call__`; `Glm5NextMoE._decode_select`, `_decode_experts`; `Glm5NextDecoderLayer._decode_deferred`; `Glm5NextModel.__call__`, `LanguageModel.sanitize`, `glm5_next_cast_predicate`, all in `omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py` |
 | oMLX kernels | `kda_decode_step`, `hc_mix`, `hc_defer_supported`, `hc_pre_fused`, `hc_post_mm`, `dsa_decode_scores`, `multi_qmv` in `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py`; `glm53_kda_prefill_eligible`/`glm53_kda_prefill` in `omlx/patches/glm53_kda_prework.py`; `_percore`/`kda_recurrence` in `omlx/patches/glm53_kda_recurrence.py`; `indexer_scores_nax`/`sparse_mla_attention_nax` in `omlx/patches/glm_moe_dsa/{indexer_nax,sparse_mla_nax}.py`; `omlx/utils/layer_pipeline.py` |
 | ds4 | `glm53_graph_kda_attention[_rows]`, `glm53_graph_hc_pre`, `glm_graph_forward_token`, `glm_graph_dense_compact_attention_limit`, `glm53_graph_native_session_batch_supported` in `ds4.c`; `ds4_gpu_glm53_kda_decode`, `ds4_gpu_glm53_kda_prefill`, command-buffer helpers in `ds4_metal.m`; `metal/glm53_kda.metal`; GLM pack/mode section of `README.md` |
 | TensorFold | `kda_block`, `dsa_block`, `layer_forward`, `Buffers`, `State` in `src/tensorfold/families/glm5_next/cuda/forward.py`; `chain` in `kda.py`; `Graphs` in `graphs.py`; `Engine.forward`, `serial_decode` in `decode.py`; application construction in `engine.py`; `qmm.py`, `exl3_mm.py`, `weights.py`, `attention.py`, `sparse.py`, `glue.py` in the same directory |
