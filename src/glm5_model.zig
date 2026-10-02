@@ -167,13 +167,13 @@ pub const Ops = struct {
 
     pub fn qmm(self: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr, transposed: bool) !Arr {
         const out = try self.slot();
-        try mlx.check(mlx.mlx_quantized_matmul(out, x, w, scales, biases, transposed, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(8), "affine", self.s));
+        try mlx.check(mlx.mlx_quantized_matmul(out, x, w, scales, biases, transposed, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(try storedAffineBits(w, scales, biases)), "affine", self.s));
         return out.*;
     }
 
     pub fn dequant(self: *Ops, w: Arr, scales: Arr, biases: Arr) !Arr {
         const out = try self.slot();
-        try mlx.check(mlx.mlx_dequantize(out, w, scales, biases, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, self.s));
+        try mlx.check(mlx.mlx_dequantize(out, w, scales, biases, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(try storedAffineBits(w, scales, biases)), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, self.s));
         return out.*;
     }
 
@@ -196,6 +196,26 @@ pub const Ops = struct {
     }
 };
 
+/// Read affine precision from stored grids, including sliced MLA/embedding tensors.
+/// The GLM packs supported here retain BF16 scale/bias grids with group size128.
+pub fn storedAffineBits(w: Arr, scales: Arr, biases: Arr) !c_int {
+    if (w.ctx == null or scales.ctx == null or biases.ctx == null or mlx.mlx_array_dtype(w) != .uint32 or
+        mlx.mlx_array_dtype(scales) != .bfloat16 or mlx.mlx_array_dtype(biases) != .bfloat16) return error.InvalidGlmAffine;
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(scales);
+    if (ws.len < 2 or ws.len != ss.len or !std.mem.eql(c_int, ss, mlx.getShape(biases)) or
+        !std.mem.eql(c_int, ws[0 .. ws.len - 1], ss[0 .. ss.len - 1])) return error.InvalidGlmAffine;
+    for (ws) |d| if (d <= 0) return error.InvalidGlmAffine;
+    const groups = ss[ss.len - 1];
+    if (groups <= 0) return error.InvalidGlmAffine;
+    const packed_bits = @as(u64, @intCast(ws[ws.len - 1])) * 32;
+    const width = @as(u64, @intCast(groups)) * 128;
+    if (packed_bits % width != 0) return error.InvalidGlmAffine;
+    const bits = packed_bits / width;
+    if (bits != 6 and bits != 8) return error.InvalidGlmAffine;
+    return @intCast(bits);
+}
+
 pub const Linear = struct {
     w: Arr,
     scales: Arr = .{ .ctx = null },
@@ -207,12 +227,13 @@ pub const Linear = struct {
         var buf: [256]u8 = undefined;
         const w = weights.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{base})) orelse return error.MissingGlmWeight;
         const shape = mlx.getShape(w);
-        if (shape.len != 2 or input == 0 or shape[0] <= 0) return error.InvalidGlmLinear;
+        if (shape.len != 2 or input == 0 or input > std.math.maxInt(c_int) or shape[0] <= 0) return error.InvalidGlmLinear;
         if (mlx.mlx_array_dtype(w) == .uint32) {
             const sc = weights.get(try std.fmt.bufPrint(&buf, "{s}.scales", .{base})) orelse return error.MissingGlmWeight;
             const bias = weights.get(try std.fmt.bufPrint(&buf, "{s}.biases", .{base})) orelse return error.MissingGlmWeight;
             const grid = [_]c_int{ shape[0], @intCast(input / 128) };
-            if (input % 128 != 0 or shape[1] != @as(c_int, @intCast(input / 4)) or
+            const bits = storedAffineBits(w, sc, bias) catch return error.InvalidGlmLinear;
+            if (input % 128 != 0 or @as(u64, @intCast(shape[1])) * 32 != @as(u64, input) * @as(u64, @intCast(bits)) or
                 !std.mem.eql(c_int, &grid, mlx.getShape(sc)) or !std.mem.eql(c_int, &grid, mlx.getShape(bias)) or
                 mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bias) != .bfloat16) return error.InvalidGlmLinear;
             return .{ .w = w, .scales = sc, .biases = bias, .input = @intCast(input), .output = shape[0] };
@@ -941,4 +962,53 @@ test "GLM KDA prework integration preserves whole layer and state bits" {
             start += rows;
         }
     }
+}
+
+test "GLM model A6 stored projection transpose and embedding rows preserve geometry" {
+    const a = std.testing.allocator;
+    const stream = mlx.gpuStream();
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    var codes: [4 * 24]u32 = @splat(0);
+    var values: [4 * 128]f32 = undefined;
+    for (&values, 0..) |*v, i| {
+        const code: u32 = @intCast((i + i / 128) % 64);
+        const shift: u5 = @intCast((i * 6) % 32);
+        codes[i * 6 / 32] |= code << shift;
+        if (shift > 26) codes[i * 6 / 32 + 1] |= code >> @as(u5, @intCast(32 - @as(u32, shift)));
+        v.* = @as(f32, @floatFromInt(code)) * 0.125 - 1;
+    }
+    const scales: [4]u16 = @splat(0x3e00);
+    const biases: [4]u16 = @splat(0xbf80);
+    try weights.map.put(try a.dupe(u8, "p.weight"), mlx.mlx_array_new_data(&codes, &[_]c_int{ 4, 24 }, 2, .uint32));
+    try weights.map.put(try a.dupe(u8, "p.scales"), mlx.mlx_array_new_data(&scales, &[_]c_int{ 4, 1 }, 2, .bfloat16));
+    try weights.map.put(try a.dupe(u8, "p.biases"), mlx.mlx_array_new_data(&biases, &[_]c_int{ 4, 1 }, 2, .bfloat16));
+    const linear = try Linear.load(&weights, "p", 128);
+    var ops = Ops{ .s = stream };
+    defer ops.deinit();
+    try std.testing.expectEqual(@as(c_int, 6), try storedAffineBits(linear.w, linear.scales, linear.biases));
+    const dense = try ops.dequant(linear.w, linear.scales, linear.biases);
+    const densef = try ops.cast(dense, .float32);
+    try mlx.check(mlx.mlx_array_eval(densef));
+    try std.testing.expectEqualSlices(f32, &values, mlx.mlx_array_data_float32(densef).?[0..values.len]);
+    const x = try ops.ones(&.{ 1, 2, 128 }, .bfloat16);
+    const y = try ops.cast(try linear.apply(&ops, x), .float32);
+    try mlx.check(mlx.mlx_array_eval(y));
+    for (mlx.mlx_array_data_float32(y).?[0..8]) |v| try std.testing.expectEqual(@as(f32, 376), v);
+    const xt = try ops.ones(&.{ 1, 4 }, .bfloat16);
+    const yt = try ops.cast(try ops.qmm(xt, linear.w, linear.scales, linear.biases, false), .float32);
+    const ref = try ops.cast(try ops.binary(.mm, xt, dense), .float32);
+    try mlx.check(mlx.mlx_array_eval(yt));
+    try mlx.check(mlx.mlx_array_eval(ref));
+    try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(ref).?[0..128], mlx.mlx_array_data_float32(yt).?[0..128]);
+    const ids = try ops.own(mlx.mlx_array_new_data(&[_]u32{ 3, 1 }, &.{ 1, 2 }, 2, .uint32));
+    const selected = try ops.dequant(try ops.take(linear.w, ids, 0), try ops.take(linear.scales, ids, 0), try ops.take(linear.biases, ids, 0));
+    const expected = try ops.take(dense, ids, 0);
+    try mlx.check(mlx.mlx_array_eval(selected));
+    try mlx.check(mlx.mlx_array_eval(expected));
+    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..256], mlx.mlx_array_data_bfloat16(selected).?[0..256]);
+    try std.testing.expectError(error.InvalidGlmLinear, Linear.load(&weights, "p", 256));
+    try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(try ops.zeros(&.{ 4, 25 }, .uint32), linear.scales, linear.biases));
+    try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(try ops.zeros(&.{ 4, 16 }, .uint32), linear.scales, linear.biases));
+    try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(linear.w, linear.scales, try ops.zeros(&.{ 4, 2 }, .bfloat16)));
 }

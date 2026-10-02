@@ -102,7 +102,7 @@ pub const Mla = struct {
         const latent: c_int = @intCast(cfg.mla_kv_lora_rank);
         if (kvb.output != h * (kd + vd)) return error.InvalidGlmMlaWeight;
         const quant = kvb.scales.ctx != null;
-        const w = try prep.reshape(kvb.w, &.{ h, kd + vd, if (quant) @divExact(latent, 4) else latent });
+        const w = try prep.reshape(kvb.w, &.{ h, kd + vd, if (quant) mlx.getShape(kvb.w)[1] else latent });
         const wk = try prep.contiguous(try prep.slice(w, 1, 0, kd));
         const wv = try prep.contiguous(try prep.slice(w, 1, kd, kd + vd));
         var sk: Arr = .{ .ctx = null };
@@ -751,6 +751,10 @@ test "GLM complete diagnostic forward advances and resets request state" {
 }
 
 fn mlaOrientationFixture(weights: *model.Weights) !model.ModelConfig {
+    return mlaOrientationFixtureBits(weights, 8);
+}
+
+fn mlaOrientationFixtureBits(weights: *model.Weights, bits: c_int) !model.ModelConfig {
     const cfg = model.ModelConfig{ .hidden_size = 128, .mla_q_lora_rank = 128, .mla_kv_lora_rank = 128, .mla_qk_nope_head_dim = 128, .mla_v_head_dim = 128, .num_attention_heads = 2, .indexer_n_heads = 2, .indexer_head_dim = 128 };
     for ([_][]const u8{ "q_a_proj.weight", "kv_a_proj_with_mqa.weight", "indexer.wk.weight" }) |name| try fixtureTensor(weights, "mla", name, &.{ 128, 128 }, .bfloat16, false);
     for ([_][]const u8{ "q_b_proj.weight", "indexer.wq_b.weight" }) |name| try fixtureTensor(weights, "mla", name, &.{ 256, 128 }, .bfloat16, false);
@@ -773,8 +777,17 @@ fn mlaOrientationFixture(weights: *model.Weights) !model.ModelConfig {
         const b: f32 = -@as(f32, @floatFromInt(i % 3)) / 64;
         bias.* = @truncate(@as(u32, @bitCast(b)) >> 16);
     }
+    if (bits == 6) {
+        @memset(&codes, 0);
+        for (0..512 * 128) |i| {
+            const value: u32 = @intCast(1 + (i / 4) % 7 + i % 4);
+            const shift: u5 = @intCast((i * 6) % 32);
+            codes[i * 6 / 32] |= value << shift;
+            if (shift > 26) codes[i * 6 / 32 + 1] |= value >> @as(u5, @intCast(32 - @as(u32, shift)));
+        }
+    }
     const a = std.testing.allocator;
-    try weights.map.put(try a.dupe(u8, "mla.kv_b_proj.weight"), mlx.mlx_array_new_data(&codes, &[_]c_int{ 512, 32 }, 2, .uint32));
+    try weights.map.put(try a.dupe(u8, "mla.kv_b_proj.weight"), mlx.mlx_array_new_data(&codes, &[_]c_int{ 512, bits * 4 }, 2, .uint32));
     try weights.map.put(try a.dupe(u8, "mla.kv_b_proj.scales"), mlx.mlx_array_new_data(&scales, &[_]c_int{ 512, 1 }, 2, .bfloat16));
     try weights.map.put(try a.dupe(u8, "mla.kv_b_proj.biases"), mlx.mlx_array_new_data(&biases, &[_]c_int{ 512, 1 }, 2, .bfloat16));
     return cfg;
@@ -1330,4 +1343,31 @@ test "GLM bounded prefill schedules preserve cache bits and reject invalid inter
         try std.testing.expectEqual(@as(usize, 0), request.offset);
         try std.testing.expect(!request.failed);
     }
+}
+
+test "GLM MLA A6 stored affine kv rows preserve both projection orientations" {
+    const s = mlx.gpuStream();
+    var weights = model.Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    const cfg = try mlaOrientationFixtureBits(&weights, 6);
+    var layer = try Mla.load(&weights, "mla", &cfg, s);
+    defer layer.deinit();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const kvb = try linear(&weights, "mla", "kv_b_proj", 128);
+    const dense = try ops.reshape(try ops.dequant(kvb.w, kvb.scales, kvb.biases), &.{ 2, 256, 128 });
+    const dk = try ops.slice(dense, 1, 0, 128);
+    const dv = try ops.slice(dense, 1, 128, 256);
+    var input: [2 * 2 * 128]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i % 9)) - 4) / 32;
+    const x = try ops.cast(try ops.own(mlx.mlx_array_new_data(&input, &[_]c_int{ 2, 2, 1, 128 }, 4, .float32)), .bfloat16);
+    const key_quant = try ops.cast(try ops.qmm(x, layer.wk, layer.sk, layer.bk, false), .float32);
+    const key_dense = try ops.cast(try ops.binary(.mm, x, dk), .float32);
+    const value_quant = try ops.cast(try ops.qmm(x, layer.wv, layer.sv, layer.bv, true), .float32);
+    const value_dense = try ops.cast(try ops.binary(.mm, x, try ops.transpose(dv, &.{ 0, 2, 1 })), .float32);
+    for ([_]Arr{ key_quant, key_dense, value_quant, value_dense }) |v| try mlx.check(mlx.mlx_array_eval(v));
+    try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(key_dense).?[0..512], mlx.mlx_array_data_float32(key_quant).?[0..512]);
+    try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(value_dense).?[0..512], mlx.mlx_array_data_float32(value_quant).?[0..512]);
+    try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(layer.wk));
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(layer.sk));
 }

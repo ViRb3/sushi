@@ -117,3 +117,19 @@ A warmed 100-pair alternating AB/BA microbenchmark, with one evaluation for the 
 set in both arms, measured four rows at 282.98 microseconds serial versus232.75 batched.
 This is a routing-component result, not end-to-end speculative speed. The timing-only binary
 avoids filling the configuration cache with unrelated correctness-test cases before measuring.
+
+
+## Stored A6 and A8 trunk grids
+
+Native linear loading and `Ops` affine matmul/dequantization infer 6 or 8 bits
+from packed weight and BF16 group128 grids. They validate matrix/grid geometry
+against the declared input width. Selected embedding rows and sliced per-head
+MLA key/value banks retain their packed storage; MLA reshape uses the stored
+packed width instead of assuming four weights per U32. Retained BF16/FP32
+tensors keep the dense path. No weights are requantized or expanded at load time.
+
+A6 regressions independently pack nonzero six-bit coefficients, verify dequantized
+values, forward/transposed matmul and gathered embedding rows, and reject malformed
+grids or unsupported widths. MLA tests cover both absorbed-key and value projection
+orientations with nonzero A6 banks. Runtime measurements for the A6 trunk are
+separate from historical A8 trunk results.

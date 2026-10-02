@@ -2,7 +2,9 @@
 
 Status: active implementation, 2026-10-03. The native diagnostic runs the full text checkpoint and
 produces coherent English. The active folder is `GLM-5.3-Flash-Sushi-2.4bpw`; its expert metadata is
-K2.25/W12, with affine8 group128 trunk. Quantization does not need restarting.
+K2.25/W12, with affine8 group128 trunk. Quantization does not need restarting. The additional `GLM-5.3-Flash-Sushi-2.3bpw`
+pack is under measurement: it keeps K2.25/W12 experts and uses an affine6 group128 trunk.
+The selected DFlash2 assistant is A6g128; BF16 assistant runs are historical baselines.
 The public served architecture remains unsupported until the integration gates below pass.
 Completed components and measurements are in [the architecture document](arch-glm5-next.md).
 The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),
