@@ -285,3 +285,72 @@ Timing binary SHA-256:
 `a38386598412ab7e1420196fb1f95bcd7c1f7c807cac3048fa4918e99abdb674`.
 The run held an exclusive GPU lock, used interactive QoS, requested maximum fans,
 and idled ten seconds at 49.84°C before timing; lock/fan cleanup completed.
+
+## Half4 composition and N2 qualification
+
+The candidate now composes with the qualified lane-ordered gate/up preparation
+and staged lane-down preparation. Singleton and paired paths load the same four
+F16 values through half4 reads, then retain the original independent FMAs and
+r-then-simdgroup reduction. All seventeen rates and production-width projection
+tests passed, followed by exact real-weight routed-chain comparisons.
+
+Three-row cases below replay the first three rows of the existing captured N3
+routes. They are not a fresh route capture from the newer N2/2.3bpw configuration.
+The comparison explicitly enabled and verified the lane-pair and lane-down
+baseline. Both variants group all three projections; numbers are warm-bank
+routed-chain medians in microseconds.
+
+| Layer | Rows | Baseline lane+down | Grouped 8 KiB parallel | Grouped 4 KiB serial |
+|---:|---:|---:|---:|---:|
+| 3 | 3 | 639.19 | 640.40 | 631.89 |
+| 20 | 3 | 716.30 | 580.65 | 573.12 |
+| 34 | 3 | 726.15 | 606.08 | 577.51 |
+| 3 | 4 | 784.05 | 782.55 | 776.12 |
+| 20 | 4 | 847.38 | 726.05 | 725.92 |
+| 34 | 4 | 846.28 | 676.64 | 708.97 |
+
+The three-row serial-member variant reduces the middle/high cases by 19.99% and
+20.47%, with ten or eleven paired wins out of eleven; the low-overlap case is
+essentially flat. Another worker reported a brief approximately 0.1-second
+CPU-only tokenizer hash during this microbenchmark window. No GPU/build overlap
+was reported, but treat the component timing as provisional rather than fully
+isolated evidence. The subsequent full-checkpoint run provides the stronger gate.
+
+`SUSHI_GLM_DFLASH_GROUP2=1` opts the DFlash FFN adapter into the serial-member,
+4 KiB, half4 variant. It is **off by default**. Eligibility is deliberately narrow:
+3–4 BF16 verification rows, hidden/intermediate widths 4096/2048, top-k eight,
+clamp ten, MCG/W12 and K2.25 gate rate. Complete bank validation remains required;
+unsupported cases use the existing routed path. One-row dispatch remains unchanged.
+The diagnostic reports `group2_batches` to prove engagement. A production-width
+integration smoke matched the baseline and independent serial-row FFN outputs.
+
+One full N2 qualification used the newer Sushi-2.3bpw target, A6/group128 assistant,
+lane-pair/down enabled, async layer group four, the same 512-token captured prefix,
+chunk 128 and 64 committed-token accounting as the preceding N2 baseline.
+
+| Measure | Group-two qualification |
+|---|---:|
+| Speculative committed-token rate | **45.4485 tok/s** |
+| Prior N2 baseline sample | 42.4344 tok/s |
+| Change versus prior sample | +7.10% |
+| Same-run matched serial | 31.4159 tok/s |
+| Speculative / matched serial | 1.44667 |
+| Rounds / accepted drafts / verified rows | 24 / 40 / 72 |
+| Group-two / FFN / batched router calls | 1008 / 1008 / 1008 |
+| Decode-phase peak | 94.979 GB |
+
+All 64 output IDs and complete final target state matched the serial oracle;
+IDs also matched the preceding N2 sample. Draft/verify/replay/commit totals were
+146.25 / 1201.90 / 42.32 / 16.73 ms. This crosses the revised 45 tok/s decode goal
+in one short run, with limited margin. Repeat and broader-prompt qualification
+remain necessary before treating it as a stable floor or enabling it by default.
+Captured chunk-128 prefill was 366.81 tok/s; this is separate from native dense
+prefill, and this run does not establish the revised 1,200 tok/s prefill goal.
+
+Implementation commits are `89632167` (standalone) and `ba106e5e` (composition and
+opt-in FFN adapter). Private artifact `glm53-group2-20261003` retains composition
+samples and `qualification-n2` settings/results. Qualification binary SHA-256:
+`af011353940b06945df3a2e99d045af873392d94a68b614a58fc71fcb736f071`.
+The build/run provenance records concurrent unrelated KLD source work rather
+than claiming a wholly clean checkout. The exclusive full-model process passed
+its gate, restored fan auto and released the GPU directly to teacher capture.
