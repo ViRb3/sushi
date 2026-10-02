@@ -167,6 +167,36 @@ The gate remains off pending a real-model comparison. Pair-kernel and routed-cha
 separate `lanePairCalls` and `lanePairChainCalls` counters. The standalone parity and timing tests
 are gated by `SUSHI_GLM_LANE_PAIR_TEST` and `SUSHI_GLM_LANE_PAIR_BENCH` respectively.
 
+### GLM opt-in lane-ordered down input
+
+`SUSHI_GLM_DOWN_LANE=1` selects an experimental separate clamped middle preparation followed by a
+lane-ordered cooperative down projection. It is off by default. It is restricted to BF16-output
+clamped decode with equal-rate MCG/W12 gate/up/down banks; all unsupported cases retain the existing
+path. The middle keeps its original clamps, Hadamard arithmetic and F16 store. Only the stored lane
+layout and the down kernel's four input loads change. Accumulator and final reduction order remain
+unchanged. The comparison also tested an uncalled version that permutes the fused middle's
+threadgroup buffer and uses threadgroup `half4` loads, preserving its single dispatch.
+
+All 17 rates and production 2048→4096 geometry passed exact F16 comparisons between all four arms.
+The integrated full clamped MoE chain also matched BF16 bits at every rate and production rows
+1, 3, 4, 7 and 16.
+The warmed experiment used three palindrome warmup rounds and forty samples per arm, an exclusive
+GPU lock, foreground QoS, ten seconds idle and paused workers. Fan maximum was requested but RPM
+confirmation was unavailable; initial maximum temperature was about 50°C.
+
+| Rows | Original separate | Original fused | Lane separate | Lane fused |
+|---:|---:|---:|---:|---:|
+| 1 | 247.416 µs | 237.708 µs | 221.750 µs | 224.125 µs |
+| 4 | 478.834 µs | 421.417 µs | 359.167 µs | 408.208 µs |
+| 8 | 803.750 µs | 691.667 µs | 619.708 µs | 654.458 µs |
+| 16 | 1393.000 µs | 1173.542 µs | 1031.334 µs | 1104.625 µs |
+
+The separate lane layout won this component experiment, reducing time by about 10–15% versus the
+current policy (separate at one row, fused at multiple rows). It remains default-off until a real
+checkpoint confirms the benefit. These synthetic eight-expert component timings cannot predict cold
+bank traffic or full-model throughput. `downLaneCalls` reports integration engagement. Tests and
+benchmark are gated separately by `SUSHI_GLM_DOWN_LANE_TEST` and `SUSHI_GLM_DOWN_LANE_BENCH`.
+
 ### GLM 512-token window-height study: retain 32
 
 A separate untimed capture provided all 42 routed layers' 512-token/top-8 histograms. Every histogram
