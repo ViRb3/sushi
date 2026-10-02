@@ -209,3 +209,21 @@ results and an aggregate comparison. Binary SHA-256:
 `62401b3a9d09b54d18be993f65df29ed4b6fb57f0e85734e00d24916efc427f0`.
 Starting temperatures ranged45.4–56.0°C; the same fan/cooldown protocol was used.
 No public cache or assistant default changed.
+
+
+## Diagnostic prefill controls
+
+The gated diagnostic now exposes `SUSHI_GLM_DFLASH_DENSE_PREFILL` and
+`SUSHI_GLM_DFLASH_PREFILL_ASYNC`, both off by default, plus
+`SUSHI_GLM_DFLASH_PREFILL_SYNC_LAYERS` (1–8, default2). They configure the request
+before warmup and captured prefill; reset and cloned serial reference preserve
+these settings. JSON records all three. These are independent of verifier
+`SUSHI_GLM_DFLASH_ASYNC_LAYERS`; no public cache or scheduler default changes.
+A larger sync interval is experimental, not presumed faster. Compare complete
+captured-prefix state and subsequent serial/spec decisions for each configuration.
+
+Private sweep scripts prepare A6 N2, N4 and N3/children1 arms against the existing
+N3/children4 lane+async4 baseline. They retain the original chunk128, staged
+captured-prefix settings for that acceptance sweep. Test dense/async prefill in
+a separate arm so prefix rounding changes cannot masquerade as an acceptance
+policy improvement. The scripts do not run automatically.

@@ -22,10 +22,13 @@ test "GLM DFlash request fork keeps rejected pool and recurrence state isolated"
     try mlx.check(mlx.mlx_array_set(&source.layers[0].recurrent.ssm_state, try ops.ones(&.{ 1, 1, 2, 2 }, .float32)));
     try mlx.check(mlx.mlx_array_set(&source.layers[0].recurrent.conv_state, try ops.ones(&.{ 1, 3, 6 }, .float32)));
     source.layers[0].recurrent.initialized = true;
+    source.dense_prefill = true;
+    source.prefill_async = true;
     source.prefill_sync_layers = 4;
     var branch = try cloneRequest(&source);
     defer branch.deinit();
     try std.testing.expectEqual(@as(u8, 4), branch.prefill_sync_layers);
+    try std.testing.expect(branch.dense_prefill and branch.prefill_async);
     _ = try branch.layers[0].attention.append(try ops.ones(&.{ 1, 4 }, .float32), try ops.zeros(&.{ 1, 2 }, .float32), try ops.zeros(&.{ 1, 2 }, .float32), ape, ops.s);
     try branch.layers[0].attention.evaluate();
     try mlx.check(mlx.mlx_array_set(&branch.layers[0].recurrent.ssm_state, try ops.zeros(&.{ 1, 1, 2, 2 }, .float32)));
