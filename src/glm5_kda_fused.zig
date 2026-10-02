@@ -400,3 +400,173 @@ pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
     calls += 1;
     return result;
 }
+
+var post_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var post_calls: usize = 0;
+pub fn postDispatchCount() usize {
+    return post_calls;
+}
+pub fn resetPostDispatchCount() void {
+    post_calls = 0;
+}
+
+pub fn post(s: mlx.mlx_stream, y: Arr, gate: Arr, norm: Arr, epsilon: f32) !?Arr {
+    if (!mlx.streamIsGpu(s) or !hardwareSupported() or y.ctx == null or gate.ctx == null or norm.ctx == null or !std.math.isFinite(epsilon) or epsilon <= 0) return null;
+    const sh = mlx.getShape(y);
+    if (sh.len != 4 or sh[0] != 1 or sh[1] <= 0 or sh[2] <= 0 or sh[3] != 128 or
+        !std.mem.eql(c_int, sh, mlx.getShape(gate)) or !std.mem.eql(c_int, &.{128}, mlx.getShape(norm)) or
+        mlx.mlx_array_dtype(y) != .bfloat16 or mlx.mlx_array_dtype(gate) != .bfloat16 or
+        (mlx.mlx_array_dtype(norm) != .bfloat16 and mlx.mlx_array_dtype(norm) != .float32)) return null;
+    const rows = std.math.mul(c_int, sh[1], sh[2]) catch return null;
+    const grid = std.math.mul(c_int, rows, 32) catch return null;
+    const mode = (try modes(s)) orelse return null;
+    if (post_kernel == null) {
+        const inputs = mlx.mlx_vector_string_new_data(&.{ "input", "gate", "weight", "eps" }, 4);
+        defer _ = mlx.mlx_vector_string_free(inputs);
+        const outputs = mlx.mlx_vector_string_new_data(&.{"out"}, 1);
+        defer _ = mlx.mlx_vector_string_free(outputs);
+        const source: [:0]const u8 =
+            \\const uint row = threadgroup_position_in_grid.x;
+            \\const uint lane = thread_index_in_simdgroup;
+            \\float x[4];
+            \\float total = 0.0f;
+            \\for (int e=0;e<4;e++) {
+            \\  x[e] = float(input[row*128 + 4*lane + e]);
+            \\  float square = x[e] * x[e];
+            \\  total = square + total;
+            \\}
+            \\total = simd_sum(total);
+            \\float variance = total * (1.0f / 128.0f);
+            \\float inv = glm_rsqrt<RSQ_F>(variance + eps[0]);
+            \\for (int e=0;e<4;e++) {
+            \\  const uint c = 4*lane + e;
+            \\  float normalized = x[e] * inv;
+            \\  float weighted = normalized * float(weight[c]);
+            \\  float sigmoid = glm_sigmoid<float,SIG_F>(float(gate[row*128+c]));
+            \\  out[row*128+c] = bfloat16_t(weighted * sigmoid);
+            \\}
+        ;
+        const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_kda_post", inputs, outputs, source, HEADER, true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        post_kernel = k;
+    }
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, sh.len, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, grid, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SIG_F", @intFromBool(mode.sig_f)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RSQ_F", @intFromBool(mode.rsq_f)));
+    const eps = mlx.mlx_array_new_data(&epsilon, &.{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(eps);
+    const inputs = mlx.mlx_vector_array_new_data(&.{ y, gate, norm, eps }, 4);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, post_kernel.?, inputs, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0));
+    post_calls += 1;
+    return out;
+}
+
+test "GLM KDA fused post preserves staged BF16 output at prefill widths" {
+    const Ops = @import("glm5_model.zig").Ops;
+    const stream = mlx.gpuStream();
+    for ([_]c_int{ 1, 17, 512 }) |rows| {
+        var ops = Ops{ .s = stream };
+        defer ops.deinit();
+        const heads: c_int = if (rows == 512) 64 else 3;
+        const shape = [_]c_int{ 1, rows, heads, 128 };
+        const key = try ops.slot();
+        try mlx.check(mlx.mlx_random_key(key, 791));
+        const y = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(y, &shape, 4, .bfloat16, 0, 0.7, key.*, stream));
+        const gate = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(gate, &shape, 4, .bfloat16, -0.3, 3, key.*, stream));
+        const norm = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(norm, &.{128}, 1, .bfloat16, 1, 0.2, key.*, stream));
+        const yf = try ops.cast(y.*, .float32);
+        const variance = try ops.reduce(try ops.binary(.mul, yf, yf), -1, true, true);
+        const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(1e-5, .float32)));
+        const normalized = try ops.binary(.mul, try ops.binary(.mul, yf, normalization), try ops.cast(norm.*, .float32));
+        const expected = try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, try ops.cast(gate.*, .float32))), .bfloat16);
+        const actual = try ops.own((try post(stream, y.*, gate.*, norm.*, 1e-5)) orelse return error.TestExpectedFusedPost);
+        try mlx.check(mlx.mlx_array_eval(actual));
+        try mlx.check(mlx.mlx_array_eval(expected));
+        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..mlx.mlx_array_size(expected)], mlx.mlx_array_data_bfloat16(actual).?[0..mlx.mlx_array_size(actual)]);
+    }
+}
+
+fn stagedPost(ops: *@import("glm5_model.zig").Ops, input: Arr, gate: Arr, norm: Arr, epsilon: f32) !Arr {
+    const y = try ops.cast(input, .float32);
+    const variance = try ops.reduce(try ops.binary(.mul, y, y), -1, true, true);
+    const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(epsilon, .float32)));
+    const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(norm, .float32));
+    return ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, try ops.cast(gate, .float32))), .bfloat16);
+}
+
+fn timePost(input: Arr, gate: Arr, norm: Arr, fused: bool) !u64 {
+    var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    var timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
+    const y = if (fused) try ops.own((try post(ops.s, input, gate, norm, 1e-5)).?) else try stagedPost(&ops, input, gate, norm, 1e-5);
+    try mlx.check(mlx.mlx_array_eval(y));
+    return timer.read();
+}
+
+test "GLM KDA fused post warmed benchmark" {
+    const path = std.c.getenv("SUSHI_GLM_POST_BENCH_OUT") orelse return error.SkipZigTest;
+    const count = 100;
+    const BenchCase = struct { rows: c_int, reference_ns: [count]u64, fused_ns: [count]u64 };
+    var results: [3]BenchCase = undefined;
+    for ([_]c_int{ 1, 17, 512 }, &results) |rows, *result| {
+        var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
+        defer ops.deinit();
+        const shape = [_]c_int{ 1, rows, 64, 128 };
+        const input = try ops.ones(&shape, .bfloat16);
+        const gate = try ops.binary(.mul, input, try ops.scalar(0.3, .bfloat16));
+        const norm = try ops.ones(&.{128}, .bfloat16);
+        const values = mlx.mlx_vector_array_new_data(&.{ input, gate, norm }, 3);
+        defer _ = mlx.mlx_vector_array_free(values);
+        try mlx.check(mlx.mlx_eval(values));
+        for (0..16) |_| {
+            _ = try timePost(input, gate, norm, false);
+            _ = try timePost(input, gate, norm, true);
+        }
+        result.rows = rows;
+        for (0..count) |i| {
+            if (i % 2 == 0) {
+                result.reference_ns[i] = try timePost(input, gate, norm, false);
+                result.fused_ns[i] = try timePost(input, gate, norm, true);
+            } else {
+                result.fused_ns[i] = try timePost(input, gate, norm, true);
+                result.reference_ns[i] = try timePost(input, gate, norm, false);
+            }
+        }
+    }
+    const raw = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .results = results, .warmup_pairs = 16, .method = "alternating AB/BA host construction and synchronous eval" }, .{ .whitespace = .indent_2 });
+    defer std.testing.allocator.free(raw);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = raw });
+}
+
+test "GLM KDA fused post validates guards and FP32 norm weights" {
+    const Ops = @import("glm5_model.zig").Ops;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const x = try ops.ones(&.{ 1, 17, 3, 128 }, .bfloat16);
+    const gate = try ops.binary(.mul, x, try ops.scalar(-5, .bfloat16));
+    const norm = try ops.ones(&.{128}, .float32);
+    for ([_]f32{ 1e-6, 1e-5, 0.01 }) |epsilon| {
+        const reference = try stagedPost(&ops, x, gate, norm, epsilon);
+        const actual = try ops.own((try post(ops.s, x, gate, norm, epsilon)).?);
+        try mlx.check(mlx.mlx_array_eval(reference));
+        try mlx.check(mlx.mlx_array_eval(actual));
+        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(reference).?[0..mlx.mlx_array_size(reference)], mlx.mlx_array_data_bfloat16(actual).?[0..mlx.mlx_array_size(actual)]);
+    }
+    try std.testing.expect((try post(ops.s, x, gate, norm, 0)) == null);
+    try std.testing.expect((try post(ops.s, x, gate, norm, std.math.nan(f32))) == null);
+    try std.testing.expect((try post(ops.s, try ops.cast(x, .float32), gate, norm, 1e-5)) == null);
+    try std.testing.expect((try post(ops.s, x, try ops.reshape(gate, &.{ 1, 17, 384 }), norm, 1e-5)) == null);
+}

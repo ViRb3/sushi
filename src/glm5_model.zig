@@ -498,12 +498,15 @@ pub const KdaLayer = struct {
         try mlx.check(mlx.mlx_array_set(&state.conv_state, new_conv));
         try mlx.check(mlx.mlx_array_set(&state.ssm_state, result.state));
         state.initialized = true;
-        const y = try ops.cast(result.y, .float32);
-        const variance = try ops.reduce(try ops.binary(.mul, y, y), -1, true, true);
-        const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(cfg.rms_norm_eps, .float32)));
-        const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(self.out_norm, .float32));
-        const gate = try ops.reshape(try ops.cast(try self.gb.apply(ops, try self.ga.apply(ops, x)), .float32), &dims);
-        const gated = try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, gate)), mlx.mlx_array_dtype(x));
+        const gate = try ops.reshape(try self.gb.apply(ops, try self.ga.apply(ops, x)), &dims);
+        const candidate = if (sh[1] > 1) try @import("glm5_kda_fused.zig").post(ops.s, result.y, gate, self.out_norm, cfg.rms_norm_eps) else null;
+        const gated = if (candidate) |value| try ops.own(value) else blk: {
+            const y = try ops.cast(result.y, .float32);
+            const variance = try ops.reduce(try ops.binary(.mul, y, y), -1, true, true);
+            const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(cfg.rms_norm_eps, .float32)));
+            const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(self.out_norm, .float32));
+            break :blk try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, try ops.cast(gate, .float32))), mlx.mlx_array_dtype(x));
+        };
         return self.out.apply(ops, try ops.reshape(gated, &.{ sh[0], sh[1], width }));
     }
 };

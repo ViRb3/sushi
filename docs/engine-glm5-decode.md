@@ -80,3 +80,19 @@ clamp boundaries, signed values and zero. Every non-NaN result bit matches the o
 NaN results remain NaN. Broadcast inputs exercise the kernel's contiguous-input preparation.
 The diagnostic reports activation dispatches, excluding warmup. This adds a small shared 128KiB
 sigmoid table when not already present, rather than changing any stored model weight.
+
+
+## Prefill KDA output fusion
+
+The prefill reference path uses a separate `glm5_kda_fused.post` kernel for 128-wide BF16
+heads. It fuses FP32 mean-square normalization, the stored norm weight and FP32 sigmoid gating,
+then stores BF16 output. Other geometry/storage retains the staged implementation. The exact
+reduction order and unary modes match the tested one-token body; recurrent state is unchanged.
+Tests compare every output bit at 1, 17 and 512 rows, including the production 64-head geometry.
+The diagnostic separately counts successful prefill epilogue dispatches, excluding warmup.
+
+A warmed alternating AB/BA component experiment (100 pairs per shape) measured median host
+construction plus synchronous evaluation of 673.08 microseconds staged versus203.92 fused
+at 512x64x128. This is an epilogue result, not whole-model throughput. The same experiment at
+one/17 rows measured277.02/318.44 versus163.23/187.63 microseconds. One-token model decode
+already has its own larger fusion; this separate helper is integrated only for multiple rows.
