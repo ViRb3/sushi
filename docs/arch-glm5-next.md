@@ -275,3 +275,12 @@ the 0.39% decode difference is not a robust isolated gain. Peak active memory wa
 55.15 MB above the preceding arm despite removal of the sorted-output scatter intermediate;
 do not infer a whole-model memory saving from the local buffer removal. Combined ReleaseFast
 validation passed 3,028 tests with 105 skipped. These results remain diagnostic, without public serving.
+
+
+A follow-up synchronous layer profile used the same 512/64 inputs and retained all output IDs.
+It measured 48.42 ms/token with profiling barriers: 30.57 ms across 31 KDA/MoE layers,
+13.58 ms across 11 MLA/MoE layers, 2.76 ms across the three dense KDA layers, and 1.50 ms
+outside those layer timers. MLA layers average 1.235 ms versus 0.986 ms for KDA/MoE layers.
+These are complete-layer times, not component attribution, and must not be compared directly
+with async4 throughput. Further serial profiling should separate HC, projections and expert work
+inside representative layers before choosing another large fusion.

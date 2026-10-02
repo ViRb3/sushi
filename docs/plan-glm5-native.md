@@ -13,7 +13,7 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
 
 - Completed: KDA preparation, independent layer fixtures, bounded IndexPool/latent attention,
   stored-grid MLA comparisons, complete diagnostic forward, request reset and coherent 512/64 generation.
-- Latest warmed serial 512/64 result: 749.28 tok/s prefill,26.44 tok/s decode; peak 96.965 GB.
+- Latest warmed serial 512/64 result: 765.94 tok/s prefill,26.54 tok/s decode; peak 97.020 GB.
   All 64 output IDs match the previous fused-KDA arm. The 2K workload separately measured 863.10/20.23.
 - Completed serial optimizations: async4 scheduling, copy-free QKV, fused KDA body, BF16-storage
   FP32 router and paired cooperative expert gate/up. Dense-prefill SDPA remains opt-in pending KLD.
