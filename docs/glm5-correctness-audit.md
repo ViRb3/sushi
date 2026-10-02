@@ -91,3 +91,19 @@ Prepared KDA constants are independently owned and safely released; prepared/unp
 state equality are tested. Fixture metadata and regeneration instructions accompany the committed
 synthetic data. These tests still do not establish full native model parity, sparse MLA correctness,
 real-checkpoint KLD or throughput.
+
+## Follow-up: complete tiny MLA reference comparison
+
+A separate synthetic oMLX oracle now covers complete BF16 MLA with two heads, 256-wide queries/values
+and 512-wide latent state. Native comparisons pass for 33-token prefill, 17/1/15 cached chunks, serial
+decode, and cached continuation through positions 2047–2052 (context lengths 2048–2053). The boundary
+case primes 2047 tokens of source-projected KV/indexer state without running quadratic prefix attention;
+it then checks single-token and 3/3 continuation across the first discarded pool.
+
+In the source framework itself, absorbing the same weights instead of expanding BF16 K/V changed
+33-token prefill output by maximum absolute error 0.00390625 and relative L2 error 0.00388339. Native
+comparisons use predeclared bounds of 0.008 maximum absolute error and 0.01 relative L2 error per chunk,
+and pass without widening those bounds. This quantifies rounding differences on the fixture; it does
+not establish real-model KLD, long-context quality, or bitwise equivalence. Decode/verify already use
+absorbed attention in the source implementation. The native engine arithmetic was not changed by this
+oracle test.

@@ -58,7 +58,7 @@ fn linear(weights: *const model.Weights, prefix: []const u8, suffix: []const u8,
     return Linear.load(weights, try std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, suffix }), input);
 }
 
-const Mla = struct {
+pub const Mla = struct {
     qa: Linear,
     qb: Linear,
     kva: Linear,
@@ -81,7 +81,7 @@ const Mla = struct {
     quantized: bool,
     prepared: Ops,
 
-    fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig, s: mlx.mlx_stream) !Mla {
+    pub fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig, s: mlx.mlx_stream) !Mla {
         var prep = Ops{ .s = s };
         errdefer prep.deinit();
         const kvb = try linear(weights, prefix, "kv_b_proj", cfg.mla_kv_lora_rank);
@@ -149,11 +149,11 @@ const Mla = struct {
         return result;
     }
 
-    fn deinit(self: *Mla) void {
+    pub fn deinit(self: *Mla) void {
         self.prepared.deinit();
     }
 
-    fn apply(self: *const Mla, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: anytype) !Arr {
+    pub fn apply(self: *const Mla, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: anytype) !Arr {
         const sh = mlx.getShape(x);
         if (sh[0] != 1) return error.GlmBatchUnsupported;
         const t = sh[1];
