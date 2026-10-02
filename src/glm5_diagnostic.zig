@@ -232,14 +232,27 @@ fn greedy(logits: Arr, s: mlx.mlx_stream) !u32 {
     defer _ = mlx.mlx_array_free(all);
     try mlx.check(mlx.mlx_isfinite(&finite, logits, s));
     try mlx.check(mlx.mlx_all(&all, finite, false, s));
-    try mlx.check(mlx.mlx_array_eval(all));
-    if (!mlx.mlx_array_data_bool(all).?[0]) return error.NonfiniteGlmLogits;
     var arg = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(arg);
     try mlx.check(mlx.mlx_argmax_axis(&arg, logits, -1, false, s));
-    try mlx.check(mlx.mlx_array_eval(arg));
+    const evals = mlx.mlx_vector_array_new_data(&.{ all, arg }, 2);
+    defer _ = mlx.mlx_vector_array_free(evals);
+    try mlx.check(mlx.mlx_eval(evals));
+    if (!mlx.mlx_array_data_bool(all).?[0]) return error.NonfiniteGlmLogits;
     if (mlx.mlx_array_size(arg) != 1) return error.InvalidGlmDiagnosticLogits;
     return mlx.mlx_array_data_uint32(arg).?[0];
+}
+
+test "GLM diagnostic greedy batches evaluation and rejects nonfinite logits" {
+    const s = mlx.gpuStream();
+    const x = mlx.mlx_array_new_data(&[_]f32{ -1, 4, 4, 0 }, &.{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    try std.testing.expectEqual(@as(u32, 1), try greedy(x, s));
+    for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |bad| {
+        const y = mlx.mlx_array_new_data(&[_]f32{ 1, bad }, &.{ 1, 1, 2 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(y);
+        try std.testing.expectError(error.NonfiniteGlmLogits, greedy(y, s));
+    }
 }
 
 // Run only after the coordinator grants the full-model GPU slot.
