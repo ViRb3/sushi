@@ -1382,7 +1382,7 @@ fn writeTinySource(
     var pattern_len: usize = 0;
     var freq_len: usize = 0;
     for (0..layers) |l| {
-        pattern_len += (try std.fmt.bufPrint(pattern[pattern_len..], "{s}1", .{ if (l == 0) "" else "," })).len;
+        pattern_len += (try std.fmt.bufPrint(pattern[pattern_len..], "{s}1", .{if (l == 0) "" else ","})).len;
         freq_len += (try std.fmt.bufPrint(freq[freq_len..], "{s}{d}", .{ if (l == 0) "" else ",", @intFromBool(l >= dense) })).len;
     }
     try dir.writeFile(io, .{ .sub_path = "config.json", .data = try std.fmt.allocPrint(allocator,
@@ -2059,18 +2059,44 @@ pub fn validateExl3Pack(io: std.Io, allocator: Allocator, model_dir: []const u8,
     defer arena.deinit();
     const alloc = arena.allocator();
     const source = try loadSourceIndex(io, alloc, model_dir);
+    try validateExl3Source(&source, alloc, config);
+}
+
+fn validateExl3Source(source: *const SourceIndex, alloc: Allocator, config: *const model.ModelConfig) !void {
     const mimo = std.mem.eql(u8, config.model_type, "mimo_v2");
-    if (mimo) try validateShardStamps(&source, config);
-    const prefix = if (mimo) "model" else "language_model.model";
+    const glm = config.isGlm5();
+    if (mimo or glm) try validateShardStamps(source, config);
+    const prefix = if (glm) "model.language_model" else if (mimo) "model" else "language_model.model";
     for (config.first_k_dense_replace..config.num_hidden_layers) |layer| {
         const base = try std.fmt.allocPrint(alloc, "{s}.layers.{d}", .{ prefix, layer });
-        _ = try validateExl3Layer(&source, alloc, config, base);
+        _ = try validateExl3Layer(source, alloc, config, base);
     }
-    if (!mimo) {
+    if (glm) {
+        var keys = source.tensors.keyIterator();
+        const start = "model.language_model.layers.";
+        while (keys.next()) |key| {
+            if (!std.mem.startsWith(u8, key.*, start) or std.mem.indexOf(u8, key.*, ".mlp.switch_mlp.") == null) continue;
+            const rest = key.*[start.len..];
+            const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.MimoLayerOutOfRange;
+            const layer = std.fmt.parseInt(u32, rest[0..dot], 10) catch return error.MimoLayerOutOfRange;
+            if (layer < config.first_k_dense_replace or @as(u64, layer) >= @as(u64, config.num_hidden_layers) + config.glm_mtp_layers) return error.MimoLayerOutOfRange;
+        }
+        for (0..config.glm_mtp_layers) |extra| {
+            const base = try std.fmt.allocPrint(alloc, "{s}.layers.{d}", .{ prefix, config.num_hidden_layers + extra });
+            const probe = try std.fmt.allocPrint(alloc, "{s}.mlp.switch_mlp.", .{base});
+            var parts = source.tensors.keyIterator();
+            while (parts.next()) |key| {
+                if (std.mem.startsWith(u8, key.*, probe)) {
+                    _ = try validateExl3Layer(source, alloc, config, base);
+                    break;
+                }
+            }
+        }
+    } else if (!mimo) {
         var it = source.tensors.keyIterator();
         while (it.next()) |key| {
             if (std.mem.startsWith(u8, key.*, "language_model.mtp.layers.0.")) {
-                _ = try validateExl3Layer(&source, alloc, config, "language_model.mtp.layers.0");
+                _ = try validateExl3Layer(source, alloc, config, "language_model.mtp.layers.0");
                 break;
             }
         }
@@ -2242,4 +2268,26 @@ test "MiMo EXL3 streaming CPU bills the FP8 trunk without routed banks" {
 
 test "MiMo EXL3 streaming loads the identical FP8 trunk without routed banks" {
     try checkMimoExl3StreamTrunk(true);
+}
+
+test "GLM EXL3 preflight refuses orphan MTP and out of range packed tensors" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = SourceIndex{ .weight_map = std.StringHashMap([]const u8).init(a), .files = std.StringHashMap(void).init(a), .tensors = std.StringHashMap(TensorMeta).init(a), .stamps = std.StringHashMap(ShardStamp).init(a) };
+    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .exl3_k4, .expert_quant_rate = .{ .n = 36 }, .num_hidden_layers = 2, .first_k_dense_replace = 1, .num_experts = 2, .num_experts_per_tok = 1, .hidden_size = 128, .moe_intermediate_size = 128, .glm_mtp_layers = 1 };
+    const code = TensorMeta{ .dtype = .u16, .shape = &.{ 2, 8, 8, 36 }, .data_start = 0, .data_end = 2 * 8 * 8 * 36 * 2, .data_base = 0, .file = "test.safetensors" };
+    const scale = TensorMeta{ .dtype = .f16, .shape = &.{ 2, 128 }, .data_start = 0, .data_end = 2 * 128 * 2, .data_base = 0, .file = "test.safetensors" };
+    for ([_][]const u8{ "gate", "up", "down" }) |p| for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
+        try source.tensors.put(try std.fmt.allocPrint(a, "model.language_model.layers.1.mlp.switch_mlp.{s}_proj.{s}", .{ p, part }), if (i == 0) code else scale);
+    };
+    try source.tensors.put("model.language_model.layers.1.mlp.gate.weight", .{ .dtype = .bf16, .shape = &.{ 2, 128 }, .data_start = 0, .data_end = 512, .data_base = 0, .file = "test.safetensors" });
+    try validateExl3Source(&source, a, &cfg);
+    for ([_]u32{ 2, 0, 3 }) |li| {
+        const key = try std.fmt.allocPrint(a, "model.language_model.layers.{d}.mlp.switch_mlp.up_proj.trellis", .{li});
+        try source.tensors.put(key, code);
+        defer _ = source.tensors.remove(key);
+        if (validateExl3Source(&source, a, &cfg)) |_| return error.ExpectedGlmPackRejection else |_| {}
+    }
 }

@@ -63,6 +63,14 @@ KV quantization adjustment follows the actual cache format. The BF16 pooled inde
 bytes/token, and the raw key-plus-gate ring is 180,224 bytes per slot. The recurrent-state plus convolution
 checkpoint is 147,619,840 bytes, including FP32 KDA states. No Qwen FP32 indexer score bank is billed.
 
+## Forward cache ownership
+
+The in-progress KDA forward stores an owned convolution tail after multi-token calls. A contiguous
+batch-one slice still aliases the full prompt buffer, so it uses the shared materialized-copy helper.
+The copy stays lazy; the enclosing forward must evaluate the cache with its normal layer boundary and
+release its operation scope. A pointer-alias regression checks that the evaluated tail retains its values
+without retaining the parent allocation. Single-token decode keeps the inexpensive contiguous view.
+
 ## Forward implementation still required
 
 - Load the resident BF16 trunk, excluding routed experts before any
@@ -110,3 +118,11 @@ chat template requested low reasoning effort. Output began `</think>Rain forms t
 and continued with coherent English about evaporation, condensation and droplets, stopping at the token
 limit. This establishes a source-checkpoint sanity result for that diagnostic forward, not full reference
 parity, broad model quality or native Sushi throughput. The native integration work above remains required.
+
+## Native load validation
+
+The GLM KDA binder validates preserved convolution and norm shapes before graph construction and
+requires FP32 decay parameters and hyper-connection coefficients. A scalar output norm must not
+silently broadcast across every channel. Packed expert preflight rejects tensors in the dense prefix or
+outside the configured trunk/MTP range, and any present MTP expert component requires a complete bank.
+These checks do not enable the architecture gate or establish full-forward parity.

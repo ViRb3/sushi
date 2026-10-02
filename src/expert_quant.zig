@@ -391,6 +391,7 @@ pub fn isRoutedExpertKey(layout: Layout, key: []const u8) bool {
             std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null,
         .exl3_k4 => (std.mem.startsWith(u8, key, "language_model.model.layers.") or
             std.mem.startsWith(u8, key, "language_model.mtp.") or
+            std.mem.startsWith(u8, key, "model.language_model.layers.") or
             std.mem.startsWith(u8, key, "model.layers.")) and
             std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null,
         .mxfp4_split => std.mem.startsWith(u8, key, "model.layers.") and
@@ -506,7 +507,7 @@ fn mxfp4IndividualBankCompleteFromFirst(
 
 /// `language_model.model.layers.` is the qwen4 pack's nesting, `model.layers.`
 /// MiMo's; a pack uses one of them for every routed layer it owns.
-const EXL3_PREFIXES = [_][]const u8{ "language_model.model.layers.", "model.layers." };
+const EXL3_PREFIXES = [_][]const u8{ "language_model.model.layers.", "model.layers.", "model.language_model.layers." };
 
 fn exl3BankComplete(map: std.json.ObjectMap, prefix: []const u8, first_moe_layer: u16, layers: u16) bool {
     if (first_moe_layer >= layers) return false;
@@ -673,6 +674,19 @@ pub fn layoutFromIndexJsonWithFirstMoe(
     const map = parsed.value.object.get("weight_map") orelse return null;
     if (map != .object) return null;
     if (std.mem.eql(u8, model_type, "glm5_next")) {
+        if (exl3BankComplete(map.object, EXL3_PREFIXES[2], first_moe_layer, layers)) {
+            for (map.object.keys()) |key| {
+                if (parseBf16IndividualKey(key) != .not_family) return null;
+                if (std.mem.startsWith(u8, key, EXL3_PREFIXES[2]) and std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null) {
+                    const rest = key[EXL3_PREFIXES[2].len..];
+                    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+                    const layer = std.fmt.parseInt(u32, rest[0..dot], 10) catch return null;
+                    if (layer < first_moe_layer or std.mem.endsWith(u8, key, ".weight") or
+                        std.mem.endsWith(u8, key, ".scales") or std.mem.endsWith(u8, key, ".biases")) return null;
+                }
+            }
+            return .exl3_k4;
+        }
         validateBf16IndividualMap(map.object, layers, first_moe_layer, null) catch return null;
         return .bf16_individual;
     }
@@ -866,7 +880,10 @@ pub const QuantStore = struct {
 
         var key_buf: [192]u8 = undefined;
         const first_layer = geometry.first_moe_layer;
-        const exl3_prefix = if (exl3BankComplete(weight_map, EXL3_PREFIXES[1], first_layer, geometry.layers)) EXL3_PREFIXES[1] else AFFINE_PREFIX;
+        const exl3_prefix = blk: {
+            for (EXL3_PREFIXES) |prefix| if (exl3BankComplete(weight_map, prefix, first_layer, geometry.layers)) break :blk prefix;
+            break :blk AFFINE_PREFIX;
+        };
         if (chosen == .mxfp4_split) {
             // Banks before first_moe_layer must be absent. A dense layer with a
             // stray switch tensor is not safe to reinterpret as a routed bank.
@@ -1872,4 +1889,29 @@ test "GLM BF16 individual source rejects incomplete quantized or malformed banks
         };
         try t.expectError(expected, result);
     }
+}
+
+test "GLM EXL3 index uses native source nesting and refuses mixed expert formats" {
+    const raw =
+        \\{"weight_map":{
+        \\"model.language_model.layers.3.mlp.switch_mlp.gate_proj.trellis":"g.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.gate_proj.suh":"g.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.gate_proj.svh":"g.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.up_proj.trellis":"u.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.up_proj.suh":"u.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.up_proj.svh":"u.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.down_proj.trellis":"d.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.down_proj.suh":"d.safetensors",
+        \\"model.language_model.layers.3.mlp.switch_mlp.down_proj.svh":"d.safetensors"}}
+    ;
+    const layout = layoutFromIndexJsonWithFirstMoe(std.testing.allocator, "glm5_next", raw, 4, 3);
+    try std.testing.expect(layout != null);
+    try std.testing.expectEqual(Layout.exl3_k4, layout.?);
+    try std.testing.expect(isRoutedExpertKey(.exl3_k4, "model.language_model.layers.3.mlp.switch_mlp.gate_proj.trellis"));
+    const mixed = try std.fmt.allocPrint(std.testing.allocator, "{s},\"model.language_model.layers.3.mlp.experts.0.gate_proj.weight\":\"bad.safetensors\"}}}}", .{raw[0 .. raw.len - 2]});
+    defer std.testing.allocator.free(mixed);
+    try std.testing.expect(layoutFromIndexJsonWithFirstMoe(std.testing.allocator, "glm5_next", mixed, 4, 3) == null);
+    const dense = try std.fmt.allocPrint(std.testing.allocator, "{s},\"model.language_model.layers.0.mlp.switch_mlp.up_proj.trellis\":\"bad.safetensors\"}}}}", .{raw[0 .. raw.len - 2]});
+    defer std.testing.allocator.free(dense);
+    try std.testing.expect(layoutFromIndexJsonWithFirstMoe(std.testing.allocator, "glm5_next", dense, 4, 3) == null);
 }
