@@ -9,7 +9,7 @@ const Arr = mlx.mlx_array;
 const Ops = base.Ops;
 const Linear = base.Linear;
 
-const Routed = struct { indices: Arr, scores: Arr };
+pub const Routed = struct { indices: Arr, scores: Arr };
 
 fn route(ops: *Ops, x: Arr, weight: Arr, correction: Arr, top: c_int, scale: f32, normalize: bool) !Routed {
     if (try @import("glm5_router.zig").route(ops.s, x, weight, correction, top, scale, normalize)) |fused| {
@@ -366,6 +366,14 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         for (self.layers) |*layer| layer.deinit();
         self.allocator.free(self.layers);
+    }
+
+    pub fn routeLayer(self: *const Model, index: usize, ops: *Ops, x: Arr) !Routed {
+        if (index >= self.layers.len) return error.InvalidGlmLayer;
+        return switch (self.layers[index].ffn) {
+            .moe => |moe| route(ops, x, moe.weight, moe.correction, @intCast(self.cfg.num_experts_per_tok), self.cfg.router_scaling_factor, self.cfg.moe_route_norm),
+            .dense => error.GlmLayerNotRouted,
+        };
     }
 
     pub fn feedForwardLayer(self: *const Model, index: usize, ops: *Ops, x: Arr) !Arr {
