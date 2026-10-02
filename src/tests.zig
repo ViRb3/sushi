@@ -81,6 +81,7 @@ test {
     _ = @import("glm5_forward.zig");
     _ = @import("glm5_mla_reference_test.zig");
     _ = @import("glm5_diagnostic.zig");
+    _ = @import("glm5_hc_capture.zig");
     _ = @import("glm5_attention.zig");
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");

@@ -339,12 +339,16 @@ pub const Hc = struct {
     }
 
     pub fn collapseReference(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
+        const mixes = try self.mixReference(ops, x, cfg);
+        return primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
+    }
+
+    pub fn mixReference(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !Arr {
         const sh = mlx.getShape(x);
         const flat = try ops.reshape(try ops.cast(x, .float32), &.{ sh[0], sh[1], sh[2] * sh[3] });
         const normalized = try ops.rms(flat, .{ .ctx = null }, cfg.rms_norm_eps);
         // This sensitive FP32 projection must not take the backend's TF32 path.
-        const mixes = try hcMixExact(ops, normalized, self.w);
-        return primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
+        return hcMixExact(ops, normalized, self.w);
     }
 };
 

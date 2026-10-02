@@ -225,7 +225,7 @@ test "GLM diagnostic output JSON text is a string with byte fallback" {
     }
 }
 
-fn greedy(logits: Arr, s: mlx.mlx_stream) !u32 {
+pub fn greedy(logits: Arr, s: mlx.mlx_stream) !u32 {
     var finite = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(finite);
     var all = mlx.mlx_array_new();

@@ -336,3 +336,27 @@ Current follow-up references: [KDA recurrence and quantized NAX research](glm5-k
 records rejected schedules and verified backend dispatch; [DFlash expert reuse](plan-glm5-dflash-expert-reuse.md)
 sets the route-overlap evidence and exact-arithmetic requirements for a later grouped kernel.
 Coordinate swizzling alone has not demonstrated a useful gain; tile-aspect experiments remain isolated.
+
+### Private HC activation capture
+
+`glm5_hc_capture.zig` contains the gated test `GLM HC private real checkpoint fixtures`.
+It reuses the indexed native loader and tokenizer. Set `SUSHI_GLM_HC_CAPTURE_MODEL`,
+`SUSHI_GLM_HC_CAPTURE_OUT` (an existing empty absolute private directory),
+`SUSHI_GLM_HC_CAPTURE_PROSE`, `SUSHI_GLM_HC_CAPTURE_CODE`,
+`SUSHI_GLM_HC_CAPTURE_REVISION` and `SUSHI_GLM_HC_CAPTURE_BINARY_SHA256` explicitly.
+Each prompt must encode to at least 512 tokens; the exact first 512 tokens are used.
+The coordinator must grant the exclusive full-model slot before this test runs.
+
+Four safetensors files contain prose/code 512-token prefill and the following one-token decode.
+Each includes the input IDs, RMS epsilon, HC epsilon and Sinkhorn iterations. Tensor names are
+`layerNN.attn|ffn.{x,w,scale,base,mix,mixed,post,comb}` for layers 0, 3, 23 and 44.
+Inputs and stored weights retain their original dtype; `mix` is the staged FP32 RMS/projection
+reference. Metadata records the supplied revision/binary hash, computed config/index/prompt hashes,
+model path and capture settings. These are quality fixtures, not timing runs; no activations belong
+in the repository. Binary provenance is supplied by the invoking runner and labeled accordingly.
+
+The request-local hook is absent by default. It validates layer ordering, range and record capacity
+before changing state, retains its own array handles, and settles captured tensors with cache outputs.
+A nonzero synthetic model test compares logits and all cache arrays through prefill and decode and
+checks invalid selections leave request state unchanged. Actual full-checkpoint fixture generation
+requires a separate explicit run; implementing this hook does not establish factored-HC quality.
