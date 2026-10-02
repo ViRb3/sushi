@@ -407,3 +407,35 @@ repeated RMS/input work and scheduling costs in this experiment. These are compo
 not full-model timings. The GPU lock and foreground QoS were used with other workers paused and ten
 seconds idle. Fan maximum was requested but reported RPM did not confirm spin-up. The isolated test
 and raw samples were archived and removed from the runtime tree; C24 remains unchanged.
+
+### Lossless BF16 streamed KLD teacher
+
+`tests/capture_glm_bf16_teacher.py` reuses the diagnostic lossless BF16 expert reader with the pinned
+oMLX GLM forward, independently of native EXL3 execution. Run it in the existing oMLX Python environment,
+with explicit `--model`, `--omlx`, `--prompts`, and private `--out` paths. The deterministic corpus is
+`tests/fixtures/glm5_kld_2code_2prose.json`. `--prepare-only` audits headers and tokenizes without loading
+model tensors. Acquire the exclusive GPU lock before actual capture; this is a long correctness run.
+
+The protocol matches standard KLD capture: two raw code seeds and two raw prose seeds, each followed
+by exactly 512 greedy continuation rows, including rows after EOS. Seed lengths are 240, 261, 190 and
+183 tokens with the official tokenizer; prefix chunks are at most 512. Store full-vocabulary little-endian
+FP32 logits and exact IDs. First-EOS scoring is a separate comparison metric, not an early capture stop.
+Source tensors must be BF16 or FP32; expert tensors must be BF16. oMLX's standard sanitize operation
+losslessly widens HC/router BF16 parameters to FP32 and reshapes convolution weights. Before/after trunk
+dtype counts are recorded. TF32, optional oMLX HC/KDA prefill fusion, decode fusion, MTP and speculation
+are disabled. MLA caches retain BF16 values and KDA state remains FP32.
+
+`--ssd-budget-gb 100` uses the established GiB convention: 107374182400 bytes. The MLX allocation limit
+is 100 GiB and its free-buffer cache is disabled. After loading the trunk, the lossless BF16 expert LRU
+is capped at the remaining budget minus a 24 GiB reserve for workspaces, current expert unions and host
+read buffers. Prefill reads expert unions directly; serial decode reuses exact BF16 arrays. Every row
+records active/cache memory, MLX peak and process peak RSS; exceeding the requested budget aborts the run.
+No timing claim should be derived from this capture.
+
+`baseline.json` is published atomically only after all four prompts finish. It uses the existing
+`mlx-serve-kld-baseline-v1` schema and standard prompt directories with `prompt_tokens.txt`,
+`generated_tokens.txt` and `logits.f32`. A durable per-row journal commits logits before token/NLL
+metadata. Resume truncates any uncommitted tail, validates source/script/corpus identities, reuses
+completed prompts, and reconstructs an interrupted prompt by serial replay with byte checks against
+all committed logits. Progress and partial manifests are not complete teacher artifacts. CPU journal/LRU
+and tiny cached/uncached resident-reference tests cover recovery, eviction/reload and exact BF16 bytes.
