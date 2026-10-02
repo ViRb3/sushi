@@ -352,6 +352,8 @@ pub const Request = struct {
     decode_async: bool = true,
     dense_prefill: bool = false,
     prefill_async: bool = false,
+    /// Bound pending prefill layers before a host wait; diagnostic experiments only.
+    prefill_sync_layers: u8 = 2,
     capture: ?*Capture = null,
     hc_capture: ?*HcCapture = null,
     layer_ns: [128]u64 = @splat(0),
@@ -503,6 +505,7 @@ pub const Model = struct {
             if (capture.ids.len == 0 or capture.ids.len > self.layers.len or capture.records.len != capture.ids.len * 2) return error.InvalidGlmHcCapture;
             for (capture.ids, 0..) |id, i| if (id >= self.layers.len or (i > 0 and id <= capture.ids[i - 1])) return error.InvalidGlmHcCapture;
         }
+        if (request.prefill_sync_layers == 0 or request.prefill_sync_layers > 8) return error.InvalidGlmPrefillSchedule;
         if (request.failed) return error.GlmRequestNeedsReset;
         if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
         errdefer request.failed = true;
@@ -565,10 +568,11 @@ pub const Model = struct {
             if (staged_prefill) {
                 const evals = mlx.mlx_vector_array_new_value(next);
                 defer _ = mlx.mlx_vector_array_free(evals);
-                const first = layer_index - layer_index % 2;
+                const interval: usize = request.prefill_sync_layers;
+                const first = layer_index - layer_index % interval;
                 try appendCaptures(evals, request.capture, request.hc_capture, first, layer_index + 1);
                 for (request.layers[first .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
-                if (layer_index % 2 == 0) {
+                if ((layer_index + 1) % interval != 0) {
                     try mlx.check(mlx.mlx_async_eval(evals));
                     if (@import("builtin").is_test) schedule_test_asyncs += 1;
                 } else {
@@ -1251,4 +1255,50 @@ test "GLM DFlash asynchronous schedules preserve nonzero tapes captures and comm
         try std.testing.expectEqualSlices(u32, reference.targets[0..reference.count], profiled.targets[0..profiled.count]);
     }
     try std.testing.expectError(error.InvalidGlmVerifySchedule, verifier.bindSchedule(3));
+}
+
+test "GLM bounded prefill schedules preserve cache bits and reject invalid intervals" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(a, cfg, &weights, s);
+    defer net.deinit();
+    for ([_]u8{ 1, 3, 4, 8 }) |interval| {
+        var baseline = try Request.init(a, 4);
+        defer baseline.deinit();
+        var pipelined = try Request.init(a, 4);
+        defer pipelined.deinit();
+        pipelined.prefill_async = true;
+        pipelined.prefill_sync_layers = interval;
+        for ([_]usize{ 17, 3, 1 }) |width| {
+            var tokens: [17]u32 = undefined;
+            for (tokens[0..width], 0..) |*v, i| v.* = @intCast(i % 4);
+            const ids = mlx.mlx_array_new_data(&tokens, &[_]c_int{ 1, @intCast(width) }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(ids);
+            const expected = try net.forwardLast(&baseline, ids, true);
+            defer _ = mlx.mlx_array_free(expected);
+            schedule_test_asyncs = 0;
+            schedule_test_syncs = 0;
+            const got = try net.forwardLast(&pipelined, ids, true);
+            defer _ = mlx.mlx_array_free(got);
+            if (width > 1) {
+                try std.testing.expectEqual(@as(usize, 4 - 4 / interval), schedule_test_asyncs);
+                try std.testing.expectEqual(@as(usize, 1 + 4 / interval), schedule_test_syncs);
+            }
+            try expectArrayBits(expected, got);
+            try expectRequestBits(&baseline, &pipelined);
+        }
+    }
+    var request = try Request.init(a, 4);
+    defer request.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2 }, &[_]c_int{ 1, 2 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    for ([_]u8{ 0, 9, 255 }) |interval| {
+        request.prefill_sync_layers = interval;
+        try std.testing.expectError(error.InvalidGlmPrefillSchedule, net.forwardLast(&request, ids, true));
+        try std.testing.expectEqual(@as(usize, 0), request.offset);
+        try std.testing.expect(!request.failed);
+    }
 }

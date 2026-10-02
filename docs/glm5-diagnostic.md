@@ -86,10 +86,12 @@ attention for decode and calls outside the dense-prefix eligibility boundary.
 Changing BF16 rounding boundaries requires independent reference and quality
 validation; it is not a byte-preserving scheduling change.
 
-`SUSHI_GLM_DIAGNOSTIC_PREFILL_ASYNC=1` experiments with at most two layers in
-flight during prefill. It is off by default; profiling keeps synchronous layer
-boundaries. The final logits and all cache outputs settle before return. The
-report records the effective prefill schedule and the successful copy-free QKV
+`SUSHI_GLM_DIAGNOSTIC_PREFILL_ASYNC=1` enables bounded asynchronous prefill.
+`SUSHI_GLM_DIAGNOSTIC_PREFILL_SYNC_LAYERS` selects the host-wait interval, from 1
+to 8 layers; the default remains 2. Larger intervals are experimental and must
+be measured for throughput and peak memory. Asynchronous prefill is off by
+default; profiling keeps synchronous layer boundaries. The final logits and all cache outputs settle before return. The
+report records the effective prefill schedule, host-wait interval and successful copy-free QKV
 dispatch count during the timed phase, excluding warmup.
 
 `SUSHI_GLM_DIAGNOSTIC_COMPONENTS=1` adds synchronized per-component attribution and
