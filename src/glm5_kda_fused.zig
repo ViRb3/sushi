@@ -299,6 +299,12 @@ fn modes(s: mlx.mlx_stream) !?Modes {
     return result;
 }
 
+pub fn sigmoidFloatMode(s: mlx.mlx_stream) !?bool {
+    if (!hardwareSupported()) return null;
+    const found = (try modes(s)) orelse return null;
+    return found.sig_f;
+}
+
 pub const Inputs = struct {
     qkv: Arr,
     beta: Arr,

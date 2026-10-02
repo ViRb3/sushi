@@ -172,6 +172,13 @@ Used in sushi (`src/glm5_kda_fused.zig`):
     retaining FP32 recurrent state. The sigmoid expressions derive from
     MLX's MIT-licensed elementwise functors.
 
+Used in sushi (`src/glm5_router.zig`):
+
+  * The FP32 router GEMV/sigmoid and stable top-k selection adapt
+    `_ROUTER_LOGITS_SOURCE` and `_ROUTER_SELECT_SOURCE` from the same
+    6745c39c GLM module. Storage checks and native fallback were added;
+    one-token FP32 score and tie-order parity is retained.
+
 Used in sushi (`src/transformer.zig`):
 
   * The GatedDeltaNet blocked-sequence prefill kernel, ported from

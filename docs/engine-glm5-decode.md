@@ -50,3 +50,13 @@ parameters. The complete GLM-filtered suite also passed with this path enabled, 
 adapter's branch-state tests. The diagnostic records successful KDA-body dispatches independently
 from QKV dispatches. Full-checkpoint throughput is a separate measurement, not inferred from these
 fusion or parity results.
+
+
+## One-token sigmoid router
+
+Eligible one-token routers use two dispatches: the source-aligned FP32 GEMV with sigmoid/correction,
+then stable selection and unbiased score normalization. The correction bias affects selection only.
+The existing path remains for other geometry, strides or storage. The fused path requires routers and correction
+biases in their original FP32 checkpoint format. Production288-expert/4096-input regressions compare
+selected order and every normalized score bit, including tied scores, normalized/unnormalized modes,
+and BF16/FP32 inputs. This optimization does not change prefill routing.

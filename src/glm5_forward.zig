@@ -12,6 +12,17 @@ const Linear = base.Linear;
 const Routed = struct { indices: Arr, scores: Arr };
 
 fn route(ops: *Ops, x: Arr, weight: Arr, correction: Arr, top: c_int, scale: f32, normalize: bool) !Routed {
+    if (try @import("glm5_router.zig").route(ops.s, x, weight, correction, top, scale, normalize)) |fused| {
+        const ids = ops.own(fused.indices) catch |e| {
+            _ = mlx.mlx_array_free(fused.scores);
+            return e;
+        };
+        return .{ .indices = ids, .scores = try ops.own(fused.scores) };
+    }
+    return routeReference(ops, x, weight, correction, top, scale, normalize);
+}
+
+fn routeReference(ops: *Ops, x: Arr, weight: Arr, correction: Arr, top: c_int, scale: f32, normalize: bool) !Routed {
     const logits = try ops.binary(.mm, try ops.cast(x, .float32), try ops.transpose(weight, &.{ 1, 0 }));
     const scores = try ops.unary(.sigmoid, logits);
     const selection = try ops.binary(.add, scores, correction);
@@ -915,4 +926,39 @@ test "GLM post-layer capture and shared draft projections retain their contracts
     capture.ids = &.{ 3, 0 };
     try std.testing.expectError(error.InvalidGlmCapture, net.forwardLast(&request, ids, true));
     try std.testing.expectEqual(@as(usize, 0), request.offset);
+}
+
+test "GLM fused router matches FP32 scores and selected order at production width" {
+    const a = std.testing.allocator;
+    const stream = mlx.gpuStream();
+    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
+    var random = std.Random.DefaultPrng.init(58289);
+    const rnd = random.random();
+    const matrix = try a.alloc(f32, 288 * 4096);
+    defer a.free(matrix);
+    var vector: [4096]f32 = undefined;
+    var bias: [288]f32 = undefined;
+    for (matrix) |*v| v.* = (rnd.float(f32) - 0.5) / 16;
+    for (&vector) |*v| v.* = (rnd.float(f32) - 0.5) * 4;
+    for (&bias) |*v| v.* = (rnd.float(f32) - 0.5) / 4;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| for ([_]bool{ true, false }) |norm| for ([_]bool{ false, true }) |ties| {
+        if (ties) {
+            @memset(matrix, 0);
+            @memset(&bias, 0);
+        } else {
+            for (matrix) |*v| v.* = (rnd.float(f32) - 0.5) / 16;
+            for (&bias) |*v| v.* = (rnd.float(f32) - 0.5) / 4;
+        }
+        var ops = Ops{ .s = stream };
+        defer ops.deinit();
+        const x = try ops.cast(try ops.own(mlx.mlx_array_new_data(&vector, &[_]c_int{ 1, 1, 4096 }, 3, .float32)), dtype);
+        const w = try ops.own(mlx.mlx_array_new_data(matrix.ptr, &[_]c_int{ 288, 4096 }, 2, .float32));
+        const correction = try ops.own(mlx.mlx_array_new_data(&bias, &[_]c_int{288}, 1, .float32));
+        const expected = try routeReference(&ops, x, w, correction, 8, 2.5, norm);
+        const got = (try @import("glm5_router.zig").route(stream, x, w, correction, 8, 2.5, norm)) orelse return error.TestExpectedFusedRouter;
+        _ = try ops.own(got.indices);
+        _ = try ops.own(got.scores);
+        try expectArrayBits(got.indices, expected.indices);
+        try expectArrayBits(got.scores, expected.scores);
+    };
 }
