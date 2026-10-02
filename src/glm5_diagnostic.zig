@@ -261,6 +261,8 @@ test "GLM native diagnostic real model" {
     const chunk = try envNumber("SUSHI_GLM_DIAGNOSTIC_CHUNK", 128);
     const warmup = try envNumber("SUSHI_GLM_DIAGNOSTIC_WARMUP", 0);
     const profile = (try envNumber("SUSHI_GLM_DIAGNOSTIC_PROFILE", 1)) != 0;
+    const warmup_decode = try envNumber("SUSHI_GLM_DIAGNOSTIC_WARMUP_DECODE", 1);
+    if (warmup_decode < 1 or warmup_decode > 4096) return error.InvalidGlmDiagnosticBudget;
     if (warmup > 8) return error.InvalidGlmDiagnosticBudget;
     if (count == 0 or count > 65536 or steps < 2 or steps > 4096 or chunk == 0) return error.InvalidGlmDiagnosticBudget;
     const memory_limit = (try envNumber("SUSHI_GLM_DIAGNOSTIC_MEMORY_GIB", 110)) * 1024 * 1024 * 1024;
@@ -336,11 +338,13 @@ test "GLM native diagnostic real model" {
             next = try greedy(result, s);
             cursor = end;
         }
-        const input = mlx.mlx_array_new_data(&next, &[_]c_int{ 1, 1 }, 2, .uint32);
-        defer _ = mlx.mlx_array_free(input);
-        const result = try net.forwardLast(&request, input, true);
-        defer _ = mlx.mlx_array_free(result);
-        try mlx.check(mlx.mlx_array_eval(result));
+        for (0..warmup_decode) |_| {
+            const input = mlx.mlx_array_new_data(&next, &[_]c_int{ 1, 1 }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(input);
+            const result = try net.forwardLast(&request, input, true);
+            defer _ = mlx.mlx_array_free(result);
+            next = try greedy(result, s);
+        }
         request.reset();
     }
     const warmup_seconds = if (warmup > 0) @as(f64, @floatFromInt(warm_start.untilNow(io, .awake).nanoseconds)) / 1e9 else 0;
@@ -402,6 +406,6 @@ test "GLM native diagnostic real model" {
     for (&decode_layer_ns, prefill_layer_ns) |*total, prefill| total.* -= prefill;
     const decoded = decodedOutput(text);
     var rate_buf: [32]u8 = undefined;
-    try writeJson(io, a, out, .{ .complete = true, .model = path, .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = timed_wired_limit, .wired_policy = wired_policy, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = decoded.output_text, .output_bytes = decoded.output_bytes, .output_text_utf8_valid = decoded.output_text_utf8_valid, .warmup_count = warmup, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .profile_enabled = profile, .dense_prefill = request.dense_prefill, .prefill_schedule = if (request.prefill_async and !profile) "async2" else "synchronous", .qkv_dispatches = @import("glm5_decode.zig").dispatchCount(), .decode_schedule = if (request.decode_async and !profile) "async4" else "synchronous", .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 attention cache; FP32 KDA state", .public_serving_enabled = false });
+    try writeJson(io, a, out, .{ .complete = true, .model = path, .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = timed_wired_limit, .wired_policy = wired_policy, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = decoded.output_text, .output_bytes = decoded.output_bytes, .output_text_utf8_valid = decoded.output_text_utf8_valid, .warmup_count = warmup, .warmup_decode_forwards_per_round = if (warmup > 0) warmup_decode else 0, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .profile_enabled = profile, .dense_prefill = request.dense_prefill, .prefill_schedule = if (request.prefill_async and !profile) "async2" else "synchronous", .qkv_dispatches = @import("glm5_decode.zig").dispatchCount(), .decode_schedule = if (request.decode_async and !profile) "async4" else "synchronous", .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 attention cache; FP32 KDA state", .public_serving_enabled = false });
     try writeJson(io, a, progress, .{ .phase = "complete", .complete = true });
 }

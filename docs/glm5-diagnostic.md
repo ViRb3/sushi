@@ -34,6 +34,7 @@ and binary provenance.
 | `DECODE` | Default 64 generated tokens; minimum 2 |
 | `CHUNK` | Default 128 prefill tokens per chunk |
 | `WARMUP` | Default 0; use 1 for a warmed measurement |
+| `WARMUP_DECODE` | Default 1; use 8 near the sparse-attention boundary to compile that path before timing |
 | `PROFILE` | Default 1; record time per model layer |
 | `MEMORY_GIB` / `CACHE_GIB` | Default 110 / 2 GiB |
 | `WIRED_GIB` | Optional; cannot exceed the reported recommended working set |
@@ -43,7 +44,7 @@ should use the same source-compatible prompt IDs as the reference run. The
 runner rejects short input rather than silently repeating it. It records the
 exact input/output IDs and decoded output text for coherence inspection.
 
-Warmup executes all requested prefill chunk shapes and one decode tick, then
+Warmup executes all requested prefill chunk shapes and the configured decode ticks, then
 resets request state. There is no prefix reuse. Load/bind, warmup, prefill and
 decode time are separate. Progress goes to `OUT.progress.json`; the harness emits
 no success diagnostics to stdout/stderr. The normal test runner may print its
