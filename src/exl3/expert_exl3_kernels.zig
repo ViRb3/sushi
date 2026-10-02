@@ -1192,7 +1192,7 @@ var gemm_nax_cached: ?bool = null;
 const PairPrepKey = struct { in_dim: c_int, nslots: c_int, topk: c_int };
 const PairGemvKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, topk: c_int, n: u32, layout: GemvLayout, group: c_int };
 const DownFusedKey = struct { in_dim: c_int, out_dim: c_int, nslots: c_int, nsplit: c_int, n: u32, layout: GemvLayout, group: c_int = 0 };
-const MidKey = struct { dim: c_int, nslots: c_int };
+const MidKey = struct { dim: c_int, nslots: c_int, limit: c_int = 0 };
 const ReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int };
 const DecodeReduceKey = struct { out_dim: c_int, rows: c_int, topk: c_int, dtype: mlx.mlx_dtype };
 var pair_gemv_cfgs: CfgCache(PairGemvKey, 8) = .{};
@@ -2411,10 +2411,10 @@ const MID_SOURCE: [:0]const u8 =
     \\float s1 = v.x - v.y;
     \\float s2 = v.z + v.w;
     \\float s3 = v.z - v.w;
-    \\const float g0 = (s0 + s2) * sc * float(svhg[sb + lane]);
-    \\const float g1 = (s1 + s3) * sc * float(svhg[sb + lane + 32u]);
-    \\const float g2 = (s0 - s2) * sc * float(svhg[sb + lane + 64u]);
-    \\const float g3 = (s1 - s3) * sc * float(svhg[sb + lane + 96u]);
+    \\float g0 = (s0 + s2) * sc * float(svhg[sb + lane]);
+    \\float g1 = (s1 + s3) * sc * float(svhg[sb + lane + 32u]);
+    \\float g2 = (s0 - s2) * sc * float(svhg[sb + lane + 64u]);
+    \\float g3 = (s1 - s3) * sc * float(svhg[sb + lane + 96u]);
     \\v = float4(float(iu[xb + lane]), float(iu[xb + lane + 32u]), float(iu[xb + lane + 64u]), float(iu[xb + lane + 96u]));
     \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
     \\  const float p0 = simd_shuffle_xor(v.x, bit);
@@ -2431,10 +2431,18 @@ const MID_SOURCE: [:0]const u8 =
     \\s1 = v.x - v.y;
     \\s2 = v.z + v.w;
     \\s3 = v.z - v.w;
-    \\const float u0 = (s0 + s2) * sc * float(svhu[sb + lane]);
-    \\const float u1 = (s1 + s3) * sc * float(svhu[sb + lane + 32u]);
-    \\const float u2 = (s0 - s2) * sc * float(svhu[sb + lane + 64u]);
-    \\const float u3 = (s1 - s3) * sc * float(svhu[sb + lane + 96u]);
+    \\float u0 = (s0 + s2) * sc * float(svhu[sb + lane]);
+    \\float u1 = (s1 + s3) * sc * float(svhu[sb + lane + 32u]);
+    \\float u2 = (s0 - s2) * sc * float(svhu[sb + lane + 64u]);
+    \\float u3 = (s1 - s3) * sc * float(svhu[sb + lane + 96u]);
+    \\if constexpr (CLAMP_LIMIT > 0) {
+    \\  g0 = min(g0, float(CLAMP_LIMIT)); g1 = min(g1, float(CLAMP_LIMIT));
+    \\  g2 = min(g2, float(CLAMP_LIMIT)); g3 = min(g3, float(CLAMP_LIMIT));
+    \\  u0 = clamp(u0, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\  u1 = clamp(u1, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\  u2 = clamp(u2, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\  u3 = clamp(u3, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+    \\}
     \\const float ysig0 = 1 / (1 + exp(abs(g0)));
     \\const float ysig1 = 1 / (1 + exp(abs(g1)));
     \\const float ysig2 = 1 / (1 + exp(abs(g2)));
@@ -2641,7 +2649,11 @@ pub fn pairGemv(s: mlx.mlx_stream, x: mlx.mlx_array, suhg: mlx.mlx_array, suhu: 
 }
 
 fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, dim: c_int, nslots: c_int) !mlx.mlx_array {
-    const key = MidKey{ .dim = dim, .nslots = nslots };
+    return midSwigluPrepWithLimit(s, ig, iu, svhg, svhu, suhd, slots, dim, nslots, 0);
+}
+
+fn midSwigluPrepWithLimit(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, dim: c_int, nslots: c_int, limit: c_int) !mlx.mlx_array {
+    const key = MidKey{ .dim = dim, .nslots = nslots, .limit = limit };
     const cfg = mid_cfgs.get(key) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -2651,6 +2663,7 @@ fn midSwigluPrep(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: 
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32 * blocks, nslots, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "CLAMP_LIMIT", limit));
         mid_cfgs.put(key, c);
         break :blk c;
     };
@@ -3093,6 +3106,75 @@ pub fn moePrefill(
     const out = try downFinishReduce(s, d_unsorted, down_svh, slots, scores, hidden, rows, topk, mlx.mlx_array_dtype(x));
     try ubenchEval(out, "token_reduce");
     return out;
+}
+
+pub fn moeSwigluClamped(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    topk: c_int,
+    limit: c_int,
+    out_dtype: mlx.mlx_dtype,
+) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const rows = sh[0];
+    const hidden = sh[1];
+    const nslots = rows * topk;
+    if (rows <= DECODE_ROWS_MAX) {
+        const repeated = try repeatRows(s, x, rows, topk);
+        defer _ = mlx.mlx_array_free(repeated);
+        const prep_g = try prepareIndexed(s, repeated, gate_suh, slots);
+        defer _ = mlx.mlx_array_free(prep_g);
+        const prep_u = try prepareIndexed(s, repeated, up_suh, slots);
+        defer _ = mlx.mlx_array_free(prep_u);
+        const gate = try indexedGemvCoopF16(s, prep_g, gate_t, slots);
+        defer _ = mlx.mlx_array_free(gate);
+        const up = try indexedGemvCoopF16(s, prep_u, up_t, slots);
+        defer _ = mlx.mlx_array_free(up);
+        const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
+        defer _ = mlx.mlx_array_free(prepared);
+        const down = try indexedGemvCoopF16(s, prepared, down_t, slots);
+        defer _ = mlx.mlx_array_free(down);
+        return downFinishReduce(s, down, down_svh, slots, scores, hidden, rows, topk, out_dtype);
+    }
+    var order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order);
+    try mlx.check(mlx.mlx_argsort_axis(&order, slots, 0, s));
+    var order_i = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order_i);
+    try mlx.check(mlx.mlx_astype(&order_i, order, .int32, s));
+    var sorted_slots = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sorted_slots);
+    try mlx.check(mlx.mlx_take_axis(&sorted_slots, slots, order, 0, s));
+    const prep = try pairPrepareFromTokens(s, x, gate_suh, up_suh, sorted_slots, order_i, hidden, nslots, topk);
+    defer _ = mlx.mlx_array_free(prep[0]);
+    defer _ = mlx.mlx_array_free(prep[1]);
+    const win = gemmWindowRows();
+    const aligned = gemmWindowAligned();
+    const tab = try gemmWindowTable(s, sorted_slots, nslots, win, aligned);
+    defer _ = mlx.mlx_array_free(tab.starts);
+    defer _ = mlx.mlx_array_free(tab.nlives);
+    const gate = try innerGemmSortedTable(s, prep[0], gate_t, sorted_slots, win, aligned, tab);
+    defer _ = mlx.mlx_array_free(gate);
+    const up = try innerGemmSortedTable(s, prep[1], up_t, sorted_slots, win, aligned, tab);
+    defer _ = mlx.mlx_array_free(up);
+    const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, sorted_slots, mlx.getShape(gate)[1], nslots, limit);
+    defer _ = mlx.mlx_array_free(prepared);
+    const down = try innerGemmSortedTable(s, prepared, down_t, sorted_slots, win, aligned, tab);
+    defer _ = mlx.mlx_array_free(down);
+    const original_order = try scatterSorted(s, down, order_i, hidden, nslots);
+    defer _ = mlx.mlx_array_free(original_order);
+    return downFinishReduce(s, original_order, down_svh, slots, scores, hidden, rows, topk, out_dtype);
 }
 
 pub fn prefillDecodeGatherMm(
@@ -9204,5 +9286,159 @@ test "exl3 shared reduction preserves the routed output rounding before addition
         const ep = mlx.mlx_array_data_float32(ef).?;
         const gp = mlx.mlx_array_data_float32(gf).?;
         try t.expectEqualSlices(u8, std.mem.sliceAsBytes(ep[0..256]), std.mem.sliceAsBytes(gp[0..256]));
+    }
+}
+
+// Staged oracle keeps the original projection and reduction ordering.
+fn clampedSortedReference(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    topk: c_int,
+    limit: c_int,
+    out_dtype: mlx.mlx_dtype,
+) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const rows = sh[0];
+    const hidden = sh[1];
+    const nslots = rows * topk;
+    const repeated = try repeatRows(s, x, rows, topk);
+    defer _ = mlx.mlx_array_free(repeated);
+    var order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(order);
+    try mlx.check(mlx.mlx_argsort_axis(&order, slots, 0, s));
+    var sorted_slots = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sorted_slots);
+    try mlx.check(mlx.mlx_take_axis(&sorted_slots, slots, order, 0, s));
+    var sorted_x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sorted_x);
+    try mlx.check(mlx.mlx_take_axis(&sorted_x, repeated, order, 0, s));
+    const prep_g = try prepareIndexed(s, sorted_x, gate_suh, sorted_slots);
+    defer _ = mlx.mlx_array_free(prep_g);
+    const prep_u = try prepareIndexed(s, sorted_x, up_suh, sorted_slots);
+    defer _ = mlx.mlx_array_free(prep_u);
+    const decode = rows <= DECODE_ROWS_MAX;
+    const gate = if (decode) try indexedGemvCoopF16(s, prep_g, gate_t, sorted_slots) else try innerGemmSorted(s, prep_g, gate_t, sorted_slots);
+    defer _ = mlx.mlx_array_free(gate);
+    const up = if (decode) try indexedGemvCoopF16(s, prep_u, up_t, sorted_slots) else try innerGemmSorted(s, prep_u, up_t, sorted_slots);
+    defer _ = mlx.mlx_array_free(up);
+    const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, sorted_slots, mlx.getShape(gate)[1], nslots, limit);
+    defer _ = mlx.mlx_array_free(prepared);
+    const down = if (decode) try indexedGemvCoopF16(s, prepared, down_t, sorted_slots) else try innerGemmSorted(s, prepared, down_t, sorted_slots);
+    defer _ = mlx.mlx_array_free(down);
+    var inverse = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inverse);
+    try mlx.check(mlx.mlx_argsort_axis(&inverse, order, 0, s));
+    var original_order = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(original_order);
+    try mlx.check(mlx.mlx_take_axis(&original_order, down, inverse, 0, s));
+    return downFinishReduce(s, original_order, down_svh, slots, scores, hidden, rows, topk, out_dtype);
+}
+
+test "exl3 clamped routing preserves staged bytes at every 2 to 4 bpw rate" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const dim = 256;
+    const experts = 8;
+    const topk = 8;
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.{ .codebook = .mul1, .window = .w16 });
+    var random = std.Random.DefaultPrng.init(89031);
+    const rnd = random.random();
+    var n: c_int = 32;
+    while (n <= 64) : (n += 2) {
+        const bits = try a.alloc(u16, experts * 16 * 16 * @as(usize, @intCast(n)));
+        defer a.free(bits);
+        for (bits) |*v| v.* = rnd.int(u16);
+        var scales: [experts * dim]u16 = undefined;
+        for (&scales) |*v| v.* = exl3.f32ToF16Bits(0.125 + rnd.float(f32) * 0.125);
+        const tr = mlx.mlx_array_new_data(bits.ptr, &[_]c_int{ experts, 16, 16, n }, 4, .uint16);
+        defer _ = mlx.mlx_array_free(tr);
+        const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ experts, dim }, 2, .float16);
+        defer _ = mlx.mlx_array_free(sc);
+        for ([_]usize{ 1, 17 }) |rows| {
+            const x = try a.alloc(f32, rows * dim);
+            defer a.free(x);
+            for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 32;
+            const ids = try a.alloc(u32, rows * topk);
+            defer a.free(ids);
+            const weights = try a.alloc(f32, rows * topk);
+            defer a.free(weights);
+            for (ids, weights, 0..) |*id, *w, i| {
+                id.* = @intCast((experts - 1 - i % experts + i / topk) % experts);
+                w.* = 0.0625 * @as(f32, @floatFromInt(1 + i % 5));
+            }
+            const xf = mlx.mlx_array_new_data(x.ptr, &[_]c_int{ @intCast(rows), dim }, 2, .float32);
+            defer _ = mlx.mlx_array_free(xf);
+            const sl = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(sl);
+            const ws = mlx.mlx_array_new_data(weights.ptr, &[_]c_int{@intCast(weights.len)}, 1, .float32);
+            defer _ = mlx.mlx_array_free(ws);
+            inline for (.{ mlx.mlx_dtype.float32, mlx.mlx_dtype.bfloat16 }) |dtype| {
+                var xa = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(xa);
+                try mlx.check(mlx.mlx_astype(&xa, xf, dtype, s));
+                const old = try clampedSortedReference(s, xa, tr, sc, sc, tr, sc, sc, tr, sc, sc, sl, ws, topk, 10, dtype);
+                defer _ = mlx.mlx_array_free(old);
+                const got = try moeSwigluClamped(s, xa, tr, sc, sc, tr, sc, sc, tr, sc, sc, sl, ws, topk, 10, dtype);
+                defer _ = mlx.mlx_array_free(got);
+                var old32 = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(old32);
+                var got32 = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(got32);
+                try mlx.check(mlx.mlx_astype(&old32, old, .float32, s));
+                try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
+                try std.testing.expectEqualSlices(u8, try gemvOutBytes(old32), try gemvOutBytes(got32));
+            }
+        }
+    }
+}
+
+test "exl3 clamped routing preserves GLM production width bytes" {
+    const s = mlx.gpuStream();
+    const dec = exl3.Decode{ .codebook = .mcg, .window = .w12 };
+    setDecodeParams(dec);
+    defer setDecodeParams(.mul1);
+    for ([_]usize{ 1, 17 }) |rows| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var f = try mimoMoeFixture(arena.allocator(), .{
+            .hidden = 4096,
+            .inter = 2048,
+            .e = 8,
+            .rows = rows,
+            .topk = 8,
+            .rate = .{ .n = 36 },
+            .dec = dec,
+            .seed = 621 + rows,
+            .banks = .{ 0.125, 0.25, 0.125, 0.25 },
+            .x_scale = 8,
+        });
+        defer f.deinit();
+        const a = f.arrays;
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, a[8], .bfloat16, s));
+        const old = try clampedSortedReference(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(old);
+        const got = try moeSwigluClamped(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
+        defer _ = mlx.mlx_array_free(got);
+        var old32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(old32);
+        var got32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got32);
+        try mlx.check(mlx.mlx_astype(&old32, old, .float32, s));
+        try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
+        try std.testing.expectEqualSlices(u8, try gemvOutBytes(old32), try gemvOutBytes(got32));
     }
 }

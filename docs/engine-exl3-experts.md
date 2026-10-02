@@ -67,6 +67,18 @@ A MiMo EXL3 pack serves RESIDENT: its banks nest under `model.layers.` (qwen4's 
 source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceResidentBytes`. See
 [arch-mimo-v2](arch-mimo-v2.md).
 
+## GLM clamped experts
+
+`moeClamped` applies the gate upper bound and symmetric up bound in FP32 before SwiGLU. Decode keeps
+slots in their original top-k order. Prefill prepares gate/up directly from token rows, shares one window
+table across all three projections, and scatters the down plane back before the existing top-k reduction.
+It does not materialize repeated and sorted token planes or sort the inverse permutation.
+
+The optimized routing matches the staged path bit-for-bit at every even packed width n32–64 (2–4 bpw),
+with BF16 and FP32 inputs/outputs, top-k eight, and decode/prefill rows. A K2.25/W12 case also checks the
+GLM hidden/intermediate widths 4096/2048. These are arithmetic and dispatch-structure checks; they do not
+establish a measured full-model speedup.
+
 ## Kernels
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
