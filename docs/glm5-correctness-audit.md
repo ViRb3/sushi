@@ -146,3 +146,16 @@ The dispatch regression failed at five tracked auxiliary calls before the change
 All-rate 288-expert output-byte comparisons and production 4096/2048 K2.25 cases pass with sparse,
 all-expert and skewed routes. Existing staged BF16/FP32 comparisons and the stride fallback remain gates.
 No full-model speedup is inferred from these component checks.
+
+## Cooperative middle/down fusion
+
+The contained decode fusion reuses the existing clamped middle body and cooperative down reduction,
+including the intermediate F16 store and final F16 inner output. Direct byte parity passes for all
+17 supported 2–4 bpw rates and both output-tile choices; production-width cases cover 1/2/4/8/16 rows.
+Whole-chain production checks assert engagement, and existing mixed-rate paths retain their fallback.
+The fast guard is restricted to the measured K2.25/W12 MCG 4096/2048 top-8 BF16 configuration.
+
+Two clean warmed component runs found a small one-row improvement (4.55% and 2.29%); the selected
+16-row variant improved stage latency by 15.77% on the repeat. A potentially overlapped run was rejected.
+These are component measurements with synthetic resident banks, not full-model throughput or quality
+results. Details are recorded in the EXL3 engine document.

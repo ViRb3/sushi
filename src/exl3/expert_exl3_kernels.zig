@@ -3228,9 +3228,17 @@ pub fn moeSwigluClamped(
         defer for (pair) |value| {
             _ = mlx.mlx_array_free(value);
         };
-        const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
-        defer _ = mlx.mlx_array_free(prepared);
-        const down = try indexedGemvCoopF16(s, prepared, down_t, slots);
+        const down = blk: {
+            const gs = mlx.getShape(gate_t);
+            const us = mlx.getShape(up_t);
+            const ds = mlx.getShape(down_t);
+            const eligible = hidden == 4096 and mlx.getShape(gate)[1] == 2048 and topk == 8 and out_dtype == .bfloat16 and
+                gs[3] == 36 and us[3] == gs[3] and ds[3] == gs[3] and active_decode.codebook == .mcg and active_decode.window == .w12;
+            if (eligible) if (try clampedMiddleDownCoop(s, gate, up, down_t, gate_svh, up_svh, down_suh, slots, limit, if (rows == 1) 4 else 8)) |fused| break :blk fused;
+            const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
+            defer _ = mlx.mlx_array_free(prepared);
+            break :blk try indexedGemvCoopF16(s, prepared, down_t, slots);
+        };
         defer _ = mlx.mlx_array_free(down);
         return downFinishReduce(s, down, down_svh, slots, scores, hidden, rows, topk, out_dtype);
     }
@@ -9502,7 +9510,7 @@ test "exl3 clamped routing preserves GLM production width bytes" {
     const dec = exl3.Decode{ .codebook = .mcg, .window = .w12 };
     setDecodeParams(dec);
     defer setDecodeParams(.mul1);
-    for ([_]usize{ 1, 17 }) |rows| {
+    for ([_]usize{ 1, 2, 4, 8, 16, 17 }) |rows| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         var f = try mimoMoeFixture(arena.allocator(), .{
@@ -9524,8 +9532,10 @@ test "exl3 clamped routing preserves GLM production width bytes" {
         try mlx.check(mlx.mlx_astype(&x, a[8], .bfloat16, s));
         const old = try clampedSortedReference(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(old);
+        resetClampedMiddleDispatchCount();
         const got = try moeSwigluClamped(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(@as(usize, if (rows <= 16) 1 else 0), clampedMiddleDispatchCount());
         var old32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(old32);
         var got32 = mlx.mlx_array_new();
@@ -9807,4 +9817,154 @@ test "exl3 GLM sorted finish retains stride fallback bytes" {
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     try clampedWindowBytes(128, 128, 36, false);
+}
+
+const CLAMPED_MIDDLE_DOWN_SOURCE: [:0]const u8 = blk: {
+    @setEvalBranchQuota(100000);
+    const mid_begin = std.mem.indexOf(u8, MID_SOURCE, "const float sc =").?;
+    const mid_end = std.mem.indexOf(u8, MID_SOURCE, "yd[xb + lane]").?;
+    const ot = "uint ot = uint(threadgroup_position_in_grid.x);";
+    const coop_begin = std.mem.indexOf(u8, INDEXED_COOP_SOURCE, ot).? + ot.len;
+    const xb = "const size_t xb = (size_t)slot * (size_t)(IDIM);";
+    const coop_xb = std.mem.indexOf(u8, INDEXED_COOP_SOURCE, xb).?;
+    const prefix =
+        \\threadgroup float partial[4 * 256];
+        \\threadgroup half prepared[uint(IDIM)];
+        \\{
+        \\ const uint slot = threadgroup_position_in_grid.y;
+        \\ const uint eid = uint(slots[slot]);
+        \\ const ushort lane = thread_index_in_simdgroup;
+        \\ for (uint block = simdgroup_index_in_threadgroup; block < uint(IDIM)/128u; block += 4u) {
+        \\  const uint base = block * 128u;
+        \\  const size_t xb = (size_t)slot * uint(IDIM) + base;
+        \\  const size_t sb = (size_t)eid * uint(IDIM) + base;
+        \\
+    ;
+    const bridge =
+        \\prepared[base + lane] = half((s0 + s2) * sc);
+        \\prepared[base + lane + 32u] = half((s1 + s3) * sc);
+        \\prepared[base + lane + 64u] = half((s0 - s2) * sc);
+        \\prepared[base + lane + 96u] = half((s1 - s3) * sc);
+        \\ }
+        \\}
+        \\threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\const threadgroup half* x = prepared;
+        \\for (uint output_tile = 0; output_tile < uint(OTPT); ++output_tile) {
+        \\ uint ot = uint(threadgroup_position_in_grid.x) * uint(OTPT) + output_tile;
+        \\
+    ;
+    break :blk prefix ++ MID_SOURCE[mid_begin..mid_end] ++ bridge ++ INDEXED_COOP_SOURCE[coop_begin..coop_xb] ++
+        "const size_t xb = 0u;" ++ INDEXED_COOP_SOURCE[coop_xb + xb.len ..] ++ "\n}\n";
+};
+const ClampedMiddleKey = struct { input: c_int, output: c_int, slots: c_int, n: u32, limit: c_int, tiles: c_int };
+var clamped_middle_cfgs: CfgCache(ClampedMiddleKey, 8) = .{};
+var clamped_middle_kernels: KernelSlots = no_kernels;
+var clamped_middle_calls: usize = 0;
+var clamped_middle_engaged: bool = false;
+pub fn clampedMiddleDispatchCount() usize {
+    return clamped_middle_calls;
+}
+pub fn resetClampedMiddleDispatchCount() void {
+    clamped_middle_calls = 0;
+}
+
+fn clampedMiddleDownCoop(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, down: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, limit: c_int, tiles: c_int) !?mlx.mlx_array {
+    const x = mlx.getShape(ig);
+    const w = mlx.getShape(down);
+    const ids = mlx.getShape(slots);
+    if (!mlx.streamIsGpu(s) or x.len != 2 or w.len != 4 or ids.len != 1 or
+        !std.mem.eql(c_int, x, mlx.getShape(iu)) or x[0] != ids[0] or x[0] < 1 or x[1] < 128 or x[1] > 8192 or @mod(x[1], 128) != 0 or
+        w[0] < 1 or w[1] < 1 or w[1] > std.math.maxInt(c_int) / 16 or w[1] * 16 != x[1] or w[2] < 1 or w[2] > std.math.maxInt(c_int) / 128 or (tiles != 1 and tiles != 4 and tiles != 8) or @mod(w[2], tiles) != 0 or limit < 1 or limit > 128 or
+        mlx.mlx_array_dtype(ig) != .float16 or mlx.mlx_array_dtype(iu) != .float16 or mlx.mlx_array_dtype(down) != .uint16 or
+        (mlx.mlx_array_dtype(slots) != .uint32 and mlx.mlx_array_dtype(slots) != .int32)) return null;
+    for ([_]mlx.mlx_array{ svhg, svhu, suhd }) |a|
+        if (mlx.mlx_array_dtype(a) != .float16 or !std.mem.eql(c_int, &.{ w[0], x[1] }, mlx.getShape(a))) return null;
+    const rate = try packedRate(w[3]);
+    const key = ClampedMiddleKey{ .input = x[1], .output = w[2] * 16, .slots = x[0], .n = rate.n, .limit = limit, .tiles = tiles };
+    const cfg = clamped_middle_cfgs.get(key) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ x[0], key.output }, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(w[2], tiles) * 128, x[0], 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+        inline for (.{ .{ "IDIM", key.input }, .{ "ODIM", key.output }, .{ "NHW", @as(c_int, @intCast(rate.n)) }, .{ "CLAMP_LIMIT", limit }, .{ "OTPT", tiles } }) |p|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, p[0], p[1]));
+        clamped_middle_cfgs.put(key, c);
+        break :blk c;
+    };
+    const k = try codebookKernel(&clamped_middle_kernels, "sushi_exl3_clamped_middle_down", &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" }, &.{"y"}, CLAMPED_MIDDLE_DOWN_SOURCE);
+    const outputs = try applyOuts(s, k, &.{ ig, iu, down, svhg, svhu, suhd, slots }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
+    try mlx.check(mlx.mlx_vector_array_get(&result, outputs, 0));
+    clamped_middle_calls += 1;
+    if (!clamped_middle_engaged) {
+        clamped_middle_engaged = true;
+        if (!@import("builtin").is_test) log.info("[exl3-decode] clamped middle/down fused inner=f16 k_splits=1\n", .{});
+    }
+    return result;
+}
+
+fn clampedMiddleDownCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_int, timing: bool) !void {
+    const s = mlx.gpuStream();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try mimoMoeFixture(a, .{ .hidden = hidden, .inter = inter, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = rate }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 99211 + rate + rows, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
+    defer f.deinit();
+    var prng = std.Random.DefaultPrng.init(7821 + rate);
+    var planes: [2]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    defer for (planes[0..made]) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    for (&planes) |*p| {
+        const data = try a.alloc(u16, rows * 8 * inter);
+        for (data) |*v| v.* = exl3.f32ToF16Bits((prng.random().float(f32) - 0.5) * 128);
+        p.* = mlx.mlx_array_new_data(data.ptr, &.{ @intCast(rows * 8), @intCast(inter) }, 2, .float16);
+        made += 1;
+    }
+    const scale = try a.alloc(u16, 8 * inter);
+    for (scale) |*v| v.* = exl3.f32ToF16Bits((prng.random().float(f32) - 0.5) * 0.5);
+    const up_scale = mlx.mlx_array_new_data(scale.ptr, &.{ 8, @intCast(inter) }, 2, .float16);
+    defer _ = mlx.mlx_array_free(up_scale);
+    const v = f.arrays;
+    const mid = try midSwigluPrepWithLimit(s, planes[0], planes[1], v[4], up_scale, v[5], v[7], @intCast(inter), @intCast(rows * 8), 10);
+    defer _ = mlx.mlx_array_free(mid);
+    const old = try indexedGemvCoopF16(s, mid, v[2], v[7]);
+    defer _ = mlx.mlx_array_free(old);
+    const got = (try clampedMiddleDownCoop(s, planes[0], planes[1], v[2], v[4], up_scale, v[5], v[7], 10, tiles)) orelse return error.TestExpectedMiddleDownFusion;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expectEqualSlices(u8, try gemvOutBytes(old), try gemvOutBytes(got));
+    if (!timing) return;
+    var durations: [2][100]u64 = undefined;
+    for (0..120) |round| for (0..2) |position| {
+        const arm = if (round % 2 == 0) position else 1 - position;
+        var timer = io_util.Stopwatch.init(std.testing.io);
+        const result = if (arm == 0) blk: {
+            const middle = try midSwigluPrepWithLimit(s, planes[0], planes[1], v[4], up_scale, v[5], v[7], @intCast(inter), @intCast(rows * 8), 10);
+            defer _ = mlx.mlx_array_free(middle);
+            break :blk try indexedGemvCoopF16(s, middle, v[2], v[7]);
+        } else (try clampedMiddleDownCoop(s, planes[0], planes[1], v[2], v[4], up_scale, v[5], v[7], 10, tiles)).?;
+        try mlx.check(mlx.mlx_array_eval(result));
+        if (round >= 20) durations[arm][round - 20] = timer.read();
+        _ = mlx.mlx_array_free(result);
+    };
+    for (&durations) |*d| std.mem.sort(u64, d, {}, std.sort.asc(u64));
+    std.debug.print("[clamped-mid-down] rows={d} tiles={d} separate_us={d:.3} fused_us={d:.3}\n", .{ rows, tiles, @as(f64, @floatFromInt(durations[0][50])) / 1000, @as(f64, @floatFromInt(durations[1][50])) / 1000 });
+}
+
+test "exl3 clamped middle down cooperative fusion preserves F16 bytes" {
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    for (0..17) |i| for ([_]c_int{ 4, 8 }) |tiles| try clampedMiddleDownCase(256, 128, 1, @intCast(32 + 2 * i), tiles, false);
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| try clampedMiddleDownCase(4096, 2048, rows, 36, if (rows == 1) 4 else 8, false);
+}
+
+test "exl3 clamped middle down warmed microbenchmark" {
+    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_MIDDLE_DOWN_BENCH"))) return error.SkipZigTest;
+    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer setDecodeParams(.mul1);
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| try clampedMiddleDownCase(4096, 2048, rows, 36, if (rows == 1) 4 else 8, true);
 }

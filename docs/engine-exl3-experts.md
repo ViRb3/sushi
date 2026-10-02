@@ -99,6 +99,40 @@ Aligned GLM prefill also avoids the scattered F16 down intermediate (32 MiB at 5
 and hidden width 4096) and one dispatch. Exact staged-output tests cover all 17 rates at 288 experts,
 real 4096/2048 projection widths, sparse/all-expert/skewed routing, and the retained stride fallback.
 
+### Cooperative clamped middle/down fusion
+
+The GLM K2.25/W12 MCG decode arm can fuse the clamped middle transform with the cooperative down
+projection. It uses the original middle arithmetic, stores the transformed input as F16 in threadgroup
+memory, and then runs the original four-simdgroup cooperative reduction and F16 output store. It does
+not substitute the normal EXL3 FP32 split-K chain. Four output tiles per group are used for one row;
+eight are used for two through sixteen rows.
+
+The served guard is BF16 output, hidden/intermediate widths 4096/2048, top-k eight and matching K2.25
+projection rates. Other widths, storage formats, codebooks and mixed rates retain the separate path.
+The kernel's direct F16 parity tests cover all 17 rates from 2 through 4 bpw with both tile choices;
+production-width tests cover 1/2/4/8/16 rows. Whole-chain staged-byte tests remain required. The runtime
+engagement counter is `clampedMiddleDispatchCount`, with a matching reset function.
+
+A warmed M5 Max component comparison used ReleaseFast, foreground QoS, an exclusive GPU lock,
+20 warmup A/B pairs and 100 alternating A/B–B/A pairs. Workers paused GPU work and builds. Max fans
+were requested and a 10-second cooldown applied; the controller did not confirm spin-up on the cool
+machine. Numbers include graph construction and evaluation wait, not just GPU execution. The banks
+were synthetic eight-expert K2.25/W12 banks; no full-model speedup is inferred.
+
+| Rows | Output tiles/group | Separate middle + down | Fused | Stage latency reduction |
+|---:|---:|---:|---:|---:|
+| 1 | 4 | 241.625 µs | 236.083 µs | 2.29% |
+| 2 | 8 | 294.875 µs | 287.167 µs | 2.61% |
+| 4 | 8 | 465.584 µs | 438.333 µs | 5.85% |
+| 8 | 8 | 788.708 µs | 686.584 µs | 12.95% |
+| 16 | 8 | 1387.833 µs | 1169.042 µs | 15.77% |
+
+The earlier clean paired sample showed a 4.55% one-row reduction, so the serial gain is small and
+context-dependent. One output tile/group was slower and is not selected. An initial timing that may
+have overlapped another GPU test was discarded. Measurements were built from `06422dd4` plus this
+change; raw records include binary/source hashes. Real-checkpoint throughput and unchanged output IDs
+must be checked on the combined final build.
+
 ## Kernels
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
