@@ -58,9 +58,9 @@ Then run N2 and N4 against N3 with that schedule. The expected mechanism is a
 better accepted-token/verification-cost tradeoff; gains are not assumed.
 
 One additional N3 chain arm (`TreeParams.children=1`) can isolate branching
-versus depth. The adapter currently hardcodes the tree defaults: children4,
-tau1.5, edge weight0.6, temperature1.0. Expose an explicit diagnostic parameter
-before this arm; do not silently alter defaults. A chain may improve depth at
+versus depth. The gated `SUSHI_GLM_DFLASH_CHILDREN` parameter now passes an explicit adapter
+argument (range1–16; default4). Existing API wrappers retain children4. Other
+tree defaults remain tau1.5, edge weight0.6, temperature1.0. A chain may improve depth at
 fixed rows but loses sibling coverage. Record accepted drafts, rounds, verified
 rows, phase times and matched serial throughput for every arm. Repeat the best
 arm on a second prompt and a 2048-token prefix before selecting a policy.
@@ -86,6 +86,10 @@ comparison. Existing MTP implementations for other families are not a validated
 GLM substitute. DFlash2 already has measured acceptance and a callable verifier,
 so its scheduling experiment remains the immediate path; MTP is a plausible
 subsequent implementation experiment, not excluded by missing trained weights.
+The local oMLX GLM runtime maps it as concat(enorm(next embedding), hnorm(raw
+hidden)) through eh_proj, then a plain residual MLA/MoE block without HC,
+shared_head.norm, and the shared vocabulary head. Raw hidden is the four-HC-stream
+mean before final norm; a future implementation must retain that exact tap.
 
 ## First async full-checkpoint qualification
 

@@ -22,8 +22,10 @@ test "GLM DFlash request fork keeps rejected pool and recurrence state isolated"
     try mlx.check(mlx.mlx_array_set(&source.layers[0].recurrent.ssm_state, try ops.ones(&.{ 1, 1, 2, 2 }, .float32)));
     try mlx.check(mlx.mlx_array_set(&source.layers[0].recurrent.conv_state, try ops.ones(&.{ 1, 3, 6 }, .float32)));
     source.layers[0].recurrent.initialized = true;
+    source.prefill_sync_layers = 4;
     var branch = try cloneRequest(&source);
     defer branch.deinit();
+    try std.testing.expectEqual(@as(u8, 4), branch.prefill_sync_layers);
     _ = try branch.layers[0].attention.append(try ops.ones(&.{ 1, 4 }, .float32), try ops.zeros(&.{ 1, 2 }, .float32), try ops.zeros(&.{ 1, 2 }, .float32), ape, ops.s);
     try branch.layers[0].attention.evaluate();
     try mlx.check(mlx.mlx_array_set(&branch.layers[0].recurrent.ssm_state, try ops.zeros(&.{ 1, 1, 2, 2 }, .float32)));
@@ -47,6 +49,7 @@ pub fn cloneRequest(source: *const forward.Request) !forward.Request {
     copy.decode_async = source.decode_async;
     copy.dense_prefill = source.dense_prefill;
     copy.prefill_async = source.prefill_async;
+    copy.prefill_sync_layers = source.prefill_sync_layers;
     for (copy.layers, source.layers) |*dst, src| {
         if (src.recurrent.initialized) {
             try mlx.check(mlx.mlx_array_set(&dst.recurrent.conv_state, src.recurrent.conv_state));
@@ -198,8 +201,12 @@ pub const Proposal = struct {
 };
 
 pub fn proposeTree(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, pending: u32, max_nodes: usize) !Proposal {
+    return proposeTreeWithChildren(assistant, context, target, pending, max_nodes, 4);
+}
+
+pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, pending: u32, max_nodes: usize, children: usize) !Proposal {
     try validatePair(assistant, target);
-    if (max_nodes == 0 or max_nodes > 15 or pending >= target.cfg.vocab_size) return error.InvalidGlmDraftTree;
+    if (max_nodes == 0 or max_nodes > 15 or children == 0 or children > 16 or pending >= target.cfg.vocab_size) return error.InvalidGlmDraftTree;
     // forwardBlock uses spare cache rows; fork so an evaluation failure cannot alter committed context.
     var work = try cloneContext(assistant, context);
     defer work.deinit();
@@ -215,7 +222,7 @@ pub fn proposeTree(assistant: *draft.DflashModel, context: *const draft.DflashCt
     const logits = try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
     var lattice = try tree.lattice(assistant.allocator, &assistant.selector.?, assistant.config.selector_top_k, hidden, logits, pending, assistant.s);
     defer lattice.deinit(assistant.allocator);
-    var branches = try tree.bestFirstTree(assistant.allocator, &lattice, .{ .max_nodes = max_nodes });
+    var branches = try tree.bestFirstTree(assistant.allocator, &lattice, .{ .max_nodes = max_nodes, .children = children });
     defer branches.deinit(assistant.allocator);
     var result = Proposal{ .count = branches.tokens.len + 1 };
     result.tokens[0] = pending;
@@ -321,6 +328,14 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     try evaluateContext(&context);
     const proposal = try proposeTree(&assistant, &context, &target, 1, 4);
     try std.testing.expectEqual(@as(usize, 5), proposal.count);
+    const explicit_default = try proposeTreeWithChildren(&assistant, &context, &target, 1, 4, 4);
+    try std.testing.expectEqualSlices(u32, proposal.tokens[0..proposal.count], explicit_default.tokens[0..explicit_default.count]);
+    try std.testing.expectEqualSlices(i32, proposal.parents[0..proposal.count], explicit_default.parents[0..explicit_default.count]);
+    const chain = try proposeTreeWithChildren(&assistant, &context, &target, 1, 3, 1);
+    try std.testing.expectEqual(@as(usize, 4), chain.count);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1, 2 }, chain.parents[0..chain.count]);
+    try std.testing.expectError(error.InvalidGlmDraftTree, proposeTreeWithChildren(&assistant, &context, &target, 1, 3, 0));
+    try std.testing.expectError(error.InvalidGlmDraftTree, proposeTreeWithChildren(&assistant, &context, &target, 1, 3, 17));
     try std.testing.expectEqual(@as(usize, 3), context.absLen());
     // The fixture head ties at token zero; its ancestry is root 1 -> token 0 -> token 0.
     const tokens = [_]u32{ 1, 0, 2, 0, 3 };
@@ -523,6 +538,11 @@ pub fn roundTreeLayerwise(io: std.Io, assistant: *draft.DflashModel, context: *d
 }
 
 pub fn roundTreeLayerwiseMode(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode) !RoundResult {
+    return roundTreeLayerwiseConfigured(io, assistant, context, target, request, pending, max_nodes, budget, eos, mode, 4);
+}
+
+pub fn roundTreeLayerwiseConfigured(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode, children: usize) !RoundResult {
+    if (children == 0 or children > 16) return error.InvalidGlmDraftTree;
     if (mode == .batched) return error.GlmBatchedVerifyUnqualified;
     try validatePair(assistant, target);
     if (budget == 0) return error.InvalidGlmDraftBudget;
@@ -533,7 +553,7 @@ pub fn roundTreeLayerwiseMode(io: std.Io, assistant: *draft.DflashModel, context
         one.tokens[0] = pending;
         one.parents[0] = -1;
         break :blk one;
-    } else try proposeTree(assistant, context, target, pending, max_nodes);
+    } else try proposeTreeWithChildren(assistant, context, target, pending, max_nodes, children);
     const draft_ns = timer.read();
     timer.reset();
     var layerwise = try @import("glm5_dflash_model.zig").verify(target, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], assistant.config.target_layer_ids, mode);
