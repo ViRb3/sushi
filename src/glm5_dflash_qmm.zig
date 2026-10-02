@@ -172,3 +172,32 @@ test "GLM DFlash affine row tiles preserve serial qmv bits" {
         }
     }
 }
+
+test "GLM DFlash affine row tiles decline incompatible grids and layouts" {
+    const s = mlx.gpuStream();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const x = try ops.ones(&.{ 1, 2, 256 }, .bfloat16);
+    const linear = Linear{ .w = try ops.zeros(&.{ 8, 64 }, .uint32), .scales = try ops.ones(&.{ 8, 2 }, .bfloat16), .biases = try ops.zeros(&.{ 8, 2 }, .bfloat16), .input = 256, .output = 8 };
+    for ([_]Arr{ linear.w, linear.scales, linear.biases }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    const before = dispatchCount();
+    var absent = linear;
+    absent.scales = .{ .ctx = null };
+    try std.testing.expect((try project(s, x, absent)) == null);
+    var wrong_group = linear;
+    wrong_group.scales = try ops.ones(&.{ 8, 4 }, .bfloat16);
+    try std.testing.expect((try project(s, x, wrong_group)) == null);
+    var wrong_dtype = linear;
+    wrong_dtype.biases = try ops.zeros(&.{ 8, 2 }, .float32);
+    try std.testing.expect((try project(s, x, wrong_dtype)) == null);
+    var dense = linear;
+    dense.w = try ops.zeros(&.{ 8, 256 }, .bfloat16);
+    try std.testing.expect((try project(s, x, dense)) == null);
+    var strided = linear;
+    strided.w = try ops.transpose(try ops.zeros(&.{ 64, 8 }, .uint32), &.{ 1, 0 });
+    try mlx.check(mlx.mlx_array_eval(strided.w));
+    try std.testing.expect((try project(s, x, strided)) == null);
+    try std.testing.expect((try project(s, try ops.ones(&.{ 1, 17, 256 }, .bfloat16), linear)) == null);
+    try std.testing.expect((try project(s, try ops.cast(x, .float32), linear)) == null);
+    try std.testing.expectEqual(before, dispatchCount());
+}

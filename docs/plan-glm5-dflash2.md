@@ -112,6 +112,8 @@ The affine row-tile candidate was disconnected. Measurement key: `glm53-dflash-s
 With affine row tiles requested, the diagnostic also records `affine_row_dispatches` and requires a
 nonzero count before reporting success. The flag is confined to this diagnostic; it does not alter
 ordinary target decoding or register a public speculative serving mode.
+Guard tests also require missing grids, wrong groups/dtypes, dense or strided banks, and excessive
+row counts to decline without a candidate dispatch.
 
 ## Sources and evidence
 
