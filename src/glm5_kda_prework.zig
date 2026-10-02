@@ -115,6 +115,18 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
     kernel = k;
     return k;
 }
+fn geometryFits(rows: c_int, heads: c_int) bool {
+    if (rows < 1 or heads < 1) return false;
+    const channels = std.math.mul(u64, @intCast(heads), 384) catch return false;
+    const input_count = std.math.mul(u64, @intCast(rows), channels) catch return false;
+    const weights = std.math.mul(u64, channels, 4) catch return false;
+    const tail = std.math.mul(u64, channels, 3) catch return false;
+    const grid = std.math.mul(u64, @intCast(heads), 128) catch return false;
+    // Shader offsets are uint32; a span of 2^32 elements has last index UINT_MAX.
+    return channels <= std.math.maxInt(c_int) and input_count <= std.math.maxInt(c_int) and
+        weights - 1 <= std.math.maxInt(u32) and tail - 1 <= std.math.maxInt(u32) and grid <= std.math.maxInt(c_int);
+}
+
 pub fn apply(s: mlx.mlx_stream, in: Inputs) !?Result {
     if (@import("builtin").is_test and force_reference_for_tests) return null;
     if (!mlx.streamIsGpu(s) or in.heads < 1 or in.heads > @divTrunc(std.math.maxInt(c_int), 384) or in.lower != -5) return null;
@@ -124,6 +136,7 @@ pub fn apply(s: mlx.mlx_stream, in: Inputs) !?Result {
     if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] != 3 * width or
         @as(i64, shape[1]) * shape[2] > std.math.maxInt(c_int) or mlx.mlx_array_dtype(in.qkv) != .bfloat16) return null;
     const rows = shape[1];
+    if (!geometryFits(rows, in.heads)) return null;
     for ([_]Arr{ in.a, in.beta, in.conv_weight }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16) return null;
     if (!std.mem.eql(c_int, &.{ 1, rows, width }, mlx.getShape(in.a)) or !std.mem.eql(c_int, &.{ 1, rows, in.heads }, mlx.getShape(in.beta)) or
         !std.mem.eql(c_int, &.{ 3 * width, 4, 1 }, mlx.getShape(in.conv_weight)) or
@@ -354,4 +367,19 @@ test "GLM KDA prework production microbenchmark" {
     }, .{ .whitespace = .indent_2 });
     defer std.testing.allocator.free(text);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = text });
+}
+
+test "GLM KDA prework geometry guards every uint32 shader offset" {
+    try std.testing.expect(geometryFits(512, 64));
+    const largest_heads: c_int = @intCast((@as(u64, std.math.maxInt(u32)) + 1) / (384 * 4));
+    try std.testing.expect(geometryFits(1, largest_heads));
+    try std.testing.expect(geometryFits(2, largest_heads));
+    try std.testing.expect(!geometryFits(1, largest_heads + 1));
+    try std.testing.expect(!geometryFits(1, 3_000_000));
+    const longest: c_int = @divTrunc(std.math.maxInt(c_int), 64 * 384);
+    try std.testing.expect(geometryFits(longest, 64));
+    try std.testing.expect(!geometryFits(longest + 1, 64));
+    try std.testing.expect(!geometryFits(0, 64));
+    try std.testing.expect(!geometryFits(1, 0));
+    try std.testing.expect(!geometryFits(std.math.maxInt(c_int), std.math.maxInt(c_int)));
 }

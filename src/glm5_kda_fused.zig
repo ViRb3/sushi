@@ -415,6 +415,14 @@ pub fn resetPostDispatchCount() void {
     post_calls = 0;
 }
 
+fn postGeometryFits(tokens: c_int, heads: c_int) bool {
+    if (tokens < 1 or heads < 1) return false;
+    const rows = std.math.mul(u64, @intCast(tokens), @intCast(heads)) catch return false;
+    const elements = std.math.mul(u64, rows, 128) catch return false;
+    const grid = std.math.mul(u64, rows, 32) catch return false;
+    return elements - 1 <= std.math.maxInt(u32) and grid <= std.math.maxInt(c_int);
+}
+
 pub fn post(s: mlx.mlx_stream, y: Arr, gate: Arr, norm: Arr, epsilon: f32) !?Arr {
     if (!mlx.streamIsGpu(s) or !hardwareSupported() or y.ctx == null or gate.ctx == null or norm.ctx == null or !std.math.isFinite(epsilon) or epsilon <= 0) return null;
     const sh = mlx.getShape(y);
@@ -422,6 +430,7 @@ pub fn post(s: mlx.mlx_stream, y: Arr, gate: Arr, norm: Arr, epsilon: f32) !?Arr
         !std.mem.eql(c_int, sh, mlx.getShape(gate)) or !std.mem.eql(c_int, &.{128}, mlx.getShape(norm)) or
         mlx.mlx_array_dtype(y) != .bfloat16 or mlx.mlx_array_dtype(gate) != .bfloat16 or
         (mlx.mlx_array_dtype(norm) != .bfloat16 and mlx.mlx_array_dtype(norm) != .float32)) return null;
+    if (!postGeometryFits(sh[1], sh[2])) return null;
     const rows = std.math.mul(c_int, sh[1], sh[2]) catch return null;
     const grid = std.math.mul(c_int, rows, 32) catch return null;
     const mode = (try modes(s)) orelse return null;
@@ -574,4 +583,15 @@ test "GLM KDA fused post validates guards and FP32 norm weights" {
     try std.testing.expect((try post(ops.s, x, gate, norm, std.math.nan(f32))) == null);
     try std.testing.expect((try post(ops.s, try ops.cast(x, .float32), gate, norm, 1e-5)) == null);
     try std.testing.expect((try post(ops.s, x, try ops.reshape(gate, &.{ 1, 17, 384 }), norm, 1e-5)) == null);
+}
+
+test "GLM KDA post geometry guards every uint32 shader offset" {
+    try std.testing.expect(postGeometryFits(512, 64));
+    try std.testing.expect(postGeometryFits(524_288, 64));
+    try std.testing.expect(!postGeometryFits(524_289, 64));
+    try std.testing.expect(postGeometryFits(33_554_432, 1));
+    try std.testing.expect(!postGeometryFits(33_554_433, 1));
+    try std.testing.expect(!postGeometryFits(0, 64));
+    try std.testing.expect(!postGeometryFits(1, 0));
+    try std.testing.expect(!postGeometryFits(std.math.maxInt(c_int), std.math.maxInt(c_int)));
 }
