@@ -73,10 +73,16 @@ round's excess rows but cannot explain a large sustained gain.
 
 ## MTP feasibility
 
-The current GLM target index contains no MTP tensors. Its diagnostic loader also
-explicitly excludes MTP names; the GLM forward has no MTP module or retained MTP
-state contract. Existing MTP implementations for other model families are not a
-valid GLM assistant substitute. Without compatible trained weights, acceptance
-and latency measurements, there is no basis to predict MTP will beat DFlash2.
-The current five-layer BF16 DFlash2 assistant is callable and has measured
-acceptance; verifier scheduling is the lower-risk next experiment.
+The target does contain trained MTP weights: 54 tensors under
+`model.language_model.layers.45.*`, including `eh_proj`, `enorm`, `hnorm`,
+`shared_head.norm`, MLA and packed MoE. Searching only for an `mtp` namespace
+misses them. The current diagnostic excludes layers outside the 45-layer target,
+and the GLM forward has no implemented MTP module or retained-state contract.
+
+A single MTP layer could cost less than the five-layer BF16 DFlash2 assistant,
+but acceptance and target verification cost determine useful throughput. MTP
+needs a loader/forward mapping and independent state/oracle tests before a fair
+comparison. Existing MTP implementations for other families are not a validated
+GLM substitute. DFlash2 already has measured acceptance and a callable verifier,
+so its scheduling experiment remains the immediate path; MTP is a plausible
+subsequent implementation experiment, not excluded by missing trained weights.
