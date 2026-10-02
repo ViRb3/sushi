@@ -1,9 +1,40 @@
 # GLM-5.3-Flash DFlash2 integration plan
 
-Status: source study and proposed implementation, 2026-10-02. Serial GLM correctness and tuning come
-first. This document does not enable speculation, report a GLM DFlash benchmark, or establish that
-the Qwen verification kernels are compatible with GLM. The target is the local Sushi 2.4bpw checkpoint;
+Status: source study and initial native correctness implementation, 2026-10-02. Serial GLM correctness
+and tuning continue separately. The implementation does not enable public serving, report a GLM
+DFlash benchmark, or establish that the Qwen verification kernels are compatible with GLM.
+The target is the local Sushi 2.4bpw checkpoint;
 the independently supplied GLM DFlash2 assistant is a draft model, not the target's MTP layer.
+
+## Implemented diagnostic foundation
+
+`src/glm5_dflash.zig` now connects the existing native DFlash2 assistant to the GLM capture,
+embedding and head interfaces. `loadAssistantBf16` explicitly requests dense loading and validates
+the declared vocabulary and target depth; no assistant or target quantization is performed by this
+adapter. `prefill` appends captured context by chunk. `proposeTree` executes the assistant, applies
+the target head, and constructs a bounded best-first tree through `glm5_dflash_tree.zig`.
+
+`verifyTreeOracle` executes **one unchanged serial target forward per tree node** against a retained
+copy of its parent's request state. That gives branch-local KDA, MLA and IndexPool semantics by
+construction. This is an executable correctness oracle, not batched tree verification and not an
+acceleration claim. It retains up to 16 request states and must be billed accordingly before a full
+model run. `commitVerified` selects the exact target-decision path, handles the output budget and
+EOS, evaluates a separate assistant-context transaction, then publishes the selected target state and
+assistant state together. Rejected branches do not enter either committed cache. Failures before
+publication leave the original request/context available; no silent serial fallback is reported.
+
+`roundTreeOracle` returns emitted IDs, the unprocessed pending token, acceptance, verified row count,
+and draft/verify/commit times. Its result explicitly names `serial_branch_oracle`. Sampling and
+production scheduling remain unsupported by this adapter. Branch-aware batched kernels, row-exact
+verification qualification, full-model parity, admission accounting and performance tuning remain
+required before a fast speculative path can be enabled.
+
+Focused ReleaseFast tests cover tree validation, zero acceptance, sibling exclusion, pre-commit
+budget/EOS handling, immutable request forks, a complete tiny native assistant proposal/round, and
+every node's recurrent state, convolution window, latent cache, pooled history, remainder and captures
+against independent serial ancestry. The model fixture includes nonzero layers and token-dependent
+embeddings; sibling recurrent states must differ. These tests do not establish real-checkpoint
+acceptance or throughput. The shared target capture hook is independently tested in `glm5_forward.zig`.
 
 ## Sources and evidence
 
