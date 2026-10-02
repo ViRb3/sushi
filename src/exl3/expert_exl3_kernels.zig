@@ -3233,7 +3233,7 @@ pub fn moeSwigluClamped(
             const us = mlx.getShape(up_t);
             const ds = mlx.getShape(down_t);
             const eligible = hidden == 4096 and mlx.getShape(gate)[1] == 2048 and topk == 8 and out_dtype == .bfloat16 and
-                gs[3] == 36 and us[3] == gs[3] and ds[3] == gs[3] and active_decode.codebook == .mcg and active_decode.window == .w12;
+                gs[3] == 36 and us[3] == gs[3] and ds[3] == gs[3] and active_decode.codebook == .mcg and active_decode.window == .w12 and clampedMiddleEnabled();
             if (eligible) if (try clampedMiddleDownCoop(s, gate, up, down_t, gate_svh, up_svh, down_suh, slots, limit, if (rows == 1) 4 else 8)) |fused| break :blk fused;
             const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
             defer _ = mlx.mlx_array_free(prepared);
@@ -9861,6 +9861,16 @@ var clamped_middle_cfgs: CfgCache(ClampedMiddleKey, 8) = .{};
 var clamped_middle_kernels: KernelSlots = no_kernels;
 var clamped_middle_calls: usize = 0;
 var clamped_middle_engaged: bool = false;
+var clamped_middle_enabled: ?bool = null;
+fn clampedMiddleEnabledFor(raw: ?[*:0]const u8) bool {
+    return raw == null or !std.mem.eql(u8, std.mem.span(raw.?), "0");
+}
+fn clampedMiddleEnabled() bool {
+    if (clamped_middle_enabled) |enabled| return enabled;
+    const enabled = clampedMiddleEnabledFor(std.c.getenv("SUSHI_EXL3_CLAMPED_MIDDLE"));
+    clamped_middle_enabled = enabled;
+    return enabled;
+}
 pub fn clampedMiddleDispatchCount() usize {
     return clamped_middle_calls;
 }
@@ -9967,4 +9977,11 @@ test "exl3 clamped middle down warmed microbenchmark" {
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
     for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| try clampedMiddleDownCase(4096, 2048, rows, 36, if (rows == 1) 4 else 8, true);
+}
+
+
+test "exl3 clamped middle diagnostic switch preserves default and explicit off" {
+    try std.testing.expect(clampedMiddleEnabledFor(null));
+    try std.testing.expect(clampedMiddleEnabledFor("1"));
+    try std.testing.expect(!clampedMiddleEnabledFor("0"));
 }

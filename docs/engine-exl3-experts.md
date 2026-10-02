@@ -107,6 +107,12 @@ memory, and then runs the original four-simdgroup cooperative reduction and F16 
 not substitute the normal EXL3 FP32 split-K chain. Four output tiles per group are used for one row;
 eight are used for two through sixteen rows.
 
+The cached diagnostic switch `SUSHI_EXL3_CLAMPED_MIDDLE=0` disables this candidate for attribution;
+absence preserves its current enabled default. This switch exists because the warm selected-bank
+microbenchmark cannot establish a benefit with full-model weight traffic. The first combined model
+run preserved all 64 output IDs but did not improve serial throughput, so isolated measurements are
+required before attributing that outcome or choosing the final default.
+
 The served guard is BF16 output, hidden/intermediate widths 4096/2048, top-k eight and matching K2.25
 projection rates. Other widths, storage formats, codebooks and mixed rates retain the separate path.
 The kernel's direct F16 parity tests cover all 17 rates from 2 through 4 bpw with both tile choices;
