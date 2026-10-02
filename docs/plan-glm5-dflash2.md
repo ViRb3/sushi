@@ -49,7 +49,7 @@ gated by `SUSHI_GLM_DFLASH_HEAD_FIXTURE=1`; it passed at 4096 input width in a d
 run on 2026-10-03. `linearRows` uses the candidate only in explicit `.affine_rows` mode, and its test
 requires a real dispatch before checking bit equality. Dense BF16 projections, unsupported affine
 geometry, per-head MLA projections and the FFN path retain their serial geometry. The real-checkpoint
-diagnostic defaults to the original strict mode until the opt-in path passes its own parity run.
+diagnostic still defaults to the original strict mode while the opt-in path is being timed.
 
 Focused ReleaseFast tests cover tree validation, zero acceptance, sibling exclusion, pre-commit
 budget/EOS handling, immutable request forks, a complete tiny native assistant proposal/round, and
@@ -108,6 +108,14 @@ assistant drafting took about 6.6 ms. The final budget-one round also paid first
 its one-row tree shape. This diagnostic commits every emitted input token, including the final one;
 its accounting differs from a serial harness that leaves the final emitted token unprocessed.
 The affine row-tile candidate was disconnected. Measurement key: `glm53-dflash-strict-32x8-20261003`.
+
+The opt-in affine run at `f7ea7afd` also passed all eight IDs and complete target-state parity, and
+its IDs matched the first strict run. It engaged 576 affine row-tile dispatches; acceptance was
+unchanged. Peak memory was 98.50 GB. First-use shader work raised the first verify to 447 ms and the
+cold aggregate was 9.87 tok/s; subsequent four-row verifies were about 106.6 ms. These two smoke runs
+also straddle the target-router optimization, so the verify-time difference is not an isolated affine
+speedup. They establish correctness and engagement. The GPU/QoS/fan protocol and 32/8 settings were
+unchanged. Measurement key: `glm53-dflash-affine-32x8-20261003`.
 
 With affine row tiles requested, the diagnostic also records `affine_row_dispatches` and requires a
 nonzero count before reporting success. The flag is confined to this diagnostic; it does not alter
