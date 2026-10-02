@@ -83,3 +83,9 @@ short-prefill attention experiment. It is off by default and retains absorbed
 attention for decode and calls outside the dense-prefix eligibility boundary.
 Changing BF16 rounding boundaries requires independent reference and quality
 validation; it is not a byte-preserving scheduling change.
+
+`SUSHI_GLM_DIAGNOSTIC_PREFILL_ASYNC=1` experiments with at most two layers in
+flight during prefill. It is off by default; profiling keeps synchronous layer
+boundaries. The final logits and all cache outputs settle before return. The
+report records the effective prefill schedule and the successful copy-free QKV
+dispatch count during the timed phase, excluding warmup.

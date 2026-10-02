@@ -264,6 +264,7 @@ pub const Request = struct {
     profile: bool = false,
     decode_async: bool = true,
     dense_prefill: bool = false,
+    prefill_async: bool = false,
     layer_ns: [128]u64 = @splat(0),
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
@@ -358,6 +359,7 @@ pub const Model = struct {
         if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
         errdefer request.failed = true;
         const staged_decode = ish[1] == 1 and request.decode_async and !request.profile;
+        const staged_prefill = ish[1] > 1 and request.prefill_async and !request.profile;
         var h: Arr = undefined;
         {
             var ops = Ops{ .s = self.s };
@@ -388,7 +390,19 @@ pub const Model = struct {
                 .moe => |moe| try moe.apply(&ops, fx, &self.cfg),
             };
             const next = try ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
-            if (!staged_decode or (layer_index + 1) % 4 == 0) {
+            if (staged_prefill) {
+                const evals = mlx.mlx_vector_array_new_value(next);
+                defer _ = mlx.mlx_vector_array_free(evals);
+                const first = layer_index - layer_index % 2;
+                for (request.layers[first .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
+                if (layer_index % 2 == 0) {
+                    try mlx.check(mlx.mlx_async_eval(evals));
+                    if (@import("builtin").is_test) schedule_test_asyncs += 1;
+                } else {
+                    try mlx.check(mlx.mlx_eval(evals));
+                    if (@import("builtin").is_test) schedule_test_syncs += 1;
+                }
+            } else if (!staged_decode or (layer_index + 1) % 4 == 0) {
                 const evals = mlx.mlx_vector_array_new_value(next);
                 defer _ = mlx.mlx_vector_array_free(evals);
                 if (staged_decode) {
@@ -411,7 +425,7 @@ pub const Model = struct {
         const logits = try self.head.apply(&ops, normalized);
         const result = try ops.result(logits);
         errdefer _ = mlx.mlx_array_free(result);
-        if (staged_decode) {
+        if (staged_decode or staged_prefill) {
             // Cache side outputs must settle even when they are not ancestors of logits.
             const evals = mlx.mlx_vector_array_new_value(result);
             defer _ = mlx.mlx_vector_array_free(evals);
@@ -767,4 +781,45 @@ test "GLM async decode settles graphs and profiling retains layer boundaries" {
     try std.testing.expectEqual(@as(usize, 4), schedule_test_syncs);
     try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
     for (request.layer_ns[0..4]) |ns| try std.testing.expect(ns > 0);
+}
+
+test "GLM two-layer prefill schedule preserves every nonzero cache bit" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(a, cfg, &weights, s);
+    defer net.deinit();
+    var baseline = try Request.init(a, 4);
+    defer baseline.deinit();
+    var pipelined = try Request.init(a, 4);
+    defer pipelined.deinit();
+    pipelined.prefill_async = true;
+    for ([_]usize{ 17, 33, 2 }) |width| {
+        var tokens: [33]u32 = undefined;
+        for (tokens[0..width], 0..) |*v, i| v.* = @intCast(i % 4);
+        const ids = mlx.mlx_array_new_data(&tokens, &[_]c_int{ 1, @intCast(width) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const expected = try net.forwardLast(&baseline, ids, true);
+        defer _ = mlx.mlx_array_free(expected);
+        schedule_test_asyncs = 0;
+        schedule_test_syncs = 0;
+        const got = try net.forwardLast(&pipelined, ids, true);
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(@as(usize, 2), schedule_test_asyncs);
+        try std.testing.expectEqual(@as(usize, 3), schedule_test_syncs);
+        try expectArrayBits(expected, got);
+        try expectRequestBits(&baseline, &pipelined);
+    }
+    pipelined.profile = true;
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2 }, &[_]c_int{ 1, 2 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    schedule_test_asyncs = 0;
+    schedule_test_syncs = 0;
+    const y = try net.forwardLast(&pipelined, ids, true);
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+    try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
+    try std.testing.expectEqual(@as(usize, 4), schedule_test_syncs);
 }

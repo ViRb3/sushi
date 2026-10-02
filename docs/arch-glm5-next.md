@@ -5,6 +5,10 @@ text forward now runs the completed EXL3 checkpoint through an opt-in diagnostic
 registered in `model.served_model_types`: production serving, full reference parity and quality gates
 remain open. See [diagnostic usage](glm5-diagnostic.md) and [attention/cache details](engine-glm5-attention.md).
 
+Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-glm5-dflash2.md),
+[correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),
+[copy-free QKV kernel](engine-glm5-decode.md). This document is the GLM documentation index.
+
 ## Checkpoint and implementation status (2026-10-02)
 
 The `GLM-5.3-Flash-Sushi-2.25bpw-A8g128-W12` checkpoint is complete: 129 routed projection banks,
@@ -220,3 +224,14 @@ speed gain at this precision. Chunk512 produced coherent English but changed one
 changing GEMM row shape changes rounding, so this is not a byte-equivalent scheduling improvement.
 It remains an explicit benchmark setting, not proof of full-model quality equivalence. The requested
 1,000/60 tok/s targets are still unmet; all measurements here are serial, without DFlash2.
+
+The opt-in source-style dense-prefill path (`324bd016`, diagnostic `6ceb3eea`) measured
+745.60 tok/s prefill and24.53 tok/s serial decode at chunk512, peak96.788 GB. It produced
+coherent English with different token choices from absorbed prefill, as expected from the
+different BF16 rounding boundaries. Tiny reference and causal-boundary fixtures pass;
+whole-model KLD is still required before treating this experiment as a quality-equivalent default.
+
+An optional two-layer prefill schedule overlaps host construction with GPU work while keeping
+at most two layer graphs in flight. Nonzero fixtures at17/33/2-token chunks preserve every logit
+and cache bit; profiling retains synchronous layers. The final cache-inclusive evaluation also
+settles an odd final layer. Actual full-model peak memory and throughput are measured separately.

@@ -70,6 +70,7 @@ test {
     _ = @import("mimo_source.zig");
     _ = @import("glm5_next.zig");
     _ = @import("glm5_model.zig");
+    _ = @import("glm5_decode.zig");
     _ = @import("glm5_forward.zig");
     _ = @import("glm5_mla_reference_test.zig");
     _ = @import("glm5_diagnostic.zig");
