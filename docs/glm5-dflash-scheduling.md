@@ -153,3 +153,31 @@ cache and FP32 KDA state. Assistant quantization can change proposals and
 acceptance; each arm must still match the target's greedy serial tokens and
 complete committed state. Compare draft time, acceptance, total decode and peak
 memory under the same verifier settings before choosing a default.
+
+## Stored assistant precision comparison
+
+The A8g128 and A6g128 assistants were then measured with the same lane+async4,
+N3/children4, prefix512/committed64/chunk128 settings and fixed prompt. The stored
+loader inferred 46 affine matrices, one retained dense matrix, and group size128
+for each; their inferred bits were8 and6 respectively. Both used the same binary
+at `606f5a57`; the BF16 comparison preceded only the loader/report extension.
+
+| Assistant | Decode tokens/s | Matched serial | Draft total | Accepted / rounds | Decode peak bytes |
+|---|---:|---:|---:|---:|---:|
+| BF16 | 34.938 | 27.691 | 160.90 ms | 41 / 23 | 98,534,128,928 |
+| A8g128 | 35.541 | 27.765 | 139.88 ms | 41 / 23 | 97,477,704,992 |
+| A6g128 | 35.716 | 27.857 | 141.88 ms | 41 / 23 | 97,205,026,080 |
+
+Every arm produced the same 64 target IDs and passed complete committed-state
+parity with its own serial reference. Lane pair/chain engagement remained966
+calls. A8 saved1.056GB of peak memory and A6 saved1.329GB relative to BF16.
+A8 reduced draft time13.1%; A6 reduced it11.8%. Total gains were1.73% and2.23%,
+respectively. The0.49% A6-versus-A8 throughput difference is too small to call a
+reliable speed advantage from single runs; its additional272.7MB memory saving
+is clear. This prompt showed no acceptance loss, not a guarantee across prompts.
+The45tokens/s target remains open.
+
+Private artifact `glm53-dflash-assistant-quant-20261003` contains separate locked
+runs, inferred storage, counters, raw phase times, output/state checks, provenance
+and binary hash. Both runs used the same foreground QoS and thermal protocol as
+the BF16 arm, with profiling and route capture off.
