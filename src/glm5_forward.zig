@@ -1254,6 +1254,35 @@ test "GLM DFlash asynchronous schedules preserve nonzero tapes captures and comm
         try std.testing.expectEqual(@as(usize, 5), verifier.syncDispatchCount());
         try std.testing.expectEqualSlices(u32, reference.targets[0..reference.count], profiled.targets[0..profiled.count]);
     }
+    // Three layers exercise both a partial final group and an entirely unqueued async4 group.
+    var short_net = net;
+    short_net.layers = net.layers[0..3];
+    var short_request = request;
+    short_request.layers = request.layers[0..3];
+    const short_taps = [_]u32{ 0, 2 };
+    const sync_binding = try verifier.bindSchedule(0);
+    defer sync_binding.restore();
+    var short_reference = try verifier.verify(&short_net, &short_request, &tokens, &parents, &short_taps, .affine_rows_ffn);
+    defer short_reference.deinit();
+    for ([_]usize{ 2, 4 }) |cadence| {
+        const binding = try verifier.bindSchedule(cadence);
+        defer binding.restore();
+        verifier.resetStats();
+        var actual = try verifier.verify(&short_net, &short_request, &tokens, &parents, &short_taps, .affine_rows_ffn);
+        defer actual.deinit();
+        try std.testing.expectEqual(@as(usize, 3) / cadence, verifier.asyncDispatchCount());
+        try std.testing.expectEqual(@as(usize, 1), verifier.syncDispatchCount());
+        try std.testing.expectEqualSlices(u32, short_reference.targets[0..short_reference.count], actual.targets[0..actual.count]);
+        for (short_reference.captures.hook.out, actual.captures.hook.out) |x, y| try expectArrayBits(x, y);
+        var expected_commit = try short_reference.prepareCommit(&short_request, 3, &.{}, net.s);
+        defer expected_commit.deinit();
+        var actual_commit = try actual.prepareCommit(&short_request, 3, &.{}, net.s);
+        defer actual_commit.deinit();
+        for (&expected_commit.states, &actual_commit.states) |*x, *y| {
+            try std.testing.expectEqual(x.* != null, y.* != null);
+            if (x.*) |*left| try expectRequestBits(left, &y.*.?);
+        }
+    }
     try std.testing.expectError(error.InvalidGlmVerifySchedule, verifier.bindSchedule(3));
 }
 
