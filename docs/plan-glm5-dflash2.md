@@ -49,6 +49,8 @@ capacity growth at prefix 255 and first sparse selection at prefix 2051, for zer
 accepted drafts. The model fixture includes nonzero layers and token-dependent embeddings; sibling
 recurrent states must differ. These tests do not establish real-checkpoint acceptance or throughput.
 The shared target capture hook is independently tested in `glm5_forward.zig`.
+The KDA tree recurrence also matches serial ancestor outputs byte-for-byte at 16 nodes with the
+production 64-head, 128-key/value geometry, for both BF16 and FP32 inputs and FP32 state.
 
 ### Full-checkpoint diagnostic
 

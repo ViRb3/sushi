@@ -91,39 +91,46 @@ pub fn recurrent(input: primitive.KdaInputs, parents: []const i32, stream: mlx.m
 
 test "GLM DFlash KDA tree follows per-channel parent state exactly" {
     const s = mlx.gpuStream();
-    const parents = [_]i32{ -1, 0, 0, 1, 2 };
-    for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
-        var ops = Ops{ .s = s };
-        defer ops.deinit();
-        var q_data: [5 * 2 * 128]f32 = undefined;
-        var k_data: @TypeOf(q_data) = undefined;
-        var g_data: @TypeOf(q_data) = undefined;
-        var v_data: [5 * 2 * 4]f32 = undefined;
-        var beta_data: [5 * 2]f32 = undefined;
-        for (&q_data, &k_data, &g_data, 0..) |*q, *k, *g, i| {
-            q.* = @as(f32, @floatFromInt(i % 13)) / 64 - 0.1;
-            k.* = @as(f32, @floatFromInt(i % 17)) / 96 - 0.08;
-            g.* = 0.1 + @as(f32, @floatFromInt(i % 29)) / 36;
-        }
-        for (&v_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 19)) / 32 - 0.2;
-        for (&beta_data, 0..) |*v, i| v.* = 0.1 + @as(f32, @floatFromInt(i)) / 16;
-        const q = try ops.cast(try ops.own(mlx.mlx_array_new_data(&q_data, &[_]c_int{ 1, 5, 2, 128 }, 4, .float32)), dtype);
-        const k = try ops.cast(try ops.own(mlx.mlx_array_new_data(&k_data, &[_]c_int{ 1, 5, 2, 128 }, 4, .float32)), dtype);
-        const v = try ops.cast(try ops.own(mlx.mlx_array_new_data(&v_data, &[_]c_int{ 1, 5, 2, 4 }, 4, .float32)), dtype);
-        const decay = try ops.own(mlx.mlx_array_new_data(&g_data, &[_]c_int{ 1, 5, 2, 128 }, 4, .float32));
-        const beta = try ops.cast(try ops.own(mlx.mlx_array_new_data(&beta_data, &[_]c_int{ 1, 5, 2 }, 3, .float32)), dtype);
-        const initial = try ops.binary(.mul, try ops.ones(&.{ 1, 2, 4, 128 }, .float32), try ops.scalar(0.07, .float32));
-        const all = try ops.own(try recurrent(.{ .q = q, .k = k, .v = v, .decay = decay, .beta = beta, .state = initial }, &parents, s));
-        var states: [5]Arr = undefined;
-        for (parents, 0..) |parent, row| {
-            const start: c_int = @intCast(row);
-            const one = try primitive.kda(.{ .q = try ops.slice(q, 1, start, start + 1), .k = try ops.slice(k, 1, start, start + 1), .v = try ops.slice(v, 1, start, start + 1), .decay = try ops.slice(decay, 1, start, start + 1), .beta = try ops.slice(beta, 1, start, start + 1), .state = if (parent < 0) initial else states[@intCast(parent)] }, s);
-            states[row] = try ops.own(one.state);
-            const y = try ops.cast(try ops.own(one.y), .float32);
-            const actual = try ops.cast(try ops.slice(all, 1, start, start + 1), .float32);
-            try mlx.check(mlx.mlx_array_eval(y));
-            try mlx.check(mlx.mlx_array_eval(actual));
-            try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(y).?[0..8], mlx.mlx_array_data_float32(actual).?[0..8]);
+    inline for (.{ .{ 5, 2, 4 }, .{ 16, 64, 128 } }) |geometry| {
+        const R = geometry[0];
+        const H = geometry[1];
+        const DV = geometry[2];
+        var parents: [R]i32 = undefined;
+        parents[0] = -1;
+        for (1..R) |row| parents[row] = @intCast((row - 1) / 2);
+        for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
+            var ops = Ops{ .s = s };
+            defer ops.deinit();
+            var q_data: [R * H * 128]f32 = undefined;
+            var k_data: @TypeOf(q_data) = undefined;
+            var g_data: @TypeOf(q_data) = undefined;
+            var v_data: [R * H * DV]f32 = undefined;
+            var beta_data: [R * H]f32 = undefined;
+            for (&q_data, &k_data, &g_data, 0..) |*q, *k, *g, i| {
+                q.* = @as(f32, @floatFromInt(i % 13)) / 64 - 0.1;
+                k.* = @as(f32, @floatFromInt(i % 17)) / 96 - 0.08;
+                g.* = 0.1 + @as(f32, @floatFromInt(i % 29)) / 36;
+            }
+            for (&v_data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 19)) / 32 - 0.2;
+            for (&beta_data, 0..) |*v, i| v.* = 0.1 + @as(f32, @floatFromInt(i % 13)) / 16;
+            const q = try ops.cast(try ops.own(mlx.mlx_array_new_data(&q_data, &[_]c_int{ 1, R, H, 128 }, 4, .float32)), dtype);
+            const k = try ops.cast(try ops.own(mlx.mlx_array_new_data(&k_data, &[_]c_int{ 1, R, H, 128 }, 4, .float32)), dtype);
+            const v = try ops.cast(try ops.own(mlx.mlx_array_new_data(&v_data, &[_]c_int{ 1, R, H, DV }, 4, .float32)), dtype);
+            const decay = try ops.own(mlx.mlx_array_new_data(&g_data, &[_]c_int{ 1, R, H, 128 }, 4, .float32));
+            const beta = try ops.cast(try ops.own(mlx.mlx_array_new_data(&beta_data, &[_]c_int{ 1, R, H }, 3, .float32)), dtype);
+            const initial = try ops.binary(.mul, try ops.ones(&.{ 1, H, DV, 128 }, .float32), try ops.scalar(0.07, .float32));
+            const all = try ops.own(try recurrent(.{ .q = q, .k = k, .v = v, .decay = decay, .beta = beta, .state = initial }, &parents, s));
+            var states: [R]Arr = undefined;
+            for (parents, 0..) |parent, row| {
+                const start: c_int = @intCast(row);
+                const one = try primitive.kda(.{ .q = try ops.slice(q, 1, start, start + 1), .k = try ops.slice(k, 1, start, start + 1), .v = try ops.slice(v, 1, start, start + 1), .decay = try ops.slice(decay, 1, start, start + 1), .beta = try ops.slice(beta, 1, start, start + 1), .state = if (parent < 0) initial else states[@intCast(parent)] }, s);
+                states[row] = try ops.own(one.state);
+                const y = try ops.cast(try ops.own(one.y), .float32);
+                const actual = try ops.cast(try ops.slice(all, 1, start, start + 1), .float32);
+                try mlx.check(mlx.mlx_array_eval(y));
+                try mlx.check(mlx.mlx_array_eval(actual));
+                try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(y).?[0 .. H * DV], mlx.mlx_array_data_float32(actual).?[0 .. H * DV]);
+            }
         }
     }
 }
