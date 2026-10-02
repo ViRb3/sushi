@@ -169,7 +169,9 @@ Used in sushi (`src/glm5_decode.zig`):
 
 The affine row tile in `src/glm5_dflash_qmm.zig` adapts that arithmetic to
 reuse each weight group across up to four verification rows, retaining the
-per-row dot, scale/bias update and SIMD reduction order.
+per-row dot, scale/bias update and SIMD reduction order. Its 6-bit path also
+adapts MLX `load_vector` and `qdot` from `quantized.h`, including grouped
+activation sums and split-byte products, under the MIT attribution below.
 
 Used in sushi (`src/glm5_kda_fused.zig`):
 

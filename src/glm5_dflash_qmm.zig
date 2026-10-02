@@ -1,4 +1,4 @@
-//! Affine8/group128 tree projections with each serial qmv row's reduction order.
+//! Affine6/8/group128 tree projections with each serial qmv row's reduction order.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
@@ -18,10 +18,21 @@ const SOURCE =
     \\  float sum[R];
     \\  for (int m = 0; m < R; ++m) {
     \\    sum[m] = 0.0f;
+    \\    if (BITS == 6) {
+    \\      for (int i = 0; i < 8; i += 4) {
+    \\        const int at = (token0+m)*K+k+lane*8+i;
+    \\        if (token0+m < M) sum[m] += x[at]+x[at+1]+x[at+2]+x[at+3];
+    \\        local[m][i] = token0+m < M ? float(x[at]) : 0.0f;
+    \\        local[m][i+1] = token0+m < M ? float(x[at+1])/64.0f : 0.0f;
+    \\        local[m][i+2] = token0+m < M ? float(x[at+2])/16.0f : 0.0f;
+    \\        local[m][i+3] = token0+m < M ? float(x[at+3])/4.0f : 0.0f;
+    \\      }
+    \\    } else {
     \\    for (int i = 0; i < 8; ++i) {
     \\      const float value = token0 + m < M ? float(x[(token0 + m) * K + k + lane * 8 + i]) : 0.0f;
     \\      sum[m] += value;
     \\      local[m][i] = value;
+    \\    }
     \\    }
     \\  }
     \\  for (int r = 0; r < 4; ++r) {
@@ -30,10 +41,22 @@ const SOURCE =
     \\    const float scale = float(scales[group]);
     \\    const float bias = float(biases[group]);
     \\    float quant[8];
-    \\    for (int i = 0; i < 8; ++i) quant[i] = float(codes[size_t(output) * K + k + lane * 8 + i]);
+    \\    if (BITS == 8) for (int i = 0; i < 8; ++i) quant[i] = float(codes[size_t(output) * K + k + lane * 8 + i]);
     \\    for (int m = 0; m < R; ++m) {
     \\      float accum = 0.0f;
-    \\      for (int i = 0; i < 8; ++i) accum += local[m][i] * quant[i];
+    \\      if (BITS == 6) {
+    \\        const device uint8_t* packed = codes + size_t(output)*(K*3/4) + (k+lane*8)*3/4;
+    \\        for (int pack = 0; pack < 2; ++pack) {
+    \\          const device uint8_t* q = packed + pack*3;
+    \\          const int i = pack*4;
+    \\          accum += (q[0]&0x3f)*local[m][i];
+    \\          accum += (q[0]&0xc0)*local[m][i+1];
+    \\          accum += (q[1]&0x0f)*(local[m][i+1]*256.0f);
+    \\          accum += (q[1]&0xf0)*local[m][i+2];
+    \\          accum += (q[2]&0x03)*(local[m][i+2]*256.0f);
+    \\          accum += (q[2]&0xfc)*local[m][i+3];
+    \\        }
+    \\      } else for (int i = 0; i < 8; ++i) accum += local[m][i] * quant[i];
     \\      result[m][r] += scale * accum + sum[m] * bias;
     \\    }
     \\  }
@@ -51,7 +74,7 @@ pub fn resetDispatchCount() void {
     dispatch_count = 0;
 }
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
-const Key = struct { m: c_int, n: c_int, k: c_int };
+const Key = struct { m: c_int, n: c_int, k: c_int, bits: c_int };
 const Cached = struct { key: Key, config: mlx.mlx_fast_metal_kernel_config };
 var configs: [32]?Cached = @splat(null);
 
@@ -70,7 +93,8 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     if (!mlx.streamIsGpu(stream) or x.ctx == null or linear.w.ctx == null or linear.scales.ctx == null or linear.biases.ctx == null) return null;
     const sh = mlx.getShape(x);
     const ws = mlx.getShape(linear.w);
-    if (sh.len != 3 or sh[0] != 1 or sh[1] < 1 or sh[1] > 16 or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0 or ws[1] != @divExact(sh[2], 4)) return null;
+    if (sh.len != 3 or sh[0] != 1 or sh[1] < 1 or sh[1] > 16 or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0) return null;
+    const bits: c_int = if (ws[1] == @divExact(sh[2], 4)) 8 else if (@as(i64, ws[1]) * 16 == @as(i64, sh[2]) * 3) 6 else return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(linear.w) != .uint32 or !(try rowMajorReady(linear.w))) return null;
     for ([_]Arr{ linear.scales, linear.biases }) |grid| {
         if (mlx.mlx_array_dtype(grid) != .bfloat16 or !std.mem.eql(c_int, &.{ ws[0], @divExact(sh[2], 128) }, mlx.getShape(grid)) or !(try rowMajorReady(grid))) return null;
@@ -88,7 +112,7 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
             return error.MetalKernelCompileFailed;
         }
     }
-    const key = Key{ .m = sh[1], .n = ws[0], .k = sh[2] };
+    const key = Key{ .m = sh[1], .n = ws[0], .k = sh[2], .bits = bits };
     var cached: ?mlx.mlx_fast_metal_kernel_config = null;
     for (configs) |item| if (item) |entry| if (std.meta.eql(key, entry.key)) {
         cached = entry.config;
@@ -108,6 +132,7 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "N", key.n));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", key.k));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "R", tile));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", bits));
         for (&configs) |*item| if (item.* == null) {
             item.* = .{ .key = key, .config = config };
             retained = true;
@@ -130,17 +155,17 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
 test "GLM DFlash affine row tiles preserve serial qmv bits" {
     const s = mlx.gpuStream();
     const Shape = struct { n: c_int, k: c_int };
-    for ([_]Shape{ .{ .n = 32, .k = 256 }, .{ .n = 1536, .k = 4096 }, .{ .n = 8192, .k = 4096 }, .{ .n = 4096, .k = 8192 }, .{ .n = 154880, .k = 4096 } }) |shape| {
+    for ([_]c_int{ 8, 6 }) |bits| for ([_]Shape{ .{ .n = 32, .k = 256 }, .{ .n = 1536, .k = 4096 }, .{ .n = 8192, .k = 4096 }, .{ .n = 4096, .k = 8192 }, .{ .n = 154880, .k = 4096 } }) |shape| {
         if (shape.n == 154880 and std.c.getenv("SUSHI_GLM_DFLASH_HEAD_FIXTURE") == null) continue;
         var ops = Ops{ .s = s };
         defer ops.deinit();
         const key = try ops.slot();
         try mlx.check(mlx.mlx_random_key(key, @intCast(shape.n + shape.k)));
         const codes = try ops.slot();
-        try mlx.check(mlx.mlx_random_bits(codes, &[_]c_int{ shape.n, @divExact(shape.k, 4) }, 2, 4, key.*, s));
+        try mlx.check(mlx.mlx_random_bits(codes, &[_]c_int{ shape.n, @divExact(shape.k * bits, 32) }, 2, 4, key.*, s));
         const scales = try ops.slot();
         try mlx.check(mlx.mlx_random_uniform(scales, try ops.scalar(0.001, .bfloat16), try ops.scalar(0.02, .bfloat16), &[_]c_int{ shape.n, @divExact(shape.k, 128) }, 2, .bfloat16, key.*, s));
-        const biases = try ops.binary(.mul, scales.*, try ops.scalar(-127.5, .bfloat16));
+        const biases = try ops.binary(.mul, scales.*, try ops.scalar(if (bits == 6) -31.5 else -127.5, .bfloat16));
         const linear = Linear{ .w = codes.*, .scales = scales.*, .biases = biases, .input = shape.k, .output = shape.n };
         const x = try ops.slot();
         try mlx.check(mlx.mlx_random_normal(x, &[_]c_int{ 1, 16, shape.k }, 3, .bfloat16, 0, 1, key.*, s));
@@ -170,7 +195,7 @@ test "GLM DFlash affine row tiles preserve serial qmv bits" {
                 try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..count], mlx.mlx_array_data_bfloat16(got).?[0..count]);
             }
         }
-    }
+    };
 }
 
 test "GLM DFlash affine row tiles decline incompatible grids and layouts" {

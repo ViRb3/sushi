@@ -227,3 +227,42 @@ N3/children4 lane+async4 baseline. They retain the original chunk128, staged
 captured-prefix settings for that acceptance sweep. Test dense/async prefill in
 a separate arm so prefix rounding changes cannot masquerade as an acceptance
 policy improvement. The scripts do not run automatically.
+
+
+## Selected assistant policy
+
+A6g128 is the selected assistant for subsequent GLM work. The controlled comparison
+showed a clear 1.329 GB decode-peak saving and a small 1.05% mean throughput increase
+with overlapping run ranges. BF16 remains a recorded historical baseline, not a
+planned deployment or further benchmark arm. Target MLA cache stays BF16 compressed,
+and KDA recurrent state stays FP32.
+
+The additional `Sushi-2.3bpw` target changes the trunk to A6g128 while retaining
+K2.25/W12 experts. Its indexed payload is 95,985,384,312 bytes; the text-only
+2,302-tensor payload is 93,295,638,776 bytes. The earlier `Sushi-2.4bpw` results used
+an A8g128 trunk and 95,471,433,976 text bytes. These target packs require separate
+serial references; assistant acceptance and generated text can change with trunk
+quantization. Runtime memory and throughput must be measured separately.
+
+
+## Stored A6 target trunk support
+
+The directory named2.3bpw contains K2.25/W12 experts with an A6g128 trunk; the
+previous2.4bpw directory used the same expert rate with A8g128 trunk. Directory
+names alone must not determine kernel bit width. Native projection/embedding
+support is a separate prerequisite from the assistant's stored quantization.
+
+`glm5_dflash_qmm` now infers6 or8 bits from the actual packed row width and input
+width, checks the original128-group grids, and includes bit width in its config
+cache key. The6-bit kernel retains MLX's grouped activation-sum order, local
+power-of-two scaling and six split-byte accumulation terms per four values.
+Simply unpacking codes and dotting them would change rounding. The8-bit body is
+unchanged; incompatible geometry still takes the serial projection fallback.
+
+Fresh ReleaseFast tests with `SUSHI_GLM_DFLASH_HEAD_FIXTURE=1` passed raw BF16
+parity for both bits at rows1/2/3/4/5/8/16 and output/input geometries32/256,
+1536/4096,8192/4096,4096/8192 and154880/4096. They compare each candidate row to
+native single-row qmv and assert integrated row-tile engagement. Malformed grids,
+dtypes and layouts still decline. These unit tests qualify projection arithmetic;
+full-checkpoint target token and state parity remains required before reporting
+new target throughput.
