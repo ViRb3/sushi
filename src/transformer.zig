@@ -203,7 +203,7 @@ fn getGdnKernelFor(comptime vectorized: bool, comptime capture_seq: bool) !mlx.m
     return kernel;
 }
 
-fn getGdnKernel(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
+pub fn getGdnKernel(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
     return if (vector_gate) getGdnKernelFor(true, false) else getGdnKernelFor(false, false);
 }
 

@@ -23,12 +23,24 @@ FP8 expert scale keys are rejected rather than silently treating the FP8 release
 not used. Source BF16 bits are preserved throughout. The optional MTP shard, shared experts and dense trunk
 are not opened by this store; a future model loader must load the trunk separately and resolve MTP explicitly.
 
+## KDA recurrence
+
+`glm5_next.kda` runs the shared vector-gate Metal recurrence with FP32 state input/output, BF16 or FP32
+Q/K/V and matching output precision. Its inputs are prepared queries/keys (L2-normalized, query additionally
+scaled by Dk^-0.5), value, per-key-channel decay factors, and beta. Shape and dtype checks reject a scalar
+per-head decay or a rounded BF16 state. The projection, convolution, normalization and output-gate prework
+are still required before this primitive forms a complete layer.
+
+The recurrence is checked against an independent scalar FP64 calculation with nonuniform channel decays,
+multiple batches and heads. Serial and multi-token execution are bit-identical for BF16 and FP32 inputs,
+including their final FP32 states. This is primitive validation, not full-model parity.
+
 ## Forward implementation still required
 
 - Parse the nested GLM configuration and load the resident BF16 trunk, excluding routed experts before any
   tensor materialization. Keep router, hyper-connection, decay and recurrent-state arithmetic at their required
   precision. No affine quantization belongs in the teacher path.
-- Implement KDA's per-key-channel decay and L2-normalized queries/keys. Qwen's scalar-per-head GDN gate is not
+- Wire KDA's per-key-channel recurrence to its decay prework and L2-normalized queries/keys. Qwen's scalar-per-head GDN gate is not
   equivalent. GLM also uses a sigmoid output gate and separate depthwise q/k/v convolutions.
 - Implement mHC's Sinkhorn residual mixing, sparse MLA attention and the IndexPool selector. The attention
   layout has 34 linear layers and 11 sparse-attention layers, no Qwen n-gram table, and no MLA RoPE channels.
