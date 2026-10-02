@@ -6,23 +6,23 @@ const primitive = @import("glm5_next.zig");
 const exl3 = @import("sushi_exl3");
 const Arr = mlx.mlx_array;
 
-const Ops = struct {
+pub const Ops = struct {
     s: mlx.mlx_stream,
     values: [768]Arr = undefined,
     count: usize = 0,
 
-    fn deinit(self: *Ops) void {
+    pub fn deinit(self: *Ops) void {
         for (self.values[0..self.count]) |value| _ = mlx.mlx_array_free(value);
     }
 
-    fn slot(self: *Ops) !*Arr {
+    pub fn slot(self: *Ops) !*Arr {
         if (self.count == self.values.len) return error.GlmGraphTooLarge;
         self.values[self.count] = mlx.mlx_array_new();
         self.count += 1;
         return &self.values[self.count - 1];
     }
 
-    fn own(self: *Ops, value: Arr) !Arr {
+    pub fn own(self: *Ops, value: Arr) !Arr {
         if (self.count == self.values.len) {
             _ = mlx.mlx_array_free(value);
             return error.GlmGraphTooLarge;
@@ -32,32 +32,32 @@ const Ops = struct {
         return value;
     }
 
-    fn cast(self: *Ops, x: Arr, dtype: mlx.mlx_dtype) !Arr {
+    pub fn cast(self: *Ops, x: Arr, dtype: mlx.mlx_dtype) !Arr {
         if (mlx.mlx_array_dtype(x) == dtype) return x;
         const out = try self.slot();
         try mlx.check(mlx.mlx_astype(out, x, dtype, self.s));
         return out.*;
     }
 
-    fn reshape(self: *Ops, x: Arr, shape: []const c_int) !Arr {
+    pub fn reshape(self: *Ops, x: Arr, shape: []const c_int) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_reshape(out, x, shape.ptr, shape.len, self.s));
         return out.*;
     }
 
-    fn transpose(self: *Ops, x: Arr, axes: []const c_int) !Arr {
+    pub fn transpose(self: *Ops, x: Arr, axes: []const c_int) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_transpose_axes(out, x, axes.ptr, axes.len, self.s));
         return out.*;
     }
 
-    fn contiguous(self: *Ops, x: Arr) !Arr {
+    pub fn contiguous(self: *Ops, x: Arr) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_contiguous(out, x, false, self.s));
         return out.*;
     }
 
-    fn slice(self: *Ops, x: Arr, axis: usize, start: c_int, end: c_int) !Arr {
+    pub fn slice(self: *Ops, x: Arr, axis: usize, start: c_int, end: c_int) !Arr {
         const shape = mlx.getShape(x);
         if (shape.len > 4 or axis >= shape.len or start < 0 or end < start or end > shape[axis]) return error.InvalidGlmShape;
         var lo: [4]c_int = @splat(0);
@@ -71,7 +71,7 @@ const Ops = struct {
         return out.*;
     }
 
-    fn concat(self: *Ops, parts: []const Arr, axis: c_int) !Arr {
+    pub fn concat(self: *Ops, parts: []const Arr, axis: c_int) !Arr {
         const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
         defer _ = mlx.mlx_vector_array_free(vec);
         const out = try self.slot();
@@ -79,24 +79,24 @@ const Ops = struct {
         return out.*;
     }
 
-    fn scalar(self: *Ops, value: f32, dtype: mlx.mlx_dtype) !Arr {
+    pub fn scalar(self: *Ops, value: f32, dtype: mlx.mlx_dtype) !Arr {
         return self.cast(try self.own(mlx.mlx_array_new_float(value)), dtype);
     }
 
-    fn ones(self: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype) !Arr {
+    pub fn ones(self: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_ones(out, shape.ptr, shape.len, dtype, self.s));
         return out.*;
     }
 
-    fn zeros(self: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype) !Arr {
+    pub fn zeros(self: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_zeros(out, shape.ptr, shape.len, dtype, self.s));
         return out.*;
     }
 
     const Binary = enum { add, sub, mul, div, min, max, mm, less, le, land, lor, floor_div };
-    fn binary(self: *Ops, comptime operation: Binary, a: Arr, b: Arr) !Arr {
+    pub fn binary(self: *Ops, comptime operation: Binary, a: Arr, b: Arr) !Arr {
         const function = switch (operation) {
             .add => mlx.mlx_add,
             .sub => mlx.mlx_subtract,
@@ -117,7 +117,7 @@ const Ops = struct {
     }
 
     const Unary = enum { exp, sigmoid, rsqrt, negative };
-    fn unary(self: *Ops, comptime operation: Unary, x: Arr) !Arr {
+    pub fn unary(self: *Ops, comptime operation: Unary, x: Arr) !Arr {
         const function = switch (operation) {
             .exp => mlx.mlx_exp,
             .sigmoid => mlx.mlx_sigmoid,
@@ -129,67 +129,66 @@ const Ops = struct {
         return out.*;
     }
 
-    fn reduce(self: *Ops, x: Arr, axis: c_int, mean: bool, keep: bool) !Arr {
+    pub fn reduce(self: *Ops, x: Arr, axis: c_int, mean: bool, keep: bool) !Arr {
         const out = try self.slot();
         if (mean) try mlx.check(mlx.mlx_mean_axis(out, x, axis, keep, self.s)) else try mlx.check(mlx.mlx_sum_axis(out, x, axis, keep, self.s));
         return out.*;
     }
 
-    fn rms(self: *Ops, x: Arr, weight: Arr, eps: f32) !Arr {
+    pub fn rms(self: *Ops, x: Arr, weight: Arr, eps: f32) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_fast_rms_norm(out, x, weight, eps, self.s));
         return out.*;
     }
 
-    fn layerNorm(self: *Ops, x: Arr, weight: Arr, bias: Arr, eps: f32) !Arr {
+    pub fn layerNorm(self: *Ops, x: Arr, weight: Arr, bias: Arr, eps: f32) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_fast_layer_norm(out, x, weight, bias, eps, self.s));
         return out.*;
     }
 
-    fn softmax(self: *Ops, x: Arr, axis: c_int) !Arr {
+    pub fn softmax(self: *Ops, x: Arr, axis: c_int) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_softmax_axis(out, x, axis, true, self.s));
         return out.*;
     }
 
-    fn take(self: *Ops, x: Arr, indices: Arr, axis: c_int) !Arr {
+    pub fn take(self: *Ops, x: Arr, indices: Arr, axis: c_int) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_take_axis(out, x, indices, axis, self.s));
         return out.*;
     }
 
-    fn broadcast(self: *Ops, x: Arr, shape: []const c_int) !Arr {
+    pub fn broadcast(self: *Ops, x: Arr, shape: []const c_int) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_broadcast_to(out, x, shape.ptr, shape.len, self.s));
         return out.*;
     }
 
-    fn qmm(self: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr, transposed: bool) !Arr {
+    pub fn qmm(self: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr, transposed: bool) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_quantized_matmul(out, x, w, scales, biases, transposed, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(8), "affine", self.s));
         return out.*;
     }
 
-    fn dequant(self: *Ops, w: Arr, scales: Arr, biases: Arr) !Arr {
+    pub fn dequant(self: *Ops, w: Arr, scales: Arr, biases: Arr) !Arr {
         const out = try self.slot();
-        try mlx.check(mlx.mlx_dequantize(out, w, scales, biases, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype.some(.bfloat16), self.s));
+        try mlx.check(mlx.mlx_dequantize(out, w, scales, biases, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, self.s));
         return out.*;
     }
 
-    fn silu(self: *Ops, x: Arr) !Arr {
-        const f = try self.cast(x, .float32);
-        const product = try self.binary(.mul, f, try self.unary(.sigmoid, f));
-        return self.cast(product, mlx.mlx_array_dtype(x));
+    pub fn silu(self: *Ops, x: Arr) !Arr {
+        // The source rounds sigmoid to the activation dtype before multiplying.
+        return self.binary(.mul, x, try self.unary(.sigmoid, x));
     }
 
-    fn conv(self: *Ops, x: Arr, weight: Arr, groups: c_int) !Arr {
+    pub fn conv(self: *Ops, x: Arr, weight: Arr, groups: c_int) !Arr {
         const out = try self.slot();
         try mlx.check(mlx.mlx_conv1d(out, x, weight, 1, 0, 1, groups, self.s));
         return out.*;
     }
 
-    fn result(_: *Ops, x: Arr) !Arr {
+    pub fn result(_: *Ops, x: Arr) !Arr {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_set(&out, x));
@@ -197,14 +196,14 @@ const Ops = struct {
     }
 };
 
-const Linear = struct {
+pub const Linear = struct {
     w: Arr,
     scales: Arr = .{ .ctx = null },
     biases: Arr = .{ .ctx = null },
     input: c_int,
     output: c_int,
 
-    fn load(weights: *const model.Weights, base: []const u8, input: u32) !Linear {
+    pub fn load(weights: *const model.Weights, base: []const u8, input: u32) !Linear {
         var buf: [256]u8 = undefined;
         const w = weights.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{base})) orelse return error.MissingGlmWeight;
         const shape = mlx.getShape(w);
@@ -222,7 +221,7 @@ const Linear = struct {
         return .{ .w = w, .input = @intCast(input), .output = shape[0] };
     }
 
-    fn apply(self: Linear, ops: *Ops, x: Arr) !Arr {
+    pub fn apply(self: Linear, ops: *Ops, x: Arr) !Arr {
         if (self.scales.ctx != null) return ops.qmm(x, self.w, self.scales, self.biases, true);
         return ops.binary(.mm, x, try ops.transpose(self.w, &.{ 1, 0 }));
     }
@@ -240,12 +239,12 @@ fn projection(weights: *const model.Weights, prefix: []const u8, leaf: []const u
     return value;
 }
 
-const DenseMlp = struct {
+pub const DenseMlp = struct {
     gate: Linear,
     up: Linear,
     down: Linear,
 
-    fn load(weights: *const model.Weights, prefix: []const u8, hidden: u32, intermediate: u32) !DenseMlp {
+    pub fn load(weights: *const model.Weights, prefix: []const u8, hidden: u32, intermediate: u32) !DenseMlp {
         return .{
             .gate = try projection(weights, prefix, "gate_proj", hidden, intermediate),
             .up = try projection(weights, prefix, "up_proj", hidden, intermediate),
@@ -253,7 +252,7 @@ const DenseMlp = struct {
         };
     }
 
-    fn apply(self: DenseMlp, ops: *Ops, x: Arr, limit: f32) !Arr {
+    pub fn apply(self: DenseMlp, ops: *Ops, x: Arr, limit: f32) !Arr {
         const gate = try self.gate.apply(ops, x);
         const up = try self.up.apply(ops, x);
         const hi = try ops.scalar(limit, mlx.mlx_array_dtype(gate));
@@ -264,12 +263,57 @@ const DenseMlp = struct {
     }
 };
 
-const Hc = struct {
+var hc_mix_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn hcMixExact(ops: *Ops, x: Arr, w: Arr) !Arr {
+    const shape = mlx.getShape(x);
+    const rows = shape[0] * shape[1];
+    const width = shape[2];
+    if (hc_mix_kernel == null) {
+        const inputs = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "x", "w" }, 2);
+        defer _ = mlx.mlx_vector_string_free(inputs);
+        const outputs = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"out"}, 1);
+        defer _ = mlx.mlx_vector_string_free(outputs);
+        const source: [:0]const u8 =
+            \\const uint group = threadgroup_position_in_grid.x;
+            \\const uint row = group / 24u;
+            \\const uint output = group % 24u;
+            \\const uint lane = thread_position_in_threadgroup.x;
+            \\threadgroup float partial[4];
+            \\float value = 0.0f;
+            \\for (uint d = lane; d < uint(WIDTH); d += 128u)
+            \\  value += x[row * uint(WIDTH) + d] * float(w[output * uint(WIDTH) + d]);
+            \\value = simd_sum(value);
+            \\if (thread_index_in_simdgroup == 0) partial[simdgroup_index_in_threadgroup] = value;
+            \\threadgroup_barrier(mem_flags::mem_threadgroup);
+            \\if (lane == 0) out[row * 24u + output] = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+        ;
+        const kernel = mlx.mlx_fast_metal_kernel_new("sushi_glm_hc_mix_fp32", inputs, outputs, source, "", true, false);
+        if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+        hc_mix_kernel = kernel;
+    }
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ shape[0], shape[1], 24 }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * 24 * 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WIDTH", width));
+    const inputs = mlx.mlx_vector_array_new_data(&[_]Arr{ x, w }, 2);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, hc_mix_kernel.?, inputs, cfg, ops.s));
+    const out = try ops.slot();
+    try mlx.check(mlx.mlx_vector_array_get(out, outputs, 0));
+    return out.*;
+}
+
+pub const Hc = struct {
     w: Arr,
     scale: Arr,
     base: Arr,
 
-    fn load(weights: *const model.Weights, prefix: []const u8, label: []const u8, hidden: u32) !Hc {
+    pub fn load(weights: *const model.Weights, prefix: []const u8, label: []const u8, hidden: u32) !Hc {
         var buf: [256]u8 = undefined;
         const value = Hc{
             .w = try named(weights, prefix, try std.fmt.bufPrint(&buf, "{s}_fn", .{label})),
@@ -278,15 +322,16 @@ const Hc = struct {
         };
         if (!std.mem.eql(c_int, &.{ 24, @intCast(hidden * 4) }, mlx.getShape(value.w)) or
             mlx.mlx_array_size(value.scale) != 3 or mlx.mlx_array_size(value.base) != 24 or
-            mlx.mlx_array_dtype(value.w) != .float32 or mlx.mlx_array_dtype(value.scale) != .float32 or mlx.mlx_array_dtype(value.base) != .float32) return error.InvalidGlmHc;
+            (mlx.mlx_array_dtype(value.w) != .float32 and mlx.mlx_array_dtype(value.w) != .bfloat16) or mlx.mlx_array_dtype(value.scale) != .float32 or mlx.mlx_array_dtype(value.base) != .float32) return error.InvalidGlmHc;
         return value;
     }
 
-    fn collapse(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
+    pub fn collapse(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
         const sh = mlx.getShape(x);
         const flat = try ops.reshape(try ops.cast(x, .float32), &.{ sh[0], sh[1], sh[2] * sh[3] });
         const normalized = try ops.rms(flat, .{ .ctx = null }, cfg.rms_norm_eps);
-        const mixes = try ops.binary(.mm, normalized, try ops.transpose(try ops.cast(self.w, .float32), &.{ 1, 0 }));
+        // This sensitive FP32 projection must not take the backend's TF32 path.
+        const mixes = try hcMixExact(ops, normalized, self.w);
         return primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
     }
 };
@@ -298,7 +343,7 @@ fn compactConvTail(ops: *Ops, input: Arr, rows: c_int, keep: c_int) !Arr {
     return ops.contiguous(tail);
 }
 
-const KdaLayer = struct {
+pub const KdaLayer = struct {
     q: Linear,
     k: Linear,
     v: Linear,
@@ -314,8 +359,33 @@ const KdaLayer = struct {
     a_log: Arr,
     dt_bias: Arr,
     out_norm: Arr,
+    prepared_conv: Arr = .{ .ctx = null },
+    prepared_decay: Arr = .{ .ctx = null },
 
-    fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig) !KdaLayer {
+    pub fn prepare(self: *KdaLayer, stream: mlx.mlx_stream) !void {
+        if (self.prepared_conv.ctx != null and self.prepared_decay.ctx != null) return;
+        var ops = Ops{ .s = stream };
+        defer ops.deinit();
+        const conv = try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
+        const decay = try ops.unary(.exp, self.a_log);
+        try mlx.check(mlx.mlx_array_eval(conv));
+        try mlx.check(mlx.mlx_array_eval(decay));
+        const owned_conv = try ops.result(conv);
+        errdefer _ = mlx.mlx_array_free(owned_conv);
+        const owned_decay = try ops.result(decay);
+        self.deinit();
+        self.prepared_conv = owned_conv;
+        self.prepared_decay = owned_decay;
+    }
+
+    pub fn deinit(self: *KdaLayer) void {
+        if (self.prepared_conv.ctx != null) _ = mlx.mlx_array_free(self.prepared_conv);
+        if (self.prepared_decay.ctx != null) _ = mlx.mlx_array_free(self.prepared_decay);
+        self.prepared_conv = .{ .ctx = null };
+        self.prepared_decay = .{ .ctx = null };
+    }
+
+    pub fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig) !KdaLayer {
         const h = cfg.hidden_size;
         const d = cfg.linear_key_head_dim;
         const width = cfg.linear_num_value_heads * d;
@@ -348,7 +418,7 @@ const KdaLayer = struct {
         return result;
     }
 
-    fn apply(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("transformer.zig").SSMCacheEntry) !Arr {
+    pub fn apply(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("transformer.zig").SSMCacheEntry) !Arr {
         const sh = mlx.getShape(x);
         const heads: c_int = @intCast(cfg.linear_num_value_heads);
         const dim: c_int = @intCast(cfg.linear_key_head_dim);
@@ -358,7 +428,7 @@ const KdaLayer = struct {
         const joined = try ops.concat(&projections, -1);
         const previous = if (state.initialized) state.conv_state else try ops.zeros(&.{ sh[0], keep, width * 3 }, mlx.mlx_array_dtype(x));
         const conv_input = try ops.concat(&.{ previous, joined }, 1);
-        const conv_weight = try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
+        const conv_weight = if (self.prepared_conv.ctx != null) self.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
         const convolved = try ops.silu(try ops.conv(conv_input, conv_weight, width * 3));
         const dims = [_]c_int{ sh[0], sh[1], heads, dim };
         const raw_q = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, 0, width), &dims), .float32);
@@ -371,7 +441,8 @@ const KdaLayer = struct {
         const k = try ops.cast(try ops.binary(.mul, raw_k, knorm), mlx.mlx_array_dtype(x));
         const a = try ops.reshape(try ops.cast(try self.fb.apply(ops, try self.fa.apply(ops, x)), .float32), &dims);
         const shift = try ops.reshape(try ops.cast(self.dt_bias, .float32), &.{ 1, 1, heads, dim });
-        const magnitude = try ops.reshape(try ops.unary(.exp, try ops.cast(self.a_log, .float32)), &.{ 1, 1, heads, 1 });
+        const exp_decay = if (self.prepared_decay.ctx != null) self.prepared_decay else try ops.unary(.exp, self.a_log);
+        const magnitude = try ops.reshape(exp_decay, &.{ 1, 1, heads, 1 });
         const forget = try ops.unary(.sigmoid, try ops.binary(.mul, magnitude, try ops.binary(.add, a, shift)));
         const decay = try ops.unary(.exp, try ops.binary(.mul, forget, try ops.scalar(cfg.kda_gate_lower_bound, .float32)));
         const beta = try ops.unary(.sigmoid, try self.beta.apply(ops, x));
@@ -466,11 +537,178 @@ test "GLM KDA loader refuses broadcast norms and malformed preserved tensors" {
     }
 }
 
-test "GLM HC loader refuses rounded FP32 coefficients" {
-    var weights = model.Weights.init(std.testing.allocator);
-    defer weights.deinit();
-    try putValidationWeight(&weights, "a.hc_attn_fn", &.{ 24, 512 }, .bfloat16);
-    try putValidationWeight(&weights, "a.hc_attn_scale", &.{3}, .float32);
-    try putValidationWeight(&weights, "a.hc_attn_base", &.{24}, .float32);
-    try std.testing.expectError(error.InvalidGlmHc, Hc.load(&weights, "a", "hc_attn", 128));
+test "GLM HC loader preserves BF16 matrix and requires FP32 coefficients" {
+    for ([_]bool{ false, true }) |rounded| {
+        var weights = model.Weights.init(std.testing.allocator);
+        defer weights.deinit();
+        try putValidationWeight(&weights, "a.hc_attn_fn", &.{ 24, 512 }, .bfloat16);
+        try putValidationWeight(&weights, "a.hc_attn_scale", &.{3}, if (rounded) .bfloat16 else .float32);
+        try putValidationWeight(&weights, "a.hc_attn_base", &.{24}, .float32);
+        if (rounded) {
+            try std.testing.expectError(error.InvalidGlmHc, Hc.load(&weights, "a", "hc_attn", 128));
+        } else {
+            const hc = try Hc.load(&weights, "a", "hc_attn", 128);
+            try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(hc.w));
+        }
+    }
+}
+
+fn loadLayerFixture() !model.Weights {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "layers.safetensors", .data = @embedFile("fixtures/glm5_layers.safetensors") });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(t.io, &path_buf);
+    const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/layers.safetensors", .{path_buf[0..n]}, 0);
+    defer t.allocator.free(path);
+    var tensors = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tensors);
+    var metadata = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(metadata);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try mlx.check(mlx.mlx_load_safetensors(&tensors, &metadata, path.ptr, cpu));
+    const iter = mlx.mlx_map_string_to_array_iterator_new(tensors);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
+    var weights = model.Weights.init(t.allocator);
+    errdefer weights.deinit();
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var value = mlx.mlx_array_new();
+        const ret = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
+        if (ret != 0 or key == null) {
+            _ = mlx.mlx_array_free(value);
+            break;
+        }
+        try mlx.check(mlx.mlx_array_eval(value));
+        try weights.map.put(try t.allocator.dupe(u8, std.mem.span(key.?)), value);
+    }
+    return weights;
+}
+
+fn expectLayerReference(actual: Arr, expected: Arr, abs: f32, rel: f32) !void {
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(expected), mlx.getShape(actual));
+    try std.testing.expectEqual(mlx.mlx_array_dtype(expected), mlx.mlx_array_dtype(actual));
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const a = try ops.contiguous(try ops.cast(actual, .float32));
+    const e = try ops.contiguous(try ops.cast(expected, .float32));
+    try mlx.check(mlx.mlx_array_eval(a));
+    try mlx.check(mlx.mlx_array_eval(e));
+    const size = mlx.mlx_array_size(a);
+    var maximum: f32 = 0;
+    var relative: f32 = 0;
+    for (mlx.mlx_array_data_float32(a).?[0..size], mlx.mlx_array_data_float32(e).?[0..size]) |v, want| {
+        maximum = @max(maximum, @abs(v - want));
+        relative = @max(relative, @abs(v - want) / @max(@abs(want), 1e-8));
+        try std.testing.expectApproxEqAbs(want, v, abs + rel * @abs(want));
+    }
+    if (@import("transformer.zig").diagEnvOn("SUSHI_GLM_REFERENCE_STATS"))
+        std.debug.print("GLM reference {s} {any}: max_abs={e} max_rel={e}\n", .{ @tagName(mlx.mlx_array_dtype(actual)), mlx.getShape(actual), maximum, relative });
+}
+
+test "GLM reference full KDA apply matches oMLX serial and irregular chunks" {
+    var fixture = try loadLayerFixture();
+    defer fixture.deinit();
+    const cfg = model.ModelConfig{ .hidden_size = 128, .linear_key_head_dim = 128, .linear_num_value_heads = 1, .linear_conv_kernel_dim = 4, .kda_gate_lower_bound = -5, .rms_norm_eps = 1e-5 };
+    var layer = try KdaLayer.load(&fixture, "a", &cfg);
+    defer layer.deinit();
+    try layer.prepare(mlx.gpuStream());
+    const Case = struct { label: []const u8, chunks: []const c_int };
+    for ([_]Case{ .{ .label = "full", .chunks = &.{5} }, .{ .label = "serial", .chunks = &.{ 1, 1, 1, 1, 1 } }, .{ .label = "irregular", .chunks = &.{ 2, 1, 2 } }, .{ .label = "cold", .chunks = &.{5} } }) |case| {
+        var state = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = !std.mem.eql(u8, case.label, "cold") };
+        defer _ = mlx.mlx_array_free(state.conv_state);
+        defer _ = mlx.mlx_array_free(state.ssm_state);
+        try mlx.check(mlx.mlx_array_set(&state.conv_state, fixture.get("initial.conv").?));
+        try mlx.check(mlx.mlx_array_set(&state.ssm_state, fixture.get("initial.state").?));
+        var pos: c_int = 0;
+        for (case.chunks) |count| {
+            var ops = Ops{ .s = mlx.gpuStream() };
+            defer ops.deinit();
+            const input = try ops.slice(fixture.get("input").?, 1, pos, pos + count);
+            const output = try layer.apply(&ops, input, &cfg, &state);
+            var name: [48]u8 = undefined;
+            const reference = fixture.get(try std.fmt.bufPrint(&name, "{s}.output", .{case.label})).?;
+            // One BF16 rounding unit plus a small cancellation allowance.
+            try expectLayerReference(output, try ops.slice(reference, 1, pos, pos + count), 0.001, 0.01);
+            try mlx.check(mlx.mlx_array_eval(state.conv_state));
+            try mlx.check(mlx.mlx_array_eval(state.ssm_state));
+            pos += count;
+        }
+        var name: [48]u8 = undefined;
+        try expectLayerReference(state.conv_state, fixture.get(try std.fmt.bufPrint(&name, "{s}.conv", .{case.label})).?, 0.001, 0.01);
+        try expectLayerReference(state.ssm_state, fixture.get(try std.fmt.bufPrint(&name, "{s}.state", .{case.label})).?, 1e-5, 0.001);
+    }
+}
+
+test "GLM reference mHC assembled collapse and expand match oMLX" {
+    var fixture = try loadLayerFixture();
+    defer fixture.deinit();
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const hc = try Hc.load(&fixture, "h", "hc_attn", 128);
+    const cfg = model.ModelConfig{ .rms_norm_eps = 1e-5 };
+    const input = fixture.get("hc.input").?;
+    const collapsed = try hc.collapse(&ops, input, &cfg);
+    defer collapsed.deinit();
+    try expectLayerReference(collapsed.mixed, fixture.get("hc.mixed").?, 0.002, 0.008);
+    try expectLayerReference(collapsed.post, fixture.get("hc.post").?, 2e-5, 0);
+    try expectLayerReference(collapsed.comb, fixture.get("hc.comb").?, 2e-5, 0);
+    const expanded = try primitive.hcExpand(input, collapsed.mixed, collapsed.post, collapsed.comb, ops.s);
+    defer _ = mlx.mlx_array_free(expanded);
+    try expectLayerReference(expanded, fixture.get("hc.expanded").?, 0.002, 0.008);
+}
+
+test "GLM reference SiLU preserves source BF16 convolution and dense FFN rounding" {
+    var fixture = try loadLayerFixture();
+    defer fixture.deinit();
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const input = fixture.get("silu.input").?;
+    try expectLayerReference(try ops.silu(input), fixture.get("silu.conv").?, 0, 0);
+    const hi = try ops.scalar(10, .bfloat16);
+    const lo = try ops.scalar(-10, .bfloat16);
+    const gate = try ops.binary(.min, input, hi);
+    const up = try ops.binary(.max, try ops.binary(.min, fixture.get("silu.up").?, hi), lo);
+    try expectLayerReference(try ops.binary(.mul, try ops.silu(gate), up), fixture.get("silu.dense").?, 0, 0);
+}
+
+test "GLM prepared KDA constants preserve results and have idempotent ownership" {
+    var fixture = try loadLayerFixture();
+    defer fixture.deinit();
+    const cfg = model.ModelConfig{ .hidden_size = 128, .linear_key_head_dim = 128, .linear_num_value_heads = 1, .linear_conv_kernel_dim = 4, .kda_gate_lower_bound = -5, .rms_norm_eps = 1e-5 };
+    var layer = try KdaLayer.load(&fixture, "a", &cfg);
+    defer layer.deinit();
+    var results: [2]Arr = undefined;
+    var states: [2]Arr = undefined;
+    var made: usize = 0;
+    defer for (0..made) |i| {
+        _ = mlx.mlx_array_free(results[i]);
+        _ = mlx.mlx_array_free(states[i]);
+    };
+    for (0..2) |pass| {
+        if (pass == 1) {
+            try layer.prepare(mlx.gpuStream());
+            const owned = layer.prepared_conv.ctx;
+            try layer.prepare(mlx.gpuStream());
+            try std.testing.expectEqual(owned, layer.prepared_conv.ctx);
+        }
+        var ops = Ops{ .s = mlx.gpuStream() };
+        defer ops.deinit();
+        var state = @import("transformer.zig").SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        defer _ = mlx.mlx_array_free(state.conv_state);
+        defer _ = mlx.mlx_array_free(state.ssm_state);
+        const out = try layer.apply(&ops, fixture.get("input").?, &cfg, &state);
+        try mlx.check(mlx.mlx_array_eval(out));
+        try mlx.check(mlx.mlx_array_eval(state.ssm_state));
+        results[pass] = try ops.result(out);
+        states[pass] = try ops.result(state.ssm_state);
+        made += 1;
+    }
+    try expectLayerReference(results[0], results[1], 0, 0);
+    try expectLayerReference(states[0], states[1], 0, 0);
+    layer.deinit();
+    layer.deinit();
+    try std.testing.expect(layer.prepared_conv.ctx == null and layer.prepared_decay.ctx == null);
 }

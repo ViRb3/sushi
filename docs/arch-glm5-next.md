@@ -153,7 +153,28 @@ parity, broad model quality or native Sushi throughput. The native integration w
 ## Native load validation
 
 The GLM KDA binder validates preserved convolution and norm shapes before graph construction and
-requires FP32 decay parameters and hyper-connection coefficients. A scalar output norm must not
+requires FP32 decay parameters and hyper-connection scale/base coefficients. The original HC mixing
+matrices are BF16 and remain stored that way; their multiplication accumulates in FP32. A scalar output norm must not
 silently broadcast across every channel. Packed expert preflight rejects tensors in the dense prefix or
 outside the configured trunk/MTP range, and any present MTP expert component requires a complete bank.
 These checks do not enable the architecture gate or establish full-forward parity.
+
+## Assembled KDA and mHC reference fixtures
+
+The small synthetic `glm5_layers` fixture records oMLX `6745c39c` source hashes, seed, dtypes and
+precision settings. It contains nonzero initial states, a cold start, full/serial/2–1–2 KDA calls,
+and mHC input/output boundaries. The fixture generator is a reference test utility, not a pack converter.
+Reference capture disables TF32; native HC mixing uses an explicit FP32 dot product and passes with the
+backend's default settings. BF16 HC matrices are converted to FP32 in the dot product without retaining
+an expanded matrix.
+
+These checks exposed two arithmetic differences: SiLU must round its sigmoid to BF16 before the
+multiply, and generic FP32 matmul could choose TF32 for HC mixing. SiLU now matches the reference
+convolution and compiled dense FFN exactly on the activation corpus. The assembled KDA and mHC
+comparisons use fixed bounds for reduction differences: KDA outputs/tails `0.001 + 0.01*abs(reference)`,
+FP32 state `1e-5 + 0.001*abs(reference)`, HC activations `0.002 + 0.008*abs(reference)`, and HC FP32
+coefficients `2e-5`. These tolerances were set before fixing the observed failures.
+
+KDA `prepare` owns a combined convolution weight and `exp(A_log)` once per layer; `deinit` is idempotent.
+Prepared and unprepared execution must produce identical output and recurrent state. This is layer
+validation, not full-model or quantized-checkpoint quality evidence.

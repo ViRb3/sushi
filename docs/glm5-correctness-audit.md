@@ -28,7 +28,7 @@ not load the complete native model or run a native quality evaluation.
 | The clamped expert API did not validate bank dimensions and scale grids before dispatch. | An invalid `[E,129]` scale grid for a 128-wide projection returned a result instead of rejecting the input. Raw kernel indexing assumes the correct grid. | `e0d38137`: validates H128 alignment, matching projection geometry and expert counts, scale shapes, trellis rates and dtypes, routed input/score shapes, and checked row products. Fourteen negative cases pass. |
 | GLM parsing silently accepted contradictory computational settings and incomplete geometry. | Defining fields such as mHC, router scoring, activation, projection bias and pooling settings could disagree with the implemented path. Missing common dimensions could inherit generic defaults; zero dimensions and inconsistent layer tables were accepted. The official nested vision metadata also enabled the generic vision flag. | `99a7321c`: strict required-field and semantic checks, positive/checked dimensions, consistent layer tables, and text-only vision handling. Twenty-five mutation cases reject invalid configurations; shared-expert counts zero and two remain supported. |
 | A test-local `projection` name shadowed the model helper. | The new module failed compilation. | `f352c5d6`: renamed the local binding; targeted module tests compile and pass. |
-| KDA preserved tensors lacked load-time shape/dtype checks. | A scalar output norm was accepted and could broadcast over every channel. Malformed convolution windows, narrowed decay parameters and incorrect bias widths were not rejected by the binder. HC coefficients likewise lacked their FP32 storage check. | `f352c5d6`: exact preserved-tensor contracts and positive/negative load tests. The malformed norm case was observed failing before the fix. |
+| KDA preserved tensors lacked load-time shape/dtype checks. | A scalar output norm was accepted and could broadcast over every channel. Malformed convolution windows, narrowed decay parameters and incorrect bias widths were not rejected by the binder. HC scale/base coefficients likewise lacked their FP32 storage check. | `f352c5d6`: preserved-tensor contracts and positive/negative load tests. The malformed norm case was observed failing before the fix. Its HC matrix FP32-only restriction was subsequently found incorrect and corrected as described below. |
 | GLM pack validation could ignore orphan MTP expert components and misplaced banks. | Preflight looked only for an MTP gate trellis, so an isolated up/down/scale component could escape validation. Packed tensors in the dense prefix or outside the declared trunk/MTP range were not comprehensively rejected. The orphan-MTP regression failed before the fix. | `554fcbfd`: any present MTP expert component requires a complete bank; invalid layer placement is rejected. Index discovery also rejects packed fragments in the dense prefix. |
 
 ## Verification and limits
@@ -71,3 +71,23 @@ measurement against a lossless teacher, and measured memory/admission behavior. 
 BF16 diagnostic generation recorded in the architecture document used a reference Python
 forward; it does not validate the native Sushi forward. No native throughput or KLD conclusion
 follows from this audit.
+
+## Follow-up: instantiated KDA/mHC and actual checkpoint metadata
+
+The complete KDA apply path now has a small independent oMLX fixture, including cold/nonzero initial
+state, full prefill, serial decode and irregular chunks. Assembled HC collapse and expansion are also
+compared. Fixed reference bounds exposed BF16 SiLU rounding and unintended TF32 HC mix arithmetic;
+the fixes preserve BF16 sigmoid rounding and use an HC-specific FP32 dot product. A separate corpus
+checks both convolution SiLU and the reference's compiled dense FFN activation exactly.
+
+Actual official and target shard headers corrected an earlier audit assumption: all 90 main-layer HC
+mixing matrices are **BF16**, while their scale/base vectors are FP32. The earlier FP32-only matrix
+binder would reject the real checkpoint. It now preserves BF16 matrices and performs FP32 arithmetic.
+The fixture uses BF16 matrices, and a positive load regression prevents repeating that mistake. All
+34 KDA layers' retained tensor shapes/dtypes were checked from target headers: FP32 decay parameters,
+BF16 convolution kernels and BF16 output norms. Runtime dtype policy alone is not evidence of storage dtype.
+
+Prepared KDA constants are independently owned and safely released; prepared/unprepared output and
+state equality are tested. Fixture metadata and regeneration instructions accompany the committed
+synthetic data. These tests still do not establish full native model parity, sparse MLA correctness,
+real-checkpoint KLD or throughput.
