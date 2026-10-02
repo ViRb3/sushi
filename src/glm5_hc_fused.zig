@@ -2,6 +2,14 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
+var enabled_cache: ?bool = null;
+fn enabled() bool {
+    if (enabled_cache) |value| return value;
+    const raw = std.c.getenv("SUSHI_GLM_HC_FUSED");
+    const value = if (raw) |text| !std.mem.eql(u8, std.mem.span(text), "0") else true;
+    enabled_cache = value;
+    return value;
+}
 var calls: usize = 0;
 pub fn dispatchCount() usize {
     return calls;
@@ -86,6 +94,7 @@ fn launch(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32, fused: bool) !Arr {
     return out;
 }
 pub fn mix(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32) !?Arr {
+    if (!enabled()) return null;
     if (!mlx.streamIsGpu(s) or x.ctx == null or w.ctx == null or !std.math.isFinite(epsilon) or epsilon <= 0) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or (mlx.mlx_array_dtype(w) != .bfloat16 and mlx.mlx_array_dtype(w) != .float32) or
         !std.mem.eql(c_int, &.{ 1, 1, 4, 4096 }, mlx.getShape(x)) or !std.mem.eql(c_int, &.{ 24, 16384 }, mlx.getShape(w))) return null;
