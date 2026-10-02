@@ -330,3 +330,9 @@ control. Prefill improved6.86% from783.03 tok/s; decode is unchanged within this
 noise. Full ReleaseFast validation passed3,038 tests with109 skipped. The1,000/60 targets
 remain unachieved; current follow-up is quantized NAX tile locality, not a claimed missing
 NAX dispatch. Rejected recurrence/window variants are documented with their measured costs.
+
+
+Current follow-up references: [KDA recurrence and quantized NAX research](glm5-kda-prefill-research.md)
+records rejected schedules and verified backend dispatch; [DFlash expert reuse](plan-glm5-dflash-expert-reuse.md)
+sets the route-overlap evidence and exact-arithmetic requirements for a later grouped kernel.
+Coordinate swizzling alone has not demonstrated a useful gain; tile-aspect experiments remain isolated.
