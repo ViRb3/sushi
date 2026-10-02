@@ -10185,6 +10185,8 @@ pub const Group2Support = struct {
     pub const cooperative_source = INDEXED_COOP_SOURCE;
     pub const prepare = pairPrepareFromTokens;
     pub const middle = midSwigluPrepWithLimit;
+    pub const lane_middle = downLanePrepare;
+    pub const lane_down = downLaneCoop;
     pub const fused_middle_down = clampedMiddleDownCoop;
     pub const pair_reference = indexedPairCoopF16;
     pub fn makeKernel(storage: *Slots, comptime name: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {

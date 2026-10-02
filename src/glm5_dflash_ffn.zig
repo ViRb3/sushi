@@ -8,6 +8,20 @@ const rows = @import("glm5_dflash_kda.zig");
 const Arr = mlx.mlx_array;
 const Ops = base.Ops;
 
+var group2_enabled: ?bool = null;
+var group2_test_override: ?bool = null;
+var group2_batches: usize = 0;
+pub fn group2BatchCount() usize {
+    return group2_batches;
+}
+pub fn resetGroup2BatchCount() void {
+    group2_batches = 0;
+}
+fn group2On() bool {
+    if (@import("builtin").is_test) if (group2_test_override) |v| return v;
+    if (group2_enabled == null) group2_enabled = @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_GROUP2");
+    return group2_enabled.?;
+}
 var routed_batches: usize = 0;
 pub fn batchCount() usize {
     return routed_batches;
@@ -65,7 +79,16 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             };
             try @import("glm5_dflash_profile.zig").captureRoutes(ops.s, index, @intCast(shape[1]), target.cfg.num_experts_per_tok, @intCast(mlx.getShape(layer.weight)[0]), routing.indices);
             try timer.finish("ffn_router", &.{ routing.indices, routing.scores });
-            const routed = try ops.own(try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, .{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window }, @intFromFloat(target.cfg.glm_swiglu_limit)));
+            const dec = api.format.Decode{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window };
+            const gs = mlx.getShape(layer.bank.gate.trellis);
+            const candidate = if (group2On() and shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and dec.window == .w12 and gs.len == 4 and gs[2] == 128 and gs[3] == 36)
+                try api.glm_group2.moeLayout(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane)
+            else
+                null;
+            const routed = try ops.own(if (candidate) |value| reused: {
+                group2_batches += 1;
+                break :reused value;
+            } else try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, dec, @intFromFloat(target.cfg.glm_swiglu_limit)));
             try timer.finish("ffn_routed", &.{routed});
             routed_batches += 1;
             if (layer.shared) |shared| {
@@ -202,15 +225,25 @@ test "GLM DFlash FFN integrates production-width batched routing" {
     const bias = try fixtures.own(mlx.mlx_array_new_data(&correction, &.{288}, 1, .float32));
     target.layers[3].ffn.moe.weight = w;
     target.layers[3].ffn.moe.correction = bias;
-    target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 128, 36);
+    target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 2048, 36);
+    target.cfg.expert_quant_codebook = .mcg;
+    target.cfg.expert_quant_window = .w12;
+    target.cfg.glm_swiglu_limit = 10;
     target.layers[3].ffn.moe.shared = null;
     try mlx.check(mlx.mlx_array_eval(w));
     const x = try fixtures.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 4, 4096 }, 731, stream));
     var ops = Ops{ .s = stream };
     defer ops.deinit();
     @import("glm5_router.zig").resetBatchCallCount();
+    group2_test_override = false;
+    defer group2_test_override = null;
+    const baseline = try apply(&target, 3, &ops, x);
+    group2_test_override = true;
+    resetGroup2BatchCount();
     const actual = try apply(&target, 3, &ops, x);
-    try std.testing.expectEqual(@as(usize, 1), @import("glm5_router.zig").batchCallCount());
+    try std.testing.expectEqual(@as(usize, 1), group2BatchCount());
+    try equal(baseline, actual, stream);
+    try std.testing.expectEqual(@as(usize, 2), @import("glm5_router.zig").batchCallCount());
     for (0..4) |i| {
         var one = Ops{ .s = stream };
         defer one.deinit();

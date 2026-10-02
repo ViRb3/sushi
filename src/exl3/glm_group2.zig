@@ -6,6 +6,7 @@ const base = @import("expert_exl3_kernels.zig");
 const support = base.Group2Support;
 const Arr = mlx.mlx_array;
 pub const Reduction = enum { parallel, serial };
+pub const Layout = enum { natural, lane };
 
 fn replace(comptime source: []const u8, comptime old: []const u8, comptime value: []const u8) [:0]const u8 {
     @setEvalBranchQuota(1000000);
@@ -78,6 +79,24 @@ const PAIR_SOURCE: [:0]const u8 =
     \\const device ushort* trellis=upper?tu:tg;
     \\device half* y=upper?yu:yg;
 ++ replace(SOURCE, "uint split = uint(threadgroup_position_in_grid.z);", "uint split=0u;");
+fn laneSource(comptime source: []const u8) [:0]const u8 {
+    @setEvalBranchQuota(1000000);
+    var result: []const u8 = source;
+    const names = [_][]const u8{ "x", "y", "z", "w" };
+    for (0..4) |r| {
+        const single_old = std.fmt.comptimePrint("const float in{d} = float(x[xb + tk * TILE + row{d}]);", .{ r, r });
+        const single_new = (if (r == 0) "const float4 in4=float4(*((const device half4*)(x+xb+tk*TILE+(lane&3u)*4u)));\n" else "") ++ std.fmt.comptimePrint("const float in{d}=in4.{s};", .{ r, names[r] });
+        result = replace(result, single_old, single_new);
+        const pair_old = std.fmt.comptimePrint("const float2 in{d} = float2(float(x[xb + tk * TILE + row{d}]),float(x[xb1 + tk * TILE + row{d}]));", .{ r, r, r });
+        const pair_new = (if (r == 0) "const float4 in4a=float4(*((const device half4*)(x+xb+tk*TILE+(lane&3u)*4u)));\nconst float4 in4b=float4(*((const device half4*)(x+xb1+tk*TILE+(lane&3u)*4u)));\n" else "") ++ std.fmt.comptimePrint("const float2 in{d}=float2(in4a.{s},in4b.{s});", .{ r, names[r], names[r] });
+        result = replace(result, pair_old, pair_new);
+    }
+    return result ++ "";
+}
+const LANE_SOURCE = laneSource(SOURCE);
+const LANE_PAIR_SOURCE = laneSource(PAIR_SOURCE);
+var single_lane_kernels: support.Slots = support.empty;
+var pair_lane_kernels: support.Slots = support.empty;
 var single_kernels: support.Slots = support.empty;
 var pair_kernels: support.Slots = support.empty;
 const Key = struct { input: c_int, output: c_int, slots: c_int, rate: c_int, paired: bool, reduction: Reduction };
@@ -110,6 +129,9 @@ fn eligible(x: Arr, bank: Arr, ids: Arr) bool {
         (mlx.mlx_array_dtype(ids) == .uint32 or mlx.mlx_array_dtype(ids) == .int32);
 }
 pub fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: Reduction) !?Arr {
+    return projectLayout(s, x, bank, ids, reduction, .natural);
+}
+pub fn projectLayout(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: Reduction, layout: Layout) !?Arr {
     if (!mlx.streamIsGpu(s) or !eligible(x, bank, ids)) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(bank);
@@ -117,7 +139,7 @@ pub fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: Reduct
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = try support.makeKernel(&single_kernels, "sushi_glm_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
+    const kernel = if (layout == .lane) try support.makeKernel(&single_lane_kernels, "sushi_glm_exl3_group2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_SOURCE) else try support.makeKernel(&single_kernels, "sushi_glm_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ x, bank, ids }, 3);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -129,6 +151,9 @@ pub fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: Reduct
     return y;
 }
 pub fn pair(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Arr, reduction: Reduction) !?[2]Arr {
+    return pairLayout(s, xg, xu, tg, tu, ids, reduction, .natural);
+}
+pub fn pairLayout(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Arr, reduction: Reduction, layout: Layout) !?[2]Arr {
     if (!mlx.streamIsGpu(s) or !eligible(xg, tg, ids) or !eligible(xu, tu, ids) or !std.mem.eql(c_int, mlx.getShape(tg), mlx.getShape(tu)) or !std.mem.eql(c_int, mlx.getShape(xg), mlx.getShape(xu))) return null;
     const xs = mlx.getShape(xg);
     const ws = mlx.getShape(tg);
@@ -136,7 +161,7 @@ pub fn pair(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Arr, red
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = try support.makeKernel(&pair_kernels, "sushi_glm_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
+    const kernel = if (layout == .lane) try support.makeKernel(&pair_lane_kernels, "sushi_glm_exl3_pair_group2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_PAIR_SOURCE) else try support.makeKernel(&pair_kernels, "sushi_glm_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ xg, xu, tg, tu, ids }, 5);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -154,6 +179,9 @@ pub const Down = enum { baseline, grouped };
 /// Research-only full routed chain. Unsupported inputs return null for baseline fallback.
 /// groupDown deliberately compares separate middle+grouped down with the native fused-middle path.
 pub fn moe(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: Arr, scores: Arr, dec: @import("expert_exl3.zig").Decode, reduction: Reduction, down: Down) !?Arr {
+    return moeLayout(s, x, bank, indices, scores, dec, reduction, down, .natural);
+}
+pub fn moeLayout(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: Arr, scores: Arr, dec: @import("expert_exl3.zig").Decode, reduction: Reduction, down: Down, layout: Layout) !?Arr {
     if (!mlx.streamIsGpu(s)) return null;
     for ([_]Arr{ x, indices, scores, bank.gate.trellis, bank.gate.suh, bank.gate.svh, bank.up.trellis, bank.up.suh, bank.up.svh, bank.down.trellis, bank.down.suh, bank.down.svh }) |value| if (value.ctx == null) return null;
     const shape = mlx.getShape(x);
@@ -183,14 +211,19 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: A
     try mlx.check(mlx.mlx_reshape(&flat, x, &.{ r, h }, 2, s));
     try mlx.check(mlx.mlx_reshape(&ids, indices, &.{nslots}, 1, s));
     try mlx.check(mlx.mlx_reshape(&sc, scores, &.{nslots}, 1, s));
-    const prep = try support.prepare(s, flat, bank.gate.suh, bank.up.suh, ids, null, h, nslots, top);
+    const prep = if (layout == .lane) try base.lanePairPrepare(s, flat, bank.gate.suh, bank.up.suh, ids, null, h, nslots, top) else try support.prepare(s, flat, bank.gate.suh, bank.up.suh, ids, null, h, nslots, top);
     defer _ = mlx.mlx_array_free(prep[0]);
     defer _ = mlx.mlx_array_free(prep[1]);
-    const gu = (try pair(s, prep[0], prep[1], bank.gate.trellis, bank.up.trellis, ids, reduction)) orelse return null;
+    const gu = (try pairLayout(s, prep[0], prep[1], bank.gate.trellis, bank.up.trellis, ids, reduction, layout)) orelse return null;
     defer for (gu) |a| {
         _ = mlx.mlx_array_free(a);
     };
     const d = blk: {
+        if (layout == .lane) {
+            const middle = try support.lane_middle(s, gu[0], gu[1], bank.gate.svh, bank.up.svh, bank.down.suh, ids, inter, nslots, 10);
+            defer _ = mlx.mlx_array_free(middle);
+            break :blk if (down == .grouped) (try projectLayout(s, middle, bank.down.trellis, ids, reduction, .lane)) orelse return null else try support.lane_down(s, middle, bank.down.trellis, ids);
+        }
         if (down == .baseline and h == 4096 and inter == 2048 and gs[3] == 36 and dec.codebook == .mcg and dec.window == .w12)
             if (try support.fused_middle_down(s, gu[0], gu[1], bank.down.trellis, bank.gate.svh, bank.up.svh, bank.down.suh, ids, 10, 8)) |v| break :blk v;
         const middle = try support.middle(s, gu[0], gu[1], bank.gate.svh, bank.up.svh, bank.down.suh, ids, inter, nslots, 10);
@@ -467,4 +500,149 @@ test "GLM group2 routed-chain guards precede any preparation" {
     malformed = valid;
     malformed.gate.trellis = huge;
     try std.testing.expect((try moe(s, x, malformed, ids, scores, dec, .parallel, .grouped)) == null);
+}
+
+fn laneInput(owned: *Owned, x: Arr, s: mlx.mlx_stream) !Arr {
+    const width: usize = @intCast(mlx.getShape(x)[1]);
+    const indices = try std.testing.allocator.alloc(u32, width);
+    defer std.testing.allocator.free(indices);
+    for (0..width / 16) |tile| for (0..4) |q| for ([_]usize{ 0, 1, 8, 9 }, 0..) |offset, j| {
+        indices[tile * 16 + q * 4 + j] = @intCast(tile * 16 + q * 2 + offset);
+    };
+    const ids = mlx.mlx_array_new_data(indices.ptr, &[_]c_int{@intCast(width)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
+    try mlx.check(mlx.mlx_take_axis(&result, x, ids, 1, s));
+    return owned.own(result);
+}
+
+test "GLM group2 half4 composition preserves all-rate cooperative projection bits" {
+    const s = mlx.gpuStream();
+    base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer base.setDecodeParams(.mul1);
+    for (0..18) |case| {
+        const production = case == 17;
+        const k: c_int = if (production) 4096 else 128;
+        const n: c_int = if (production) 2048 else 128;
+        const rate: c_int = if (production) 36 else @intCast(32 + 2 * case);
+        var owned: Owned = .{};
+        defer owned.deinit();
+        const g = try owned.weights(32, k, n, rate, 987);
+        const u = try owned.weights(32, k, n, rate, 977);
+        for ([_]c_int{ 3, 32, 65, 128 }) |count| {
+            const xg = try owned.floats(&.{ count, k }, .float16, 877, 0.3, s);
+            const xu = try owned.floats(&.{ count, k }, .float16, 857, 0.5, s);
+            const pg = try laneInput(&owned, xg, s);
+            const pu = try laneInput(&owned, xu, s);
+            var data: [128]u32 = undefined;
+            for (data[0..@intCast(count)], 0..) |*id, i| id.* = @intCast(i % 17);
+            const ids = try owned.own(mlx.mlx_array_new_data(&data, &.{count}, 1, .uint32));
+            const rg = try owned.own(try base.indexedGemvCoopF16(s, xg, g, ids));
+            const ru = try owned.own(try base.indexedGemvCoopF16(s, xu, u, ids));
+            for ([_]Reduction{ .parallel, .serial }) |reduction| {
+                const got = (try projectLayout(s, pg, g, ids, reduction, .lane)) orelse return error.TestExpectedGroup2;
+                defer _ = mlx.mlx_array_free(got);
+                try exact(rg, got);
+                const pair_out = (try pairLayout(s, pg, pu, g, u, ids, reduction, .lane)) orelse return error.TestExpectedGroup2;
+                defer for (pair_out) |v| {
+                    _ = mlx.mlx_array_free(v);
+                };
+                try exact(rg, pair_out[0]);
+                try exact(ru, pair_out[1]);
+            }
+        }
+    }
+}
+fn realLaneArm(s: mlx.mlx_stream, f: Real, id: usize) !Arr {
+    const dec = @import("expert_exl3.zig").Decode{ .codebook = .mcg, .window = .w12 };
+    if (id == 0) return @import("root.zig").moeClamped(s, f.x, f.bank, f.ids, f.scores, dec, 10);
+    return (try moeLayout(s, f.x, f.bank, f.ids, f.scores, dec, if (id == 1 or id == 3) .parallel else .serial, if (id <= 2) .baseline else .grouped, .lane)) orelse error.TestExpectedGroup2;
+}
+fn requireLaneBaseline() !void {
+    const pair_on = std.c.getenv("SUSHI_GLM_LANE_PAIR") orelse return error.MissingLaneBaseline;
+    const down_on = std.c.getenv("SUSHI_GLM_DOWN_LANE") orelse return error.MissingLaneBaseline;
+    if (!std.mem.eql(u8, std.mem.span(pair_on), "1") or !std.mem.eql(u8, std.mem.span(down_on), "1")) return error.MissingLaneBaseline;
+}
+
+test "GLM group2 half4 actual weights preserve lane-plus-down fullchain bits" {
+    _ = std.c.getenv("SUSHI_GLM_GROUP2_LANE_TEST") orelse return error.SkipZigTest;
+    const path = std.c.getenv("SUSHI_GLM_GROUP2_FIXTURE") orelse return error.MissingGroup2Fixture;
+    try requireLaneBaseline();
+    const a = std.testing.allocator;
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(path), a, .limited(1024 * 1024));
+    defer a.free(data);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
+    defer parsed.deinit();
+    const s = mlx.gpuStream();
+    for (parsed.value.object.get("cases").?.array.items) |case| {
+        var owned: Owned = .{};
+        defer owned.deinit();
+        const f = try realFixture(&owned, case, s);
+        const pair_before = base.lanePairChainCalls();
+        const down_before = base.downLaneCalls();
+        const expected = try realLaneArm(s, f, 0);
+        defer _ = mlx.mlx_array_free(expected);
+        try std.testing.expectEqual(pair_before + 1, base.lanePairChainCalls());
+        try std.testing.expectEqual(down_before + 1, base.downLaneCalls());
+        for (1..5) |id| {
+            const actual = try realLaneArm(s, f, id);
+            defer _ = mlx.mlx_array_free(actual);
+            try exact(expected, actual);
+        }
+    }
+}
+fn timeLane(s: mlx.mlx_stream, f: Real, id: usize, count: usize) !u64 {
+    const clock = @import("mlx_host").io_util.Stopwatch.init(std.testing.io);
+    for (0..count) |_| {
+        const y = try realLaneArm(s, f, id);
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+    }
+    return clock.read() / count;
+}
+
+test "GLM group2 isolated lane-route timing" {
+    const output = std.c.getenv("SUSHI_GLM_GROUP2_LANE_BENCH_OUT") orelse return error.SkipZigTest;
+    const path = std.c.getenv("SUSHI_GLM_GROUP2_FIXTURE") orelse return error.MissingGroup2Fixture;
+    try requireLaneBaseline();
+    const a = std.testing.allocator;
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(path), a, .limited(1024 * 1024));
+    defer a.free(data);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
+    defer parsed.deinit();
+    const cases = parsed.value.object.get("cases").?.array.items;
+    if (cases.len != 6) return error.BadGroup2Fixture;
+    var samples: [6][11][5]u64 = undefined;
+    var layers: [6]i64 = undefined;
+    var saved: [6]i64 = undefined;
+    var row_counts: [6]i64 = undefined;
+    const s = mlx.gpuStream();
+    for (cases, 0..) |case, ci| {
+        var owned: Owned = .{};
+        defer owned.deinit();
+        const f = try realFixture(&owned, case, s);
+        layers[ci] = f.layer;
+        row_counts[ci] = mlx.getShape(f.x)[1];
+        saved[ci] = f.saved;
+        const pair_before = base.lanePairChainCalls();
+        const down_before = base.downLaneCalls();
+        const expected = try realLaneArm(s, f, 0);
+        defer _ = mlx.mlx_array_free(expected);
+        try std.testing.expectEqual(pair_before + 1, base.lanePairChainCalls());
+        try std.testing.expectEqual(down_before + 1, base.downLaneCalls());
+        for (0..5) |id| {
+            const actual = try realLaneArm(s, f, id);
+            defer _ = mlx.mlx_array_free(actual);
+            try exact(expected, actual);
+            _ = try timeLane(s, f, id, 5);
+        }
+        for (0..11) |round| for (0..5) |step| {
+            const id = if (round % 2 == 0) step else 4 - step;
+            samples[ci][round][id] = try timeLane(s, f, id, 3);
+        };
+    }
+    const json = try std.json.Stringify.valueAlloc(a, .{ .exact = true, .arms = .{ "lane_down_baseline", "group_lane_pair_parallel", "group_lane_pair_serial", "group_lane_all_parallel", "group_lane_all_serial" }, .layers = layers, .saved_slots = saved, .rows = row_counts, .topk = 8, .route_source = "three-row cases are prefixes of the captured N3 routes", .warmup = 5, .repetitions = 3, .timing = "warm selected real banks, synthetic activations, host apply+eval+free, interleaved arms", .nanoseconds = samples }, .{ .whitespace = .indent_2 });
+    defer a.free(json);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
 }
