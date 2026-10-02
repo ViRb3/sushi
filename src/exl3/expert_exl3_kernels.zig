@@ -1906,6 +1906,13 @@ const INDEXED_PAIR_COOP_SOURCE: [:0]const u8 = blk: {
 var indexed_pair_coop_kernel: KernelSlots = no_kernels;
 var indexed_pair_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var indexed_pair_coop_engaged: bool = false;
+var indexed_pair_coop_calls: usize = 0;
+pub fn pairedCooperativeCalls() usize {
+    return indexed_pair_coop_calls;
+}
+pub fn resetPairedCooperativeCalls() void {
+    indexed_pair_coop_calls = 0;
+}
 
 fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array) !?[2]mlx.mlx_array {
     const xs = mlx.getShape(xg);
@@ -1943,6 +1950,7 @@ fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, t
         _ = mlx.mlx_array_free(value);
     };
     for (&result, 0..) |*value, i| try mlx.check(mlx.mlx_vector_array_get(value, outputs, i));
+    indexed_pair_coop_calls += 1;
     if (!indexed_pair_coop_engaged) {
         indexed_pair_coop_engaged = true;
         if (!@import("builtin").is_test) log.info("[exl3-decode] paired cooperative gate/up engaged inner=f16 k_splits=1\n", .{});
