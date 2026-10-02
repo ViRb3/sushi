@@ -144,6 +144,53 @@ ordinary target decoding or register a public speculative serving mode.
 Guard tests also require missing grids, wrong groups/dtypes, dense or strided banks, and excessive
 row counts to decline without a candidate dispatch.
 
+### Warmed width comparison
+
+At `f0093a9e`, all three widths passed the same 512-token prompt and 64-token output check on
+2026-10-03. Every output ID matched across widths and each run's serial reference; complete final
+target-state parity passed. Settings: original BF16 assistant, affine row tiles and batched FFN on,
+chunk-128 absorbed captured prefill, one warmup covering prefill/native serial/full-tree/one-row
+shapes, greedy, BF16 latent cache and FP32 KDA state. Each run held the GPU lock separately, used
+`taskpolicy -a`, max fans and ten seconds idle below 90 C, then restored fan auto and released.
+
+Both decode rates below count **64 committed input tokens, including the final emitted token**.
+The matched serial loop starts from the identical captured prefix, uses native async4 decoding
+without unused draft captures, and excludes comparison/logging from timing. These rates must not be
+compared directly with the separate 64-output/63-forward native benchmark. Each width is one sample
+on one prompt; the small N3 gain is not established as a repeatable speedup.
+
+| Draft nodes / verify rows | Rounds | Accepted drafts | Outputs/round | Spec tok/s | Matched serial tok/s | Ratio | Decode-phase peak GB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 / 2 | 37 | 27 | 1.730 | 23.279 | 26.548 | 0.8769 | 98.527 |
+| 3 / 4 | 23 | 41 | 2.783 | 27.025 | 26.538 | 1.0184 | 98.539 |
+| 7 / 8 | 20 | 44 | 3.200 | 19.667 | 26.517 | 0.7417 | 98.562 |
+
+The peak counter resets after prefill: these are decode-phase peaks, not load/warmup/whole-run peaks.
+Captured prefill was 354.1–355.0 tok/s under this diagnostic's settings. It is a different prefill
+path from the separately recorded dense, chunk-512, no-capture serial benchmark. Neither the
+1,000 tok/s prefill goal nor the 60 tok/s decode goal is reached by this speculative configuration.
+
+| Draft nodes | Draft total ms | Verify total ms | Replay total ms | Commit total ms | Verify share of decode |
+|---|---:|---:|---:|---:|---:|
+| 1 | 247.02 | 2409.39 | 62.28 | 29.37 | 87.64% |
+| 3 | 153.94 | 2145.63 | 39.98 | 27.85 | 90.60% |
+| 7 | 134.37 | 3047.03 | 36.07 | 36.00 | 93.64% |
+
+All options engaged: affine dispatches were 12099/7521/6540 and routed FFN batches were
+1554/966/840 for N1/N3/N7. Forced intermediate MLA branch flushes were zero. The planned MLA live
+scratch bounds were approximately 8.03/16.08/32.23 MB, below the 256 MiB cap. Measurement keys:
+`glm53-dflash-warm-512x64-n1-20261003`, `glm53-dflash-warm-512x64-n3-20261003`, and
+`glm53-dflash-warm-512x64-n7-20261003`.
+
+The measured bottleneck is target verification as a whole. N7 verifies 160 rows versus N3's 92
+while saving only three rounds; N1 verifies 74 rows but needs fourteen more rounds than N3. Neither
+drafting nor replay dominates. Next, profile verifier projections, KDA prework/recurrence, MLA,
+routed/shared FFN, graph construction and synchronization separately. Per-layer native timings do
+not isolate those components and must not be used to assign the entire cost to experts or attention.
+Candidate work includes exact kernel fusions, fewer layer-boundary synchronizations while evaluating
+all saved prework, and measuring repeated-expert reuse. Retune tree policy only with measured
+verification cost and broader prompt coverage. Keep speculation opt-in until a useful gain is proven.
+
 ## Sources and evidence
 
 The following revisions were inspected locally; no model was loaded and no GPU test was run for this
