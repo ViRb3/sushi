@@ -160,6 +160,10 @@ Used in sushi (`src/glm5_decode.zig`):
     each bank keeps its original packed weights, scales and biases.
     Its MLX-derived qmv-fast arithmetic retains the MIT attribution below.
 
+The affine row tile in `src/glm5_dflash_qmm.zig` adapts that arithmetic to
+reuse each weight group across up to four verification rows, retaining the
+per-row dot, scale/bias update and SIMD reduction order.
+
 Used in sushi (`src/glm5_kda_fused.zig`):
 
   * The one-token KDA body adapts `_KDA_SOURCE` from the same 6745c39c

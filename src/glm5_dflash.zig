@@ -534,3 +534,7 @@ pub fn roundTreeLayerwise(io: std.Io, assistant: *draft.DflashModel, context: *d
 test {
     _ = @import("glm5_dflash_diagnostic.zig");
 }
+
+test {
+    _ = @import("glm5_dflash_qmm.zig");
+}

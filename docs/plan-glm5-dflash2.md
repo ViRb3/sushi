@@ -41,6 +41,14 @@ by this entry point. This reduces repeated model orchestration and recurrent wor
 per-row projection work and per-branch MLA evaluation. It is not the final performance endpoint.
 Real-checkpoint parity, broad row-exact qualification, admission accounting and tuning remain gates.
 
+`glm5_dflash_qmm.zig` contains a separate, currently unselected affine8/group128 candidate. It reuses
+each weight group across up to four rows while preserving the serial qmv dot and reduction order.
+Focused tests match every output bit for 1, 2, 3, 4, 5, 8 and 16 rows at input/output geometries
+4096/8192, 8192/4096 and 4096/1536, plus a small guard geometry. The optional 154880-row head test is
+gated by `SUSHI_GLM_DFLASH_HEAD_FIXTURE=1`; its completion must be recorded separately. The candidate
+is not yet used by `linearRows` or the real-checkpoint diagnostic. Dense BF16 projections retain their
+serial geometry and are not covered by this affine candidate.
+
 Focused ReleaseFast tests cover tree validation, zero acceptance, sibling exclusion, pre-commit
 budget/EOS handling, immutable request forks, a complete tiny native assistant proposal/round, and
 every node's recurrent state, convolution window, latent cache, pooled history, remainder and captures
