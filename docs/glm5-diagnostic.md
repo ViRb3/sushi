@@ -109,3 +109,9 @@ Decode contains a large per-evaluation floor: even the final FFN addition costs 
 0.14 ms under this method. Use these totals to prioritize experiments; use queued paired
 microbenchmarks and full-model runs to establish gains, rather than treating synchronized
 component totals as pure GPU times or subtracting an assumed universal barrier constant.
+
+
+For a separate untimed routing capture, `SUSHI_EXL3_UNION_HIST=1` enables per-expert
+prefill counts on stderr and marks the JSON report. It forces route evaluation and logging;
+never enable it in a throughput arm. Use `WARMUP=0`, one full prefill chunk and minimal decode
+when capturing a single set of layer histograms for a replay microbenchmark.
