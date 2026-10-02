@@ -29,6 +29,9 @@ the widest layer rate. A MiMo EXL3 pack streams the same way beside its FP8 trun
 packs are refused by name and serve resident until their streaming lands. MiMo's original MXFP4 checkpoint streams too ([arch-mimo-v2](arch-mimo-v2.md)). Trunk + MTP resident; routed experts come from SSD through
 zero-copy slabs. With no budget a pack loads resident as before.
 
+The GLM-5.3-Flash BF16 individual-expert source adapter also uses this cache and fill pool. It is tested at the
+source/slab level only; the model is not served until its forward is implemented ([GLM foundation](arch-glm5-next.md)).
+
 ## Budget
 
 - `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident

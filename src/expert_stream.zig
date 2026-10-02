@@ -82,7 +82,7 @@ pub fn mxfp4ExpertBytes(hidden: u32, intermediate: u32) !u64 {
 pub fn expertBytesFor(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: quant.Layout) !u64 {
     switch (layout) {
         .bf16_fused => return expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate),
-        .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
+        .bf16_individual, .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
             var store = try quant.QuantStore.openForLayout(allocator, model_dir, .{
                 .layers = geometry.layers,
                 .experts = geometry.experts,
@@ -1585,7 +1585,7 @@ pub const Engine = struct {
     /// the expert compute before the host reads the router ids. Null when the
     /// store is not quantized.
     pub fn specRoute(self: *Engine, layer_index: u16) !?SpecRoute {
-        if (self.store.quantized == null or layer_index >= self.layers.len) return null;
+        if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
         const layer = &self.layers[layer_index];
         if (!layer.active or layer.slabs.len != self.store.componentCount()) return null;
         const experts = layer.cache.expert_to_slot.len;
@@ -1771,7 +1771,8 @@ pub const Engine = struct {
             }
         }
 
-        const quantized = self.store.quantized != null;
+        const individual_bf16 = self.store.layout() == .bf16_individual;
+        const quantized = self.store.quantized != null and !individual_bf16;
         var raws: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         var views: FusedViews = .{ .gate = .{ .ctx = null }, .up = .{ .ctx = null }, .down = .{ .ctx = null } };
         if (quantized) {
@@ -1784,6 +1785,17 @@ pub const Engine = struct {
                 else
                     read_set[ci].array;
             }
+        } else if (individual_bf16) {
+            const axes = [_]c_int{ 0, 2, 1 };
+            views.gate = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(views.gate);
+            try mlx.check(mlx.mlx_transpose_axes(&views.gate, read_set[@backingInt(quant.Component.gate_w)].array, &axes, 3, self.s));
+            views.up = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(views.up);
+            try mlx.check(mlx.mlx_transpose_axes(&views.up, read_set[@backingInt(quant.Component.up_w)].array, &axes, 3, self.s));
+            views.down = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(views.down);
+            try mlx.check(mlx.mlx_transpose_axes(&views.down, read_set[@backingInt(quant.Component.down_w)].array, &axes, 3, self.s));
         } else {
             raws[0] = try read_set[0].borrow();
             errdefer _ = mlx.mlx_array_free(raws[0]);
@@ -3433,7 +3445,7 @@ test "expert substitution reuses an expert another row is fetching anyway" {
     var sc = PickScratch(6){};
     const logits = [_]f32{
         3.0, 2.9, 2.0, -30.0, -30.0, -30.0,
-        3.0, 2.9, 2.8, 2.9, -30.0, -30.0,
+        3.0, 2.9, 2.8, 2.9,   -30.0, -30.0,
     };
     var ids = [_]u16{ 0, 1, 2, 0, 1, 3 };
     const cached = [_]bool{ true, true, false, false, true, true };
@@ -3515,4 +3527,59 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
     const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
     for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
     try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
+}
+
+test "GLM BF16 stream imports split expert slabs and preserves bytes across cache and union" {
+    const t = std.testing;
+    const fixture = @import("glm_stream_fixture.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture.write(t.allocator, tmp.dir, .none);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(t.io, &path_buf);
+    const geometry = Geometry{ .layers = 4, .experts = 4, .hidden = 32, .intermediate = 16, .first_moe_layer = 3 };
+    const s = tinyStream();
+    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geometry, 2 * 3072, s, .{ .layout = .bf16_individual, .bounce_size = 1 << 20 });
+    defer engine.deinit();
+    try t.expectEqual(@as(u64, 6), engine.slab_imports);
+    try t.expectEqual(@as(u64, 0), engine.fallback_imports);
+    try t.expectEqual(@as(u64, 3072), engine.store.perExpertBytes());
+    try t.expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
+    try t.expect((try engine.specRoute(3)) == null);
+    const groups = [_][]const u16{ &.{ 3, 1 }, &.{ 1, 3, 1 }, &.{ 0, 1, 2, 3 }, &.{ 2, 0 } };
+    for (groups, 0..) |ids, group| {
+        var prepared = try engine.prepareHost(3, ids);
+        defer prepared.deinit();
+        try t.expect(!prepared.quantized);
+        try t.expectEqual(group == 2, prepared.workspace);
+        for ([_]mlx.mlx_array{ prepared.gate, prepared.up, prepared.down }, 0..) |array, pi| {
+            try t.expect(array.ctx != null);
+            try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(array));
+            const shape = mlx.getShape(array);
+            try t.expectEqual(@as(usize, 3), shape.len);
+            try t.expectEqual(@as(c_int, if (pi == 2) 16 else 32), shape[1]);
+            try t.expectEqual(@as(c_int, if (pi == 2) 32 else 16), shape[2]);
+            const input_dim: c_int = if (pi == 2) 16 else 32;
+            const input_data: [32]u16 = @splat(0x3f80);
+            const input = mlx.mlx_array_new_data(&input_data, &[_]c_int{ 1, 1, input_dim }, 3, .bfloat16);
+            defer _ = mlx.mlx_array_free(input);
+            const first_slot = [_]u32{prepared.remapped[0]};
+            const selected = mlx.mlx_array_new_data(&first_slot, &[_]c_int{1}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(selected);
+            var result = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(result);
+            try mlx.check(mlx.mlx_gather_mm(&result, input, array, .{ .ctx = null }, selected, false, s));
+            try mlx.check(mlx.mlx_array_eval(result));
+            const result_data = mlx.mlx_array_data_bfloat16(result).?;
+            // Summing 16 or 32 identical powers-of-two-scaled BF16 values is exact.
+            const expected = fixture.value(ids[0], pi) + @as(u16, if (pi == 2) 4 else 5) * 128;
+            for (result_data[0..mlx.mlx_array_size(result)]) |v| try t.expectEqual(expected, v);
+            const ci = pi * 3;
+            for (ids, prepared.remapped) |expert, slot| {
+                const bytes = if (prepared.workspace) engine.union_slabs[ci].slotBytes(slot) else engine.cacheSlotBytesAt(3, slot, ci);
+                for (0..512) |i| try t.expectEqual(fixture.value(expert, pi), std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little));
+            }
+        }
+        if (group == 1) try t.expectEqual(@as(u64, 2), engine.fill_experts_total);
+    }
 }

@@ -279,7 +279,7 @@ pub fn qwen4StreamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, mod
             var experts = expert_quant.QuantStore.open(allocator, model_dir, geometry) catch return null;
             experts.deinit();
         },
-        .mxfp4_split, .mxfp4_individual => {
+        .bf16_individual, .mxfp4_split, .mxfp4_individual => {
             var experts = expert_quant.QuantStore.openForLayout(allocator, model_dir, geometry, layout) catch return null;
             experts.deinit();
         },
