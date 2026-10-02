@@ -386,3 +386,24 @@ MLX MIT attribution applies. Dedicated kernel caches keep six/eight-bit source v
 Raw BF16 parity passed against MLX affine6/group128 for all three 4096→8192 projections and smaller
 unequal output banks. Existing affine8, dense/strided refusal tests and mixed-rate refusal also passed.
 These component results establish exact arithmetic; they do not establish full-checkpoint speed.
+
+### Rejected HC column group sizes 6 and 12
+
+A standalone scheduling experiment retained the exact RMS and FP32 dot kernels but grouped six or
+twelve HC outputs per threadgroup instead of the qualified 24. No RMS factoring or TF32 arithmetic
+was used. Captured prose/code 512-token inputs at layers 0, 3, 23 and 44, for both attention and FFN,
+matched the saved FP32 mixes and all mixed/post/comb outputs bit-for-bit.
+
+Four warmup pairs preceded 24 alternating AB/BA pairs per candidate and capture point, comparing
+C6/C12 directly with C24. Sum of the eight point medians was:
+
+| Fixture | C24 paired with C6 | C6 | C24 paired with C12 | C12 |
+|---|---:|---:|---:|---:|
+| Prose | 2607.749 µs | 3298.645 µs | 2558.854 µs | 2795.978 µs |
+| Code | 2548.479 µs | 3265.356 µs | 2549.249 µs | 2775.043 µs |
+
+C6 was 26–28% slower and C12 about 9% slower. Reducing per-thread accumulator count did not offset
+repeated RMS/input work and scheduling costs in this experiment. These are component measurements,
+not full-model timings. The GPU lock and foreground QoS were used with other workers paused and ten
+seconds idle. Fan maximum was requested but reported RPM did not confirm spin-up. The isolated test
+and raw samples were archived and removed from the runtime tree; C24 remains unchanged.
