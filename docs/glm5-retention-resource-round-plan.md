@@ -54,3 +54,26 @@ requires exact full-chain/model gates, equal reference memory, HTTP2K–16K and
 selected32K qualification, then commit/push. Keep A6, BF16 compressed MLA,
 FP32 KDA state/accumulators, original small tensors and resident embeddings.
 No precision restoration/64K/128K. Goals1500/60 remain active and unproven.
+
+## Outcome
+
+The [retention attribution](glm5-prefill-weight-retention-result.md) proved
+coefficients and outputs exact but found no repeatable latency saving: resident
+banks were 0.36% slower with four wins in eleven pairs. No runtime retention
+cache, alternate cohort or model gate followed.
+
+The [unchanged routed replay](glm5-routed-resource-replay-result.md) completed
+with all 516096 BF16 outputs exact in both passes. The corrected private
+collector recorded 210 named dispatches and 96 completed buffers without
+overflow; installed libraries, shaders and runtime stayed unchanged. Its
+[resource result](glm5-routed-resource-result.md) reports pipeline resources
+and buffer correlations. Buffer intervals overlap and cannot establish kernel
+shares or actual-verifier attribution; supported counters supply no traffic
+or ALU measurements. This closes the bounded diagnostic without a speed claim.
+
+Private probe roots were archived and removed; all jobs ended and the GPU lock
+was released. The next round starts with two source-only researchers seeking
+a new prefill candidate and a new verifier candidate. A4/group64 remains an
+optional smaller, faster drafter under the existing
+[assistant contract](glm5-dflash-affine-storage.md); mixed overall decode and
+acceptance evidence does not change the A6 default. Goals remain unfulfilled.
