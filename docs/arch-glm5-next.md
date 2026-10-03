@@ -8,6 +8,7 @@ remain open. See [diagnostic usage](glm5-diagnostic.md) and [attention/cache det
 Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-glm5-dflash2.md),
 [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),
 [serial decode kernels](engine-glm5-decode.md),
+[head-packed NAX attention](glm5-attention-head-packed.md),
 [external runtime comparison](glm5-external-efficiency-comparison.md), and
 [internal reuse comparison](glm5-internal-efficiency-comparison.md). This document is the GLM documentation index.
 

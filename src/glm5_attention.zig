@@ -4,6 +4,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const prefill_direct = @import("glm5_attention_prefill.zig");
+const packed_nax = @import("glm5_attention_nax_packed.zig");
 const Arr = mlx.mlx_array;
 const nil = Arr{ .ctx = null };
 const pool_size = 4;
@@ -310,7 +311,16 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     return kernelOutput(scope, ev, 0);
 }
 
-fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, direct: bool) !Arr {
+fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, direct: bool, headpack: bool) !Arr {
+    if (headpack) {
+        var ops = @import("glm5_model.zig").Ops{ .s = scope.s };
+        defer ops.deinit();
+        if (try packed_nax.run(&ops, q, state.latent, selected.?, offset, state.processed, scale)) |out| {
+            // Materialize the small result before releasing the gathered bank.
+            try mlx.check(mlx.mlx_array_eval(out));
+            return scope.own(try ops.result(out));
+        }
+    }
     const sh = mlx.getShape(q);
     const rows = sh[0];
     const heads = sh[1];
@@ -370,11 +380,13 @@ pub fn attend(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
             mlx.mlx_array_dtype(w) != mlx.mlx_array_dtype(iq)) return error.InvalidGlmAttentionShape;
     }
     const splits: c_int = if (sh[0] <= 8) 8 else 1;
+    const headpack = sparse and splits == 1 and sh[1] == 64 and sh[2] == 512 and
+        mlx.mlx_array_dtype(q) == .bfloat16 and packed_nax.enabled();
     const direct = splits == 1 and prefill_direct.enabled();
     const per_row = if (direct) try prefill_direct.rowBytes(@intCast(sh[1]), @intCast(sh[2]), mlx.mlx_array_itemsize(q)) else try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
     const pool_bytes = @max(@as(usize, 4), state.processed / 4 * 4);
     if (per_row > attention_scratch_bytes or (sparse and pool_bytes > score_scratch_bytes)) return error.GlmAttentionScratchBudget;
-    const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), 128));
+    const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), if (headpack) packed_nax.max_rows else 128));
     const parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
     var start: usize = 0;
@@ -384,7 +396,7 @@ pub fn attend(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
         defer scope.deinit();
         const qc = try scope.cut(q, @intCast(start), @intCast(end));
         const selected = if (sparse) try selectChunk(&scope, state, try scope.cut(index_q.?, @intCast(start), @intCast(end)), try scope.cut(weights.?, @intCast(start), @intCast(end)), offset + start) else null;
-        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits, direct);
+        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits, direct, headpack);
         // Settle bounded chunks before dropping their score/partial buffers.
         if (@as(usize, @intCast(sh[0])) > max_rows) try mlx.check(mlx.mlx_array_eval(out));
         try mlx.check(mlx.mlx_vector_array_append_value(parts, out));

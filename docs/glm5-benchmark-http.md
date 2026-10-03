@@ -117,3 +117,24 @@ The private `glm53-bench-http-20261003` artifact retains requests, raw SSE,
 response IDs, props/model metadata, red/green logs and binary/runtime/source
 hashes. These are correctness/surface checks; the separately recorded full
 llmprobe ladder is the throughput baseline.
+
+### BF16 packed-attention candidate
+
+`SUSHI_GLM_ATTENTION_PACKED=1` selects bounded head-packed native NAX attention
+for sparse BF16 MLA prefill with more than eight input rows. Each call gathers
+only the 2051 selected latent slots; it reuses one BF16 bank for K and V and
+keeps native accumulation in FP32. Invalid and future slots contain zeros and
+have false mask bits. All-empty selections return zero. Serial decode and the
+DFlash verification attention path retain their existing dispatch.
+
+The candidate uses at most 16 real query rows per settled chunk. Admission
+adds a conservative 64 MiB per pending layer for the gathered bank and native
+attention intermediates. It also now includes the existing head-batched MLA
+permutation buffers: a 2048-row chunk with two pending layers adds 768 MiB.
+The response diagnostic records both opt-in settings and the number of packed
+attention dispatches for that request.
+
+The owner permits ordinary BF16 NAX compound rounding with FP32 accumulators
+and canceled precision-restoration work. The component qualification is in
+[the packed-attention report](glm5-attention-head-packed.md). Full-model throughput
+and long-prefix output drift must be measured before promoting this candidate.

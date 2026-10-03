@@ -203,7 +203,9 @@ fn requestReserve(cfg: *const model.ModelConfig, draft_cfg: ?*const dflash.Dflas
     const activations = @as(u128, chunk) * (@as(u128, cfg.hidden_size) * 64 + width * 32 + @as(u128, cfg.num_experts_per_tok) * (@as(u128, cfg.moe_intermediate_size) * 8 + @as(u128, cfg.hidden_size) * 4)) * 2;
     const scratch = @as(u128, @import("glm5_attention.zig").score_scratch_bytes + @import("glm5_attention.zig").attention_scratch_bytes) * 2 + @import("glm5_dflash_memory.zig").limit_bytes;
     const expanded = try @import("glm5_a6_dense_once.zig").transientBudget(chunk, 2);
-    return std.math.cast(usize, recurrent + latent + assistant_cache + activations + scratch + expanded + 256 * 1024 * 1024) orelse error.BenchmarkMemoryOverflow;
+    const mla_batch = try @import("glm5_mla_prefill_batch.zig").transientBudget(chunk, 2);
+    const packed_bytes = try @import("glm5_attention_nax_packed.zig").transientBudget(chunk, 2);
+    return std.math.cast(usize, recurrent + latent + assistant_cache + activations + scratch + expanded + mla_batch + packed_bytes + 256 * 1024 * 1024) orelse error.BenchmarkMemoryOverflow;
 }
 
 fn plannedGrowth(cfg: *const model.ModelConfig, prompt: usize, output: usize) !usize {
@@ -290,6 +292,32 @@ test "GLM benchmark HTTP context admission never truncates and preserves DFlash 
     try std.testing.expectEqual(@as(usize, 132096), scratchLimit(&cfg, 132096));
     try std.testing.expectError(error.GlmTreeScratchLimit, @import("glm5_dflash_memory.zig").plan(131072, 131072, 32768, 512, 128, 64, 3, 2));
     try std.testing.expect((try requestReserve(&cfg, null, 131072, 2048)) > (try requestReserve(&cfg, null, 65536, 2048)));
+}
+
+test "GLM benchmark HTTP admission includes head-batched MLA permutation buffers" {
+    const batch = @import("glm5_mla_prefill_batch.zig");
+    const cfg = model.ModelConfig{ .num_hidden_layers = 45, .full_attention_interval = 4, .hidden_size = 4096, .mla_kv_lora_rank = 512, .indexer_head_dim = 128, .num_attention_heads = 64, .linear_num_value_heads = 64, .linear_key_head_dim = 128 };
+    const baseline = blk: {
+        const binding = batch.bind(false);
+        defer binding.restore();
+        break :blk try requestReserve(&cfg, null, 32768, 2048);
+    };
+    const binding = batch.bind(true);
+    defer binding.restore();
+    try std.testing.expectEqual(try batch.transientBudget(2048, 2), (try requestReserve(&cfg, null, 32768, 2048)) - baseline);
+}
+
+test "GLM benchmark HTTP admission includes bounded packed attention banks" {
+    const headpack = @import("glm5_attention_nax_packed.zig");
+    const cfg = model.ModelConfig{ .num_hidden_layers = 45, .full_attention_interval = 4, .hidden_size = 4096, .mla_kv_lora_rank = 512, .indexer_head_dim = 128, .num_attention_heads = 64, .linear_num_value_heads = 64, .linear_key_head_dim = 128 };
+    const baseline = blk: {
+        const binding = headpack.bind(false);
+        defer binding.restore();
+        break :blk try requestReserve(&cfg, null, 32768, 2048);
+    };
+    const binding = headpack.bind(true);
+    defer binding.restore();
+    try std.testing.expectEqual(2 * headpack.scratch_limit, (try requestReserve(&cfg, null, 32768, 2048)) - baseline);
 }
 
 test "GLM benchmark HTTP CLI is explicit assistant and benchmark EOS mode" {
@@ -482,6 +510,8 @@ const Runtime = struct {
         dense_rows: bool,
         mini_head: bool,
         a6_dense_prefill: bool,
+        mla_headbatch: bool,
+        packed_attention: bool,
         kda_value_rows: usize,
         benchmark_ignore_eos_enabled: bool,
     } {
@@ -500,6 +530,8 @@ const Runtime = struct {
             .dense_rows = @import("glm5_dflash_dense_rows.zig").enabled(),
             .mini_head = if (self.assistant) |draft_model| draft_model.draft_head != null else false,
             .a6_dense_prefill = @import("glm5_a6_dense_once.zig").enabled(),
+            .mla_headbatch = @import("glm5_mla_prefill_batch.zig").enabled(),
+            .packed_attention = @import("glm5_attention_nax_packed.zig").enabled(),
             .kda_value_rows = (@import("glm5_kda_value_rows.zig").configuredRows() catch null) orelse 0,
             .benchmark_ignore_eos_enabled = self.options.allow_ignore_eos,
         };
@@ -594,6 +626,7 @@ const Runtime = struct {
         }
         var request = try forward.Request.init(a, self.cfg.num_hidden_layers);
         defer request.deinit();
+        @import("glm5_attention_nax_packed.zig").resetDispatchCount();
         request.dense_prefill = true;
         request.prefill_async = true;
         request.prefill_sync_layers = 2;
@@ -663,7 +696,7 @@ const Runtime = struct {
         const finish = if (stopped) "stop" else "length";
         const counts = usage(ids.len, emit.ids.items.len);
         const stats = .{ .prompt_n = ids.len, .prompt_ms = @as(f64, @floatFromInt(prefill_ns)) / 1e6, .predicted_n = emit.ids.items.len, .predicted_ms = @as(f64, @floatFromInt(decode_ns)) / 1e6 };
-        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted };
+        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted };
         if (completion.stream) {
             const last = try frameJson(a, id, self.name, emit.created, null, finish, false);
             defer a.free(last);
