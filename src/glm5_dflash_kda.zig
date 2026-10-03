@@ -38,8 +38,48 @@ const SOURCE =
     \\}
 ;
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
-
+var leaf_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var cached_hits: usize = 0;
+var cached_misses: usize = 0;
+pub fn leafHits() usize {
+    return cached_hits;
+}
+pub fn leafMisses() usize {
+    return cached_misses;
+}
+pub fn resetLeafStats() void {
+    cached_hits = 0;
+    cached_misses = 0;
+}
+pub fn leafEnabled() bool {
+    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_KDA_KEEP_LEAF");
+}
+pub fn cachedLeafRow(parents: []const i32) u32 {
+    var row: u32 = 0;
+    for (parents[1..], 1..) |parent, child| if (parent == row) {
+        row = @intCast(child);
+    };
+    return row;
+}
+pub const LeafResult = struct {
+    y: Arr,
+    state: Arr = .{ .ctx = null },
+    row: u32,
+    pub fn deinit(self: LeafResult) void {
+        _ = mlx.mlx_array_free(self.y);
+        if (self.state.ctx != null) _ = mlx.mlx_array_free(self.state);
+    }
+};
 pub fn recurrent(input: primitive.KdaInputs, parents: []const i32, stream: mlx.mlx_stream) !Arr {
+    const result = try recurrentImpl(input, parents, stream, false);
+    return result.y;
+}
+pub fn recurrentLeaf(input: primitive.KdaInputs, parents: []const i32, stream: mlx.mlx_stream) !LeafResult {
+    if (parents.len == 0 or parents.len > 3) return error.InvalidGlmDraftTree;
+    return recurrentImpl(input, parents, stream, true);
+}
+
+fn recurrentImpl(input: primitive.KdaInputs, parents: []const i32, stream: mlx.mlx_stream, keep_leaf: bool) !LeafResult {
     if (!mlx.streamIsGpu(stream)) return error.KdaGpuRequired;
     const q = mlx.getShape(input.q);
     const v = mlx.getShape(input.v);
@@ -52,22 +92,30 @@ pub fn recurrent(input: primitive.KdaInputs, parents: []const i32, stream: mlx.m
         mlx.mlx_array_dtype(input.state) != .float32 or mlx.mlx_array_dtype(input.decay) != .float32 or (beta_type != .bfloat16 and beta_type != .float32)) return error.InvalidKdaDtype;
     if (parents[0] != -1) return error.InvalidGlmDraftTree;
     for (parents[1..], 1..) |parent, row| if (parent < 0 or parent >= row) return error.InvalidGlmDraftTree;
-    if (kernel == null) {
+    const selected_kernel = if (keep_leaf) &leaf_kernel else &kernel;
+    if (selected_kernel.* == null) {
         const names = [_][*:0]const u8{ "q", "k", "v", "decay", "beta", "state_in", "parents" };
-        const outputs = [_][*:0]const u8{"y"};
+        const outputs: []const [*:0]const u8 = if (keep_leaf) &.{ "y", "leaf_state" } else &.{"y"};
         const iv = mlx.mlx_vector_string_new_data(&names, names.len);
         defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outputs, outputs.len);
+        const ov = mlx.mlx_vector_string_new_data(outputs.ptr, outputs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        kernel = mlx.mlx_fast_metal_kernel_new("sushi_glm_kda_tree", iv, ov, SOURCE, "", true, false);
-        if (kernel.?.ctx == null) {
-            kernel = null;
+        const stored: [:0]const u8 = SOURCE ++ "for(int i=0;i<N;++i) leaf_state[(head*Dv+dv)*Dk+N*lane+i]=saved[KEEP_ROW][i];";
+        selected_kernel.* = mlx.mlx_fast_metal_kernel_new(if (keep_leaf) "sushi_glm_kda_tree_leaf" else "sushi_glm_kda_tree", iv, ov, if (keep_leaf) stored else SOURCE, "", true, false);
+        if (selected_kernel.*.?.ctx == null) {
+            selected_kernel.* = null;
             return error.MetalKernelCompileFailed;
         }
     }
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, v.ptr, 4, dtype));
+    const row = cachedLeafRow(parents);
+    if (keep_leaf) {
+        const shape = mlx.getShape(input.state);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, shape.ptr, 4, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KEEP_ROW", @intCast(row)));
+    }
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, v[3], q[2]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", dtype));
@@ -83,10 +131,14 @@ pub fn recurrent(input: primitive.KdaInputs, parents: []const i32, stream: mlx.m
     defer _ = mlx.mlx_vector_array_free(inputs);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel.?, inputs, config, stream));
-    var result = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(result);
-    try mlx.check(mlx.mlx_vector_array_get(&result, outputs, 0));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, selected_kernel.*.?, inputs, config, stream));
+    var result = LeafResult{ .y = mlx.mlx_array_new(), .row = row };
+    errdefer result.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&result.y, outputs, 0));
+    if (keep_leaf) {
+        result.state = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&result.state, outputs, 1));
+    }
     return result;
 }
 
@@ -166,7 +218,10 @@ pub const Tape = struct {
     conv_input: Arr,
     parents: [16]i32 = @splat(-1),
     count: usize = 0,
+    retained_state: Arr = .{ .ctx = null },
+    retained_row: u32 = std.math.maxInt(u32),
     pub fn deinit(self: *Tape) void {
+        if (self.retained_state.ctx != null) _ = mlx.mlx_array_free(self.retained_state);
         for ([_]Arr{ self.inputs.q, self.inputs.k, self.inputs.v, self.inputs.decay, self.inputs.beta, self.inputs.state, self.conv_input }) |value| _ = mlx.mlx_array_free(value);
     }
     pub fn replay(self: *const Tape, path: []const u32, s: mlx.mlx_stream) !@import("transformer.zig").SSMCacheEntry {
@@ -178,8 +233,18 @@ pub const Tape = struct {
         var ops = Ops{ .s = s };
         defer ops.deinit();
         const indices = try ops.own(mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .uint32));
-        const output = try primitive.kda(.{ .q = try ops.take(self.inputs.q, indices, 1), .k = try ops.take(self.inputs.k, indices, 1), .v = try ops.take(self.inputs.v, indices, 1), .decay = try ops.take(self.inputs.decay, indices, 1), .beta = try ops.take(self.inputs.beta, indices, 1), .state = self.inputs.state }, s);
-        defer output.deinit();
+        const reused = self.retained_state.ctx != null and path[path.len - 1] == self.retained_row;
+        const state = if (reused) blk: {
+            const value = try ops.result(self.retained_state);
+            cached_hits += 1;
+            break :blk value;
+        } else blk: {
+            if (self.retained_state.ctx != null) cached_misses += 1;
+            const output = try primitive.kda(.{ .q = try ops.take(self.inputs.q, indices, 1), .k = try ops.take(self.inputs.k, indices, 1), .v = try ops.take(self.inputs.v, indices, 1), .decay = try ops.take(self.inputs.decay, indices, 1), .beta = try ops.take(self.inputs.beta, indices, 1), .state = self.inputs.state }, s);
+            defer output.deinit();
+            break :blk try ops.result(output.state);
+        };
+        errdefer _ = mlx.mlx_array_free(state);
         var tail: [3]u32 = undefined;
         for (&tail, 0..) |*row, i| {
             const position = @as(i32, @intCast(path.len)) - 3 + @as(i32, @intCast(i));
@@ -188,7 +253,7 @@ pub const Tape = struct {
         const tail_ids = try ops.own(mlx.mlx_array_new_data(&tail, &[_]c_int{3}, 1, .uint32));
         const conv = try ops.result(try ops.contiguous(try ops.take(self.conv_input, tail_ids, 1)));
         errdefer _ = mlx.mlx_array_free(conv);
-        return .{ .conv_state = conv, .ssm_state = try ops.result(output.state), .initialized = true };
+        return .{ .conv_state = conv, .ssm_state = state, .initialized = true };
     }
 };
 
@@ -266,7 +331,9 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     try profile.finish("kda_prework", &.{ work[0], work[1], work[2], work[3], work[4], conv_input });
     const initial = if (state.initialized) state.ssm_state else try ops.zeros(&.{ 1, heads, dim, dim }, .float32);
     const inputs = primitive.KdaInputs{ .q = work[0], .k = work[1], .v = work[2], .decay = work[3], .beta = work[4], .state = initial };
-    const y_bf = try ops.own(try recurrent(inputs, parents, ops.s));
+    const retained: ?LeafResult = if (leafEnabled() and parents.len <= 3) try recurrentLeaf(inputs, parents, ops.s) else null;
+    defer if (retained) |value| value.deinit();
+    const y_bf = try ops.own(if (retained) |value| try ops.result(value.y) else try recurrent(inputs, parents, ops.s));
     try profile.finish("kda_recurrence", &.{y_bf});
     const gate_bf = try ops.reshape(try linearRows(ops, layer.gb, try linearRows(ops, layer.ga, x, mode), mode), &dims);
     const post = if (!force_staged_for_tests and sh[1] > 1) try @import("glm5_kda_fused.zig").post(ops.s, y_bf, gate_bf, layer.out_norm, cfg.rms_norm_eps) else null;
@@ -285,6 +352,10 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     errdefer tape.deinit();
     inline for (.{ "q", "k", "v", "decay", "beta", "state" }) |name| @field(tape.inputs, name) = try ops.result(@field(inputs, name));
     tape.conv_input = try ops.result(conv_input);
+    if (retained) |value| {
+        tape.retained_state = try ops.result(value.state);
+        tape.retained_row = value.row;
+    }
     tape.count = parents.len;
     @memcpy(tape.parents[0..parents.len], parents);
     return .{ .output = output, .tape = tape };
