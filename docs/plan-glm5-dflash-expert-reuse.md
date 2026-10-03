@@ -383,3 +383,31 @@ five warmups, eleven alternating pairs and three fresh chains per sample;
 foreground QoS, exclusive GPU lock, maximum fans and ten seconds idle below90°C.
 Private artifact `glm53-group3-20261003` preserves source, binary/runtime hashes,
 parity logs, raw samples and telemetry. No compiler or other GPU work overlapped.
+
+## Partner prepass: exact output, no consistent gain
+
+An isolated candidate at `5206ad9a` replaced repeated inline membership ballots
+with one GPU dispatch producing U32 partner slots. Odd occurrences carry
+`UINT_MAX`; leaders point to the next equal-expert occurrence or themselves for
+an unmatched tail. Gate/up/down retained their original serial 4 KiB lane bodies,
+slot stores and arithmetic. No production caller changed.
+
+The captured L20 three-row fixture has 24 assignments, 17 unique experts and
+18 leaders; its partner table is 96 bytes. Metadata rank/tail checks covered
+24/32/65/128 slots and boundaries 31/32/63/64/127. The full routed-chain BF16 output
+matched every baseline bit on the original compact checkpoint banks, with
+synthetic BF16 activations and scores. Five focused tests passed.
+
+Eleven alternating AB/BA pairs, four fresh chains per sample after three warmup
+pairs, timed all preparation, partner allocation/dispatch, gate/up, middle, down,
+finish, evaluation and free. Inline grouping measured 590.385 µs versus
+589.416 µs with the prepass, a 0.164% median reduction. Only five pairs favored
+the candidate; the median paired difference was a 0.154% regression. This does
+not establish a consistent gain, so no contrasting fixture or runtime hook was
+warranted. The source and research seam were removed and archived privately.
+
+The ReleaseFast run used MLX 0.32.3, interactive `taskpolicy -a`, exclusive lock
+`glm-group2-partners`, maximum fans confirmed near 5354/5750 RPM and ten seconds
+idle below 90°C. Measurement key `glm53-group2-partners-20261003` retains source,
+raw samples, commands and telemetry; binary SHA-256 is
+`b8ac6c61f7ac1832a83362fbfad79b81de640b63669c89fb24940a1df0270fed`.
