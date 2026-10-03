@@ -81,3 +81,19 @@ The [holder protocol](glm5-qkv-observer-protocol.md) passed its directed red/gre
 sequence with synthetic buffers, no model or timing claim. Root's narrow
 interception/head-observer seams are uncommitted and disabled by default.
 The single actual-tree verifier attribution remains pending.
+
+## Round closed
+
+The [actual verifier result](glm5-qkv-attribution-result.md) proved held raw
+outputs, all three-row logits/decisions and complete valid committed state exact.
+Complete medians were48.868083→42.276333 ms,13.4889% lower in all eleven pairs,
+with unchanged non-QKV engagement and original cadence. This one-case perfect-
+reuse ceiling supports separate raw-projection implementation research; it
+is not a production cache, isolated QKV duration or throughput gain.
+
+Both diagnostic production seams were restored. Compiled sources, raw outputs,
+proofs, every pair and lifecycle records were hash-verified and archived; owned
+private holders/probes/roots were removed. Runtime `4fcb541e` and its qualified
+CLI remain unchanged, GPU free and fans automatic. No optimization ships from
+this measurement round. The next round starts with two source-only reports on
+large GEMM/projection work before any three-worker implementation.

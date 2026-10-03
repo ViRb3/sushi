@@ -1,8 +1,12 @@
 # Frozen raw-QKV observer protocol
 
-The bounded diagnostic holder passes its fixture-free protocol gate. This is
-preparation for the [one-tree counterfactual](glm5-prefill-qkv-attribution-round-plan.md),
-not a numerical kernel, cache or performance result.
+The bounded diagnostic holder passed its fixture-free protocol gate and the
+[completed one-tree actual-model attribution](glm5-qkv-attribution-result.md).
+Exact raw outputs, all three-row
+logits/decisions and valid committed states passed; complete median latency was
+48.868083 → 42.276333 ms (13.4889%, 11/11 pairs). This is a one-case perfect-reuse
+ceiling, without a cache, kernel-time or production-throughput claim. The
+[round plan](glm5-prefill-qkv-attribution-round-plan.md) defines that scope.
 
 A private red copy retained the normal capture/observe behavior but declined
 reuse. ReleaseFast build passed; the proof failed at `ExpectedQkvReuse` after
@@ -35,5 +39,11 @@ Green binary SHA256:
 Accepted staged libraries, ReleaseFast, foreground `taskpolicy -a`, separate
 per-job locks, max fans/idle and automatic fan cleanup were used. Both runs
 are terminal; raw source, commands, hashes, exits and logs are preserved
-privately under artifact key `glm53-qkv-observer-proof-20261004`. There is no
-model load, shader dispatch benchmark or throughput claim in this gate.
+privately under artifact key `glm53-qkv-observer-proof-20261004`. The protocol
+gate itself loaded no model and measured no shader or throughput performance.
+
+After the actual-model job, root removed the shared diagnostic seams. The
+helper and private protocol probe were hash-verified against their compiled
+sources, archived privately and removed. Their exact protocol/source evidence
+remains under `glm53-qkv-observer-proof-20261004`; actual-model evidence is under
+`glm53-qkv-attribution-20261004`. No runtime optimization landed from this gate.
