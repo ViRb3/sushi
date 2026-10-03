@@ -1,4 +1,4 @@
-//! One exact R3 A6 hoist test on a production 8192x4096 q_proj bank.
+//! Exact R3 A6 hoist probe on an original production projection bank.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("glm5_model.zig");
@@ -21,11 +21,13 @@ fn load(ops: *Ops, desc: std.json.Value) !Arr {
 }
 fn timed(linear: model.Linear, input: Arr, variant: bool) !u64 {
     const watch = @import("io_util.zig").Stopwatch.init(std.testing.io);
-    const y = (if (variant) try hoisted.project(mlx.gpuStream(), input, linear) else try original.project(mlx.gpuStream(), input, linear)) orelse return error.ExpectedHoistProjection;
-    errdefer _ = mlx.mlx_array_free(y);
-    try mlx.check(mlx.mlx_array_eval(y));
-    _ = mlx.mlx_array_free(y);
-    return watch.read();
+    for (0..8) |_| {
+        const y = (if (variant) try hoisted.project(mlx.gpuStream(), input, linear) else try original.project(mlx.gpuStream(), input, linear)) orelse return error.ExpectedHoistProjection;
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+        _ = mlx.mlx_array_free(y);
+    }
+    return watch.read() / 8;
 }
 test "GLM A6 R3 masked coefficient hoist production bits and timing" {
     const output = std.c.getenv("SUSHI_GLM_A6_HOIST_OUT") orelse return error.SkipZigTest;
@@ -37,11 +39,15 @@ test "GLM A6 R3 masked coefficient hoist production bits and timing" {
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     const records = parsed.value.object.get("records").?;
-    const linear = model.Linear{ .input = 4096, .output = 8192, .w = try load(&ops, records.object.get("weight").?), .scales = try load(&ops, records.object.get("scales").?), .biases = try load(&ops, records.object.get("biases").?) };
+    const weight = try load(&ops, records.object.get("weight").?);
+    const scales = try load(&ops, records.object.get("scales").?);
+    const k = mlx.getShape(scales)[1] * 128;
+    const n = mlx.getShape(weight)[0];
+    const linear = model.Linear{ .input = k, .output = n, .w = weight, .scales = scales, .biases = try load(&ops, records.object.get("biases").?) };
     const key = try ops.slot();
     try mlx.check(mlx.mlx_random_key(key, 5303));
     const input = try ops.slot();
-    try mlx.check(mlx.mlx_random_normal(input, &.{ 1, 3, 4096 }, 3, .bfloat16, 0, 1, key.*, ops.s));
+    try mlx.check(mlx.mlx_random_normal(input, &.{ 1, 3, k }, 3, .bfloat16, 0, 1, key.*, ops.s));
     const values = mlx.mlx_vector_array_new_data(&.{ input.*, linear.w, linear.scales, linear.biases }, 4);
     defer _ = mlx.mlx_vector_array_free(values);
     try mlx.check(mlx.mlx_eval(values));
@@ -49,7 +55,8 @@ test "GLM A6 R3 masked coefficient hoist production bits and timing" {
     const b = try ops.own((try hoisted.project(ops.s, input.*, linear)) orelse return error.ExpectedHoistProjection);
     try mlx.check(mlx.mlx_array_eval(a));
     try mlx.check(mlx.mlx_array_eval(b));
-    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(a).?[0..3 * 8192], mlx.mlx_array_data_bfloat16(b).?[0..3 * 8192]);
+    const count: usize = @intCast(3 * n);
+    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(a).?[0..count], mlx.mlx_array_data_bfloat16(b).?[0..count]);
     var samples: [2][11]u64 = undefined;
     for (0..3) |_| for ([_]bool{ false, true }) |variant| {
         _ = try timed(linear, input.*, variant);
@@ -58,7 +65,7 @@ test "GLM A6 R3 masked coefficient hoist production bits and timing" {
         const arm = if (round % 2 == 0) position else 1 - position;
         samples[arm][round] = try timed(linear, input.*, arm == 1);
     };
-    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .model = parsed.value.object.get("model").?.string, .layer = 0, .projection = "q_proj", .shape = .{ 3, 4096, 8192 }, .fixture = records, .exact_bf16_values = 3 * 8192, .arms = .{ "current A6 rowtile", "hoisted12maskedfloatcoeffs" }, .nanoseconds = samples, .warmups = 3, .rounds = 11, .timing = "hostapply/eval/free; resident original production U32A6/BF16scale/bias; syntheticBF16RMSinput", .runtime_hook = false }, .{ .whitespace = .indent_2 });
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .model = parsed.value.object.get("model").?.string, .layer = 0, .projection = if (parsed.value.object.get("projection")) |value| value.string else "q_proj", .shape = .{ 3, k, n }, .fixture = records, .exact_bf16_values = count, .arms = .{ "current A6 rowtile", "hoisted12maskedfloatcoeffs" }, .nanoseconds = samples, .warmups = 3, .rounds = 11, .fresh_calls_per_sample = 8, .timing = "hostapply/eval/free; resident original production U32A6/BF16scale/bias; syntheticBF16input", .runtime_hook = false }, .{ .whitespace = .indent_2 });
     defer std.testing.allocator.free(json);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
 }

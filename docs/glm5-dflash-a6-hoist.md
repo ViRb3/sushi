@@ -40,3 +40,27 @@ one geometry, without extending the timing claim to output/shared projections
 or other row counts. Control/counter and the narrow caller delegation were
 added after timing and require the combined integration build/model gate.
 There is no full-model throughput claim from this component.
+
+## Output-projection extension declined
+
+A subsequent component at `2f446c5a` broadened only the guard to admit the
+original layer-0 output bank, A6/group128 `[4096,1536]` U32 with `[4096,64]`
+BF16 scale/bias grids. The unchanged shader produced all 12,288 three-row
+BF16 outputs bit for bit. The generalized probe first failed on the original
+QKV-only guard, then passed with this temporary extension.
+
+Eleven alternating AB/BA single-call pairs measured 576.584 versus 535.834 µs,
+but only seven pairs favored hoisting and several samples had large host
+outliers. A bounded follow-up averaged eight fresh apply/evaluate/free calls
+per sample, with three warmups and eleven alternating pairs. It measured
+325.140 versus 316.026 µs, a 2.80% median reduction, again with seven paired
+wins. Both arms drifted substantially across the run. These results do not
+establish a repeatable output-projection gain, so the production guard remains
+QKV-only. No full-model output-hoist arm was warranted.
+
+Both runs used exclusive lock `glm-a6-output-hoist-v61`, interactive QoS,
+MLX v0.32.3, maximum fans and ten seconds idle; the second run started at
+54.20°C. Both focused tests passed.
+The generalized probe retains fixture-derived dimensions and eight fresh calls
+per sample. Exact source, temporary guard, tensor hashes, results and provenance
+are archived under measurement key `glm53-a6-output-hoist-20261003`.
