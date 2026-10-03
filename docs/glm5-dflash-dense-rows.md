@@ -46,3 +46,24 @@ BF16 output bits and checks dispatch engagement. Diagnostic JSON reports
 `dense_row_dispatches` and mini-head storage/readout counters.
 Full-model decode speed, actual-checkpoint state parity, KLD and wider rows remain
 unqualified; the component result alone does not establish those properties.
+
+## Full checkpoint qualification
+
+The ReleaseFast diagnostic built from `e4be4673` ran the A6-trunk 2.3bpw target
+and A6g128 assistant with N2/children4, async4, grouped experts and lane/down
+enabled, prefix512/chunk128,64 committed inputs and one warmup. Dense rows were
+enabled; mini-head, profiling and route capture were disabled. All64 output IDs
+and complete committed state matched the independent serial reference. The
+helper recorded4,608 calls;24 rounds accepted40 drafts, as in the prior arm.
+
+Decode measured45.8676 tok/s against the inherited45.4485 tok/s group2 result,
+while matched serial measured30.9358. Verifier time was1,189.197 ms versus the
+older1,201.903 ms; draft146.348, replay43.211 and commit15.760 ms. Decode-only peak
+was94,978,758,176 bytes. The roughly0.92% throughput difference is a single-run
+qualification, not a robust speed estimate or evidence that the60 tok/s goal
+is reached. Default remains off pending repeat and broader prompts.
+
+The run used foreground `taskpolicy -a`, exclusive GPU lock, maximum fans and
+ten seconds idle below90°C; no compiler or other GPU job overlapped. The fixed
+binary and exact settings are preserved in private artifact
+`glm53-dense-mini-20261003`. The complete checkpoint ReleaseFast suite also passed.
