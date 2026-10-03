@@ -10,6 +10,7 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [serial decode kernels](engine-glm5-decode.md),
 [head-packed NAX attention](glm5-attention-head-packed.md),
 [bounded IndexPool scoring](glm5-indexpool-nax-score.md),
+[stored affine assistant formats](glm5-dflash-affine-storage.md),
 [bounded draft readouts](glm5-dflash-readout-horizon.md),
 [verification latent overlays](glm5-dflash-latent-overlay.md),
 [verification projection batching](glm5-mla-verify-batch.md),

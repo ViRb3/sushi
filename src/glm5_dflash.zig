@@ -533,7 +533,7 @@ pub const AssistantStorage = struct {
     dense_linears: usize = 0,
     affine_linears: usize = 0,
     pub fn label(self: AssistantStorage) []const u8 {
-        return if (self.affine_linears == 0) "BF16" else if (self.bits == 8) "A8g128" else "A6g128";
+        return if (self.affine_linears == 0) "BF16" else if (self.bits == 4 and self.group_size == 64) "A4g64" else if (self.bits == 8) "A8g128" else "A6g128";
     }
     fn add(self: *AssistantStorage, linear: *const draft.DflashLinear) !void {
         if (linear.w.ctx == null) return error.UnsupportedGlmDraftStorage;
@@ -544,12 +544,12 @@ pub const AssistantStorage = struct {
             self.dense_linears += 1;
             return;
         }
-        if ((linear.bits != 6 and linear.bits != 8) or linear.bits != self.bits or linear.group_size != 128 or
+        if (!((linear.bits == 4 and linear.group_size == 64) or ((linear.bits == 6 or linear.bits == 8) and linear.group_size == 128)) or linear.bits != self.bits or linear.group_size != self.group_size or
             mlx.mlx_array_dtype(linear.w) != .uint32 or linear.scales.ctx == null or linear.biases.ctx == null or
             mlx.mlx_array_dtype(linear.scales) != .bfloat16 or mlx.mlx_array_dtype(linear.biases) != .bfloat16) return error.UnsupportedGlmDraftStorage;
         const ss = mlx.getShape(linear.scales);
         if (ss.len != 2 or ss[0] != ws[0] or ss[1] <= 0 or !std.mem.eql(c_int, ss, mlx.getShape(linear.biases)) or
-            @as(u64, @intCast(ws[1])) * 32 != @as(u64, @intCast(ss[1])) * 128 * linear.bits) return error.UnsupportedGlmDraftStorage;
+            @as(u64, @intCast(ws[1])) * 32 != @as(u64, @intCast(ss[1])) * linear.group_size * linear.bits) return error.UnsupportedGlmDraftStorage;
         self.affine_linears += 1;
     }
 };
@@ -687,32 +687,41 @@ test {
     _ = @import("glm5_dflash_ffn.zig");
 }
 
-test "GLM draft stored BF16 A6 and A8 validate packed geometry without changing arrays" {
+test "GLM draft stored BF16 A4 A6 and A8 validate packed geometry without changing arrays" {
     const nil = mlx.mlx_array{ .ctx = null };
     const codes: [32]u32 = @splat(0);
     const scales: [2]u16 = .{ 0x3f80, 0 };
-    for ([_]u32{ 6, 8 }) |bits| {
-        const cols: c_int = @intCast(128 * bits / 32);
+    for ([_][2]u32{ .{ 4, 64 }, .{ 6, 128 }, .{ 8, 128 } }) |spec| {
+        const bits = spec[0];
+        const group = spec[1];
+        const cols: c_int = @intCast(group * bits / 32);
         const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ 1, cols }, 2, .uint32);
         defer _ = mlx.mlx_array_free(w);
         const scale = mlx.mlx_array_new_data(&scales, &[_]c_int{ 1, 1 }, 2, .bfloat16);
         defer _ = mlx.mlx_array_free(scale);
-        var linear = draft.DflashLinear{ .w = w, .scales = scale, .biases = scale, .bits = bits, .group_size = 128 };
-        var storage = AssistantStorage{ .bits = bits, .group_size = 128 };
+        var linear = draft.DflashLinear{ .w = w, .scales = scale, .biases = scale, .bits = bits, .group_size = group };
+        var storage = AssistantStorage{ .bits = bits, .group_size = group };
         try storage.add(&linear);
         try std.testing.expectEqual(@as(usize, 1), storage.affine_linears);
         try std.testing.expectEqual(w.ctx, linear.w.ctx);
-        linear.group_size = 64;
+        try std.testing.expectEqual(scale.ctx, linear.scales.ctx);
+        try std.testing.expectEqual(scale.ctx, linear.biases.ctx);
+        try std.testing.expectEqualStrings(if (bits == 4) "A4g64" else if (bits == 6) "A6g128" else "A8g128", storage.label());
+        linear.group_size = if (group == 64) 128 else 64;
         try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
-        linear.group_size = 128;
+        linear.group_size = group;
         linear.biases = nil;
         try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
         const bad = mlx.mlx_array_new_data(&scales, &[_]c_int{ 1, 2 }, 2, .bfloat16);
         defer _ = mlx.mlx_array_free(bad);
         linear.biases = bad;
         try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
+        linear.scales = bad;
+        try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
+        linear.scales = scale;
         linear.biases = scale;
         linear.bits = if (bits == 6) 8 else 6;
+        linear.group_size = 128;
         try std.testing.expectError(error.UnsupportedGlmDraftStorage, storage.add(&linear));
     }
     const w = mlx.mlx_array_new_data(&scales, &[_]c_int{ 1, 2 }, 2, .bfloat16);
