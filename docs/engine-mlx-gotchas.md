@@ -54,6 +54,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - Slice-born weights into gather_qmm/quantized_matmul are `mlx_contiguous`-materialized at load; mlx
   `Copy`/`contiguous` are VIEW ops (a slice OUTLIVING its parent goes through `materializedOwnedCopy`).
 - A raw data-pointer read must PROVE row-major contiguity; a helper that materializes a VIEW owns it (`takeContig`).
+- Lazy transpose/broadcast descriptors can expose placeholder contiguous strides; evaluate the view before a
+  pointer/stride oracle, and do not infer physical copies or broadcast storage from unevaluated metadata.
 - A weights MAP outliving the model pins every buffer; mlx-c `iterator_next` hands a +1; `mlx_array_new_data`
   COPIES shape-worth of bytes.
 - **A refcount-shared snapshot makes every later write copy the whole buffer** (MLX donates only a sole owner's

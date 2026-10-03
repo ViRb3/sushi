@@ -51,3 +51,16 @@ acceptance; commit/push only accepted runtime.
 CPU builds, quiet fixture jobs and model loads are sequentially granted by root,
 foreground QoS/thermal protocol/per-job GPU lock. RoutineHTTP2K–16K; selected32K
 once for an accepted combined winner. Workers prepare source/tests first.
+
+
+## Outcome
+
+Both components were rejected and archived, with no production seam added.
+[Full-history native](glm5-full-history-native-component.md) preserved exact
+retrieval and passed safety/layout checks, but took180.460ms versus131.378ms
+(37.36% slower,0/11 wins). The producer's exact mask proof is retained in
+[its evidence](glm5-full-history-mask-producer.md).
+[Exact cutoff selection](glm5-exact-pool-partition.md) preserved ordered IDs,
+expanded IDs and all attention bits, but complete attention took133.128ms
+versus131.010ms (1.62% slower,2/11 wins). No layout/radix variant or model
+follow-up was justified. Runtime remains `e1597cc2`; both goals remain open.
