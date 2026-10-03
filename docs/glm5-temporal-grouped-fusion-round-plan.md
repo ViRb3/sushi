@@ -48,3 +48,15 @@ Commit and push only accepted runtime. Archive and remove rejected prototypes.
 A6 remains default; A4/group64 stays optional. Keep BF16 compressed MLA, FP32
 KDA state/accumulators, original small tensors and resident embeddings.
 Prefill1500/decode60 and stable 2K–32K remain unproven and active.
+
+## Outcome
+
+Both candidates were exact and slower. [Grouped fusion](glm5-grouped-fusion-current-replay.md)
+matched all stages and 516096 routed BF16 outputs, but lost every pair:
+17.953958 to 20.023042 ms, 11.52% slower. [Temporal KDA](glm5-kda-temporal-result.md)
+passed all four final tests, including complete cold/nonzero layer state parity,
+but also lost every pair: 14.527666 to 16.246584 ms, 11.83% slower.
+The first temporal green attempt stopped on empty cold-state cloning; the
+harness-only repair preserved the candidate schedule and arithmetic.
+No model arm, retuning or variant followed. Sources were archived and removed,
+root seams/bills restored, and accepted runtime remains `e1597cc2`.
