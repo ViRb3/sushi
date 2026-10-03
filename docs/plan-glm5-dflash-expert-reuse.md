@@ -354,3 +354,32 @@ samples and `qualification-n2` settings/results. Qualification binary SHA-256:
 The build/run provenance records concurrent unrelated KLD source work rather
 than claiming a wholly clean checkout. The exclusive full-model process passed
 its gate, restored fan auto and released the GPU directly to teacher capture.
+
+## Three-member sharing: mixed result, not integrated
+
+An isolated extension shared each trellis read across three members, retaining
+each member's FMAs and reduction order. All-rate projection, singleton/strided
+and captured real-bank full-chain checks passed exactly (nine passes, two timing
+skips). Both serial4KiB and parallel12KiB reductions were tested. The candidate
+was built at `0e48f7d5` on MLX0.32.3; the baseline was the existing group2 serial
+half4 chain, interleaved in the same process.
+
+| Layer | Rows | Group2 serial µs | Group3 serial µs | Change | Group3 wins /11 |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 3 | 628.139 | 640.541 | +1.97% | 1 |
+| 20 | 3 | 564.847 | 612.736 | +8.48% | 1 |
+| 34 | 3 | 591.139 | 536.458 | −9.25% | 10 |
+| 3 | 4 | 756.319 | 767.333 | +1.46% | 3 |
+| 20 | 4 | 757.555 | 742.555 | −1.98% | 6 |
+| 34 | 4 | 711.819 | 748.222 | +5.11% | 3 |
+
+Parallel group3 lost every case by1.62–29.10%. Serial group3 helps one high-overlap
+three-row case but regresses the other three-row cases; it is rejected as a
+general replacement. No production selector or model result was changed. The
+standalone code was archived privately rather than adding another consumer path.
+These replay routes are prefixes of the older N3 capture, not a new N2 capture.
+The measurement used synthetic BF16 activations, warm real K2.25/W12 banks,
+five warmups, eleven alternating pairs and three fresh chains per sample;
+foreground QoS, exclusive GPU lock, maximum fans and ten seconds idle below90°C.
+Private artifact `glm53-group3-20261003` preserves source, binary/runtime hashes,
+parity logs, raw samples and telemetry. No compiler or other GPU work overlapped.
