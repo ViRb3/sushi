@@ -324,3 +324,105 @@ filter is `GLM QMM prefill isolated aspect timing`, enabled by
 `SUSHI_GLM_QMM_ASPECT_BENCH_OUT`. This experiment demonstrates why fewer logical
 weight traversals or smaller explicit shared-memory storage alone do not predict
 an end-to-end win. No full-model timing was performed for either tile candidate.
+
+## A6/group128 audit of the newer trunk
+
+CPU-only follow-up, 2026-10-03. The runtime remains MLX
+`1f8e74e3f12f31365464a6867c6579f0e9b29d85`. New checkpoint headers independently
+confirm KDA Q/K/V `[8192,768]` U32 and output `[4096,1536]` U32, with BF16 scales
+and biases at group128: these are six-bit weights. `storedAffineBits` infers six
+from the packed/scaling dimensions and `Ops.qmm` passes it to MLX. The installed
+metallib contains the BF16/group128/bits6 NAX kernel for both batch0 and batch1;
+this conclusion does not assume that A8 support implies A6 support.
+
+The table reports source-selected dispatch at cold 512- and 2048-row prefill.
+The recorded newer-target native benchmarks actually use chunks of 512 and 2048
+respectively, with dense MLA prefill enabled. M below is the actual matrix row
+count, not merely the number of tokens in a higher-rank tensor.
+
+| Projection | Logical K → N | 512 rows | 2048 rows |
+|---|---|---|---|
+| KDA Q/K/V individually | 4096 → 8192 | A6 NAX | A6 NAX |
+| KDA output | 8192 → 4096 | A6 NAX | A6 NAX |
+| MLA query A | 4096 → 1536 | A6 NAX | A6 NAX |
+| MLA query B | 1536 → 16384 | A6 NAX | A6 NAX |
+| MLA latent A | 4096 → 512 | Legacy A6 split-K, two partitions | A6 NAX |
+| MLA output | 16384 → 4096 | A6 NAX | A6 NAX |
+| Dense MLA K/V expansion, each | 512 → 256, 64 heads | Batched A6 NAX | Batched A6 NAX |
+| Index query, if consumed | 1536 → 4096 | A6 NAX | A6 NAX |
+
+All listed NAX calls use BM64/BN64/BK64, four simdgroups and 9 KiB of explicit
+BF16 weight staging. For MLA latent A at M512, `qmm_splitk` computes
+`ceil(512/32)*ceil(512/32)=256` provisional groups, so it selects two K partitions.
+That branch uses legacy `qmm_t_splitk`, a 1 MiB BF16 partial plane and a separate
+sum. At M2048 it computes 1024 groups and falls through to NAX. This is a newly
+identified shape-specific edge, **not an A6-only regression**. Forcing NAX there
+would change the partial rounding/reduction order, and cannot be presented as
+an exact schedule change. It does not explain the remaining 2K prefill gap,
+because the 2K call already takes NAX.
+
+Dense MLA expansion broadcasts the latent cache over 64 head-batched K/V banks;
+its effective batch count is 64 and M is the cached-token count. It bypasses the
+single-batch split-K heuristic and reaches the b6 NAX path directly. Cached
+chunks use the accumulated cache length for this expansion, rather than the
+current chunk length.
+
+Absorbed prefill is different: queries/values are shaped `[T,64,1,D]`, so M=1 at
+both token counts. Query absorption uses non-transposed `qvm` (K256,N512), and
+value unembedding uses `qmv` (K512,N256). Neither becomes a large NAX matmul merely
+because T is 2048. Moreover the ordinary `qmm` host path only selects NAX for
+transposed weights, despite a non-transposed NAX body existing in the library.
+Rebatching absorbed attention is an independent arithmetic/layout change, not a
+missing A6 specialization. Native dense prefill already avoids this path here.
+Index queries and index weights remain lazy and unconsumed for these cold
+prefixes; forcing them during profiling would overstate the normal work.
+
+Small retained tensors remain BF16: KDA FA/GA `[128,4096]`, FB/GB `[8192,128]`,
+beta `[64,4096]`; MLA index keys/compression `[128,4096]` and index weights
+`[32,4096]`. At M2048 the skinny K4096 projections no longer satisfy dense MLX's
+split-K heuristic, so regular NAX uses only 32 groups (and a partial N tile for
+N32/64). This group count alone does not establish idle hardware: independent
+commands and backend scheduling must also be considered.
+
+A6 does have a distinct unpack cost. `QuantizedBlockLoader` gives each thread
+32 weights, read as eight 3-byte packs through `dequantize<...,4,6>`; A8 uses 32
+single-byte packs. A6 saves packed bytes but introduces cross-byte masks/shifts.
+A source-grounded secondary experiment would compare the unchanged A6 NAX body
+with word-wise unpacking of those same 24 bytes (six aligned U32 loads), preserving
+identical integer codes and the exact scale/bias/BF16 boundary. First inspect
+compiler output: the compiler may already combine byte reads, so no performance
+claim follows from the C++ spelling. Avoid padded uint3/ulong3 loads that overread
+or assume stronger alignment. No unpack kernel was written in this audit, and
+rejected A8 swizzle/aspect experiments are not being repeated.
+
+Primary symbols are `Linear.apply`/`storedAffineBits` and `Mla.applyMode`/
+`densePrefill` in Sushi; `QuantizedMatmul::eval_gpu`, `qmm`, `qmm_splitk`,
+`qmm_nax` in MLX `quantized.cpp`; and `QuantizedBlockLoader`, `dequantize` plus
+`qmm_t_nax_tgp_impl` in `quantized_nax.h`, at the runtime revision above.
+
+## Register-resident reuse across KDA value rows
+
+The next exact recurrence experiment is different from both rejected staging
+and the small raw threadgroup-height change. One 32-lane SIMD group can carry
+R=2 or 4 independent value rows, retaining each lane's four **contiguous** keys
+`4*lane+i`. It loads a common K/decay value once, applies it to each member's
+state and dot accumulator in i=0..3 order, performs a separate unchanged
+`simd_sum` for each member, then similarly reuses K/Q during the state/output
+update. Beta is shared; V remains member-specific. State stays FP32 throughout.
+
+Persistent state per lane rises from four FP32 values to eight or sixteen.
+Common K and per-member accumulators/deltas add further registers; compiler
+spills and occupancy are unknown. No threadgroup storage or barriers are needed.
+Keeping four SIMD groups per threadgroup gives 2048/1024/512 groups for R1/R2/R4
+at B1,H64,Dv128. This removes repeated source loads/instructions and may improve
+independent instruction scheduling; it does not reduce the mathematical FMAs or
+prove proportional DRAM savings.
+
+Prepare an isolated R1 control plus R2/R4 candidates, with exact output/final-state
+and irregular continuation tests against `getGdnKernel(true)` before timing.
+Do not use the blocked GDN kernel's eight-lane/sixteen-key contraction or its
+scalar gate as a replacement. With recurrence around one tenth of 2K prefill,
+a substantial primitive reduction could address the remaining overall gap;
+the measured fraction and end-to-end effect must be rechecked after qualification.
+All GPU tests and runtime/default changes remain deferred while teacher capture
+owns the GPU.
