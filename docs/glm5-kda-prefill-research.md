@@ -657,5 +657,20 @@ when the timed profile is synchronous. With async2 the bound is 512 MiB, without
 changing stored/resident tensor bytes. Focused opt-in Linear, guard and bill
 tests passed (four including their test root, two gated research skips);
 eligible outputs were exact and three-row decode did not increment the counter.
-This is an opt-in qualification hook; full-model throughput and peak memory
-remain the next gate.
+The subsequent full native checkpoint run qualified the hook at2K. The fixed
+ReleaseFast binary was built from `bcc89c6e` plus the hook subsequently committed
+unchanged as `63bfbba3`. It used the2.3bpw A6-trunk target, R4 recurrence, lane/down,
+dense SDPA prefill, async2 prefill/async4 decode, chunk2048,64 output tokens and
+one warmup with eight decode forwards. Components, route histograms and profiling
+were disabled. Foreground QoS, exclusive GPU lock, maximum fans and ten seconds
+idle below90°C were recorded; no compiler/GPU job overlapped.
+
+Prefill measured1,219.30194 tok/s versus inherited R4's1,193.70359 (+2.14%). All64
+output IDs were unchanged. The hook engaged136 times (four projections across
+34 KDA layers); serial decode measured24.6266 tok/s. Peak was95,311,918,132 bytes,
+160 MiB above the prior arm, within the declared512 MiB additional transient
+bound. This single-run full-model qualification is consistent with the isolated
+paired win, but does not establish broader contexts, a default policy or the
+1,500 tok/s goal. The option remains off by default. Private artifact
+`glm53-a6-dense-full-20261003` retains source diff, binary hash, settings, raw
+result, ID comparison and telemetry.
