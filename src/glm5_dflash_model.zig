@@ -193,7 +193,7 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         } else for (0..parents.len) |row| {
             const values = try ops.qmm(attention_rows[row], layer.wv, layer.sv, layer.bv, true);
             result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
-        };
+        }
     }
     try profile.finish("mla_branches", result_rows[0..parents.len]);
     const output = try kda.linearRows(ops, layer.out, try ops.concat(result_rows[0..parents.len], 1), mode);
