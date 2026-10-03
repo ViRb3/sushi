@@ -409,3 +409,22 @@ Artifacts `glm53-native-decode-llmprobe-20261003` and
 `e825e47bb24c5697`, MLX0.32.3, foreground QoS and exclusive locks. Both exited
 0, with server stopped, lock released and fans auto. Full ReleaseFast suite
 and CLI passed. This opt-in does not attain the 1500/60 goals.
+
+### Optional packed B32 prefill
+
+`SUSHI_GLM_PREFILL_PACKED32=1`, together with packed attention and prefill cadence,
+combines two unchanged T16 selectors into one native B32 gather/attention call.
+Scoring modes and pool ordering stay unchanged. Exactly32 rows use the new
+batch; every smaller remainder uses fragments of16 or fewer. Cold dense prefill
+and native B1/B3 decode are unchanged. The default remains B16.
+
+The conservative async2 reserve increases by256 MiB:128 MiB per B32 graph,
+two graphs per layer, two pending layers. Metadata reports `prefill_packed32`
+and `sushi_diagnostic.packed32_attention_calls`; zero calls at a small/dense rung
+do not establish engagement. All original cache/activation/selector bills remain.
+
+The [component and model gate](glm5-packed32-result.md) records exact ordered IDs,
+BF16 outputs and full16K prefix/64-token continuation state. Whole-attention time
+fell15.38%; matched model prefill latency fell4.93%, versus1.95% control drift.
+This is an accepted memory/performance opt-in, with HTTP2K–32K qualification
+pending. It does not claim1500 prefill or60 decode tok/s.

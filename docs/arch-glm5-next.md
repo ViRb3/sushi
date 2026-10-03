@@ -14,6 +14,8 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [stored affine assistant formats](glm5-dflash-affine-storage.md),
 [singleton and KDA endpoint round](glm5-singleton-endpoint-round-plan.md),
 [temporal KDA and grouped fusion round](glm5-temporal-grouped-fusion-round-plan.md),
+[packed B32 prefill qualification](glm5-packed32-result.md),
+[current decode system trace](glm5-current-gpu-profile-result.md),
 [bounded draft readouts](glm5-dflash-readout-horizon.md),
 [verification latent overlays](glm5-dflash-latent-overlay.md),
 [verification projection batching](glm5-mla-verify-batch.md),

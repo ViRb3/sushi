@@ -37,8 +37,8 @@ pub fn resetPackedCadenceCalls() void {
     cadence_calls = 0;
 }
 pub fn packedCadenceTransientBudget(chunk: usize, pending_layers: usize) !usize {
-    if (!packed_nax.enabled() or !packedCadenceEnabled() or chunk <= packed_nax.max_rows) return 0;
-    return std.math.mul(usize, packed_nax.scratch_limit, pending_layers);
+    if (!packed_nax.enabled() or !packedCadenceEnabled() or chunk <= packed_nax.batchRows()) return 0;
+    return std.math.mul(usize, packed_nax.scratchLimit(), pending_layers);
 }
 
 threadlocal var captured_cadence: bool = false;
@@ -384,6 +384,21 @@ pub fn probeSelect(state: *const State, index_q: Arr, weights: Arr, offset: usiz
     return scope.result(try selectChunk(&scope, state, index_q, weights, offset));
 }
 
+fn selectPackedChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
+    const rows = mlx.getShape(index_q)[0];
+    if (rows <= packed_nax.max_rows) return selectChunk(scope, state, index_q, weights, offset);
+    if (rows != 32) return error.InvalidGlmAttentionShape;
+    const first = try selectChunk(scope, state, try scope.cut(index_q, 0, 16), try scope.cut(weights, 0, 16), offset);
+    const second = try selectChunk(scope, state, try scope.cut(index_q, 16, 32), try scope.cut(weights, 16, 32), offset + 16);
+    return scope.join(first, second);
+}
+
+pub fn probePackedSelect(state: *const State, index_q: Arr, weights: Arr, offset: usize, s: mlx.mlx_stream) !Arr {
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    return scope.result(try selectPackedChunk(&scope, state, index_q, weights, offset));
+}
+
 /// The same per-node rule is used for serial decode and verifier ancestry.
 pub fn decodeSelected(state: *const State, index_q: Arr, weights: Arr, offset: usize, s: mlx.mlx_stream) !Arr {
     var scope = Scope{ .s = s };
@@ -488,6 +503,21 @@ const PackedTile = struct {
     }
 };
 
+fn packedTileRows(remaining: usize, max_rows: usize) usize {
+    const cap = if (max_rows >= 32 and remaining >= 32) @as(usize, 32) else @min(max_rows, packed_nax.max_rows);
+    return @min(remaining, cap);
+}
+
+test "GLM packed32 scheduling keeps every remainder in original selector geometry" {
+    try std.testing.expectEqual(@as(usize, 32), packedTileRows(49, 32));
+    try std.testing.expectEqual(@as(usize, 32), packedTileRows(32, 32));
+    try std.testing.expectEqual(@as(usize, 16), packedTileRows(31, 32));
+    try std.testing.expectEqual(@as(usize, 16), packedTileRows(17, 32));
+    try std.testing.expectEqual(@as(usize, 1), packedTileRows(1, 32));
+    try std.testing.expectEqual(@as(usize, 16), packedTileRows(17, 16));
+    try std.testing.expectEqual(@as(usize, 5), packedTileRows(5, 16));
+}
+
 fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32, max_rows: usize, direct: bool, s: mlx.mlx_stream) !Arr {
     const rows: usize = @intCast(mlx.getShape(q)[0]);
     const parts = mlx.mlx_vector_array_new();
@@ -504,9 +534,9 @@ fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset:
         var count: usize = 0;
         for (&tiles) |*tile| {
             if (start == rows) break;
-            const end = @min(rows, start + max_rows);
+            const end = start + packedTileRows(rows - start, max_rows);
             const qc = try tile.scope.cut(q, @intCast(start), @intCast(end));
-            const selected = try selectChunk(&tile.scope, state, try tile.scope.cut(iq, @intCast(start), @intCast(end)), try tile.scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
+            const selected = try selectPackedChunk(&tile.scope, state, try tile.scope.cut(iq, @intCast(start), @intCast(end)), try tile.scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
             tile.out = (try packed_nax.run(&tile.ops, qc, state.latent, selected, offset + start, state.processed, scale)) orelse
                 try attentionChunk(&tile.scope, state, qc, selected, offset + start, scale, 1, direct, false, null);
             const submit = mlx.mlx_vector_array_new_data(&.{tile.out}, 1);
@@ -556,10 +586,12 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
     const per_row = if (direct) try prefill_direct.rowBytes(@intCast(sh[1]), @intCast(sh[2]), mlx.mlx_array_itemsize(q)) else try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
     const pool_bytes = @max(@as(usize, 4), state.processed / 4 * 4);
     if (per_row > attention_scratch_bytes or (sparse and pool_bytes > score_scratch_bytes)) return error.GlmAttentionScratchBudget;
-    const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), if (headpack) packed_nax.max_rows else 128));
+    const wide_chunk = headpack and packedCadenceEnabled() and packed_nax.batch32Enabled() and sh[0] >= 32;
+    const packed_rows = if (wide_chunk) packed_nax.batchRows() else packed_nax.max_rows;
+    const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), if (headpack) packed_rows else 128));
     if (headpack) {
         try captureCadence(state, q, index_q.?, weights.?, offset, scale);
-        if (packedCadenceEnabled() and @as(usize, @intCast(sh[0])) > max_rows) {
+        if (packedCadenceEnabled() and (@as(usize, @intCast(sh[0])) > max_rows or (wide_chunk and max_rows == 32))) {
             const out = try attendPackedPairs(state, q, index_q.?, weights.?, offset, scale, max_rows, direct, s);
             cadence_calls += 1;
             return out;

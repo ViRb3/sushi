@@ -352,6 +352,23 @@ test "GLM benchmark HTTP admission includes joined KDA cluster activations" {
     try std.testing.expectEqual(2 * cluster.transient_bytes, (try requestReserve(&cfg, null, 32768, 2048)) - baseline);
 }
 
+test "GLM benchmark HTTP admission includes both packed32 banks per pending layer" {
+    const headpack = @import("glm5_attention_nax_packed.zig");
+    const packing = headpack.bind(true);
+    defer packing.restore();
+    const cadence = @import("glm5_attention.zig").bindPackedCadence(true);
+    defer cadence.restore();
+    const cfg = model.ModelConfig{ .num_hidden_layers = 45, .full_attention_interval = 4, .hidden_size = 4096, .mla_kv_lora_rank = 512, .indexer_head_dim = 128, .num_attention_heads = 64, .linear_num_value_heads = 64, .linear_key_head_dim = 128 };
+    const baseline = blk: {
+        const binding = headpack.bind32(false);
+        defer binding.restore();
+        break :blk try requestReserve(&cfg, null, 32768, 2048);
+    };
+    const binding = headpack.bind32(true);
+    defer binding.restore();
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), (try requestReserve(&cfg, null, 32768, 2048)) - baseline);
+}
+
 test "GLM benchmark HTTP CLI is explicit assistant and benchmark EOS mode" {
     const opts = try parseOptions(&.{ "/model", "--assistant", "/assistant", "--ctx-size", "132096", "--benchmark-ignore-eos" });
     try std.testing.expectEqualStrings("/assistant", opts.assistant.?);
@@ -544,6 +561,7 @@ const Runtime = struct {
         a6_dense_prefill: bool,
         mla_headbatch: bool,
         packed_attention: bool,
+        prefill_packed32: bool,
         nax_index_scores: bool,
         verify_mla_batch: bool,
         bounded_draft_readout: bool,
@@ -576,6 +594,7 @@ const Runtime = struct {
             .a6_dense_prefill = @import("glm5_a6_dense_once.zig").enabled(),
             .mla_headbatch = @import("glm5_mla_prefill_batch.zig").enabled(),
             .packed_attention = @import("glm5_attention_nax_packed.zig").enabled(),
+            .prefill_packed32 = @import("glm5_attention_nax_packed.zig").batch32Enabled(),
             .nax_index_scores = @import("glm5_indexpool_nax.zig").enabled(),
             .verify_mla_batch = @import("glm5_mla_verify_batch.zig").enabled(),
             .bounded_draft_readout = diag.diagEnvOn("SUSHI_GLM_DFLASH_READOUT_HORIZON"),
@@ -772,7 +791,7 @@ const Runtime = struct {
         const finish = if (stopped) "stop" else "length";
         const counts = usage(ids.len, emit.ids.items.len);
         const stats = .{ .prompt_n = ids.len, .prompt_ms = @as(f64, @floatFromInt(prefill_ns)) / 1e6, .predicted_n = emit.ids.items.len, .predicted_ms = @as(f64, @floatFromInt(decode_ns)) / 1e6 };
-        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .packed_cadence_calls = @import("glm5_attention.zig").packedCadenceCalls(), .prefill_grid_calls = @import("sushi_exl3").glm_prefill_grid.dispatchCount(), .decode_native_b1_calls = @import("glm5_attention_decode_batch.zig").b1Calls(), .decode_native_b3_calls = @import("glm5_attention_decode_batch.zig").b3Calls(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .a6_dense_prefill_calls = @import("glm5_a6_dense_once.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .assistant_commit_window_calls = adapter.commitWindowCalls() - commit_window_before, .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
+        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .packed32_attention_calls = @import("glm5_attention_nax_packed.zig").wideDispatchCount(), .packed_cadence_calls = @import("glm5_attention.zig").packedCadenceCalls(), .prefill_grid_calls = @import("sushi_exl3").glm_prefill_grid.dispatchCount(), .decode_native_b1_calls = @import("glm5_attention_decode_batch.zig").b1Calls(), .decode_native_b3_calls = @import("glm5_attention_decode_batch.zig").b3Calls(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .a6_dense_prefill_calls = @import("glm5_a6_dense_once.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .assistant_commit_window_calls = adapter.commitWindowCalls() - commit_window_before, .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
         if (completion.stream) {
             const last = try frameJson(a, id, self.name, emit.created, null, finish, false);
             defer a.free(last);
