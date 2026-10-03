@@ -402,7 +402,7 @@ Primary symbols are `Linear.apply`/`storedAffineBits` and `Mla.applyMode`/
 
 ## Register-resident reuse across KDA value rows
 
-The next exact recurrence experiment is different from both rejected staging
+This exact recurrence experiment is different from both rejected staging
 and the small raw threadgroup-height change. One 32-lane SIMD group can carry
 R=2 or 4 independent value rows, retaining each lane's four **contiguous** keys
 `4*lane+i`. It loads a common K/decay value once, applies it to each member's
@@ -418,22 +418,46 @@ at B1,H64,Dv128. This removes repeated source loads/instructions and may improve
 independent instruction scheduling; it does not reduce the mathematical FMAs or
 prove proportional DRAM savings.
 
-Prepare an isolated R1 control plus R2/R4 candidates, with exact output/final-state
-and irregular continuation tests against `getGdnKernel(true)` before timing.
-Do not use the blocked GDN kernel's eight-lane/sixteen-key contraction or its
-scalar gate as a replacement. With recurrence around one tenth of 2K prefill,
-a substantial primitive reduction could address the remaining overall gap;
-the measured fraction and end-to-end effect must be rechecked after qualification.
-All GPU tests and runtime/default changes remain deferred while teacher capture
-owns the GPU.
+`src/glm5_kda_value_rows.zig` contains isolated R1/R2/R4 candidates. Explicitly
+unrolled member/key loops preserve independent accumulations and avoid dynamic
+private-array indexing. The reference is `getGdnKernel(true)` through
+`glm5_next.kda`; the blocked GDN kernel's eight-lane/sixteen-key contraction and
+scalar gate are not substitutes. All candidates passed exact raw output and
+FP32 final-state comparisons with nonzero state: BF16/FP32 inputs, BF16/FP32
+beta, varying channel decay/beta, short B2/H3 geometries and B1/H64 at 512 and
+2048 tokens. Both production lengths/dtypes also passed 17/63/rest continuation,
+including concatenated output and final state. Four focused tests passed; the
+gated timing test was skipped in the initial parity run and passed when enabled.
 
-Preparation status: the isolated R1/R2/R4 prototype and its test binary were
-CPU-compiled with `--test-no-exec`. The Metal source has **not** been compiled by
-MLX, run, or parity/timing-qualified. Explicitly unrolled member/key loops preserve
-independent accumulations and avoid relying on dynamic private-array indexing.
-The private `glm53-kda-value-rows-20261003` artifact retains the exact source,
-build recipe and binary hashes; production dispatch and comparison binaries remain
-unchanged. GPU qualification waits for teacher capture to release the device.
+The exclusive microbenchmark used interactive QoS (`taskpolicy -a`), lock owner
+`glm53-kda-value-rows-v61`, maximum fans requested, initial temperature 80.31°C
+and ten seconds of idle. No model was loaded. Inputs were materialized before
+timing, both outputs were evaluated, and every timed arm built fresh graphs.
+Twelve warmups per arm preceded eleven alternating forward/reverse rounds;
+each sample contains four apply/evaluate/free repetitions. The timing run
+rechecked exact parity before sampling. This is a same-process comparison
+against native and an R1 control, not an old-binary baseline rerun.
+
+| Tokens, B1/H64/D128 | Native ms | R1 ms | R2 ms | R4 ms | R4 vs native |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 1.330771 | 1.329448 | 1.133229 | 1.039438 | −21.89% |
+| 2048 | 5.480125 | 5.555490 | 4.391063 | 3.616761 | −34.00% |
+
+R2 and R4 won all eleven paired comparisons at both lengths. R1 differs from
+native by −0.10% at 512 and +1.38% at 2048, so the larger R4 gains survive the
+source/control packaging change. Keep the candidate isolated or opt-in until a
+full-model measurement establishes its effect. At the earlier approximate 10%
+recurrence share, even removing recurrence entirely would not close a 22.7%
+latency gap from 1159.73 to 1500 tok/s; the current share must be measured again.
+
+The base checkout was `bd955e12ccf981adf20dbcb5cc99180e9991eacf` plus this
+isolated candidate and focused test root. The timing binary SHA-256 is
+`1de4316f3f2ffca46b725d32b960056ca27a56e43c0c40a17f6aff715e146045`.
+The private `glm53-kda-value-rows-qualified-20261003` artifact retains exact
+source, build recipe, parity/timing logs, raw samples and provenance. The gated
+filter is `GLM KDA value-row isolated timing`, enabled by
+`SUSHI_GLM_VALUE_ROWS_BENCH_OUT` naming its JSON result file. The earlier
+CPU-only `glm53-kda-value-rows-20261003` snapshot is also preserved.
 
 
 ## CPU-only A6 unpack inspection
