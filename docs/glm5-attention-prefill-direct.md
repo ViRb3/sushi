@@ -27,6 +27,20 @@ qualification. Tests must compare raw BF16/FP32 bits with the unchanged old
 one-part merge, including masked rows, signed zero and NaNs, and exercise causal
 pool/tail boundaries. No numerical threshold is relaxed.
 
+The full4K-prefix/64-position diagnostic on the2.3bpw target subsequently
+matched all64 reference top1 decisions and distributions: mean/first KL0,
+cosine1, BF16 MLA and FP32 KDA. Head batching was forced off in both arms.
+The reference and candidate used independent Requests and the same loaded
+weights/teacher-forced continuation. Peak was95,336,773,556 bytes. Cold-reference
+prefill9.166 seconds versus candidate8.498 is diagnostic timing, not a controlled
+speed claim. The next gate is the shorter2K–16K llmprobe arm.
+
+Private artifact `glm53-long-prefill-drift-20261003` retains `direct.json`,
+source/binary/runtime hashes and exact flags. The gated
+`glm5_prefill_drift.zig` diagnostic also reports raw logit mismatches on future
+runs; this recorded run predates that additional counter. The option remains
+off by default pending throughput qualification.
+
 ## Component qualification
 
 ReleaseFast component tests passed 4/4 on MLX 0.32.3. Direct output matches the

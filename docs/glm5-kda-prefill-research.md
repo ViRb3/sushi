@@ -749,3 +749,19 @@ root/command, complete BF16 ULP/F32 differences, both FP64 reference errors,
 timing samples/summary, telemetry and source/binary/runtime hashes. Its gates
 are `SUSHI_GLM_MLA_BATCH_PARITY_OUT` and `SUSHI_GLM_MLA_BATCH_BENCH_OUT` under
 `GLM MLA headbatch prefill`. No model quality or throughput claim is made here.
+
+The subsequent4K/64 diagnostic used the same loaded2.3bpw weights with the
+original projections as reference, then head batching for the same long prefix
+and teacher-forced continuation. Eleven query and eleven value calls engaged.
+First-position KL was0.00028924; mean KL across64 positions was0.01160392,
+top1 matched63/64 and cosine was0.9991044. No EOS occurred in the64 reference
+tokens. The largest position KL was0.395861. This is material kernel drift;
+the ordinary BF16 head-batch option remains unpromoted and default off.
+It is not quantization KLD against a lossless teacher.
+
+The fixed ReleaseFast diagnostic and settings are retained in private artifact
+`glm53-long-prefill-drift-20261003`. Its source snapshot matches `c57f317b` plus
+`glm5_prefill_drift.zig`, with direct attention disabled to isolate projections.
+Peak was95,500,874,808 bytes. Reference/candidate prefill was10.192/8.969 seconds,
+but cold reference followed by candidate is not an interleaved throughput gate.
+A precision-restoring projection variant requires separate qualification.
