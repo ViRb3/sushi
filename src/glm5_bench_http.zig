@@ -205,9 +205,10 @@ fn requestReserve(cfg: *const model.ModelConfig, draft_cfg: ?*const dflash.Dflas
     const expanded = try @import("glm5_a6_dense_once.zig").transientBudget(chunk, 2);
     const mla_batch = try @import("glm5_mla_prefill_batch.zig").transientBudget(chunk, 2);
     const packed_bytes = try @import("glm5_attention_nax_packed.zig").transientBudget(chunk, 2);
+    const cadence_bytes = try @import("glm5_attention.zig").packedCadenceTransientBudget(chunk, 2);
     const index_bytes = try @import("glm5_indexpool_nax.zig").transientBudget(chunk, 2);
     const cluster_bytes = try @import("glm5_kda_prefill_cluster.zig").transientBudget(chunk, 2);
-    return std.math.cast(usize, recurrent + latent + assistant_cache + activations + scratch + expanded + mla_batch + packed_bytes + index_bytes + cluster_bytes + 256 * 1024 * 1024) orelse error.BenchmarkMemoryOverflow;
+    return std.math.cast(usize, recurrent + latent + assistant_cache + activations + scratch + expanded + mla_batch + packed_bytes + cadence_bytes + index_bytes + cluster_bytes + 256 * 1024 * 1024) orelse error.BenchmarkMemoryOverflow;
 }
 
 fn plannedGrowth(cfg: *const model.ModelConfig, prompt: usize, output: usize) !usize {
@@ -310,6 +311,8 @@ test "GLM benchmark HTTP admission includes head-batched MLA permutation buffers
 }
 
 test "GLM benchmark HTTP admission includes bounded packed attention banks" {
+    const cadence = @import("glm5_attention.zig").bindPackedCadence(false);
+    defer cadence.restore();
     const headpack = @import("glm5_attention_nax_packed.zig");
     const cfg = model.ModelConfig{ .num_hidden_layers = 45, .full_attention_interval = 4, .hidden_size = 4096, .mla_kv_lora_rank = 512, .indexer_head_dim = 128, .num_attention_heads = 64, .linear_num_value_heads = 64, .linear_key_head_dim = 128 };
     const baseline = blk: {
@@ -549,6 +552,8 @@ const Runtime = struct {
         kda_prefill_cluster_resident_bytes: usize,
         affine6_hoist: bool,
         assistant_commit_window: bool,
+        prefill_cadence: bool,
+        prefill_grid_transpose: bool,
         kda_value_rows: usize,
         benchmark_ignore_eos_enabled: bool,
     } {
@@ -578,6 +583,8 @@ const Runtime = struct {
             .kda_prefill_cluster_resident_bytes = self.target.kdaPrefillClusterBytes(),
             .affine6_hoist = @import("glm5_dflash_a6_hoist.zig").enabled(),
             .assistant_commit_window = diag.diagEnvOn("SUSHI_GLM_DFLASH_COMMIT_WINDOW"),
+            .prefill_cadence = @import("glm5_attention.zig").packedCadenceEnabled(),
+            .prefill_grid_transpose = diag.diagEnvOn("SUSHI_GLM_PREFILL_GRID_TRANSPOSE"),
             .kda_value_rows = (@import("glm5_kda_value_rows.zig").configuredRows() catch null) orelse 0,
             .benchmark_ignore_eos_enabled = self.options.allow_ignore_eos,
         };
@@ -673,6 +680,8 @@ const Runtime = struct {
         var request = try forward.Request.init(a, self.cfg.num_hidden_layers);
         defer request.deinit();
         @import("glm5_attention_nax_packed.zig").resetDispatchCount();
+        @import("glm5_attention.zig").resetPackedCadenceCalls();
+        @import("sushi_exl3").glm_prefill_grid.resetDispatchCount();
         @import("glm5_indexpool_nax.zig").resetDispatchCount();
         @import("glm5_mla_verify_batch.zig").resetDispatchCount();
         @import("glm5_dflash_kda.zig").resetLeafStats();
@@ -758,7 +767,7 @@ const Runtime = struct {
         const finish = if (stopped) "stop" else "length";
         const counts = usage(ids.len, emit.ids.items.len);
         const stats = .{ .prompt_n = ids.len, .prompt_ms = @as(f64, @floatFromInt(prefill_ns)) / 1e6, .predicted_n = emit.ids.items.len, .predicted_ms = @as(f64, @floatFromInt(decode_ns)) / 1e6 };
-        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .assistant_commit_window_calls = adapter.commitWindowCalls() - commit_window_before, .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
+        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .packed_cadence_calls = @import("glm5_attention.zig").packedCadenceCalls(), .prefill_grid_calls = @import("sushi_exl3").glm_prefill_grid.dispatchCount(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .assistant_commit_window_calls = adapter.commitWindowCalls() - commit_window_before, .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
         if (completion.stream) {
             const last = try frameJson(a, id, self.name, emit.created, null, finish, false);
             defer a.free(last);
@@ -766,7 +775,7 @@ const Runtime = struct {
             if (completion.include_usage) try sendEvent(a, conn, .{ .id = id, .object = "chat.completion.chunk", .created = emit.created, .model = self.name, .choices = [_]Frame.Choice{}, .usage = counts, .timings = stats, .sushi_diagnostic = diagnostic });
             try conn.writeAll("data: [DONE]\n\n");
         } else try sendJson(a, conn, "200 OK", .{ .id = id, .object = "chat.completion", .created = emit.created, .model = self.name, .choices = [_]@TypeOf(.{ .index = @as(usize, 0), .message = .{ .role = "assistant", .content = emit.text.items }, .finish_reason = finish }){.{ .index = 0, .message = .{ .role = "assistant", .content = emit.text.items }, .finish_reason = finish }}, .usage = counts, .timings = stats, .sushi_diagnostic = diagnostic });
-        @import("log.zig").info("[glm-bench] request={d} backend={s} prompt={d} output={d} prefill_ms={d:.2} decode_ms={d:.2} rounds={d} ignore_eos={} packed={d} index_nax={d} mla_q={d} mla_v={d} horizon={d} kda_hit={d} kda_miss={d} draft_ns={d} verify_ns={d} replay_ns={d} commit_ns={d} cluster={d} block_tail={d} a6_hoist={d} commit_window={d}\n", .{ self.sequence, self.backend(), ids.len, emit.ids.items.len, stats.prompt_ms, stats.predicted_ms, rounds, completion.ignore_eos, diagnostic.packed_attention_calls, diagnostic.nax_index_score_calls, diagnostic.verify_mla_query_calls, diagnostic.verify_mla_value_calls, diagnostic.bounded_draft_readout_calls, diagnostic.kda_leaf_hits, diagnostic.kda_leaf_misses, draft_ns, verify_ns, replay_ns, commit_ns, diagnostic.kda_cluster_calls, diagnostic.assistant_block_tail_calls, diagnostic.affine6_hoist_calls, diagnostic.assistant_commit_window_calls });
+        @import("log.zig").info("[glm-bench] request={d} backend={s} prompt={d} output={d} prefill_ms={d:.2} decode_ms={d:.2} rounds={d} ignore_eos={} packed={d} index_nax={d} mla_q={d} mla_v={d} horizon={d} kda_hit={d} kda_miss={d} draft_ns={d} verify_ns={d} replay_ns={d} commit_ns={d} cluster={d} block_tail={d} a6_hoist={d} commit_window={d} cadence={d} prefill_grid={d}\n", .{ self.sequence, self.backend(), ids.len, emit.ids.items.len, stats.prompt_ms, stats.predicted_ms, rounds, completion.ignore_eos, diagnostic.packed_attention_calls, diagnostic.nax_index_score_calls, diagnostic.verify_mla_query_calls, diagnostic.verify_mla_value_calls, diagnostic.bounded_draft_readout_calls, diagnostic.kda_leaf_hits, diagnostic.kda_leaf_misses, draft_ns, verify_ns, replay_ns, commit_ns, diagnostic.kda_cluster_calls, diagnostic.assistant_block_tail_calls, diagnostic.affine6_hoist_calls, diagnostic.assistant_commit_window_calls, diagnostic.packed_cadence_calls, diagnostic.prefill_grid_calls });
     }
     fn handle(self: *Runtime, a: std.mem.Allocator, conn: *net.Conn) !void {
         const http = try readHttp(a, conn);
@@ -877,4 +886,21 @@ test "GLM benchmark HTTP reserve forecast bills every MLA full replacement" {
     const cfg = model.ModelConfig{ .num_hidden_layers = 45, .full_attention_interval = 4, .mla_kv_lora_rank = 512, .indexer_head_dim = 128 };
     try std.testing.expectEqual(@as(usize, 143785984 * 11), try plannedGrowth(&cfg, 131072, 256));
     try std.testing.expectError(error.Overflow, plannedGrowth(&cfg, std.math.maxInt(usize), 1));
+}
+
+// The second packed tile is additional to the original per-layer packed bill.
+test "GLM benchmark HTTP admission includes second packed attention tile" {
+    const attention = @import("glm5_attention.zig");
+    const headpack_binding = @import("glm5_attention_nax_packed.zig").bind(true);
+    defer headpack_binding.restore();
+    const cfg = model.ModelConfig{ .num_hidden_layers = 45, .full_attention_interval = 4, .hidden_size = 4096, .mla_kv_lora_rank = 512, .indexer_head_dim = 128, .num_attention_heads = 64, .linear_num_value_heads = 64, .linear_key_head_dim = 128 };
+    const baseline = blk: {
+        const off = attention.bindPackedCadence(false);
+        defer off.restore();
+        break :blk try requestReserve(&cfg, null, 32768, 2048);
+    };
+    const on = attention.bindPackedCadence(true);
+    defer on.restore();
+    try std.testing.expectEqual(2 * @import("glm5_attention_nax_packed.zig").scratch_limit, (try requestReserve(&cfg, null, 32768, 2048)) - baseline);
+    try std.testing.expectEqual(@as(usize, 0), try attention.packedCadenceTransientBudget(16, 2));
 }
