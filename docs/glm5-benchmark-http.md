@@ -313,3 +313,42 @@ released and fans returned automatic. Binary/runtime/flags and all requests
 are retained under measurement key `glm53-commit-window-llmprobe-20261003`.
 The next candidates and their paired gates are described in
 [the next-wave plan](glm5-next-wave-performance-plan.md).
+
+### Bounded packed cadence and exact expert grid transpose
+
+Source `f9f4c8d2` enables `SUSHI_GLM_PREFILL_CADENCE=1` and
+`SUSHI_GLM_PREFILL_GRID_TRANSPOSE=1` on the preceding commit-window stack.
+The first overlaps at most two unchanged 16-query packed attention graphs;
+the second reorders physical expert-GEMM tiles for qualified full T2048 chunks.
+Both remain opt-in. The full ReleaseFast suite/CLI build passed; the 8K,
+32-output gate matched every target ID and complete final state, with 33
+cadence calls and 168 expert-grid calls.
+
+Same llmprobe 0.6.13 bench-only protocol, runs 1, reasoning default, second
+predictable-context request and 191 decode forwards:
+
+| Context | Before / new input IDs | Prefill before / new tok/s | Decode before / new tok/s | Prefill change |
+|---|---:|---:|---:|---:|
+| 2K | 2036 / 2037 | 947.64 / 931.71 | 46.85 / 47.08 | -1.68% |
+| 4K | 4059 / 4061 | 758.10 / 802.82 | 45.76 / 45.48 | +5.90% |
+| 8K | 8225 / 8225 | 665.03 / 727.81 | 44.20 / 44.44 | +9.44% |
+| 16K | 16278 / 16274 | 605.59 / 655.06 | 41.41 / 43.04 | +8.17% |
+
+The two new paths do not engage on the 2037-ID predictable 2K input, so its
+small decline reflects the separate run rather than either implementation.
+At 4K/8K/16K the cadence and grid counts were 11/42, 44/168 and 77/294.
+The paired component tests independently support both changes; this HTTP run
+measures their combined stack and does not divide its gain between them.
+Decode code is unchanged by this wave, so its movement is not attributed to
+the prefill candidates. The 1500 prefill/60 decode goals remain open.
+
+Admission adds 64 MiB for the second packed tile per pending MLA layer, or
+128 MiB at async2, above the original packed bill. Expert-grid ordering adds
+no new arrays or weight copies. [Cadence qualification](glm5-prefill-cadence.md)
+and [expert-grid qualification](engine-exl3-experts.md) give paired evidence.
+
+All 27 server requests, flags, binary/runtime provenance and client JSON/HTML
+are retained under key `glm53-prefill-wave-llmprobe-20261003`. The client exited
+0; server stopped, GPU lock released and fans restored automatic. Foreground
+QoS, maximum fans and a cool ten-second idle were used. Final selected 32K
+qualification is pending; routine iterations stay at 2K–16K.
