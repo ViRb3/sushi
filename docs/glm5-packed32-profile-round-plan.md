@@ -47,3 +47,17 @@ Then schedule the B32 component job. Commit/push only accepted runtime; rejected
 prototypes are archived and removed. A6 default, optional A4, BF16 compressed MLA,
 FP32 KDA state/accumulators and resident embeddings remain unchanged. No precision
 restoration or 64K/128K tests. Goals 1500/60 and stable 2K–32K remain active.
+
+## Outcome
+
+Packed32 is accepted as an opt-in: the [component/model gate](glm5-packed32-result.md)
+passed exact IDs, outputs, valid state and continuation, reducing complete
+attention latency15.38% and matched16K prefill latency4.93% (control drift1.95%).
+Full ReleaseFast and quiet/local-path checks passed. HTTP2K–32K qualification
+is next; there is no 1500/60 claim.
+
+The [one system trace](glm5-current-gpu-profile-result.md) recorded successfully
+and preserved192 output IDs, but failed formal kernel-family attribution because
+shader intervals/names were unavailable. Correlated target compute intervals
+covered95.39% of the observed late-decode span; gaps are not proven CPU stalls.
+No second trace, instrumentation patch or inferred stage budget followed.
