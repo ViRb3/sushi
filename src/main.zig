@@ -267,9 +267,10 @@ fn printUsage(io: std.Io) void {
         \\                        Default 0; env SUSHI_PREFILL_DECODE_SHARE.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
-        \\                        (default: 32). 0 disables the cache — which also
-        \\                        turns off SSM checkpoint capture, since
-        \\                        checkpoints exist only to feed it.
+        \\                        (default: 32). 0 disables all prefix reuse.
+        \\  --no-prefix-cache-ram
+        \\                      Disable idle RAM retention; an enabled SSD tier
+        \\                        still persists and restores reusable prefixes.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: one
         \\                        session at the working context where memory
@@ -806,6 +807,8 @@ pub fn main(init: std.process.Init) !void {
             } else |_| {}
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
+        } else if (std.mem.eql(u8, args[i], "--no-prefix-cache-ram")) {
+            server_mod.prefix_cache_ram_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -1455,13 +1458,14 @@ pub fn main(init: std.process.Init) !void {
             .kv_quant_config = kv_quant_config,
             .kv_quant_explicit = kv_quant_explicit,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+            .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .expert_cache_bytes = expert_cache_bytes,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
+            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .metrics = server_mod.g_metrics,
@@ -1759,13 +1763,14 @@ fn runHeadlessServe(
         // was silently dead for the entire headless serving mode (the default
         // `serve` path). Mirrors the LoadParams built in `main()`.
         .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+        .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .expert_cache_bytes = expert_cache_bytes,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
+        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ane_prefill = ane_prefill,
