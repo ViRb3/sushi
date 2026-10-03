@@ -49,3 +49,19 @@ failed helpers/taps are archived and removed. CPU/GPU jobs receive sequential
 grants, foreground QoS, thermal protocol and per-job GPU locks. No variant sweep.
 RoutineHTTP2K–16K; selected32K once for a final winner. Prefill1500/decode60
 remain open, and no component/capture outcome is a throughput promise.
+
+
+## Outcome
+
+[Joint QKV](glm5-joint-m3-qkv-result.md) was exact but its0.571% complete-layer
+change won only6/11 pairs; the candidate and raw hook were removed without a
+model comparison.
+[Current capture/replay](glm5-current-routed-replay.md) passed all192 native
+target IDs and247,959,552 valid-state bytes, plus516,096 replay output bits.
+Full original-bank42-chain replay median was17.823ms across3 warm baseline
+samples; this is isolated saved-workload cost, not verifier attribution.
+Three current rounds had3024 assignments,461 pair leaders and2102 singleton
+leaders:69.51% singleton assignments /82.01% singleton leaders.
+This evidence can guide a bounded follow-up; it proves no new kernel speedup.
+Diagnostic helper/tap/private harness were archived and removed after capture.
+Runtime/source remain exactly `e1597cc2`, with goals1500/60 still open.
