@@ -3,6 +3,7 @@
 //! defaults when integrating this state into serving. KDA separately keeps FP32 state.
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const prefill_direct = @import("glm5_attention_prefill.zig");
 const Arr = mlx.mlx_array;
 const nil = Arr{ .ctx = null };
 const pool_size = 4;
@@ -248,35 +249,7 @@ const EXPAND: [:0]const u8 =
     \\}
     \\out[i]=token;
 ;
-const ATTENTION: [:0]const u8 =
-    \\#pragma clang fp contract(off)
-    \\const uint lane=thread_position_in_threadgroup.x;
-    \\const uint head=threadgroup_position_in_grid.y;
-    \\const uint row=threadgroup_position_in_grid.z/uint(SPLITS);
-    \\const uint part=threadgroup_position_in_grid.z%uint(SPLITS);
-    \\constexpr uint ITEMS=(uint(D)+31u)/32u;
-    \\float query[ITEMS],acc[ITEMS];
-    \\for(uint j=0;j<ITEMS;++j) {uint d=lane+j*32u; query[j]=d<uint(D)?float(q[(row*uint(H)+head)*uint(D)+d]):0.0f;acc[j]=0.0f;}
-    \\const uint pos=uint(offset)+row;
-    \\const uint count=SELECTED?2051u:pos+1u;
-    \\const uint chunk=(count+uint(SPLITS)-1u)/uint(SPLITS);
-    \\const uint begin=part*chunk,end=min(count,begin+chunk);
-    \\float maximum=-INFINITY,denom=0.0f;
-    \\for(uint k=begin;k<end;++k) {
-    \\  const int token=SELECTED?selected[row*2051u+k]:int(k);
-    \\  if(token<0 || uint(token)>pos || uint(token)>=uint(length)) continue;
-    \\  float values[ITEMS]; float dot=0.0f;
-    \\  for(uint j=0;j<ITEMS;++j) {uint d=lane+j*32u;values[j]=d<uint(D)?float(cache[uint(token)*uint(D)+d]):0.0f;dot+=query[j]*values[j];}
-    \\  dot=simd_sum(dot)*float(scale);
-    \\  float next=max(maximum,dot),old=precise::exp(maximum-next),p=precise::exp(dot-next);
-    \\  denom=denom*old+p;
-    \\  for(uint j=0;j<ITEMS;++j) acc[j]=acc[j]*old+p*values[j];
-    \\  maximum=next;
-    \\}
-    \\const uint base=((row*uint(H)+head)*uint(SPLITS)+part);
-    \\for(uint j=0;j<ITEMS;++j) {uint d=lane+j*32u;if(d<uint(D)) partial[base*uint(D)+d]=acc[j];}
-    \\if(lane==0) {stats[base*2u]=maximum;stats[base*2u+1u]=denom;}
-;
+const ATTENTION: [:0]const u8 = prefill_direct.common ++ prefill_direct.partial_tail;
 const MERGE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint i=thread_position_in_grid.x;
@@ -337,7 +310,7 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     return kernelOutput(scope, ev, 0);
 }
 
-fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int) !Arr {
+fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, direct: bool) !Arr {
     const sh = mlx.getShape(q);
     const rows = sh[0];
     const heads = sh[1];
@@ -346,6 +319,7 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
     const length = try scope.own(mlx.mlx_array_new_int(@intCast(state.processed)));
     const scaling = try scope.own(mlx.mlx_array_new_float(scale));
     const indices = selected orelse try scope.zeros(&.{1}, .int32);
+    if (direct) return scope.own(try prefill_direct.attend(q, state.latent, indices, off, length, scaling, selected != null, scope.s));
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, heads, splits, dim }, 4, .float32));
@@ -396,7 +370,8 @@ pub fn attend(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
             mlx.mlx_array_dtype(w) != mlx.mlx_array_dtype(iq)) return error.InvalidGlmAttentionShape;
     }
     const splits: c_int = if (sh[0] <= 8) 8 else 1;
-    const per_row = try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
+    const direct = splits == 1 and prefill_direct.enabled();
+    const per_row = if (direct) try prefill_direct.rowBytes(@intCast(sh[1]), @intCast(sh[2]), mlx.mlx_array_itemsize(q)) else try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
     const pool_bytes = @max(@as(usize, 4), state.processed / 4 * 4);
     if (per_row > attention_scratch_bytes or (sparse and pool_bytes > score_scratch_bytes)) return error.GlmAttentionScratchBudget;
     const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), 128));
@@ -409,7 +384,7 @@ pub fn attend(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
         defer scope.deinit();
         const qc = try scope.cut(q, @intCast(start), @intCast(end));
         const selected = if (sparse) try selectChunk(&scope, state, try scope.cut(index_q.?, @intCast(start), @intCast(end)), try scope.cut(weights.?, @intCast(start), @intCast(end)), offset + start) else null;
-        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits);
+        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits, direct);
         // Settle bounded chunks before dropping their score/partial buffers.
         if (@as(usize, @intCast(sh[0])) > max_rows) try mlx.check(mlx.mlx_array_eval(out));
         try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
