@@ -414,17 +414,72 @@ and CLI passed. This opt-in does not attain the 1500/60 goals.
 
 `SUSHI_GLM_PREFILL_PACKED32=1`, together with packed attention and prefill cadence,
 combines two unchanged T16 selectors into one native B32 gather/attention call.
-Scoring modes and pool ordering stay unchanged. Exactly32 rows use the new
-batch; every smaller remainder uses fragments of16 or fewer. Cold dense prefill
+Scoring modes and pool ordering stay unchanged. Exactly 32 rows use the new
+batch; every smaller remainder uses fragments of 16 or fewer. Cold dense prefill
 and native B1/B3 decode are unchanged. The default remains B16.
 
-The conservative async2 reserve increases by256 MiB:128 MiB per B32 graph,
+The conservative async2 reserve increases by 256 MiB: 128 MiB per B32 graph,
 two graphs per layer, two pending layers. Metadata reports `prefill_packed32`
 and `sushi_diagnostic.packed32_attention_calls`; zero calls at a small/dense rung
 do not establish engagement. All original cache/activation/selector bills remain.
 
 The [component and model gate](glm5-packed32-result.md) records exact ordered IDs,
-BF16 outputs and full16K prefix/64-token continuation state. Whole-attention time
-fell15.38%; matched model prefill latency fell4.93%, versus1.95% control drift.
-This is an accepted memory/performance opt-in, with HTTP2K–32K qualification
-pending. It does not claim1500 prefill or60 decode tok/s.
+BF16 outputs and full 16K prefix/64-token continuation state. Whole-attention time
+fell 15.38%; matched model prefill latency fell 4.93%, versus 1.95% control drift.
+This is an accepted memory/performance opt-in; the pinned HTTP 2K–32K
+qualification below is complete. It does not claim 1500 prefill or 60 decode tok/s.
+
+Pinned llmprobe 0.6.13 ran bench-only, one measured request per cell, with the
+accepted target plus A6g128, native B1/B3, N2/children4/async4, chunk2048/async2,
+greedy sampling and prefix cache off. All ten measured cells returned 192 IDs.
+Rates use server timers: actual input count / prefill time, and 191 post-prefill
+IDs / decode time. The arrows compare the inherited native-mode boot with the
+packed32 boot; timings and exact output-ID arrays are retained privately.
+
+| Rung | Workload | Actual input tokens | Prefill tok/s, inherited → B32 | Decode tok/s, inherited → B32 | B32 calls | Native B3 calls | Rounds |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2K | Ordinary | 2073 | 861.36 → 893.75 | 42.16 → 46.11 | 0 | 770 | 70 |
+| 2K | Predictable | 2037 | 930.49 → 986.45 | 46.04 → 49.60 | 0 | 704 | 64 |
+| 4K | Ordinary | 4097 | 748.72 → 862.62 | 41.33 → 44.10 | 704 | 803 | 73 |
+| 4K | Predictable | 4061 | 782.74 → 861.46 | 46.19 → 48.76 | 682 | 715 | 65 |
+| 8K | Ordinary | 8261 | 725.45 → 796.55 | 42.09 → 45.20 | 2134 | 759 | 69 |
+| 8K | Predictable | 8225 | 727.32 → 799.98 | 46.57 → 48.85 | 2123 | 704 | 64 |
+| 16K | Ordinary | 16310 | 655.77 → 737.88 | 41.71 → 44.39 | 4895 | 748 | 68 |
+| 16K | Predictable | 16274 | 654.76 → 735.43 | 44.20 → 47.19 | 4884 | 704 | 64 |
+| 32K | Ordinary | 33631 | 614.65 → 664.19 | 38.08 → 40.10 | 10846 | 814 | 74 |
+| 32K | Predictable | 33595 | 608.77 → 659.75 | 43.00 → 46.62 | 10835 | 704 | 64 |
+
+These are separate-boot comparisons, with no rerun of the inherited baseline.
+Current minus inherited input counts are +1/+2/0/−4 at 2K/4K/8K/16K for both workloads;
+32K counts match. The 2K dense cells made zero B32 calls, so their movement is
+not evidence for packed32. Decode arithmetic is unchanged; its movement is not
+assigned to this prefill change. Mode-matched token/state parity is established by the separate model gate;
+these HTTP comparisons do not establish cross-boot output parity.
+
+Both jobs report MLX 0.32.3, BF16 MLA caches, FP32 KDA state, packed attention,
+prefill cadence and packed32 enabled, together with the accepted projection,
+NAX scoring, grid, KDA, assistant and native-decode flags. Post-job active memory
+was 94,548,862,200 bytes in both boots, against a 115,448,725,504-byte admission
+limit. HTTP does not expose an allocator peak; the matched gate's peaks and
+conservative async2 increment remain documented separately. Final per-request
+cache-growth reservations and complete settings are retained in diagnostics.
+
+The server allowed benchmark ignore-EOS, but the measured pinned-client cells
+reported `ignore_eos:false`; all nevertheless emitted the requested 192 IDs.
+The private passive diagnostics subscriber retained final response diagnostics
+without modifying requests, transport or the pinned client bundle. It copied
+response chunks in memory and appended once per final response; that small
+client overhead was not isolated. Request bodies were iterable and unavailable
+to the subscriber. `/tokenize` and final usage supply actual counts, not input
+ID arrays; no raw-body recovery or transport changes were made.
+
+Artifacts `glm53-packed32-llmprobe-20261003` and
+`glm53-packed32-32k-20261003` preserve 27 and 21 final responses respectively,
+client JSON/HTML, output IDs, exact server times, counters, settings and telemetry.
+The frozen original-path CLI was built from accepted runtime `af51e72f`, source
+checkpoint `d1ba5b8c`, SHA256
+`bbd0125a483c93f2f809a153c20be7ba6df8743ef9b9da1dc6225cc5081167d6`,
+verified before and after both jobs. Later source WIP does not describe this
+binary. Both clients exited 0; own servers stopped, GPU locks released and fans
+restored to auto. Foreground QoS, maximum-fan confirmation and required idle
+were used. No baseline rerun, 64K or 128K rung was run.

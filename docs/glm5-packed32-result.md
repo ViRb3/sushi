@@ -3,8 +3,8 @@
 The fixed B32 candidate passed the directed fixture gate and reduced complete
 attention time by 15.38%. The matched 16K model gate then reduced prefill latency
 by 4.93%, with exact logits, valid state and continuation. It is accepted as an
-opt-in with a larger conservative memory allowance. HTTP qualification follows;
-the component percentage is not a prefill-throughput percentage.
+opt-in with a larger conservative memory allowance. Pinned HTTP 2K–32K qualification is complete; the component percentage is not
+a prefill-throughput percentage. The default remains B16.
 
 The candidate keeps two original T16 selector calls per B32 call, concatenates
 ordered IDs, and changes the native batch dimension only. The native
@@ -84,3 +84,28 @@ oracle, continuation ID and thermal record. Foreground QoS, per-job lock,
 confirmed maximum fans and required idle were used; process ended, lock released
 and fans automatic. Full ReleaseFast suite and local-path/quiet-runner guards
 also passed before the model gate.
+
+
+## HTTP qualification
+
+The [complete HTTP table](glm5-benchmark-http.md#optional-packed-b32-prefill)
+records all ordinary/predictable 2K, 4K, 8K, 16K and selected 32K cells, exact
+input counts, B32/native B3 counters and inherited rates. Every cell emitted
+192 IDs. B32 calls were zero at 2K and positive at every larger rung. At 32K,
+predictable/ordinary used 33595/33631 input tokens and measured
+659.75/664.19 prefill plus 46.62/40.10 decode tok/s, against inherited
+608.77/614.65 prefill and 43.00/38.08 decode. These separate-boot movements are
+not a matched latency claim; decode arithmetic is unchanged. The matched 16K
+ABBA and complete continuation/state gate remain the acceptance evidence.
+
+Artifacts `glm53-packed32-llmprobe-20261003` and
+`glm53-packed32-32k-20261003` retain exact server timings, all final output IDs,
+27/21 response diagnostics, settings, memory and thermal records. Pinned
+llmprobe 0.6.13 used the accepted target/A6/native N2 stack with packed32 on,
+chunk2048/async2 and verification async4. Final active memory was
+94,548,862,200 bytes with a 115,448,725,504-byte limit; HTTP reports no peak.
+The measured requests reported ignore-EOS false despite server permission;
+all completed 192 IDs. The unchanged client used a passive final-response
+subscriber with unisolated small logging overhead. Both jobs exited 0, servers
+stopped, locks released and fans automatic. Runtime `af51e72f` is accepted as
+an opt-in; this qualification adds no default change or 1500/60 claim.
