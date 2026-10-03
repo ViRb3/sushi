@@ -14,8 +14,14 @@ measured 2K/4K/8K/16K prefill 931.71/802.82/727.81/655.06 tok/s and decode
 47.08/45.48/44.44/43.04 tok/s. At 16K it recorded 64 rounds and
 6.334/60.336/1.503/0.986 ms draft/verify/replay/commit per round. This wave
 changed prefill, not decode; do not attribute across-boot decode differences
-to those kernels. The final 32K HTTP cell is still running.
-At predictable 32K, 191 timed forwards in 64 rounds measured 39.880 tok/s:
+to those kernels. The final predictable 32K-labelled request had 33595 input
+IDs, 604.18 prefill tok/s and 42.39 decode tok/s, with 64 rounds and
+6.277/60.528/2.359/1.001 ms draft/verify/replay/commit. Its input count was
+2.59% above the inherited 32747-ID cell, so that comparison is not an identical
+workload. Both prefill arms engaged; the separate 32K/64 native gate matched
+every target ID and the complete state.
+The inherited predictable 32K cell's 191 timed forwards in 64 rounds measured
+39.880 tok/s:
 draft/verify/replay/commit were 6.680/64.680/2.277/0.971 ms per round. Verification
 consumed about 86.4% of decode time. At unchanged tokens per round, 60 tok/s
 requires approximately 49.74 ms total per round, about 25 ms less than this run.
@@ -213,3 +219,39 @@ Workers 1/2 share no implementation file until coordinator integration.
 Schedule their small component timings, retain the latest HTTP baseline, then
 run one combined correctness/real-performance gate and push only accepted
 changes. Continue research if 1500/60 and stable 32K remain unmet.
+
+## Shared-prefix scorer outcome: exact, rejected
+
+The isolated candidate was built from `eaae0912` plus uncommitted helper/probe,
+its isolated test root and a two-line read-only SCORE export. It reused actual
+16K `index_q`, weights and pooled planes, with explicitly constructed causal
+branch frontiers/suffix arrangements. The timed case had 4095 common pools,
+4096 pools per branch and offsets 16383/16384/16384. Other checks covered chain
+and fork at all four history remainders, a distinct fork suffix, negative
+weights, equal scores at the 512 cutoff and a synthetic 8500-pool guard made
+from repeated real keys. These were not actual speculative-tree captures.
+
+All 205300 compared score values and ordered expanded selected IDs matched
+bit for bit, and all three focused tests passed. Eleven alternating ABBA/BAAB
+blocks after three warmup pairs produced 22 fresh complete-selector samples
+per arm, including scoring, each original branch-sized negative/argpartition,
+pool expansion, endpoint evaluation and frees. Materialized prefix/branch key
+inputs were common to both arms and excluded from timing.
+
+| Complete three selectors | Median µs | Change | Paired wins |
+|---|---:|---:|---:|
+| Three original scalar scorers | 377.375 | Reference | — |
+| One shared-prefix scalar scorer | 446.1665 | +18.23% | 1/22 |
+
+The median paired regression was 16.94%. Fewer logical key reads and groups did
+not produce a useful inclusive gain; this comparison does not isolate compiler,
+register or partition/view costs. No model arm, production hook or alternative
+NAX variant was warranted. The helper, probe, isolated root and SCORE export
+were removed and archived. No implementation commit was created.
+
+The run used ReleaseFast on MLX 0.32.3, interactive `taskpolicy -a`, exclusive
+lock `glm-shared-prefix-scorer`, confirmed maximum fans near 5352/5768 RPM,
+47.04°C initial temperature and ten seconds idle. Measurement key
+`glm53-shared-prefix-scorer-20261003` retains source, export patch, command,
+fixture/source hashes and raw samples. Binary SHA-256:
+`15bf7e4b120c6c4ae1ce9f841fd8eb8b57136e627034bb485878aaee98df48b4`.
