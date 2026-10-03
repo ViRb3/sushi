@@ -67,3 +67,17 @@ An eventual runtime candidate still needs its own inclusive/model/HTTP gates.
 Preserve BF16 compressed MLA, FP32 persistent KDA/accumulators, original small
 tensors, resident embeddings and A6 default. No restoration or64K/128K.
 Goals1500 prefill/60 speculative decode remain active and unmet.
+
+## Completed prefill and protocol work
+
+The [prefill endpoint result](glm5-wide-prefill-attribution-result.md) proved
+all12 stage arrays and final outputs exact. Five settlements increased complete
+L20 latency4.09%; GEMMs were90.30% of staged group clocks. The6.01% subtraction
+remains a heuristic, and normal removable cost is unknown. No small router or
+single-stage fusion is selected. Private files and the read-only alias were
+archived/removed; no runtime candidate followed.
+
+The [holder protocol](glm5-qkv-observer-protocol.md) passed its directed red/green
+sequence with synthetic buffers, no model or timing claim. Root's narrow
+interception/head-observer seams are uncommitted and disabled by default.
+The single actual-tree verifier attribution remains pending.

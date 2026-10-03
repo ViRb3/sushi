@@ -64,7 +64,9 @@ Report their complete-chain overhead; phase clocks must not be silently summed
 into normal HTTP or model latency shares.
 
 The concrete decision is whether the non-GEMM portion is large enough to warrant
-an exact consumer fusion next. Require a conservative surrounding-work opportunity
+an exact consumer fusion next. The 5% rule is a diagnostic screening heuristic,
+not a rigorous unperturbed latency bound; inserted waits can alter overlap,
+cache, ownership and clock behavior. Require a conservative surrounding-work opportunity
 of at least 5% of the original complete L20 clock after accounting for observed
 inserted-wait overhead; otherwise stop preparation/metadata/finalizer optimization
 work for the next wave. If the group clocks are dominated by perturbation, report
