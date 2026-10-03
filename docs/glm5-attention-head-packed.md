@@ -80,6 +80,42 @@ were added after the measured run; they do not change its attention math or
 its already-contiguous fixture path. Their validation belongs to the subsequent
 integration build. No model dispatch or default was changed by this component.
 
+## Rejected decode/verification extension
+
+A separate 2026-10-03 probe tested one to three nodes against the existing
+eight-split scalar attention and original merge. The NAX gather understood
+immutable prefix plus ancestry tails, using sibling paths `[0]`, `[0,1]`,
+`[0,2]`; valid tail tokens were read from the branch overlay. Thus this was an
+attention comparison for verification views, with shared IndexPool selection
+excluded from both arms. Each node used a fresh scope, including tail take,
+gather or scalar partials, native SDPA or merge, evaluation and free.
+
+| Prefix | Nodes | Split8 + merge, µs | Overlay NAX, µs | Latency change |
+| --- | ---: | ---: | ---: | ---: |
+| 4096 | 1 | 603.105 | 743.354 | +23.25% |
+| 4096 | 2 | 777.250 | 1191.187 | +53.26% |
+| 4096 | 3 | 1051.896 | 1606.230 | +52.70% |
+| 16384 | 1 | 351.021 | 464.709 | +32.39% |
+| 16384 | 2 | 587.646 | 845.042 | +43.80% |
+| 16384 | 3 | 846.000 | 1347.104 | +59.23% |
+| 32768 | 1 | 283.396 | 423.480 | +49.43% |
+| 32768 | 2 | 560.917 | 898.542 | +60.19% |
+| 32768 | 3 | 844.167 | 1249.646 | +48.03% |
+
+All nine cases had zero paired wins over six alternating rounds, following
+two warmups. Outputs were finite, with expected NAX relative L2 difference
+0.00131–0.00139 and maximum absolute difference 0.00048828125. The native
+Q64/D512 path has only two tensor threadgroups per node; its low parallelism
+and additional gather/launch costs are possible explanations, not a measured
+cost attribution. There is no cross-history scaling claim for these small
+measurements.
+
+Two focused tests passed on MLX v0.32.3. The quiet ReleaseFast run used an
+exclusive GPU lock, interactive QoS, maximum fans requested, 47.06°C initial
+temperature and ten seconds idle. Source, raw samples, errors and provenance
+were archived; the candidate/probe/wrapper were removed. No model hook,
+additional variant or full-model run was warranted.
+
 ## Full-model combination check
 
 Source `a88d8921` combines packed attention with ordinary BF16 head-batched MLA

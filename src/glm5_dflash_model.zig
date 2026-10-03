@@ -120,13 +120,16 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     var profile = profiling.Timer.start(parents.len);
     const qr = try ops.rms(try kda.linearRows(ops, layer.qa, x, mode), layer.qa_norm, cfg.rms_norm_eps);
     const q = try ops.reshape(try kda.linearRows(ops, layer.qb, qr, mode), &.{ t, heads, 1, kd });
-    // Head-batched projections keep each node's serial [1,H,1,D] geometry.
-    var absorbed: [16]Arr = undefined;
-    for (0..parents.len) |row| {
-        const one = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
-        absorbed[row] = if (layer.quantized) try ops.qmm(one, layer.wk, layer.sk, layer.bk, false) else try ops.binary(.mm, one, layer.wk);
-    }
-    const qa = try ops.reshape(try ops.concat(absorbed[0..parents.len], 0), &.{ t, heads, width });
+    const verify_batch = @import("glm5_mla_verify_batch.zig");
+    const broadcast_q = if (layer.quantized) try verify_batch.run(ops, .{ .x = q, .w = layer.wk, .scales = layer.sk, .biases = layer.bk }, .query) else null;
+    const qa = try ops.reshape(if (broadcast_q) |out| out else blk: {
+        var absorbed: [16]Arr = undefined;
+        for (0..parents.len) |row| {
+            const one = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
+            absorbed[row] = if (layer.quantized) try ops.qmm(one, layer.wk, layer.sk, layer.bk, false) else try ops.binary(.mm, one, layer.wk);
+        }
+        break :blk try ops.concat(absorbed[0..parents.len], 0);
+    }, &.{ t, heads, width });
     const latent = try ops.reshape(try ops.rms(try kda.linearRows(ops, layer.kva, x, mode), layer.kv_norm, cfg.rms_norm_eps), &.{ t, width });
     const index_q = try ops.reshape(try kda.linearRows(ops, layer.iq, qr, mode), &.{ t, ih, iw });
     const keys = try ops.reshape(try ops.layerNorm(try kda.linearRows(ops, layer.ik, x, mode), layer.ik_norm, layer.ik_bias, 1e-6), &.{ t, iw });
@@ -143,6 +146,7 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     // sparse branches naturally bill their necessary indexer work in mla_branches.
     try profile.finish("mla_common", &.{ qa, latent, keys, gates });
     var result_rows: [16]Arr = undefined;
+    var attention_rows: [16]Arr = undefined;
     var pending: [16]Arr = undefined;
     var pending_count: usize = 0;
     for (0..parents.len) |row| {
@@ -176,8 +180,20 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
             pending_count = 0;
         }
         const y4 = try ops.reshape(y, &.{ 1, heads, 1, width });
-        const values = if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
-        result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
+        attention_rows[row] = y4;
+        if (broadcast_q == null) {
+            const values = if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
+            result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
+        }
+    }
+    if (broadcast_q != null) {
+        const combined = try ops.concat(attention_rows[0..parents.len], 0);
+        if (try verify_batch.run(ops, .{ .x = combined, .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value)) |values| {
+            for (0..parents.len) |row| result_rows[row] = try ops.reshape(try ops.slice(values, 0, @intCast(row), @intCast(row + 1)), &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
+        } else for (0..parents.len) |row| {
+            const values = try ops.qmm(attention_rows[row], layer.wv, layer.sv, layer.bv, true);
+            result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
+        };
     }
     try profile.finish("mla_branches", result_rows[0..parents.len]);
     const output = try kda.linearRows(ops, layer.out, try ops.concat(result_rows[0..parents.len], 1), mode);
