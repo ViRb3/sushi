@@ -39,6 +39,10 @@ extracted; final helper parity and refusal checks passed after extraction.
 | 4 | 244.322 µs | 168.114 µs | 31.91% |
 
 At the current three-row verifier width the median difference was 51.709 µs per
-five-projection chain. This validates the component candidate only. It is not
-integrated into the production verifier and establishes no full-model decode
-speed, actual-checkpoint state parity, KLD result or wider-row qualification.
+five-projection chain. The verifier now tries this helper after affine QMM declines
+when `SUSHI_GLM_DFLASH_DENSE_ROWS=1`; the default remains off. The independent
+serial-row mode remains unchanged. An integrated three-row test compares all 384
+BF16 output bits and checks dispatch engagement. Diagnostic JSON reports
+`dense_row_dispatches` and mini-head storage/readout counters.
+Full-model decode speed, actual-checkpoint state parity, KLD and wider rows remain
+unqualified; the component result alone does not establish those properties.

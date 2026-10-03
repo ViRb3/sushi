@@ -142,7 +142,11 @@ pub fn linearRows(ops: *Ops, linear: @import("glm5_model.zig").Linear, x: Arr, m
     const shape = mlx.getShape(x);
     if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > 16) return error.InvalidGlmDraftShape;
     if (mode == .batched or shape[1] == 1) return linear.apply(ops, x);
-    if (mode == .affine_rows or mode == .affine_rows_ffn) if (try @import("glm5_dflash_qmm.zig").project(ops.s, x, linear)) |output| return ops.own(output);
+    if (mode == .affine_rows or mode == .affine_rows_ffn) {
+        if (try @import("glm5_dflash_qmm.zig").project(ops.s, x, linear)) |output| return ops.own(output);
+        const dense = @import("glm5_dflash_dense_rows.zig");
+        if (dense.enabled()) if (try dense.project(ops, linear, x)) |output| return output;
+    }
     var rows: [16]Arr = undefined;
     var made: usize = 0;
     defer for (rows[0..made]) |value| {
@@ -453,4 +457,27 @@ test "GLM DFlash KDA replay keeps raw BF16 one-token history bits" {
         try mlx.check(mlx.mlx_array_eval(state.conv_state));
         try std.testing.expectEqualSlices(u16, &expected, mlx.mlx_array_data_bfloat16(state.conv_state).?[0..expected.len]);
     }
+}
+
+test "GLM DFlash opt-in dense rows preserve integrated serial outputs" {
+    const dense = @import("glm5_dflash_dense_rows.zig");
+    if (!dense.enabled()) return error.SkipZigTest;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const key = try ops.slot();
+    try mlx.check(mlx.mlx_random_key(key, 443));
+    const w = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(w, &.{ 128, 4096 }, 2, .bfloat16, 0, 0.05, key.*, ops.s));
+    const x = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(x, &.{ 1, 3, 4096 }, 3, .bfloat16, 0, 0.1, key.*, ops.s));
+    try mlx.check(mlx.mlx_array_eval(w.*));
+    const linear = @import("glm5_model.zig").Linear{ .w = w.*, .input = 4096, .output = 128 };
+    const before = dense.dispatchCount();
+    const expected = try linearRows(&ops, linear, x.*, .serial_rows);
+    try std.testing.expectEqual(before, dense.dispatchCount());
+    const actual = try linearRows(&ops, linear, x.*, .affine_rows_ffn);
+    try std.testing.expectEqual(before + 1, dense.dispatchCount());
+    try mlx.check(mlx.mlx_array_eval(expected));
+    try mlx.check(mlx.mlx_array_eval(actual));
+    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..384], mlx.mlx_array_data_bfloat16(actual).?[0..384]);
 }

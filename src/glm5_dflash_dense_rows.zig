@@ -1,6 +1,23 @@
 //! Retained BF16 KDA projections using the serial GEMV kernel's batch grid.
+const std = @import("std");
 const mlx = @import("mlx.zig");
 const native = @import("glm5_model.zig");
+
+var enabled_cache: ?bool = null;
+var calls: usize = 0;
+pub fn enabled() bool {
+    if (enabled_cache) |value| return value;
+    const raw = std.c.getenv("SUSHI_GLM_DFLASH_DENSE_ROWS");
+    const value = if (raw) |text| std.mem.eql(u8, std.mem.span(text), "1") else false;
+    enabled_cache = value;
+    return value;
+}
+pub fn dispatchCount() usize {
+    return calls;
+}
+pub fn resetDispatchCount() void {
+    calls = 0;
+}
 
 pub fn project(ops: *native.Ops, linear: native.Linear, x: mlx.mlx_array) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(ops.s) or x.ctx == null or linear.w.ctx == null or linear.scales.ctx != null or linear.biases.ctx != null) return null;
@@ -19,11 +36,12 @@ pub fn project(ops: *native.Ops, linear: native.Linear, x: mlx.mlx_array) !?mlx.
     // Its ordinary GEMV template and reduction order match each serial row.
     const columns = try ops.reshape(x, &.{ sh[1], sh[2], 1 });
     const y = try ops.binary(.mm, linear.w, columns);
-    return try ops.reshape(y, &.{ 1, sh[1], linear.output });
+    const output = try ops.reshape(y, &.{ 1, sh[1], linear.output });
+    calls += 1;
+    return output;
 }
 
 test "GLM DFlash dense column batch rejects unsupported inputs" {
-    const std = @import("std");
     var ops = native.Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     const x = try ops.ones(&.{ 1, 3, 4096 }, .bfloat16);
