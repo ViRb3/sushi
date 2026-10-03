@@ -156,3 +156,49 @@ seconds before timing; cleanup restored automatic fans and released the lock.
 Private artifact `glm53-qkv-rows-20261003` preserves source, exact-output tests,
 binary and all samples. Timing binary SHA-256:
 `6d4144462a9e0bd73d70d1df5a20ba72e63b7b55a3e0e4b6cc3aad75fd18a46a`.
+
+## Isolated short-row HC collapse and normalization
+
+`glm5_hc_norm.apply` is an unintegrated candidate that combines HC collapse and
+its following BF16 RMS normalization. It accepts the existing FP32 HC mixes,
+scale and base plus a stored BF16 norm weight. It retains the original Sinkhorn,
+post and combination-matrix arithmetic and emits those arrays together with the
+mixed BF16 stream and normalized BF16 output. Unsupported shapes, storage or
+parameters decline; no engine callsite or default enables it.
+
+The 4096-wide RMS maps the pinned MLX single-row kernel: 1024 threads each read
+four consecutive values, then reduce in the same SIMD and threadgroup order.
+The collapse result rounds to BF16 before its square participates in RMS; the
+normalized value rounds to BF16 before multiplication by the BF16 norm weight.
+Dropping either boundary changes the reference arithmetic. Tests compare all
+four output arrays bitwise at one/three/four rows, zero/tiny/unit/large input
+magnitudes and three normalization epsilons. Invalid storage, absent tensors,
+iteration bounds and invalid epsilons decline without recording a dispatch.
+
+A quiet foreground-QoS component experiment against the existing collapse plus
+MLX RMS chain used eight warmups per arm and31 alternating forward/reverse pairs.
+Both arms constructed, evaluated and freed all four output arrays. Queued calls
+used16 independent, already-materialized fixtures; timings below divide each
+queued evaluation by16. Source was built on `a40d6cd7`, with concurrent native
+source work outside this standalone module. No full-model benefit is established.
+
+| Verification rows | Queued calls | Baseline µs/call | Candidate µs/call | Change | Paired wins |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 1 | 177.917 | 168.625 | +5.22% | 22/31 |
+| 3 | 16 | 18.318 | 17.917 | +2.19% | 24/31 |
+| 4 | 1 | 178.208 | 174.041 | +2.34% | 24/31 |
+| 4 | 16 | 18.328 | 18.042 | +1.56% | 23/31 |
+
+The queued three-row saving is only0.401 microseconds per call. At90 HC calls
+per verification round, that component saving would be approximately36 microseconds
+per round if it carried into the model. This candidate cannot account for the
+large remaining gap to60 committed tokens/s. Keep the measured improvement for
+later composition, but prioritize larger verifier costs before spending a full
+model run solely on this fusion. Full-checkpoint output/state parity and ordinary
+throughput remain required for integration.
+
+The run held an exclusive GPU lock, requested maximum fans and idled ten seconds
+before timing; cleanup restored automatic fans and released the lock. Private
+artifact `glm53-hc-norm-20261003` preserves standalone source, binary, all three
+passing tests, thermal status and raw samples. Timing binary SHA-256:
+`b0e7b153f097e28c70d22d0ced44525c6c52b20861814747ff54366145d24884`.
