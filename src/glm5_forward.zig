@@ -242,6 +242,7 @@ const Moe = struct {
     }
     fn applyTracked(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, component: ?*ComponentTimer) !Arr {
         const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
+        try @import("glm5_prefill_grid_capture.zig").capture(self.layer_index, x, routing.indices, routing.scores);
         try ComponentTimer.mark(component, "router", &.{ routing.indices, routing.scores }, null);
         const routed = if (self.streamed) |store| try store.apply(self.layer_index, ops, x, routing.indices, routing.scores, cfg.glm_swiglu_limit) else try ops.own(try exl3.moeClamped(ops.s, x, self.bank, routing.indices, routing.scores, .{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window }, @intFromFloat(cfg.glm_swiglu_limit)));
         try ComponentTimer.mark(component, "routed", &.{routed}, null);

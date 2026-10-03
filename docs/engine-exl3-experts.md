@@ -457,3 +457,49 @@ No further NAX padding experiment or model-level run was warranted.
 - A "systematically wrong but not garbage" pack whose reference decoders agree points at live-path numerics OR at
   the pack's own weights along real activations (a converter-side defect; converter details live in the private
   repo), not the bit layout.
+
+### GLM 2K grid transpose: exact component win
+
+The isolated `glm_prefill_grid` helper transposes physical threadgroup axes for
+original sorted WIN32 NAX projections: physical X visits routing windows and
+physical Y visits 128-column output stripes. Logical window/output IDs, dot
+body, accumulation order, F16 stores and metadata remain unchanged. It uses
+no new dispatch, weight copy or precision conversion. The candidate admits only
+BF16 B1/T2048/H4096/I2048, top-eight, E288 and n36/MCG/W12. No production caller
+selects the candidate.
+
+An opt-in normal-FFN capture records the first actual L20 T2048 input, indices
+and scores as BF16/U32/F32 arrays, totaling 16.125 MiB plus headers. The capture
+forces evaluation and is not a throughput run. The probe loads the original nine
+L20 bank tensors lazily from the three checkpoint shards, preserving all 288
+experts' physical spacing. It does not compact banks or scale older routes.
+
+This actual fixture contained 16384 assignments, 265 active experts, 671 live
+WIN32 windows and 1174 M16 tiles; the maximum expert received 571 rows. Capacity
+remained 800, with 12800/12800/25600 dispatched gate/up/down threadgroups per
+layer in both arms. All 8388608 final BF16 output values matched the unchanged
+native routed chain bit for bit. Six focused tests passed.
+
+Three warmup pairs preceded eleven alternating AB/BA pairs. Timing included
+sorting, metadata/inverse, preparation, all three GEMMs, middle transform,
+finish, allocation, endpoint evaluation and frees on fresh graphs. Original
+full expert banks remained resident; input, routes and scores were actual
+captured arrays.
+
+| Whole L20 routed chain | Median ms | Change | Paired wins |
+|---|---:|---:|---:|
+| Native grid | 19.640459 | Reference | — |
+| Transposed grid | 17.957667 | −8.568% | 11/11 |
+
+This qualifies one inclusive component comparison, not full-model throughput
+or a default change. Improved cache locality is a hypothesis: Metal execution
+order and physical traffic were not traced. The arithmetic and issued tile count
+are unchanged.
+
+The source baseline was `49192c0b` plus the isolated helper/probe and capture
+seam. The ReleaseFast run used MLX 0.32.3, interactive `taskpolicy -a`, exclusive
+lock `glm-prefill-grid-transpose`, confirmed maximum fans near 5346/5780 RPM,
+54.68°C initial temperature and ten seconds idle. Private measurement key
+`glm53-prefill-grid-transpose-20261003` retains the actual fixture, raw samples,
+source/build/run commands and provenance. Binary SHA-256:
+`e17997486ed69723e1f368dc8a7b6fdf2422e8bb994deb4ce9423ed80f67dc7d`.
