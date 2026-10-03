@@ -591,3 +591,57 @@ test root, build command, raw parity/timing, summary, telemetry and binary/sourc
 hashes. The base was `ae12b393` plus this isolated extension. Its gated filter is
 `GLM A6 eight SIMD tall tile isolated timing`, enabled by
 `SUSHI_GLM_A6_TALL_BENCH_OUT` naming the output JSON.
+
+### Runtime BF16 dequantization before dense NAX
+
+`src/glm5_a6_dense_once.zig` tests dequantizing one complete A6 bank to BF16 per
+projection and then running ordinary dense matmul. It uses existing
+`Ops.dequant`, transpose and matmul, with no new shader or persistent expanded
+weight tensor. The guard for any later integration must stay at B1/T2048,
+BF16/GPU/A6/group128 and the actual QKV/output widths. Each temporary bank is
+67,108,864 bytes, so an async2 bound of four KDA projections per layer is
+536,870,912 additional bytes before reclamation; a runtime hook must account
+for that transient memory and keep original stored tensors unchanged.
+
+The initial qualification compared every decoded BF16 coefficient against an
+independent implementation of the native NAX integer unpack, FP32 scale/bias
+arithmetic and BF16 store boundary. The finite fixture scales times a six-bit
+integer have an exact FP32 product, so FMA contraction cannot change this oracle.
+Both shapes had zero mismatches across 33,554,432 weights each. Affine and dense
+outputs also matched every BF16 bit: 16,777,216 QKV values and 8,388,608 output
+values. A sampled FP64 dot reference checked 256 dispersed output positions per
+shape; both arms had identical RMS/max errors, without tolerance relaxation.
+
+The inclusive microbenchmark reconstructed, evaluated and freed a fresh BF16
+weight/matmul graph on every repetition. Dequantization, graph construction,
+allocation, transpose view, matmul, evaluation wait and frees were all timed.
+The qualification's expanded bank was released before sampling, and no expanded
+bank was reused by the timed path. Inputs were materialized; each shape used one
+synthetic bank, with different qualification and timing seeds. The timing
+fixtures rechecked all decoded weights and recorded zero output mismatches.
+
+Twelve warmups per arm preceded eleven alternating AB/BA rounds with four
+repetitions per sample. The run used interactive QoS, exclusive GPU lock owner
+`glm-a6-dense-once-v61`, maximum fans requested, initial temperature 47.06°C
+and ten seconds idle. Other builds paused for timing; no model was loaded.
+
+| 2048-row projection | Affine NAX ms | Dequant + dense inclusive ms | Reduction | Paired wins |
+|---|---:|---:|---:|---:|
+| QKV 4096→8192 | 2.732989 | 2.530552 | 7.41% | 11/11 |
+| Output 8192→4096 | 2.863562 | 2.712552 | 5.27% | 11/11 |
+
+The result is a consistent primitive win with exact fixture arithmetic. Three
+QKV projections plus one output across 34 KDA layers suggest about 25.8 ms saved,
+before full-model interactions and memory effects. It does not establish a
+1500 tok/s workload or justify a default change; a narrow opt-in full-model
+counter/peak-memory gate is next. The focused qualification and timing runs
+each had two passing tests including their temporary root and one gated skip.
+
+The base checkout was `e4be4673ff8b3f0cfad231818b48dcbb00ccae3b` plus the isolated
+module. The timing binary SHA-256 was
+`0313f20af242e39140396f065a0d15aade52b4307322b03b52f1f76afc71ff7a`.
+The private `glm53-a6-dense-once-20261003` artifact retains source, explicit build
+command, test root, complete weight/output statistics, FP64 sample errors,
+raw timing, summary, telemetry and hashes. Its gates are
+`SUSHI_GLM_A6_DENSE_PARITY_OUT` and `SUSHI_GLM_A6_DENSE_BENCH_OUT` for the
+`GLM A6 dense once` test filter.
