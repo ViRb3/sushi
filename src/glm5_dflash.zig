@@ -208,6 +208,15 @@ pub fn proposeTree(assistant: *draft.DflashModel, context: *const draft.DflashCt
     return proposeTreeWithChildren(assistant, context, target, pending, max_nodes, 4);
 }
 
+var readout_horizon_calls: usize = 0;
+pub fn readoutHorizonCalls() usize {
+    return readout_horizon_calls;
+}
+fn readoutHorizonEnabled(max_nodes: usize, block_size: usize, mini: bool) bool {
+    if (max_nodes != 2 or block_size != 8 or mini) return false;
+    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_READOUT_HORIZON");
+}
+
 pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, pending: u32, max_nodes: usize, children: usize) !Proposal {
     try validatePair(assistant, target);
     if (max_nodes == 0 or max_nodes > 15 or children == 0 or children > 16 or pending >= target.cfg.vocab_size) return error.InvalidGlmDraftTree;
@@ -221,13 +230,17 @@ pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const dr
     const ids = try ops.own(mlx.mlx_array_new_data(&noise, &[_]c_int{ 1, @intCast(assistant.config.block_size) }, 2, .uint32));
     const embeds = try ops.own(try target.rawEmbedding(ids));
     const hidden = try ops.own(try draft.forwardBlock(assistant, &work, embeds, context.absLen()));
+    const bounded = readoutHorizonEnabled(max_nodes, assistant.config.block_size, assistant.draft_head != null);
+    const readout_input = if (bounded) try ops.slice(hidden, 1, 1, 3) else hidden;
     const projected = if (assistant.draft_head) |*coarse|
         try ops.own(try @import("glm5_dflash_mini.zig").project(target.head, coarse, hidden, assistant.s))
     else
-        try ops.own(try target.projectHead(hidden));
+        try ops.own(try target.projectHead(readout_input));
     const transformed = try ops.own(try draft.applyLogitTransforms(projected, assistant.config.output_multiplier, assistant.config.logit_softcap, assistant.s));
-    const logits = if (assistant.draft_head != null) transformed else try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
-    var lattice = try tree.lattice(assistant.allocator, &assistant.selector.?, assistant.config.selector_top_k, hidden, logits, pending, assistant.s);
+    const logits = if (bounded or assistant.draft_head != null) transformed else try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
+    const selector_input = if (bounded) try ops.slice(hidden, 1, 0, 3) else hidden;
+    var lattice = try tree.lattice(assistant.allocator, &assistant.selector.?, assistant.config.selector_top_k, selector_input, logits, pending, assistant.s);
+    if (bounded) readout_horizon_calls += 1;
     defer lattice.deinit(assistant.allocator);
     var branches = try tree.bestFirstTree(assistant.allocator, &lattice, .{ .max_nodes = max_nodes, .children = children });
     defer branches.deinit(assistant.allocator);
@@ -678,4 +691,122 @@ test "GLM draft stored BF16 A6 and A8 validate packed geometry without changing 
     try storage.add(&dense);
     try std.testing.expectEqual(@as(usize, 1), storage.dense_linears);
     try std.testing.expectEqualStrings("BF16", storage.label());
+}
+
+test "GLM N2 best-first selection is independent of unused future lattice depths" {
+    const k = 4;
+    var cands: [7 * k]i32 = undefined;
+    var unary: [7 * k]f32 = undefined;
+    var anchor: [k]f32 = undefined;
+    var edges: [6 * k * k]f32 = undefined;
+    for (&cands, &unary, 0..) |*id, *v, i| {
+        id.* = @intCast(100 + i);
+        v.* = @as(f32, @floatFromInt((i * 7) % 13)) / 8 - 0.5;
+    }
+    for (&anchor, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 3)) / 4;
+    for (&edges, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 3) % 17)) / 8 - 0.75;
+    const full = tree.Lattice{ .m = 7, .k = k, .cands = &cands, .unary = &unary, .e0 = &anchor, .e = &edges };
+    const short = tree.Lattice{ .m = 2, .k = k, .cands = cands[0 .. 2 * k], .unary = unary[0 .. 2 * k], .e0 = &anchor, .e = edges[0 .. k * k] };
+    for ([_]usize{ 1, 2, 4 }) |children| {
+        var original = try tree.bestFirstTree(std.testing.allocator, &full, .{ .max_nodes = 2, .children = children });
+        defer original.deinit(std.testing.allocator);
+        var bounded = try tree.bestFirstTree(std.testing.allocator, &short, .{ .max_nodes = 2, .children = children });
+        defer bounded.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u32, original.tokens, bounded.tokens);
+        try std.testing.expectEqualSlices(i32, original.parents, bounded.parents);
+        try std.testing.expectEqualSlices(u32, original.depth, bounded.depth);
+    }
+}
+
+test "GLM N2 horizon production head and selector component" {
+    const head_path = std.c.getenv("SUSHI_GLM_HORIZON_HEAD_SHARD") orelse return error.SkipZigTest;
+    const selector_path = std.c.getenv("SUSHI_GLM_HORIZON_SELECTOR_SHARD") orelse return error.MissingGlmDiagnosticInput;
+    const output = std.c.getenv("SUSHI_GLM_HORIZON_OUT") orelse return error.MissingGlmDiagnosticOutput;
+    const s = mlx.gpuStream();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    var arrays = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(arrays);
+    var metadata = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(metadata);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, head_path, cpu));
+    var head_arrays: [3]Arr = undefined;
+    for ([_][*:0]const u8{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }, 0..) |name, i| {
+        const slot = try ops.slot();
+        try mlx.check(mlx.mlx_map_string_to_array_get(slot, arrays, name));
+        head_arrays[i] = slot.*;
+    }
+    const native = @import("glm5_model.zig");
+    const head = native.Linear{ .w = head_arrays[0], .scales = head_arrays[1], .biases = head_arrays[2], .input = mlx.getShape(head_arrays[1])[1] * 128, .output = mlx.getShape(head_arrays[0])[0] };
+    try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, selector_path, cpu));
+    var selector_arrays: [3]Arr = undefined;
+    for ([_][*:0]const u8{ "candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook", "candidate_selector.hidden_projection.weight" }, 0..) |name, i| {
+        const slot = try ops.slot();
+        try mlx.check(mlx.mlx_map_string_to_array_get(slot, arrays, name));
+        selector_arrays[i] = slot.*;
+    }
+    const selector = draft.Selector{ .pred_codebook = selector_arrays[0], .succ_codebook = selector_arrays[1], .hidden_projection = .{ .w = try ops.transpose(selector_arrays[2], &.{ 1, 0 }), .scales = .{ .ctx = null }, .biases = .{ .ctx = null } } };
+    const key = try ops.slot();
+    try mlx.check(mlx.mlx_random_key(key, 0x53132));
+    const hidden = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(hidden, &[_]c_int{ 1, 8, head.input }, 3, .bfloat16, 0, 1, key.*, s));
+    try mlx.check(mlx.mlx_array_eval(hidden.*));
+    const original = try head.apply(&ops, hidden.*);
+    const bounded = try head.apply(&ops, try ops.slice(hidden.*, 1, 1, 3));
+    try mlx.check(mlx.mlx_array_eval(original));
+    try mlx.check(mlx.mlx_array_eval(bounded));
+    const vocab: usize = @intCast(head.output);
+    const expected = mlx.mlx_array_data_bfloat16(original) orelse return error.MlxArrayDataNull;
+    const actual = mlx.mlx_array_data_bfloat16(bounded) orelse return error.MlxArrayDataNull;
+    var logit_mismatches: usize = 0;
+    for (0..2 * vocab) |i| if (expected[vocab + i] != actual[i]) {
+        logit_mismatches += 1;
+    };
+    // Use the shipped selector on the same immutable eight-row fixture.
+    var full = try tree.lattice(std.testing.allocator, &selector, 16, hidden.*, try ops.slice(original, 1, 1, 8), 1, s);
+    defer full.deinit(std.testing.allocator);
+    var short = try tree.lattice(std.testing.allocator, &selector, 16, try ops.slice(hidden.*, 1, 0, 3), bounded, 1, s);
+    defer short.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(i32, full.cands[0..32], short.cands);
+    try std.testing.expectEqualSlices(f32, full.unary[0..32], short.unary);
+    try std.testing.expectEqualSlices(f32, full.e0, short.e0);
+    try std.testing.expectEqualSlices(f32, full.e[0..256], short.e);
+    for ([_]usize{ 1, 2, 4 }) |children| {
+        var before = try tree.bestFirstTree(std.testing.allocator, &full, .{ .max_nodes = 2, .children = children });
+        defer before.deinit(std.testing.allocator);
+        var after = try tree.bestFirstTree(std.testing.allocator, &short, .{ .max_nodes = 2, .children = children });
+        defer after.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u32, before.tokens, after.tokens);
+        try std.testing.expectEqualSlices(i32, before.parents, after.parents);
+        try std.testing.expectEqualSlices(u32, before.depth, after.depth);
+    }
+    // Isolated readout+lattice phase only; the proposal hot path has no clocks.
+    var full_ns: [4]u64 = undefined;
+    var horizon_ns: [4]u64 = undefined;
+    for (0..6) |iteration| {
+        for (0..2) |arm| {
+            const use_horizon = (iteration + arm) % 2 == 1;
+            var scope = Ops{ .s = s };
+            defer scope.deinit();
+            const watch = @import("io_util.zig").Stopwatch.init(std.testing.io);
+            const input = if (use_horizon) try scope.slice(hidden.*, 1, 1, 3) else hidden.*;
+            const projected = try head.apply(&scope, input);
+            const logits = if (use_horizon) projected else try scope.slice(projected, 1, 1, 8);
+            const selector_input = if (use_horizon) try scope.slice(hidden.*, 1, 0, 3) else hidden.*;
+            var lat = try tree.lattice(std.testing.allocator, &selector, 16, selector_input, logits, 1, s);
+            defer lat.deinit(std.testing.allocator);
+            var selected = try tree.bestFirstTree(std.testing.allocator, &lat, .{ .max_nodes = 2, .children = 4 });
+            defer selected.deinit(std.testing.allocator);
+            const ns = watch.read();
+            if (iteration >= 2) {
+                if (use_horizon) horizon_ns[iteration - 2] = ns else full_ns[iteration - 2] = ns;
+            }
+        }
+    }
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .head_bits = try native.storedAffineBits(head.w, head.scales, head.biases), .vocab = vocab, .hidden = head.input, .selector_rank = mlx.getShape(selector.pred_codebook)[1], .input = "fixed-seed random BF16 hidden, seed 0x53132; real target A6 head and real assistant BF16 selector; no full model loaded", .first_two_logit_bit_mismatches = logit_mismatches, .candidate_rows_equal = 2, .unary_rows_equal = 2, .anchor_and_first_edge_equal = true, .n2_tree_children_equal = .{ 1, 2, 4 }, .timing = "readout+lattice+N2 tree only; four interleaved pairs after two warmup pairs; ns", .full_ns = full_ns, .horizon_ns = horizon_ns }, .{ .whitespace = .indent_2 });
+    defer std.testing.allocator.free(json);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
+    try std.testing.expectEqual(@as(usize, 0), logit_mismatches);
 }
