@@ -7,12 +7,68 @@ const prefill_direct = @import("glm5_attention_prefill.zig");
 const packed_nax = @import("glm5_attention_nax_packed.zig");
 const latent_overlay = @import("glm5_attention_overlay.zig");
 const Arr = mlx.mlx_array;
+const Ops = @import("glm5_model.zig").Ops;
 const nil = Arr{ .ctx = null };
 const pool_size = 4;
 const pool_budget = 512;
 const selected_width = pool_size * pool_budget + pool_size - 1;
 pub const score_scratch_bytes: usize = 2 * 1024 * 1024;
 pub const attention_scratch_bytes: usize = 8 * 1024 * 1024;
+threadlocal var packed_cadence: ?bool = null;
+var cadence_calls: usize = 0;
+pub const CadenceBinding = struct {
+    previous: ?bool,
+    pub fn restore(self: CadenceBinding) void {
+        packed_cadence = self.previous;
+    }
+};
+pub fn bindPackedCadence(on: bool) CadenceBinding {
+    const binding = CadenceBinding{ .previous = packed_cadence };
+    packed_cadence = on;
+    return binding;
+}
+pub fn packedCadenceEnabled() bool {
+    return packed_cadence orelse @import("transformer.zig").diagEnvOn("SUSHI_GLM_PREFILL_CADENCE");
+}
+pub fn packedCadenceCalls() usize {
+    return cadence_calls;
+}
+pub fn resetPackedCadenceCalls() void {
+    cadence_calls = 0;
+}
+pub fn packedCadenceTransientBudget(chunk: usize, pending_layers: usize) !usize {
+    if (!packed_nax.enabled() or !packedCadenceEnabled() or chunk <= packed_nax.max_rows) return 0;
+    return std.math.mul(usize, packed_nax.scratch_limit, pending_layers);
+}
+
+threadlocal var captured_cadence: bool = false;
+fn captureCadence(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32) !void {
+    if (captured_cadence or mlx.getShape(q)[0] != 2048) return;
+    const path = std.c.getenv("SUSHI_GLM_PREFILL_CADENCE_CAPTURE") orelse return;
+    const history_target = if (std.c.getenv("SUSHI_GLM_PREFILL_CADENCE_CAPTURE_HISTORY")) |raw|
+        try std.fmt.parseInt(usize, std.mem.span(raw), 10)
+    else
+        8192;
+    if (history_target != 8192 and history_target != 16384) return error.InvalidCadenceCaptureHistory;
+    if (state.processed != history_target) return;
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const off: u32 = @intCast(offset);
+    const history: u32 = @intCast(state.processed);
+    const values = [_]Arr{ q, iq, weights, state.latent, state.pooled, try ops.own(mlx.mlx_array_new_data(&off, &.{}, 0, .uint32)), try ops.own(mlx.mlx_array_new_data(&history, &.{}, 0, .uint32)), try ops.own(mlx.mlx_array_new_data(&scale, &.{}, 0, .float32)) };
+    const ev = mlx.mlx_vector_array_new_data(&values, values.len);
+    defer _ = mlx.mlx_vector_array_free(ev);
+    try mlx.check(mlx.mlx_eval(ev));
+    const arrays = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(arrays);
+    const metadata = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(metadata);
+    for ([_][*:0]const u8{ "q", "index_q", "weights", "latent", "pooled", "offset", "processed", "scale" }, values) |name, value|
+        try mlx.check(mlx.mlx_map_string_to_array_insert(arrays, name, value));
+    try mlx.check(mlx.mlx_map_string_to_string_insert(metadata, "provenance", "first real MLA T2048 at selected history; capture forces evaluation; not a throughput run"));
+    try mlx.check(mlx.mlx_save_safetensors(path, arrays, metadata));
+    captured_cadence = true;
+}
 
 const Scope = struct {
     s: mlx.mlx_stream,
@@ -388,6 +444,60 @@ pub fn attendOverlay(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, 
     if (state.processed != view.length() or offset + 1 != state.processed) return error.InvalidGlmOverlay;
     return attendImpl(state, q, index_q, weights, offset, scale, view, s);
 }
+
+const PackedTile = struct {
+    scope: Scope,
+    ops: Ops,
+    out: Arr = nil,
+    pending: bool = false,
+    fn deinit(self: *PackedTile) void {
+        // Error paths must also settle submitted work before releasing its bank.
+        if (self.pending) _ = mlx.mlx_array_eval(self.out);
+        self.ops.deinit();
+        self.scope.deinit();
+    }
+};
+
+fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32, max_rows: usize, direct: bool, s: mlx.mlx_stream) !Arr {
+    const rows: usize = @intCast(mlx.getShape(q)[0]);
+    const parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    var start: usize = 0;
+    while (start < rows) {
+        var tiles = [_]PackedTile{
+            .{ .scope = .{ .s = s }, .ops = .{ .s = s } },
+            .{ .scope = .{ .s = s }, .ops = .{ .s = s } },
+        };
+        defer for (&tiles) |*tile| tile.deinit();
+        const outputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs);
+        var count: usize = 0;
+        for (&tiles) |*tile| {
+            if (start == rows) break;
+            const end = @min(rows, start + max_rows);
+            const qc = try tile.scope.cut(q, @intCast(start), @intCast(end));
+            const selected = try selectChunk(&tile.scope, state, try tile.scope.cut(iq, @intCast(start), @intCast(end)), try tile.scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
+            tile.out = (try packed_nax.run(&tile.ops, qc, state.latent, selected, offset + start, state.processed, scale)) orelse
+                try attentionChunk(&tile.scope, state, qc, selected, offset + start, scale, 1, direct, false, null);
+            const submit = mlx.mlx_vector_array_new_data(&.{tile.out}, 1);
+            defer _ = mlx.mlx_vector_array_free(submit);
+            tile.pending = true;
+            try mlx.check(mlx.mlx_async_eval(submit));
+            try mlx.check(mlx.mlx_vector_array_append_value(outputs, tile.out));
+            count += 1;
+            start = end;
+        }
+        try mlx.check(mlx.mlx_eval(outputs));
+        for (tiles[0..count]) |*tile| {
+            tile.pending = false;
+            try mlx.check(mlx.mlx_vector_array_append_value(parts, tile.out));
+        }
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, parts, 0, s));
+    return out;
+}
 fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset: usize, scale: f32, overlay: ?latent_overlay.View, s: mlx.mlx_stream) !Arr {
     if (!mlx.streamIsGpu(s)) return error.GlmAttentionGpuRequired;
     if (q.ctx == null) return error.InvalidGlmAttentionShape;
@@ -415,6 +525,14 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
     const pool_bytes = @max(@as(usize, 4), state.processed / 4 * 4);
     if (per_row > attention_scratch_bytes or (sparse and pool_bytes > score_scratch_bytes)) return error.GlmAttentionScratchBudget;
     const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), if (headpack) packed_nax.max_rows else 128));
+    if (headpack) {
+        try captureCadence(state, q, index_q.?, weights.?, offset, scale);
+        if (packedCadenceEnabled() and @as(usize, @intCast(sh[0])) > max_rows) {
+            const out = try attendPackedPairs(state, q, index_q.?, weights.?, offset, scale, max_rows, direct, s);
+            cadence_calls += 1;
+            return out;
+        }
+    }
     const parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
     var start: usize = 0;
