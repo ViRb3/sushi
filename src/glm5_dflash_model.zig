@@ -83,6 +83,14 @@ pub const MlaTape = struct {
         const indices = try ops.own(mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .uint32));
         _ = try state.append(try ops.take(self.latent, indices, 0), try ops.take(self.keys, indices, 0), try ops.take(self.gates, indices, 0), self.ape, s);
     }
+    fn appendIndex(self: *const MlaTape, state: *attention.State, path: []const u32, s: mlx.mlx_stream) !Arr {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const indices = try ops.own(mlx.mlx_array_new_data(path.ptr, &.{@intCast(path.len)}, 1, .uint32));
+        const tail = try ops.take(self.latent, indices, 0);
+        _ = try state.appendIndexOnly(tail, try ops.take(self.keys, indices, 0), try ops.take(self.gates, indices, 0), self.ape, s);
+        return ops.result(tail);
+    }
 };
 
 fn forkAttention(source: *const attention.State) !attention.State {
@@ -142,9 +150,21 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         defer branch.deinit();
         var path: [16]u32 = undefined;
         const kept = ancestry(parents, row, &path);
-        try tape.append(&branch, kept, ops.s);
+        const overlay = parents.len <= 3;
+        const tail = if (overlay) try ops.own(try tape.appendIndex(&branch, kept, ops.s)) else blk: {
+            try tape.append(&branch, kept, ops.s);
+            break :blk Arr{ .ctx = null };
+        };
         const from: c_int = @intCast(row);
-        const y = try ops.own(try attention.attend(&branch, try ops.slice(qa, 0, from, from + 1), try ops.slice(index_q, 0, from, from + 1), try ops.slice(index_weights, 0, from, from + 1), state.processed + kept.len - 1, 1 / @sqrt(@as(f32, @floatFromInt(kd))), ops.s));
+        const query = try ops.slice(qa, 0, from, from + 1);
+        const index_query = try ops.slice(index_q, 0, from, from + 1);
+        const weights = try ops.slice(index_weights, 0, from, from + 1);
+        const offset = state.processed + kept.len - 1;
+        const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
+        const y = try ops.own(if (overlay)
+            try attention.attendOverlay(&branch, query, index_query, weights, offset, scale, .{ .prefix = state.latent, .prefix_rows = state.processed, .tail = tail }, ops.s)
+        else
+            try attention.attend(&branch, query, index_query, weights, offset, scale, ops.s));
         pending[pending_count] = y;
         pending_count += 1;
         // The final group settles at the enclosing layer boundary.
@@ -505,4 +525,61 @@ test "GLM DFlash component profiling preserves nonzero captures and complete com
         mla_calls += layer.mla_common.calls;
     }
     try std.testing.expect(kda_calls > 0 and mla_calls > 0);
+}
+
+test "GLM latent overlay three-node verifier commits independent serial ancestry" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = @import("model.zig").Weights.init(a);
+    defer weights.deinit();
+    const cfg = try forward.completeFixture(&weights);
+    var iterator = weights.map.iterator();
+    var seed: usize = 23;
+    while (iterator.next()) |entry| {
+        const value = entry.value_ptr;
+        const sh = mlx.getShape(value.*);
+        if (sh.len < 2 or mlx.mlx_array_dtype(value.*) != .bfloat16 or std.mem.endsWith(u8, entry.key_ptr.*, ".scales") or std.mem.endsWith(u8, entry.key_ptr.*, ".biases")) continue;
+        const replacement = try @import("dflash.zig").TinyFix.bf16ArrShaped(sh, seed, s);
+        _ = mlx.mlx_array_free(value.*);
+        value.* = replacement;
+        seed += 1;
+    }
+    var target = try forward.Model.load(a, cfg, &weights, s);
+    defer target.deinit();
+    var request = try forward.Request.init(a, target.layers.len);
+    defer request.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const logits = try target.forwardLast(&request, ids, true);
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_array_eval(logits));
+    var tokens = [_]u32{ 1, 0, 0 };
+    const taps = [_]u32{ 0, 3 };
+    for ([_][3]i32{ .{ -1, 0, 1 }, .{ -1, 0, 0 } }) |parents| {
+        tokens[2] = if (parents[2] == 0) 2 else 0;
+        var oracle = try adapter.verifyTreeOracle(&target, &request, &tokens, &parents, &taps);
+        defer oracle.deinit();
+        var computed = try verify(&target, &request, &tokens, &parents, &taps, .serial_rows);
+        defer computed.deinit();
+        try std.testing.expectEqualSlices(u32, oracle.targets[0..oracle.count], computed.targets[0..computed.count]);
+        var captures = Ops{ .s = s };
+        defer captures.deinit();
+        for (0..3) |row| for (computed.captures.hook.out, oracle.captures[row].?.hook.out) |left, right| {
+            try profileArrayEqual(try captures.slice(left, 1, @intCast(row), @intCast(row + 1)), right, s);
+        };
+        for ([_]usize{ 1, 2, 3 }) |budget| {
+            var committed = try computed.prepareCommit(&request, budget, &.{}, s);
+            defer committed.deinit();
+            const accepted = try tree.accept(&tokens, &parents, oracle.targets[0..oracle.count], budget, &.{});
+            const last = accepted.rows[accepted.count - 1];
+            const left = committed.states[last].?;
+            const right = oracle.states[last].?;
+            try std.testing.expectEqual(right.offset, left.offset);
+            for (left.layers, right.layers) |x, y| {
+                for (x.attention.arrays(), y.attention.arrays()) |u, v| try profileArrayEqual(u, v, s);
+                try profileArrayEqual(x.recurrent.conv_state, y.recurrent.conv_state, s);
+                try profileArrayEqual(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
+            }
+        }
+    }
 }

@@ -5,6 +5,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const prefill_direct = @import("glm5_attention_prefill.zig");
 const packed_nax = @import("glm5_attention_nax_packed.zig");
+const latent_overlay = @import("glm5_attention_overlay.zig");
 const Arr = mlx.mlx_array;
 const nil = Arr{ .ctx = null };
 const pool_size = 4;
@@ -150,6 +151,13 @@ pub const State = struct {
         try mlx.check(mlx.mlx_eval(vec));
     }
     pub fn append(self: *State, latent: Arr, keys: Arr, gates: Arr, ape: Arr, s: mlx.mlx_stream) !usize {
+        return self.appendImpl(latent, keys, gates, ape, s, true);
+    }
+    /// Verification forks retain their latent prefix; attention reads the supplied overlay.
+    pub fn appendIndexOnly(self: *State, latent: Arr, keys: Arr, gates: Arr, ape: Arr, s: mlx.mlx_stream) !usize {
+        return self.appendImpl(latent, keys, gates, ape, s, false);
+    }
+    fn appendImpl(self: *State, latent: Arr, keys: Arr, gates: Arr, ape: Arr, s: mlx.mlx_stream, store_latent: bool) !usize {
         if (latent.ctx == null or keys.ctx == null or gates.ctx == null or ape.ctx == null) return error.InvalidGlmAttentionShape;
         const ls = mlx.getShape(latent);
         const ks = mlx.getShape(keys);
@@ -163,7 +171,7 @@ pub const State = struct {
         const next = try std.math.add(usize, self.processed, @intCast(ls[0]));
         var scope = Scope{ .s = s };
         defer scope.deinit();
-        const l = try scope.appendRows(self.latent, self.processed, latent);
+        const l = if (store_latent) try scope.appendRows(self.latent, self.processed, latent) else self.latent;
         const k = try scope.join(self.tail_keys, keys);
         const g = try scope.join(self.tail_gates, gates);
         const ready = @divTrunc(mlx.getShape(k)[0], 4) * 4;
@@ -172,7 +180,7 @@ pub const State = struct {
         const tail_g = try scope.copy(try scope.cut(g, ready, mlx.getShape(g)[0]));
         var new = State{ .processed = next };
         errdefer new.deinit();
-        new.latent = try scope.result(l);
+        if (l.ctx != null) new.latent = try scope.result(l);
         if (p.ctx != null) new.pooled = try scope.result(p);
         new.tail_keys = try scope.result(tail_k);
         new.tail_gates = try scope.result(tail_g);
@@ -313,7 +321,7 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     return kernelOutput(scope, ev, 0);
 }
 
-fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, direct: bool, headpack: bool) !Arr {
+fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, direct: bool, headpack: bool, overlay: ?latent_overlay.View) !Arr {
     if (headpack) {
         var ops = @import("glm5_model.zig").Ops{ .s = scope.s };
         defer ops.deinit();
@@ -342,11 +350,20 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
     try template(cfg, "D", dim);
     try template(cfg, "SPLITS", splits);
     try template(cfg, "SELECTED", @intFromBool(selected != null));
-    const k = try kernel(&attention_kernel, "sushi_glm_latent_partial", &.{ "q", "cache", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION);
-    const ov = try apply(k, &.{ q, state.latent, indices, off, length, scaling }, cfg, scope.s);
-    defer _ = mlx.mlx_vector_array_free(ov);
-    const partial = try kernelOutput(scope, ov, 0);
-    const stats = try kernelOutput(scope, ov, 1);
+    var partial: Arr = undefined;
+    var stats: Arr = undefined;
+    if (overlay) |view| {
+        const result = try latent_overlay.partials(q, view, indices, off, length, scaling, splits, selected != null, scope.s);
+        defer result.deinit();
+        partial = try scope.own(try scope.result(result.partial));
+        stats = try scope.own(try scope.result(result.stats));
+    } else {
+        const k = try kernel(&attention_kernel, "sushi_glm_latent_partial", &.{ "q", "cache", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION);
+        const ov = try apply(k, &.{ q, state.latent, indices, off, length, scaling }, cfg, scope.s);
+        defer _ = mlx.mlx_vector_array_free(ov);
+        partial = try kernelOutput(scope, ov, 0);
+        stats = try kernelOutput(scope, ov, 1);
+    }
     const mc = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(mc);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(mc, sh.ptr, 3, mlx.mlx_array_dtype(q)));
@@ -364,12 +381,21 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
 }
 
 pub fn attend(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset: usize, scale: f32, s: mlx.mlx_stream) !Arr {
+    return attendImpl(state, q, index_q, weights, offset, scale, null, s);
+}
+pub fn attendOverlay(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset: usize, scale: f32, view: latent_overlay.View, s: mlx.mlx_stream) !Arr {
+    try view.validate(q);
+    if (state.processed != view.length() or offset + 1 != state.processed) return error.InvalidGlmOverlay;
+    return attendImpl(state, q, index_q, weights, offset, scale, view, s);
+}
+fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset: usize, scale: f32, overlay: ?latent_overlay.View, s: mlx.mlx_stream) !Arr {
     if (!mlx.streamIsGpu(s)) return error.GlmAttentionGpuRequired;
     if (q.ctx == null) return error.InvalidGlmAttentionShape;
     const sh = mlx.getShape(q);
+    const cache = if (overlay) |view| view.storage() else state.latent;
     if (sh.len != 3 or sh[0] <= 0 or sh[1] <= 0 or sh[2] <= 0 or !supported(mlx.mlx_array_dtype(q)) or
-        !std.math.isFinite(scale) or scale <= 0 or state.latent.ctx == null or
-        sh[2] != mlx.getShape(state.latent)[1] or mlx.mlx_array_dtype(q) != mlx.mlx_array_dtype(state.latent) or
+        !std.math.isFinite(scale) or scale <= 0 or cache.ctx == null or
+        sh[2] != mlx.getShape(cache)[1] or mlx.mlx_array_dtype(q) != mlx.mlx_array_dtype(cache) or
         offset > state.processed or @as(usize, @intCast(sh[0])) > state.processed - offset) return error.InvalidGlmAttentionShape;
     const sparse = offset + @as(usize, @intCast(sh[0])) > pool_size * (pool_budget + 1) - 1;
     if (sparse) {
@@ -382,7 +408,7 @@ pub fn attend(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
             mlx.mlx_array_dtype(w) != mlx.mlx_array_dtype(iq)) return error.InvalidGlmAttentionShape;
     }
     const splits: c_int = if (sh[0] <= 8) 8 else 1;
-    const headpack = sparse and splits == 1 and sh[1] == 64 and sh[2] == 512 and
+    const headpack = overlay == null and sparse and splits == 1 and sh[1] == 64 and sh[2] == 512 and
         mlx.mlx_array_dtype(q) == .bfloat16 and packed_nax.enabled();
     const direct = splits == 1 and prefill_direct.enabled();
     const per_row = if (direct) try prefill_direct.rowBytes(@intCast(sh[1]), @intCast(sh[2]), mlx.mlx_array_itemsize(q)) else try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
@@ -398,7 +424,7 @@ pub fn attend(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
         defer scope.deinit();
         const qc = try scope.cut(q, @intCast(start), @intCast(end));
         const selected = if (sparse) try selectChunk(&scope, state, try scope.cut(index_q.?, @intCast(start), @intCast(end)), try scope.cut(weights.?, @intCast(start), @intCast(end)), offset + start) else null;
-        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits, direct, headpack);
+        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits, direct, headpack, overlay);
         // Settle bounded chunks before dropping their score/partial buffers.
         if (@as(usize, @intCast(sh[0])) > max_rows) try mlx.check(mlx.mlx_array_eval(out));
         try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
