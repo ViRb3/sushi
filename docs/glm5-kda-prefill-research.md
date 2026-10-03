@@ -489,3 +489,59 @@ after the teacher releases the GPU, with both byte controls retained. No runtime
 patch or production dispatch change has been made. The private artifact
 `glm53-a6-unpack-audit-20261003` retains source, AIR, counts, compiler identity and
 hashes; all work in this investigation was CPU-only.
+
+### Complete A6 NAX qualification
+
+The follow-up `src/glm5_a6_prefill.zig` keeps the native BM64/BN64/BK64,
+WM2/WN2 tile and all NAX arithmetic. It embeds the existing attributed MLX
+header, changing only its unsafe weight-loader operation. Its controls are
+unchanged byte unpacking and the same byte loop with explicit full unrolling.
+The word arm consumes exactly six scalar U32 values for each thread's 32
+coefficients, reconstructs identical integers and preserves scale/bias arithmetic
+and the BF16 staging boundary. No shared MLX library or vendor header changed.
+The native loader's row, thread and K-tile offsets supply four-byte alignment;
+there is no padded vector load or overread. The guard accepts only materialized,
+contiguous BF16 input and A6/group128 banks at the actual 512/2048-row QKV and
+output geometries. This remains an isolated experiment with no runtime import.
+
+All three custom arms passed every native BF16 output bit at all four shapes.
+The timing run rechecked that parity on four independent banks. Guard tests also
+passed. The initial parity run had three passing tests, including its temporary
+root, and one gated timing skip; the enabled timing run passed all four tests.
+
+Timing used lock owner `glm53-a6-unpack-v61`, interactive QoS (`taskpolicy -a`),
+maximum fans requested, 52.12°C initial temperature and ten seconds of idle.
+No model was loaded. Inputs were evaluated before timing; twelve warmups per
+arm preceded eleven alternating forward/reverse rounds with eight fresh
+apply/evaluate/free evaluations per sample. One-bank and four-bank rotation
+were measured separately. The four arms shared each input geometry and bank.
+
+| Rows / projection | Banks | Native ms | Byte clone ms | Unrolled byte ms | Word ms |
+|---|---:|---:|---:|---:|---:|
+| 512 / QKV | 1 | 0.903520 | 0.899765 | 0.904260 | 0.883562 |
+| 512 / QKV | 4 | 0.912244 | 0.913578 | 0.934817 | 0.881479 |
+| 512 / output | 1 | 0.928750 | 0.927432 | 0.939609 | 0.889692 |
+| 512 / output | 4 | 0.960401 | 0.954708 | 0.955619 | 0.920849 |
+| 2048 / QKV | 1 | 2.726270 | 2.752114 | 2.749083 | 2.650989 |
+| 2048 / QKV | 4 | 2.740838 | 2.762437 | 2.754406 | 2.662109 |
+| 2048 / output | 1 | 2.924453 | 2.936890 | 2.910781 | 2.855145 |
+| 2048 / output | 4 | 2.852390 | 2.871614 | 2.873328 | 2.796416 |
+
+Word unpacking beats the unrolled-byte control in all eleven paired samples of
+all eight cells. Against the unchanged byte clone, four-bank gains are 3.51%
+(QKV) and 3.55% (output) at 512, and 3.63% / 2.62% at 2048. The clone/native
+packaging difference reduces the corresponding 2048 advantage over native to
+2.87% / 1.96%. This is a modest consistent primitive gain. Applying those two
+native differences to three QKV projections plus one output across 34 KDA
+layers suggests about 10 ms saved, before interactions with the rest of the
+model; no end-to-end benefit or reduction in DRAM transactions is established.
+Further integration needs a full-model gate and support for lazy graph inputs,
+which the isolated materialization guard deliberately declines.
+
+The base checkout was `a40d6cd73a3faef22c653e296e46a3d1da317f2b` plus the isolated
+module/test root. The timing binary SHA-256 is
+`446c6b8cbda6defd9c8f76b382d592cf3e42fa90ce159abdd478dfd0bd823662`.
+The private `glm53-a6-unpack-qualified-20261003` artifact retains exact source,
+vendor header, build command, parity/timing logs, raw samples, telemetry and
+provenance. Its gated filter is `GLM A6 unpack isolated timing`, enabled by
+`SUSHI_GLM_A6_UNPACK_BENCH_OUT` naming its JSON result file.
