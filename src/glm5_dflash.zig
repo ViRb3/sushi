@@ -147,6 +147,35 @@ fn cloneContext(assistant: *const draft.DflashModel, source: *const draft.Dflash
     return copy;
 }
 
+var commit_window_calls: usize = 0;
+pub fn commitWindowCalls() usize {
+    return commit_window_calls;
+}
+
+fn cropCommitContext(assistant: *const draft.DflashModel, next: *draft.DflashCtx) !bool {
+    const cfg = &assistant.config;
+    if (assistant.layers.len != 5 or cfg.block_size != 8 or cfg.sliding_window != 2048 or next.cache.config.scheme != .off or next.cache.step < 2048) return false;
+    const diag = @import("transformer.zig");
+    if (!diag.diagEnvOn("SUSHI_GLM_DFLASH_BLOCK_TAIL") or !diag.diagEnvOn("SUSHI_GLM_DFLASH_COMMIT_WINDOW")) return false;
+    for (assistant.layers, next.cache.entries) |layer, entry| {
+        if (layer.layer_type != .sliding_attention or !entry.initialized or entry.ringed or entry.base != 0 or entry.offset != next.cache.step or mlx.mlx_array_dtype(entry.keys) != .bfloat16 or mlx.mlx_array_dtype(entry.values) != .bfloat16) return false;
+    }
+    const keep = cfg.sliding_window - 1;
+    const drop = next.cache.step - keep;
+    var ops = Ops{ .s = assistant.s };
+    defer ops.deinit();
+    for (next.cache.entries) |*entry| {
+        const k = try ops.slice(entry.keys, 2, @intCast(drop), @intCast(next.cache.step));
+        const v = try ops.slice(entry.values, 2, @intCast(drop), @intCast(next.cache.step));
+        try mlx.check(mlx.mlx_array_set(&entry.keys, k));
+        try mlx.check(mlx.mlx_array_set(&entry.values, v));
+        entry.offset = keep;
+    }
+    next.cache.step = keep;
+    next.base_pos += drop;
+    return true;
+}
+
 fn evaluateContext(context: *draft.DflashCtx) !void {
     const arrays = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(arrays);
@@ -167,6 +196,7 @@ pub fn commitVerified(assistant: *const draft.DflashModel, context: *draft.Dflas
     if (verified.states[last].?.offset != verified.offset + accepted.count) return error.InvalidGlmDraftOffset;
     var next_context = try cloneContext(assistant, context);
     errdefer next_context.deinit();
+    const windowed = try cropCommitContext(assistant, &next_context);
     var ops = Ops{ .s = assistant.s };
     defer ops.deinit();
     var projected: [16]Arr = undefined;
@@ -183,6 +213,7 @@ pub fn commitVerified(assistant: *const draft.DflashModel, context: *draft.Dflas
     verified.states[last] = null;
     context.deinit();
     context.* = next_context;
+    if (windowed) commit_window_calls += 1;
     return accepted;
 }
 
@@ -809,4 +840,135 @@ test "GLM N2 horizon production head and selector component" {
     defer std.testing.allocator.free(json);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
     try std.testing.expectEqual(@as(usize, 0), logit_mismatches);
+}
+
+test "GLM assistant commit window actual A6 preserves KV and proposals" {
+    const dir = std.c.getenv("SUSHI_GLM_COMMIT_WINDOW_ASSISTANT") orelse return error.SkipZigTest;
+    const head_path = std.c.getenv("SUSHI_GLM_COMMIT_WINDOW_HEAD_SHARD") orelse return error.MissingGlmDiagnosticInput;
+    const output = std.c.getenv("SUSHI_GLM_COMMIT_WINDOW_OUT") orelse return error.MissingGlmDiagnosticOutput;
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    var assistant = try draft.loadDflashQuant(io, allocator, s, std.mem.span(dir), 0);
+    defer assistant.deinit();
+    var source = try draft.DflashCtx.init(allocator, &assistant, 37);
+    defer source.deinit();
+    source.cache.reserve_tokens = 33024;
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const key = try ops.slot();
+    try mlx.check(mlx.mlx_random_key(key, 0x53132));
+    for (0..5) |li| {
+        const k = try ops.slot();
+        const v = try ops.slot();
+        for ([_]*Arr{ k, v }) |a| try mlx.check(mlx.mlx_random_normal(a, &[_]c_int{ 1, 8, 32768, 128 }, 4, .bfloat16, 0, 1, key.*, s));
+        _ = try source.cache.update(@intCast(li), k.*, v.*, s, 0);
+    }
+    try evaluateContext(&source);
+    const CacheHash = struct {
+        fn run(ctx: *const draft.DflashCtx) ![32]u8 {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            for (ctx.cache.entries) |entry| for ([_]Arr{ entry.keys, entry.values }) |a| {
+                const data = mlx.mlx_array_data_bfloat16(a) orelse return error.MlxArrayDataNull;
+                hash.update(std.mem.sliceAsBytes(data[0..mlx.mlx_array_size(a)]));
+            };
+            return hash.finalResult();
+        }
+    };
+    const source_hash = try CacheHash.run(&source);
+    var captures: [5]Arr = undefined;
+    for (&captures) |*capture| {
+        const a = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(a, &[_]c_int{ 1, 3, 4096 }, 3, .bfloat16, 0, 1, key.*, s));
+        capture.* = a.*;
+        try mlx.check(mlx.mlx_array_eval(a.*));
+    }
+    var full = try cloneContext(&assistant, &source);
+    defer full.deinit();
+    try draft.appendContext(&assistant, &full, &captures, source.absLen());
+    try evaluateContext(&full);
+    var windowed = try cloneContext(&assistant, &source);
+    defer windowed.deinit();
+    try std.testing.expect(try cropCommitContext(&assistant, &windowed));
+    try std.testing.expectEqual(source.absLen(), windowed.absLen());
+    try std.testing.expectEqual(@as(usize, 37 + 32768 - 2047), windowed.base_pos);
+    try draft.appendContext(&assistant, &windowed, &captures, source.absLen());
+    try evaluateContext(&windowed);
+    try std.testing.expectEqual(full.absLen(), windowed.absLen());
+    try std.testing.expectEqual(@as(usize, 32768 + 3), full.cache.step);
+    try std.testing.expectEqual(@as(usize, 2050), windowed.cache.step);
+    var compared: usize = 0;
+    for (full.cache.entries, windowed.cache.entries) |old, new| for ([_][2]Arr{ .{ old.keys, new.keys }, .{ old.values, new.values } }) |pair| {
+        const expected = try ops.contiguous(try ops.slice(pair[0], 2, 32768 - 2047, 32768 + 3));
+        const actual = try ops.contiguous(try ops.slice(pair[1], 2, 0, 2050));
+        try mlx.check(mlx.mlx_array_eval(expected));
+        try mlx.check(mlx.mlx_array_eval(actual));
+        const n = mlx.mlx_array_size(expected);
+        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..n], mlx.mlx_array_data_bfloat16(actual).?[0..n]);
+        compared += n;
+    };
+    const noise = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(noise, &[_]c_int{ 1, 8, 4096 }, 3, .bfloat16, 0, 1, key.*, s));
+    const hidden_full = try ops.own(try draft.forwardBlock(&assistant, &full, noise.*, full.absLen()));
+    const hidden_window = try ops.own(try draft.forwardBlock(&assistant, &windowed, noise.*, windowed.absLen()));
+    try mlx.check(mlx.mlx_array_eval(hidden_full));
+    try mlx.check(mlx.mlx_array_eval(hidden_window));
+    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(hidden_full).?[0 .. 8 * 4096], mlx.mlx_array_data_bfloat16(hidden_window).?[0 .. 8 * 4096]);
+    var arrays = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(arrays);
+    var metadata = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(metadata);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, head_path, cpu));
+    var head_arrays: [3]Arr = undefined;
+    for ([_][*:0]const u8{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }, 0..) |name, i| {
+        const a = try ops.slot();
+        try mlx.check(mlx.mlx_map_string_to_array_get(a, arrays, name));
+        head_arrays[i] = a.*;
+    }
+    const head = @import("glm5_model.zig").Linear{ .w = head_arrays[0], .scales = head_arrays[1], .biases = head_arrays[2], .input = 4096, .output = mlx.getShape(head_arrays[0])[0] };
+    var logits: [2]Arr = undefined;
+    var lattices: [2]tree.Lattice = undefined;
+    for ([_]Arr{ hidden_full, hidden_window }, 0..) |hidden, arm| {
+        logits[arm] = try ops.own(try draft.applyLogitTransforms(try head.apply(&ops, try ops.slice(hidden, 1, 1, 3)), assistant.config.output_multiplier, assistant.config.logit_softcap, s));
+        lattices[arm] = try tree.lattice(allocator, &assistant.selector.?, 16, try ops.slice(hidden, 1, 0, 3), logits[arm], 1, s);
+    }
+    defer for (&lattices) |*lat| lat.deinit(allocator);
+    const logit_count = mlx.mlx_array_size(logits[0]);
+    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(logits[0]).?[0..logit_count], mlx.mlx_array_data_bfloat16(logits[1]).?[0..logit_count]);
+    try std.testing.expectEqualSlices(i32, lattices[0].cands, lattices[1].cands);
+    try std.testing.expectEqualSlices(f32, lattices[0].unary, lattices[1].unary);
+    try std.testing.expectEqualSlices(f32, lattices[0].e0, lattices[1].e0);
+    try std.testing.expectEqualSlices(f32, lattices[0].e, lattices[1].e);
+    for ([_]usize{ 1, 2, 4 }) |children| {
+        var before = try tree.bestFirstTree(allocator, &lattices[0], .{ .max_nodes = 2, .children = children });
+        defer before.deinit(allocator);
+        var after = try tree.bestFirstTree(allocator, &lattices[1], .{ .max_nodes = 2, .children = children });
+        defer after.deinit(allocator);
+        try std.testing.expectEqualSlices(u32, before.tokens, after.tokens);
+        try std.testing.expectEqualSlices(i32, before.parents, after.parents);
+        try std.testing.expectEqualSlices(u32, before.depth, after.depth);
+    }
+    var original_ns: [4]u64 = undefined;
+    var window_ns: [4]u64 = undefined;
+    for (0..6) |iteration| for (0..2) |arm| {
+        const crop = (iteration + arm) % 2 == 1;
+        const watch = @import("io_util.zig").Stopwatch.init(std.testing.io);
+        var work = try cloneContext(&assistant, &source);
+        defer work.deinit();
+        if (crop) try std.testing.expect(try cropCommitContext(&assistant, &work));
+        try draft.appendContext(&assistant, &work, &captures, source.absLen());
+        try evaluateContext(&work);
+        const ns = watch.read();
+        if (iteration >= 2) {
+            if (crop) window_ns[iteration - 2] = ns else original_ns[iteration - 2] = ns;
+        }
+    };
+    try std.testing.expectEqualSlices(u8, &source_hash, &(try CacheHash.run(&source)));
+    try std.testing.expectEqual(@as(usize, 32768), source.cache.step);
+    try std.testing.expectEqual(@as(usize, 37), source.base_pos);
+    const json = try std.json.Stringify.valueAlloc(allocator, .{ .input = "actual A6 assistant/head, fixedseed BF16 KV32768 +three accepted capture rows +full8 block, base37", .source_hash_unchanged = true, .retained_and_appended_kv_bits_equal = compared, .absolute_length = windowed.absLen(), .window_base = windowed.base_pos, .window_rows = windowed.cache.step, .replacement_capacity = mlx.getShape(windowed.cache.entries[0].keys)[2], .full8_hidden_bits_equal = 8 * 4096, .first_two_readout_bits_equal = logit_count, .lattice_scores_equal = true, .n2_trees_equal = true, .timing = "clone+optionalcrop+acceptedfeatureprojection+KVappend+eval; four alternating pairs after two warmups; ns", .full_ns = original_ns, .window_ns = window_ns }, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
 }
