@@ -434,3 +434,34 @@ independent accumulations and avoid relying on dynamic private-array indexing.
 The private `glm53-kda-value-rows-20261003` artifact retains the exact source,
 build recipe and binary hashes; production dispatch and comparison binaries remain
 unchanged. GPU qualification waits for teacher capture to release the device.
+
+
+## CPU-only A6 unpack inspection
+
+An isolated Metal 3.2 probe compiled with Apple metal 32023.921, `-O3 -S
+-emit-llvm`, compares the existing byte spelling, an explicitly unrolled byte
+control, and six aligned U32 reads for the same 32 six-bit coefficients. Each
+arm uses the same scalar scale/bias arithmetic and BF16 store boundary. The
+word spelling uses six scalar reads rather than a padded three-component vector;
+it consumes exactly 24 bytes and requires only four-byte alignment. The audited
+64-by-64 weight-loader geometry supplies that alignment.
+
+| Isolated arm | AIR weight loads | Unpack structure | Bytes per thread |
+|---|---|---|---:|
+| Byte spelling | Three i8 loads in an eight-iteration loop | Loop | 24 |
+| Unrolled byte control | 24 i8 loads | Straight-line | 24 |
+| Word spelling | Six i32 loads | Straight-line | 24 |
+
+The common scale/bias reads are excluded from the table. The unrolled control
+separates changing load width from removing a loop. Integer reconstruction matched
+10,000 deterministic random 24-byte inputs (320,000 coefficients), including
+word-crossing positions. No tensor values or weights were modified.
+
+This is AIR, **not final GPU instructions or memory transactions**. The GPU backend
+may still combine byte loads; the complete NAX kernel also has different register
+pressure from this probe. Therefore neither fewer device transactions nor a speed
+gain is established. It justifies an isolated full-QMM parity/timing experiment
+after the teacher releases the GPU, with both byte controls retained. No runtime
+patch or production dispatch change has been made. The private artifact
+`glm53-a6-unpack-audit-20261003` retains source, AIR, counts, compiler identity and
+hashes; all work in this investigation was CPU-only.
