@@ -516,3 +516,64 @@ fixture probe assert that unsupported calls leave this counter unchanged.
 The chain's arrays and bounds are the original chain's, so no new transient
 buffer or resident weight bill is required. This source integration still
 requires the combined full-model qualification; the option remains off.
+
+### Near-full grid extension component
+
+An isolated extension from `19ab4f9b` admitted only B1/T1536–2048 at the same
+H4096/I2048/E288/top-eight/n36/MCG/W12/WIN32/clamp-ten geometry. It derives
+S=8*T throughout output config, reshape, preparation, metadata/inverse, middle,
+finish and result shapes, without padding. The cache retains exactly two
+projection geometries; changing S rebuilds that geometry's config. The MLX-C
+apply copies the config, so previously constructed lazy graphs retain their own
+shapes/grids after the old config is freed.
+
+The existing actual T2048 L20 fixture was sliced in lockstep to T2037 and T1536.
+Both candidate graphs were constructed before evaluating either, replacing both
+cached configs while the first graph remained lazy. All 14635008 final BF16
+values matched the native chains; output shapes were exact, T2037 window
+capacity was 798, and T1535/T2049 declined without changing the counter.
+Five focused tests passed. This is a sliced fixture proof, not a cold 2037 model
+capture or a whole-model result.
+
+Three warmup pairs and eleven alternating pairs timed fresh complete T2037
+chains, including sort, metadata/inverse, preparation, three GEMMs, middle,
+finish, allocation, endpoint evaluation and frees. Native measured 19.836458 ms
+versus 17.933583 ms transposed, a 9.593% median reduction with 11/11 paired wins;
+the paired median reduction was 9.470%. No other row count received tuning.
+
+The ReleaseFast run used foreground `taskpolicy -a`, exclusive lock
+`glm-nearfull-grid`, verified maximum fans near 5343/5772 RPM, 50.38°C initial
+temperature and ten seconds quiet idle after the external benchmark released
+its FIFO lock. Measurement key `glm53-nearfull-grid-20261003` retains source,
+commands, source/fixture hashes and raw samples. Binary SHA-256:
+`fe49e4f03e7bcc2f9d64069e416c2fc484c5a7996cbff97de52734ab2a050f2e`.
+The subsequent actual 2037 model gate used the first 2037 IDs from the original
+2048-ID fixture, one loaded target, async2 prefill and profiling off. A6
+expansion was scoped off in all measured arms. Both control/candidate reference
+requests and logits were prepared before all timed arms and remained held;
+active-start memory was 93880747768 bytes and peak 95570294220 bytes in every arm.
+Grid engagement was 0/42/42/0, with zero A6 calls. Final logits and all valid
+cache/state bytes matched. One 64-token continuation from those two reference
+snapshots, after ABBA and outside timing, also matched every full logit array
+and final state at offset 2101.
+
+| Actual 2037 prefill arm | Seconds |
+|---|---:|
+| Control A1 | 1.819391 |
+| Candidate B1 | 1.927313 |
+| Candidate B2 | 1.832245 |
+| Control A2 | 1.894118 |
+
+Control mean was 1.856754 s (1097.08 tok/s), candidate 1.879779 s (1083.64 tok/s):
+**1.24% slower**, with overlapping/drifting samples. The sliced component win
+therefore did not transfer to a repeatable actual-model gain. The extension,
+probe changes and private evaluator/root were archived; only the documentation
+lesson remains. No alternate range, rerun, implementation commit or push was
+warranted. The accepted T2048 helper remains unchanged.
+
+The real-model run used ReleaseFast, interactive QoS, exclusive lock
+`glm-nearfull-grid-model`, confirmed maximum fans 5353/5786 RPM, 47.95°C initial
+temperature and ten seconds quiet idle. The same private measurement key retains
+ABBA samples, both-reference ownership, exact-state/continuation evidence and
+source/binary stamps. Real-model binary SHA-256:
+`7064f4f411a89b247ce125aae8c1d8dbb02aa82076b6ad9248d2a377e4223f47`.
