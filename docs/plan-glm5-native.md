@@ -27,9 +27,10 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
  24rounds/40 accepted drafts/72 verification rows are unchanged. Decode-only peak94.979 GB.
   This clears45 in one run; repeats and broader prompts/contexts remain open. See
   [grouped expert results](plan-glm5-dflash-expert-reuse.md) and [scheduling](glm5-dflash-scheduling.md).
-- Active quality study: four raw prompts (two code,two prose),512 BF16 teacher-generated
-  continuation rows each, lossless streamed source and100 GiB SSD/RAM budget. Both A6/A8
-  trunk packs will use the same teacher IDs/logits, BF16 cache and FP32 KDA state. Results pending.
+- Completed reduced quality screen: the user stopped the teacher at one code prompt,
+  512 BF16 continuation rows. A6/A8 trunk KL was0.09292886/0.09544605 against the same
+  teacher IDs/logits, BF16 cache and FP32 KDA state. This is code-only coverage; see
+  [the KLD report](glm5-kld.md). Further capture waits for improved native streaming.
 - Remaining: optimize toward at least 1,500 tok/s prefill and 60 tok/s speculative decode
   using DFlash2; broader model quality coverage;
   broader long-context coverage; production loader/lifecycle/server integration. The sections below
