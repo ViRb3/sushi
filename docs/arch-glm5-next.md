@@ -51,9 +51,18 @@ Subsequent diagnostics produce coherent English. The A6-trunk `Sushi-2.3bpw` tar
 K2.25/W12 experts and runs with the selected A6g128 DFlash2 assistant. Native prefill measured
 888.97 tok/s at512 and1,159.73 at2K. The opt-in N2/async4/grouped-expert verifier reached45.45 tok/s
 on512/64 with unchanged serial token IDs and complete cache state; this is one measured run.
-Cache remains BF16 compressed MLA with FP32 KDA state. Four-prompt lossless BF16 KLD capture
-and both target comparisons are in progress. See the [current execution plan](plan-glm5-native.md)
+Cache remains BF16 compressed MLA with FP32 KDA state. Lossless BF16 teacher capture
+and both target comparisons remain pending after the slow capture was stopped. See the [current execution plan](plan-glm5-native.md)
 for workload distinctions and remaining validation.
+
+The later accepted prefill stack measured 931.71/802.82/727.81/655.06 tok/s
+on predictable HTTP 2K/4K/8K/16K workloads. Optional native B1/B3 attention
+subsequently measured 46.04/46.19/46.57/44.20 tok/s decode on those rungs;
+its separate 32K predictable run measured 608.77 prefill and 43.00 decode.
+These workload-specific measurements remain below the 1500/60 goals. A4/group64
+assistant consumption is supported, but A6 stays default because matched total
+decode gains were within control drift. See the linked benchmark and assistant
+documents for exact input lengths, parity scope and comparison limits.
 
 ## Source layout
 
@@ -133,7 +142,7 @@ record the audited foundation; new complete-forward behavior needs its own revie
   60 tok/s speculative decode using DFlash2; these are goals, not measured results.
 - Compare full MLA/reference layer outputs and logits: absorbed latent attention and expanded dense
   attention have different BF16 rounding boundaries even when their projection algebra agrees.
-- Measure KLD against a lossless BF16 teacher and validate 4K/16K contexts before 64K. The identity-prior
+- Measure KLD against a lossless BF16 teacher and qualify selected changes through 32K. The identity-prior
   quantized checkpoint has no accepted full-model quality result yet.
 - Replace diagnostic per-layer synchronous evaluation only after proving bounded memory and state
   equivalence. Profile KDA, attention, routing and projection dispatch before choosing optimizations.
