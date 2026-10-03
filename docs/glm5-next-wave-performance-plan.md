@@ -187,8 +187,8 @@ requires a separate qualification and is outside this first candidate.
 five retained BF16 column GEMV projections, separately projecting the same input
 through FA128, GA128 and beta64. Prefill already owns an evaluated
 `[320,4096]` joined BF16 bank per KDA layer. Slice its first 256 channels for
-T3 verification using `weight[256,4096] @ input[3,4096,1]`, compact the two
-128-channel results, and retain beta, FB and GB on their current paths. This
+T3 verification using `weight[256,4096] @ input[3,4096,1]`, keep two
+128-channel views, and retain beta, FB and GB on their current paths. This
 changes three first-stage commands to two. It does not retry the rejected
 ordinary T3 NAX chain.
 
@@ -206,7 +206,9 @@ probe. Coordinator owns the narrow `src/glm5_dflash_kda.zig` delegation. Reuse
 Do not modify the existing T2048 helper or general `linearRows` behavior.
 
 **Geometry and memory:** B1/T3/K4096, BF16 input and retained joined weights,
-FP32 reduction; compact outputs `[1,3,128]` each. Existing 85 MiB model bank
+FP32 reduction; outputs `[1,3,128]` each have last stride one and batch
+row stride256. FB/GB consume these via the existing column-GEMV reshape,
+whose native vector batch stride preserves row selection. Existing 85 MiB model bank
 suffices. Added joined output is 1536 bytes per pending layer, 6144 bytes at
 async4, plus existing output planes. Require bank availability, shape and compact
 strides; fall back when the prefill bank was not prepared. No per-round bank
@@ -215,14 +217,15 @@ preparation, weight conversion, padding or custom shader is needed.
 **Expected ceiling:** prior five-chain column batching saved approximately
 52 microseconds versus serial at T3; further clustering is unmeasured. One saved
 command per KDA layer is a modest opportunity, perhaps at most 1–2 ms per
-verifier round. Stop if output compaction erases the inclusive gain. Lowrank/beta
+verifier round. Automatic reshape/copy costs belong in the inclusive result. Lowrank/beta
 and gate/post profile fields contain unrelated work and forced waits; their
 approximately 12 ms per round sum is not this candidate's available saving.
 
 **One focused proof and performance test:** use actual layer-zero retained
 FA/GA/beta/FB/GB banks and a fixed nonzero normalized T3 BF16 input. Control is
 the current five-column-GEMV chain. Compare every first-stage and downstream
-output bit. Include both compact copies, beta, FB/GB, fresh graph construction,
+output bit; materialize the strided views only for the comparison outside
+timing. Include any native reshape/copy work, beta, FB/GB, fresh graph construction,
 endpoint evaluation and frees in 11 AB/BA pairs after three warmups. Check
 one unsupported-input fallback and bank borrowing after the producing Ops scope
 ends. Integrate only on a consistent inclusive win, then use the existing short
@@ -238,7 +241,8 @@ DFlash output/full-state gate. No follow-up variant sweep for a losing arm.
    synchronization and cannot be called a throughput result.
 3. Calibrate exact inputs through the tokenizer/template. HTTP rungs cross the
    2048-row dispatch threshold: predictable 2K has 2036 IDs and zero cluster
-   calls; ordinary 2K has 2072 IDs and 34 cluster calls. Do not infer a cluster
+   calls; ordinary 2K has 2072 IDs and 34 cluster calls. The exact-T2048
+   A6 dense-prefill guard also falls back at 2036 rows. Do not infer a cluster
    benefit by comparing those different workloads. Keep ordinary and predictable
    context rows separate, and report accepted drafts/tokens per step alongside
    rates. The ordinary 32K case has KDA misses; the predictable case has none.
@@ -266,3 +270,18 @@ because its profile marker is large: its forced-evaluation tax and existing R4
 qualification make that an unsupported priority. No precision restoration,
 embedding offload, speculative precision reduction, new cache transaction API,
 or broad parameter search belongs in this wave.
+
+## Focused wave outcomes
+
+- Routed partner map: every output bit matched, but 590.385→589.416 µs
+  inclusive medians (−0.16%), 5/11 wins and paired median 0.15% slower did not
+  establish a gain. The prototype was archived; no production hook landed.
+- Retained view-only N256 FA/GA clustering: all 50,112 first-stage/downstream
+  BF16 values matched, including safe strided-view consumption and lifetime.
+  Current five-chain median 256.562 µs versus 266.072 µs candidate (+3.71%),
+  only 5/11 paired wins. Rejected and archived; no additional variant or
+  full-model run. See [the retained-row lesson](glm5-dflash-dense-rows.md).
+- Sparse cadence remains the only candidate with an inclusive measured win:
+  the 8K component preserved every bit and won 11/11 pairs, approximately
+  18.6% faster. Long-prefix NAX-selector cadence still requires its 16K guard
+  before integration; this is not an HTTP throughput claim.

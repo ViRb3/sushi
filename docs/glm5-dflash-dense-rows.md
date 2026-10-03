@@ -90,3 +90,34 @@ The run used foreground `taskpolicy -a`, exclusive GPU lock, maximum fans and
 ten seconds idle below90°C; no compiler or other GPU job overlapped. The fixed
 binary and exact settings are preserved in private artifact
 `glm53-dense-mini-20261003`. The complete checkpoint ReleaseFast suite also passed.
+
+## Rejected exact FA/GA column-GEMV clustering
+
+A focused component at `21578aba` reused the existing prepared `[320,4096]`
+BF16 prefill bank for T3 verification. Its first 256 channels combined FA and
+GA in one column GEMV; beta, FB and GB retained their current path. N256 still
+meets native `K >= 16*N` at K4096, preserving the original BM1/BN8/SM1/SN32/
+TM4/TN4 reduction. N320 fails that predicate and was not tested. The candidate
+passed strided FA/GA views directly to FB/GB, with vector batch stride256 and
+last stride1, including any native reshape/copy costs in timing.
+
+All 50,112 first-stage and downstream BF16 values matched the current
+five-column-GEMV chain on actual layer-zero retained banks and one fixed-seed
+normalized BF16 T3 input. The strided comparisons were compacted only outside
+timing. A separate behavioral fixture checked different FA/GA contents, retained
+outputs after the producing Ops scope ended, strides and unsupported fallback.
+The test first failed on an unavailable candidate, then passed after the helper
+was added; all three focused tests passed in the production-bank run.
+
+The inclusive five-projection median was 256.562 µs for the current chain and
+266.072 µs for clustering, 3.71% slower with only 5/11 paired wins. Three warmup
+pairs preceded eleven alternating AB/BA pairs, each averaging eight fresh
+chains with endpoint evaluation and frees. Single process, ReleaseFast, MLX
+0.32.3, foreground QoS, exclusive GPU lock, maximum fans requested and ten
+seconds idle were recorded. No full model was loaded. The isolated helper,
+probe/root, binary, bank/input settings and raw samples are archived under
+measurement key `glm53-retained-fa-ga-cluster-20261003`.
+
+Exact arithmetic and one fewer projection command did not yield a consistent
+inclusive gain. This arm is rejected; no copy variant, runtime hook, new default
+or full-model repetition was warranted.
