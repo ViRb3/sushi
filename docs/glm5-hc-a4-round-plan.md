@@ -52,3 +52,29 @@ A4 evidence stays consumer-only, with no unmeasured whole-engine memory claim.
 Keep A6 default, BF16 compressed MLA, FP32 KDA state/accumulators, original small
 tensors and resident embeddings. No precision restoration or64K/128K.
 Goals1500 prefill/60 decode remain active and unmet.
+
+
+## Recorded round outcomes
+
+- **SIMD32 HC collapse:** exact eight-block component, 27.6367% median reduction
+  and 11/11 wins. The one matched current-stack 8K/192 model gate preserved all
+  IDs and valid state, with 7200 candidate calls per enabled arm and a 2.6475%
+  clone/decode/cleanup reduction versus 1.9891% control drift. The optional default-off consumer feature retains
+  original outputs/declared shared arrays and adds no runtime tensor plane. The full ReleaseFast suite, quiet-output
+  guard and CLI build passed; HTTP qualification remains pending; this is not a new 2K–32K rate table.
+  [Component proof](glm5-hc-collapse-simd32-component.md) and
+  [model proof](glm5-hc-collapse-model-result.md).
+- **Four-output HC expansion:** exact complete-L0 component won 0.4328% and
+  11/11 pairs, but the 16K model ABBA was 0.3361% slower amid 1.8959% control
+  drift. Rejected; helper/private harnesses removed and expansion delegation
+  restored. [Complete result](glm5-hc-expand-prefill-result.md).
+- **A4 current-native comparison:** every target ID/valid state matched at the
+  fixed ordinary/predictable inputs of 8756/8720 IDs. Ordinary total decode was
+  slightly slower; predictable gain was below control drift. Replacement gate
+  failed, with no broader ladder or default change. A6 remains default; A4 remains
+  an optional consumer format. [Consumer result](glm5-a4-current-native-result.md).
+
+HTTP mode metadata now names `hc_collapse_simd32` and its actual
+`hc_collapse_simd32_calls` counter for forthcoming qualification. These model
+and component clocks have distinct scopes; none establishes the 1500/60 goals,
+new admission limits, or an unmeasured context result.

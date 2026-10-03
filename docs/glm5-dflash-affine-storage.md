@@ -114,3 +114,22 @@ assistants: loaded active memory was 95.323 GB, equal starting active memory was
 95.924 GB ordinary and 95.922 GB predictable, and measured peaks were
 96.344–96.482 GB. A6 and A4 arms had essentially the same peak because both
 weight sets were resident. No separate per-assistant resident delta was measured.
+
+
+## Current-native nominal 8K gate
+
+The [current-native matched result](glm5-a4-current-native-result.md) closes the
+short-input/native-off evidence gap with frozen 8756 ordinary and 8720 predictable
+IDs, native B1/B3 and packed32 on, both assistants resident and one shared target
+prefix per prompt. All eight 192-output arms matched serial target IDs and every
+valid final state at actual 191/192 committed inputs.
+
+A6/A4 delivery rates were 47.3790/47.2572 tok/s ordinary and 49.0335/49.8204
+predictable. Ordinary latency regressed 0.2577%; predictable improved 1.5795%,
+below 4.2007% A6 control drift. Both fail the frozen per-prompt criterion.
+A4 drafting remained faster, but this does not establish replacement performance.
+A6g128 remains the default; A4g64 remains optional, with no ladder/default switch.
+The result records all arm/phase/preparation/cleanup timings, engagement,
+equal-resident measured peaks and the unchanged 14,264,893,440-byte conservative
+bill under 115,448,725,504-byte limits. Evidence key:
+`glm53-a4-current-native-8k-20261003`.

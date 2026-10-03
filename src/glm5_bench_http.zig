@@ -574,6 +574,7 @@ const Runtime = struct {
         prefill_cadence: bool,
         prefill_grid_transpose: bool,
         decode_native_batch: bool,
+        hc_collapse_simd32: bool,
         kda_value_rows: usize,
         benchmark_ignore_eos_enabled: bool,
     } {
@@ -607,6 +608,7 @@ const Runtime = struct {
             .prefill_cadence = @import("glm5_attention.zig").packedCadenceEnabled(),
             .prefill_grid_transpose = diag.diagEnvOn("SUSHI_GLM_PREFILL_GRID_TRANSPOSE"),
             .decode_native_batch = @import("glm5_attention_decode_batch.zig").enabled(),
+            .hc_collapse_simd32 = @import("glm5_hc_collapse_simd32.zig").enabled(),
             .kda_value_rows = (@import("glm5_kda_value_rows.zig").configuredRows() catch null) orelse 0,
             .benchmark_ignore_eos_enabled = self.options.allow_ignore_eos,
         };
@@ -704,6 +706,7 @@ const Runtime = struct {
         @import("glm5_attention_nax_packed.zig").resetDispatchCount();
         @import("glm5_attention.zig").resetPackedCadenceCalls();
         @import("glm5_attention_decode_batch.zig").resetCalls();
+        @import("glm5_hc_collapse_simd32.zig").resetDispatchCount();
         @import("sushi_exl3").glm_prefill_grid.resetDispatchCount();
         @import("glm5_indexpool_nax.zig").resetDispatchCount();
         @import("glm5_mla_verify_batch.zig").resetDispatchCount();
@@ -791,7 +794,7 @@ const Runtime = struct {
         const finish = if (stopped) "stop" else "length";
         const counts = usage(ids.len, emit.ids.items.len);
         const stats = .{ .prompt_n = ids.len, .prompt_ms = @as(f64, @floatFromInt(prefill_ns)) / 1e6, .predicted_n = emit.ids.items.len, .predicted_ms = @as(f64, @floatFromInt(decode_ns)) / 1e6 };
-        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .packed32_attention_calls = @import("glm5_attention_nax_packed.zig").wideDispatchCount(), .packed_cadence_calls = @import("glm5_attention.zig").packedCadenceCalls(), .prefill_grid_calls = @import("sushi_exl3").glm_prefill_grid.dispatchCount(), .decode_native_b1_calls = @import("glm5_attention_decode_batch.zig").b1Calls(), .decode_native_b3_calls = @import("glm5_attention_decode_batch.zig").b3Calls(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .a6_dense_prefill_calls = @import("glm5_a6_dense_once.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .assistant_commit_window_calls = adapter.commitWindowCalls() - commit_window_before, .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
+        const diagnostic = .{ .hc_collapse_simd32_calls = @import("glm5_hc_collapse_simd32.zig").dispatchCount(), .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .packed32_attention_calls = @import("glm5_attention_nax_packed.zig").wideDispatchCount(), .packed_cadence_calls = @import("glm5_attention.zig").packedCadenceCalls(), .prefill_grid_calls = @import("sushi_exl3").glm_prefill_grid.dispatchCount(), .decode_native_b1_calls = @import("glm5_attention_decode_batch.zig").b1Calls(), .decode_native_b3_calls = @import("glm5_attention_decode_batch.zig").b3Calls(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .a6_dense_prefill_calls = @import("glm5_a6_dense_once.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .assistant_commit_window_calls = adapter.commitWindowCalls() - commit_window_before, .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
         if (completion.stream) {
             const last = try frameJson(a, id, self.name, emit.created, null, finish, false);
             defer a.free(last);

@@ -15,6 +15,9 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [singleton and KDA endpoint round](glm5-singleton-endpoint-round-plan.md),
 [temporal KDA and grouped fusion round](glm5-temporal-grouped-fusion-round-plan.md),
 [packed B32 prefill qualification](glm5-packed32-result.md),
+[exact SIMD32 HC collapse](glm5-hc-collapse-simd32-component.md),
+[HC collapse model gate](glm5-hc-collapse-model-result.md),
+[HC and current-native A4 round outcomes](glm5-hc-a4-round-plan.md),
 [current decode system trace](glm5-current-gpu-profile-result.md),
 [bounded draft readouts](glm5-dflash-readout-horizon.md),
 [verification latent overlays](glm5-dflash-latent-overlay.md),
@@ -66,6 +69,27 @@ These workload-specific measurements remain below the 1500/60 goals. A4/group64
 assistant consumption is supported, but A6 stays default because matched total
 decode gains were within control drift. See the linked benchmark and assistant
 documents for exact input lengths, parity scope and comparison limits.
+
+A new default-off `SUSHI_GLM_HC_COLLAPSE_SIMD32=1` option preserves exact
+T3 HC coefficient preparation at the qualified B1/four-stream/4096-width,
+20-iteration geometry. Its BF16 mixed and FP32 coefficient outputs and declared shared
+arrays retain their original sizes; it adds no runtime tensor plane. The fixed eight-
+block component passed exact downstream proofs and all eleven paired wins.
+The matched current-stack 8K/192 model gate preserved every ID and valid state
+and reduced clone/decode/cleanup latency 2.6475%, versus 1.9891% control drift,
+with 7200 engaged calls per enabled arm. This is one model qualification; the full ReleaseFast suite, quiet-output guard and CLI build passed; HTTP qualification
+is still pending. Metadata exposes `hc_collapse_simd32` and
+`hc_collapse_simd32_calls` for that work. No 2K–32K rate or admission guarantee
+is inferred. See [component evidence](glm5-hc-collapse-simd32-component.md),
+[model evidence](glm5-hc-collapse-model-result.md) and
+[round outcomes](glm5-hc-a4-round-plan.md).
+
+The separate four-output HC prefill expansion was rejected after its exact
+16K model gate established no speed gain. The matched current-native A4 test
+also failed its replacement-performance rule; A4 remains optional and A6 remains
+default. The 1500 prefill/60 DFlash2 decode goals remain unmet. See
+[expansion rejection](glm5-hc-expand-prefill-result.md) and
+[A4 consumer result](glm5-a4-current-native-result.md).
 
 ## Source layout
 

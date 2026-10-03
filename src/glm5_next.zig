@@ -109,6 +109,10 @@ pub fn hcCollapse(x: mlx.mlx_array, mixes: mlx.mlx_array, scale: mlx.mlx_array, 
     const rows = try std.math.mul(c_int, sh[0], sh[1]);
     if (mlx.mlx_array_size(mixes) != @as(usize, @intCast(rows)) * 24 or mlx.mlx_array_size(scale) != 3 or mlx.mlx_array_size(base) != 24) return error.InvalidHcShape;
     if ((dtype != .float32 and dtype != .bfloat16) or mlx.mlx_array_dtype(mixes) != .float32 or mlx.mlx_array_dtype(scale) != .float32 or mlx.mlx_array_dtype(base) != .float32) return error.InvalidHcDtype;
+    const cooperative = @import("glm5_hc_collapse_simd32.zig");
+    if (cooperative.enabled()) {
+        if (try cooperative.collapse(x, mixes, scale, base, iters, epsilon, s)) |out| return out;
+    }
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ sh[0], sh[1], sh[3] }, 3, dtype));
