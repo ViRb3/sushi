@@ -61,7 +61,8 @@ Goals1500 prefill/60 decode remain active and unmet.
   IDs and valid state, with 7200 candidate calls per enabled arm and a 2.6475%
   clone/decode/cleanup reduction versus 1.9891% control drift. The optional default-off consumer feature retains
   original outputs/declared shared arrays and adds no runtime tensor plane. The full ReleaseFast suite, quiet-output
-  guard and CLI build passed; HTTP qualification remains pending; this is not a new 2K–32K rate table.
+  guard and CLI build passed; [HTTP qualification](glm5-hc-collapse-http-result.md)
+  completed all ten 2K–32K cells, with separate-boot/input comparison caveats.
   [Component proof](glm5-hc-collapse-simd32-component.md) and
   [model proof](glm5-hc-collapse-model-result.md).
 - **Four-output HC expansion:** exact complete-L0 component won 0.4328% and
@@ -75,6 +76,6 @@ Goals1500 prefill/60 decode remain active and unmet.
   an optional consumer format. [Consumer result](glm5-a4-current-native-result.md).
 
 HTTP mode metadata now names `hc_collapse_simd32` and its actual
-`hc_collapse_simd32_calls` counter for forthcoming qualification. These model
+`hc_collapse_simd32_calls` counter for completed qualification. These model
 and component clocks have distinct scopes; none establishes the 1500/60 goals,
 new admission limits, or an unmeasured context result.

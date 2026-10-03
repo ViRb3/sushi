@@ -483,3 +483,37 @@ verified before and after both jobs. Later source WIP does not describe this
 binary. Both clients exited 0; own servers stopped, GPU locks released and fans
 restored to auto. Foreground QoS, maximum-fan confirmation and required idle
 were used. No baseline rerun, 64K or 128K rung was run.
+
+
+### Optional SIMD32 HC collapse
+
+`SUSHI_GLM_HC_COLLAPSE_SIMD32=1` uses the exact small-row HC collapse helper
+on the accepted A6/native B1/B3/packed32 N2C4 stack. Metadata reports
+`settings.hc_collapse_simd32` and `sushi_diagnostic.hc_collapse_simd32_calls`.
+Rejected HC prefill expansion stayed off. Default settings remain unchanged.
+
+[Complete qualification](glm5-hc-collapse-http-result.md) records all ten
+ordinary/predictable 2K–32K cells, actual inputs, 192 output IDs each, helper/B32/
+native B3 counts, server timings and admission. Predictable decode measured
+51.24/49.72/50.50/49.02/47.80 tok/s; ordinary measured
+45.66/44.74/43.95/41.75/41.66. Selected 32K used 33543/33579 predictable/ordinary
+inputs, with 667.37/668.35 prefill tok/s. Decode uses 191 post-prefill outputs.
+
+The recorded `af51e72f` packed32 baseline was inherited, with no rerun.
+Inputs differ slightly and boots are separate; unchanged prefill movement is
+not assigned to HC collapse. All measured requests reported ignore-EOS false,
+despite server permission, and nevertheless emitted 192 IDs. Complete final
+diagnostics were captured passively with unchanged request/client transport;
+raw bodies remained unavailable. Post-job active memory was 94,548,862,200 bytes
+against 115,448,725,504-byte limits, and HTTP exposes no allocator peak. Source
+admission calculations and actual growth remain in the artifact; reserves and
+limits were unchanged.
+
+Runtime `4fcb541e` was accepted/pushed after exact model and focused/full suite
+gates. The qualification CLI was compiled at `99547a26` plus the identical
+runtime patch, hash `102cb8d5efcf279295ea059201eb0a88c3e7d85321a68dced625c0b4c6858ae3`;
+no postcommit rebuild is claimed. Pinned llmprobe 0.6.13 artifact keys are
+`glm53-hc-qualified-llmprobe-20261004` and `glm53-hc-qualified-32k-20261004`.
+Both jobs exited 0; servers stopped, locks released and fans restored auto.
+No baseline rerun or 64K/128K rung followed. Goals 1500 prefill/60 decode remain
+unmet; this accepted helper is an opt-in.

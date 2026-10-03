@@ -106,3 +106,8 @@ The ReleaseFast CLI build also passed. Frozen CLI SHA256 is
 built from checkpoint `99547a26` plus the recorded final runtime/test patch.
 The forthcoming HTTP run will identify its runtime commit and verify this hash
 before and after each job. No installed library or cache precision changed.
+
+[HTTP qualification](glm5-hc-collapse-http-result.md) subsequently completed all
+ten 2K–32K cells with 192 outputs each, current settings/counters and unchanged
+admission. Separate-boot/input differences remain explicit; the matched model
+clock above remains the acceptance evidence. Both jobs ended and cleaned up.

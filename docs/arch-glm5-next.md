@@ -77,10 +77,14 @@ arrays retain their original sizes; it adds no runtime tensor plane. The fixed e
 block component passed exact downstream proofs and all eleven paired wins.
 The matched current-stack 8K/192 model gate preserved every ID and valid state
 and reduced clone/decode/cleanup latency 2.6475%, versus 1.9891% control drift,
-with 7200 engaged calls per enabled arm. This is one model qualification; the full ReleaseFast suite, quiet-output guard and CLI build passed; HTTP qualification
-is still pending. Metadata exposes `hc_collapse_simd32` and
-`hc_collapse_simd32_calls` for that work. No 2K–32K rate or admission guarantee
-is inferred. See [component evidence](glm5-hc-collapse-simd32-component.md),
+with 7200 engaged calls per enabled arm. The full ReleaseFast suite, quiet-output
+guard and CLI build passed. [HTTP qualification](glm5-hc-collapse-http-result.md)
+completed 2K–32K with 192 outputs in all ten cells. Predictable decode was
+51.24/49.72/50.50/49.02/47.80 tok/s; ordinary was
+45.66/44.74/43.95/41.75/41.66. Those separate-boot/input comparisons do not isolate
+a kernel gain. Metadata exposes `hc_collapse_simd32` and
+`hc_collapse_simd32_calls`; the existing admission path and reserves remain.
+See [component evidence](glm5-hc-collapse-simd32-component.md),
 [model evidence](glm5-hc-collapse-model-result.md) and
 [round outcomes](glm5-hc-a4-round-plan.md).
 
