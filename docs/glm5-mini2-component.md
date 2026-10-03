@@ -1,7 +1,11 @@
 # Fixed mini2 proposal component
 
-The fixed complete-proposal component passed exactness and won all eleven pairs;
-actual model acceptance is pending. The null red stub failed at the intended check; the single frozen green body
+The candidate is **rejected after the [actual model gate](glm5-mini2-matched-model-result.md)**. Both frozen performance
+criteria failed: ordinary latency reduction 0.7621% was below 1.8003% control
+drift; predictable reduction 0.0990% was below 0.7309% drift. All 192 IDs and
+valid states remained exact; acceptance/round counts were unchanged. The complete
+component win below therefore does not establish a runtime speedup. No bit,
+group, shortlist variant or rerun follows. The null red stub failed at the intended check; the single frozen green body
 is now applied, passed its focused build/proof gate. No shared source/caller or
 public test-runner edit was made. The [round plan](glm5-route6-mini2-round-plan.md)
 fixes N2, horizon2, A3/gs64, shortlist32 and selector top16.
@@ -99,8 +103,8 @@ Final build PID 97554/run PID 97860 ended, lock released and fans automatic.
 Foreground QoS and confirmed maximum fans/quiet idle were recorded. Exact
 source/binary/library/activation hashes, cold JSON, complete proofs, all pairs,
 peak and telemetry remain private under `glm53-mini2-component-20261004`.
-No caller hook, target-model job, bit/group/shortlist variant or retest followed
-this component. Only a clear current-full2 model gate can support acceptance.
+No caller hook or target-model job was part of the numerical component. The
+later model gate below failed; no bit/group/shortlist variant or retest followed.
 
 After the numerical gate, a small scoped policy test and API were added without
 head-math changes: `Mode {full2, mini2}`, `bind/restore`, `currentMode` and
@@ -110,5 +114,19 @@ integration and the coarse object's lifetime. Both explicit modes bypass the
 legacy mini7 path: mini2 applies only to bounded N2/block8; partial N1 retains
 current full8 source readout/seven draft rows in both modes. There is no horizon1
 optimization. The same coarse object remains resident in full2 controls.
-These policy additions have separate hashes and await model validation; no
-caller or default change was made by this helper worker.
+These policy additions have separate hashes. Root restored the rejected caller
+seam to the accepted runtime; no default change was retained.
+
+
+## Actual model disposition
+
+The current HC_ON/A6/native full2/mini2 comparison preserved exact outputs and
+valid target state on both frozen prompts. Ordinary used 68 rounds/123 accepted
+drafts; predictable used 65 rounds/127. Candidate mini2 calls were 68/65 versus
+zero in controls; legacy mini calls were zero. Neither total latency reduction
+exceeded its A-control drift, despite the earlier 11/11 complete component win.
+Cold preparation and 277544960-byte auxiliary residency remain real costs; no
+memory credit, acceptance or default claim is retained. Model evidence key
+`glm53-mini2-matched-8k-20261004` retains all arm intervals, phases and admission.
+The corrected helper and private component probe were hash-archived and removed
+with byte verification. Only this result lesson and private evidence remain.

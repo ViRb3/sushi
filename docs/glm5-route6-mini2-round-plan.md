@@ -82,3 +82,19 @@ The [mini2 component](glm5-mini2-component.md) preserved selected source-head
 logits/masks/proposals and retained all12 real top1 plus192/192 top16 candidates.
 Complete proposal latency decreased26.13% in all eleven pairs. Only the fixed
 full-model full2/mini2 ABBA can decide runtime acceptance; it remains pending.
+
+## Round closed
+
+The [fixed mini2 model comparison](glm5-mini2-matched-model-result.md) preserved
+all192 serial IDs, valid final states and acceptance on both prompts, but its
+complete gains failed both declared performance criteria:0.7621% ordinary versus
+1.8003% control drift, and0.0990% predictable versus0.7309%. Faster drafting
+was insufficient for model acceptance. No HTTP ladder, shortlist variant or
+numeric rerun followed. The caller was restored and owned helper/probe/model
+files were hash-archived and removed.
+
+Neither candidate changes runtime `4fcb541e` or its completed2K–32K
+qualification. BF16 compressed MLA, FP32 KDA state, original small tensors and
+A6 default remain. All jobs ended, GPU locks released and fans automatic.
+Goals1500/60 remain active; the next round requires two new source-only reports
+and a bounded three-worker plan before implementation.
