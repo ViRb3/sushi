@@ -545,3 +545,49 @@ The private `glm53-a6-unpack-qualified-20261003` artifact retains exact source,
 vendor header, build command, parity/timing logs, raw samples, telemetry and
 provenance. Its gated filter is `GLM A6 unpack isolated timing`, enabled by
 `SUSHI_GLM_A6_UNPACK_BENCH_OUT` naming its JSON result file.
+
+### Eight-SIMD A6 tile: 128×64 with unchanged per-SIMD geometry
+
+The next isolated variant doubles BM64→128 and WM2→4 while retaining BN64,
+BK64 and WN2. Each SIMD still computes SM32/SN32 with the same accumulator,
+fragment and K order. The 256-thread group shares one decoded weight tile
+across four M SIMD groups instead of two. The explicit shared buffer remains
+9 KiB (`64*72*BF16`); this quantized body has no separate threadgroup input tile.
+`QuantizedBlockLoader.n_reads` falls from eight to four, so each thread decodes
+16 coefficients rather than 32. Thread count across the projection stays the
+same, while threadgroup count and logical weight-tile decodes halve. Register
+allocation, residency and actual memory transactions still require measurement.
+This differs from the earlier rejected BM128/BN32/WM4/WN1 aspect experiment.
+
+`glm5_a6_prefill.applyTall` admits only materialized contiguous A6/group128 BF16
+inputs at the actual 2048-row QKV/output shapes. The unchanged header compiled
+and every native BF16 output bit matched at both shapes. Timing rechecked exact
+output across four independent banks for native, the BM64 byte clone and the
+BM128 byte candidate. No word-unpack arm was stacked into this experiment.
+
+The exclusive run used lock owner `glm-a6-tall8-v61`, interactive QoS,
+maximum fans requested, 49.60°C initial temperature and ten seconds idle.
+Twelve warmups per arm preceded eleven alternating forward/reverse rounds,
+each with eight fresh apply/evaluate/free evaluations and four-bank rotation.
+Inputs were evaluated before timing; no model was loaded. The focused parity
+run had two passes including its temporary root and one timing skip; the
+subsequent timing run passed all three tests.
+
+| 2048-row projection | Native ms | Same-body BM64 ms | BM128/WM4 ms | vs same-body |
+|---|---:|---:|---:|---:|
+| QKV 4096→8192 | 2.867203 | 2.846067 | 2.716942 | −4.54% |
+| Output 8192→4096 | 2.891796 | 2.936109 | 2.809880 | −4.30% |
+
+The candidate won all eleven paired comparisons against the same-body control
+for each shape. Its advantages against the native library were 5.24% and 2.83%,
+so the packaging/control difference matters. The gain is consistent but modest;
+fewer logical weight decodes did not produce a proportional latency reduction.
+The isolated candidate remains available without a production import. It has no
+full-model qualification, and its gains cannot be added to the word-unpack
+numbers without a combined comparison.
+
+The private `glm53-a6-tall8-20261003` artifact preserves exact candidate source,
+test root, build command, raw parity/timing, summary, telemetry and binary/source
+hashes. The base was `ae12b393` plus this isolated extension. Its gated filter is
+`GLM A6 eight SIMD tall tile isolated timing`, enabled by
+`SUSHI_GLM_A6_TALL_BENCH_OUT` naming the output JSON.

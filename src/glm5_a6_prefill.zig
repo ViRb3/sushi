@@ -1,4 +1,4 @@
-//! Isolated affine6/group128 loader experiment; the native NAX tile/body stays unchanged.
+//! Isolated affine6/group128 loader and tile experiments; no production caller.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -276,4 +276,132 @@ test "GLM A6 unpack isolated timing" {
     }, .{ .whitespace = .indent_2 });
     defer std.testing.allocator.free(json);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = json });
+}
+
+const TALL_SOURCE =
+    \\uint3 tile = threadgroup_position_in_grid;
+    \\threadgroup bfloat16_t Ws[64 * 72];
+    \\qmm_t_nax_tgp_impl<bfloat16_t,128,6,true,128,64,64,4,2>(
+    \\  w, scales, biases, x, y, Ws, K, N, M, tile,
+    \\  thread_index_in_threadgroup, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+;
+var tall_kernel: ?mlx.mlx_fast_metal_kernel = null;
+pub fn applyTall(s: mlx.mlx_stream, input: Input) !?Arr {
+    if (!mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
+    for ([_]Arr{ input.x, input.w, input.scales, input.biases }) |a| if (!try ready(a)) return null;
+    const xs = mlx.getShape(input.x);
+    const ws = mlx.getShape(input.w);
+    if (xs.len != 3 or xs[0] != 1 or xs[1] != 2048 or ws.len != 2) return null;
+    const k = xs[2];
+    const n = ws[0];
+    const m = xs[1];
+    if (!((k == 4096 and n == 8192) or (k == 8192 and n == 4096)) or ws[1] != @divExact(k * 3, 16)) return null;
+    const ss = [_]c_int{ n, @divExact(k, 128) };
+    if (!std.mem.eql(c_int, &ss, mlx.getShape(input.scales)) or !std.mem.eql(c_int, &ss, mlx.getShape(input.biases)) or
+        mlx.mlx_array_dtype(input.x) != .bfloat16 or mlx.mlx_array_dtype(input.w) != .uint32 or
+        mlx.mlx_array_dtype(input.scales) != .bfloat16 or mlx.mlx_array_dtype(input.biases) != .bfloat16) return null;
+    if (tall_kernel == null) {
+        const ins = mlx.mlx_vector_string_new_data(&.{ "w", "scales", "biases", "x", "K", "N", "M" }, 7);
+        defer _ = mlx.mlx_vector_string_free(ins);
+        const outs = mlx.mlx_vector_string_new_data(&.{"y"}, 1);
+        defer _ = mlx.mlx_vector_string_free(outs);
+        const value = mlx.mlx_fast_metal_kernel_new("sushi_glm_a6_tall128n64", ins, outs, TALL_SOURCE, HEADER, false, false);
+        if (value.ctx == null) return error.MetalKernelCompileFailed;
+        tall_kernel = value;
+    }
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, m, n }, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(n, 64) * 32, @divExact(m, 128) * 2, 4));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 2, 4));
+    const ka = mlx.mlx_array_new_int(k);
+    defer _ = mlx.mlx_array_free(ka);
+    const na = mlx.mlx_array_new_int(n);
+    defer _ = mlx.mlx_array_free(na);
+    const ma = mlx.mlx_array_new_int(m);
+    defer _ = mlx.mlx_array_free(ma);
+    const inputs = mlx.mlx_vector_array_new_data(&.{ input.w, input.scales, input.biases, input.x, ka, na, ma }, 7);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, tall_kernel.?, inputs, cfg, s));
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs, 0));
+    return y;
+}
+
+fn tallArm(s: mlx.mlx_stream, input: Input, arm: usize) !Arr {
+    return switch (arm) {
+        0 => try native(s, input),
+        1 => (try apply(s, input, 0)) orelse return error.TestExpectedA6,
+        2 => (try applyTall(s, input)) orelse return error.TestExpectedA6,
+        else => unreachable,
+    };
+}
+fn timedTall(s: mlx.mlx_stream, banks: []const Input, arm: usize, start: usize, repetitions: usize) !u64 {
+    const timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
+    for (0..repetitions) |i| {
+        const got = try tallArm(s, banks[(start + i) % banks.len], arm);
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_array_eval(got));
+    }
+    return timer.read() / repetitions;
+}
+
+test "GLM A6 eight SIMD tall tile exact production parity" {
+    const s = mlx.gpuStream();
+    for ([_]c_int{ 4096, 8192 }) |k| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const input = try fixture(&ops, 2048, k, if (k == 4096) 8192 else 4096, 901);
+        const expected = try native(s, input);
+        defer _ = mlx.mlx_array_free(expected);
+        const got = (try applyTall(s, input)) orelse return error.TestExpectedA6;
+        defer _ = mlx.mlx_array_free(got);
+        try exact(expected, got);
+    }
+}
+
+test "GLM A6 eight SIMD tall tile isolated timing" {
+    const out = std.c.getenv("SUSHI_GLM_A6_TALL_BENCH_OUT") orelse return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var samples: [2][11][3]u64 = undefined;
+    for ([_]c_int{ 4096, 8192 }, 0..) |k, shape| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        var banks: [4]Input = undefined;
+        for (&banks, 0..) |*b, i| b.* = try fixture(&ops, 2048, k, if (k == 4096) 8192 else 4096, @intCast(907 + i));
+        for (banks) |input| {
+            const expected = try native(s, input);
+            defer _ = mlx.mlx_array_free(expected);
+            for (1..3) |arm| {
+                const got = try tallArm(s, input, arm);
+                defer _ = mlx.mlx_array_free(got);
+                try exact(expected, got);
+            }
+        }
+        for (0..3) |arm| _ = try timedTall(s, &banks, arm, 0, 12);
+        for (0..11) |round| for (0..3) |position| {
+            const arm = if (round % 2 == 0) position else 2 - position;
+            samples[shape][round][arm] = try timedTall(s, &banks, arm, round, 8);
+        };
+    }
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+        .nanoseconds = samples,
+        .m = 2048,
+        .input_widths = .{ 4096, 8192 },
+        .arms = .{ "native MLX", "same-body BM64 BN64 WM2 WN2", "BM128 BN64 WM4 WN2" },
+        .bank_rotation = 4,
+        .warmups_per_arm = 12,
+        .rounds = 11,
+        .repetitions = 8,
+        .shared_weights_bytes = 9216,
+        .thread_count = .{ 128, 128, 256 },
+        .method = "host apply/eval/free; inputs materialized; alternating forward/reverse",
+        .exact_bf16 = true,
+        .full_model = false,
+    }, .{ .whitespace = .indent_2 });
+    defer std.testing.allocator.free(json);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(out), .data = json });
 }
