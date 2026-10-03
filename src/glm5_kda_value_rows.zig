@@ -53,6 +53,25 @@ const SOURCE =
     \\GLM_VALUE_UNROLL for(uint r=0;r<uint(R);++r) GLM_VALUE_UNROLL for(uint i=0;i<4u;++i)
     \\ state_out[(size_t(n)*128u+dv0+r)*128u+4u*lane+i]=state[r][i];
 ;
+// Diagnostic policy; production default stays on the existing recurrence.
+var selected_rows: ?u32 = null;
+var dispatches: usize = 0;
+pub fn configuredRows() !?u32 {
+    if (selected_rows == null) {
+        const raw = std.c.getenv("SUSHI_GLM_KDA_VALUE_ROWS");
+        const rows = if (raw) |value| std.fmt.parseInt(u32, std.mem.span(value), 10) catch return error.InvalidKdaValueRows else 0;
+        if (rows != 0 and rows != 1 and rows != 2 and rows != 4) return error.InvalidKdaValueRows;
+        selected_rows = rows;
+    }
+    return if (selected_rows.? == 0) null else selected_rows.?;
+}
+pub fn dispatchCount() usize {
+    return dispatches;
+}
+pub fn resetDispatchCount() void {
+    dispatches = 0;
+}
+
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn spanFits(shape: []const c_int) bool {
@@ -105,6 +124,7 @@ pub fn run(input: primitive.KdaInputs, rows_per_simd: u32, s: mlx.mlx_stream) !?
     errdefer result.deinit();
     try mlx.check(mlx.mlx_vector_array_get(&result.y, ov, 0));
     try mlx.check(mlx.mlx_vector_array_get(&result.state, ov, 1));
+    dispatches += 1;
     return result;
 }
 

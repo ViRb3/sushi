@@ -30,8 +30,8 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
 - Active quality study: four raw prompts (two code,two prose),512 BF16 teacher-generated
   continuation rows each, lossless streamed source and100 GiB SSD/RAM budget. Both A6/A8
   trunk packs will use the same teacher IDs/logits, BF16 cache and FP32 KDA state. Results pending.
-- Remaining: optimize toward at least 1,200 tok/s prefill and 45 tok/s speculative decode
-  using MTP or DFlash2; full-model lossless-teacher KLD;
+- Remaining: optimize toward at least 1,500 tok/s prefill and 60 tok/s speculative decode
+  using DFlash2; broader model quality coverage;
   broader long-context coverage; production loader/lifecycle/server integration. The sections below
   retain the acceptance criteria, including completed foundations, rather than implying each is missing.
 

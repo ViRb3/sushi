@@ -113,3 +113,25 @@ truncated and stopped-by-user flags, and the exact reason
 `code-python-topological-sort`, the first completed prompt. The report states
 one code prompt/no prose. An incomplete second prompt is never scored. The prior
 explicit two-prompt and original four-prompt contracts remain supported.
+
+
+## Completed one-code-prompt comparison
+
+The user stopped Python capture after the first completed prompt. Both students
+scored the same512 full-vocabulary teacher rows from
+`code-python-topological-sort`, using the same committed-source snapshot
+`bd955e12` and executable SHA-256
+`8074db6047904b081ab187c1a1e2d05e7a348001fd75389c8dcbd916771ad899`.
+No EOS occurs in these512 rows, so the EOS-inclusive and all-position readings agree.
+
+| Target directory | Trunk | KLD | Top-1 agreement | Student NLL | MLX peak GB |
+|---|---|---:|---:|---:|---:|
+| Sushi-2.3bpw | A6g128 | 0.092928863 | 462/512 (90.2344%) | 0.370006442 | 93.9578 |
+| Sushi-2.4bpw | A8g128 | 0.095446051 | 461/512 (90.0391%) | 0.373898854 | 96.1798 |
+
+Both use K2.25/W12 experts, BF16 compressed MLA cache, FP32 KDA state and
+teacher forcing. The A6 reading is slightly lower on this single code sample;
+there is no prose coverage and this does not establish a general quality ranking.
+The independent oMLX-teacher/native-student engine floor remains unmeasured.
+Private artifact `glm53-kld-students-20261003` preserves both full reports and
+input/source fingerprints. The incomplete second teacher prompt was excluded.

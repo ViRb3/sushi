@@ -553,7 +553,13 @@ pub const KdaLayer = struct {
             break :blk prework_mod.Result{ .q = q, .k = k, .v = values, .decay = decay, .beta = beta, .conv = conv_tail };
         };
         const recurrent = if (state.initialized) state.ssm_state else try ops.zeros(&.{ sh[0], heads, dim, dim }, .float32);
-        const result = try primitive.kda(.{ .q = prepared.q, .k = prepared.k, .v = prepared.v, .decay = prepared.decay, .beta = prepared.beta, .state = recurrent }, ops.s);
+        const inputs = primitive.KdaInputs{ .q = prepared.q, .k = prepared.k, .v = prepared.v, .decay = prepared.decay, .beta = prepared.beta, .state = recurrent };
+        const value_rows = @import("glm5_kda_value_rows.zig");
+        const scheduled = if (sh[1] >= 128) blk: {
+            const rows = try value_rows.configuredRows() orelse break :blk null;
+            break :blk try value_rows.run(inputs, rows, ops.s);
+        } else null;
+        const result = scheduled orelse try primitive.kda(inputs, ops.s);
         defer result.deinit();
         try mlx.check(mlx.mlx_array_set(&state.conv_state, prepared.conv));
         try mlx.check(mlx.mlx_array_set(&state.ssm_state, result.state));

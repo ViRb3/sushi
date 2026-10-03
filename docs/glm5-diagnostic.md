@@ -137,3 +137,11 @@ auto mode retains the original serial path and selects the candidate only for el
 multirow calls; explicit1 permits serial experiments. These controls distinguish
 warm component results from full-model streaming behavior; check the respective engagement
 counters. The initial combined arm preserved output IDs but did not show a decode gain.
+
+
+`SUSHI_GLM_KDA_VALUE_ROWS=4` opts into the qualified register-resident recurrence
+for eligible prefill calls with at least128 rows. Values0 (baseline),1 (control),
+2 and4 are accepted. It preserves FP32 recurrent state and the original per-row
+reduction order; unsupported geometry retains the existing recurrence. JSON
+records the selected value and successful dispatch count. Full-model throughput
+must be measured separately from the isolated recurrence gain; the default is0.

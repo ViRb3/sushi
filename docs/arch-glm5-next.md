@@ -120,8 +120,8 @@ The ordered milestones remain in the [native execution plan](plan-glm5-native.md
 record the audited foundation; new complete-forward behavior needs its own review.
 
 - Run the full 512-token prompt and 64-token generation with warmup, explicit timing denominators,
-  actual memory and per-layer attribution. Current targets are at least 1,200 tok/s prefill and
-  45 tok/s speculative decode using MTP or DFlash2; these are goals, not measured results.
+  actual memory and per-layer attribution. Current targets are at least 1,500 tok/s prefill and
+  60 tok/s speculative decode using DFlash2; these are goals, not measured results.
 - Compare full MLA/reference layer outputs and logits: absorbed latent attention and expanded dense
   attention have different BF16 rounding boundaries even when their projection algebra agrees.
 - Measure KLD against a lossless BF16 teacher and validate 4K/16K contexts before 64K. The identity-prior
