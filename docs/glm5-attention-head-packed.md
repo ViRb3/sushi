@@ -79,3 +79,21 @@ Control/admission APIs and an audit fix preventing flag-based full-cache copies
 were added after the measured run; they do not change its attention math or
 its already-contiguous fixture path. Their validation belongs to the subsequent
 integration build. No model dispatch or default was changed by this component.
+
+## Full-model combination check
+
+Source `a88d8921` combines packed attention with ordinary BF16 head-batched MLA
+projections on the 2.3bpw target. A 4096-token prefix (the existing 2048-token
+fixture repeated twice), followed by 64 forced reference continuation tokens,
+completed with finite scores and matching top tokens at all 64 positions. Mean
+KL relative to the same quantized model with both paths disabled was 0.00394027;
+first-position KL was 0.00032350; maximum row KL was 0.060244. This measures kernel drift; it is not KLD against
+the original BF16 checkpoint.
+
+The candidate recorded 11 query and 11 value projection dispatches and 1408 packed
+attention dispatches. Peak active MLX memory was 95,500,858,424 bytes. Both arms kept
+BF16 compressed MLA cache and FP32 KDA recurrent state. ReleaseFast full suite,
+HTTP admission tests and 12 staged-runtime checks passed. Foreground QoS, exclusive
+GPU lock and max fans were used. Measurement key: `glm53-packed-headbatch-drift-20261003`.
+Cold reference/candidate prefill times were 10.121/4.636 seconds; they are diagnostic
+order-dependent timings. The separate llmprobe ladder determines throughput.
