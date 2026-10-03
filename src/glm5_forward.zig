@@ -1371,3 +1371,51 @@ test "GLM MLA A6 stored affine kv rows preserve both projection orientations" {
     try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(layer.wk));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(layer.sk));
 }
+
+test "GLM KLD native self teacher aligns prediction rows and forced token state" {
+    const compare = @import("glm5_kld.zig");
+    const a = std.testing.allocator;
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try nonzeroDecodeFixture(&weights);
+    var net = try Model.load(a, cfg, &weights, mlx.gpuStream());
+    defer net.deinit();
+    var teacher = try Request.init(a, 4);
+    defer teacher.deinit();
+    teacher.dense_prefill = true;
+    teacher.prefill_async = true;
+    var student = try Request.init(a, 4);
+    defer student.deinit();
+    student.dense_prefill = true;
+    student.prefill_async = true;
+    const prompt = [_]u32{ 1, 2, 3 };
+    const generated = [_]u32{ 2, 1, 3 };
+    const rows = try a.alloc(f32, generated.len * cfg.vocab_size);
+    defer a.free(rows);
+    for (0..generated.len) |position| {
+        const ids: []const u32 = if (position == 0) &prompt else generated[position - 1 .. position];
+        const input = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(input);
+        const logits = try net.forwardLast(&teacher, input, true);
+        defer _ = mlx.mlx_array_free(logits);
+        try compare.copyLogits(net.s, logits, rows[position * cfg.vocab_size ..][0..cfg.vocab_size]);
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "logits.f32", .data = std.mem.sliceAsBytes(rows) });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/logits.f32", .{dir}, 0);
+    defer a.free(path);
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.TestFixtureOpen;
+    defer _ = std.c.close(fd);
+    const result = try compare.scorePrompt(a, &net, &student, &prompt, &generated, fd, &.{1}, 512);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), result.all.positions);
+    try std.testing.expectEqual(@as(usize, 2), result.through_eos.positions);
+    try std.testing.expectEqual(@as(?usize, 1), result.first_eos);
+    for (result.per_position_kld) |value| try std.testing.expectApproxEqAbs(@as(f64, 0), value, 1e-12);
+    try std.testing.expectEqual(prompt.len + generated.len - 1, student.offset);
+    try expectRequestBits(&teacher, &student);
+}
