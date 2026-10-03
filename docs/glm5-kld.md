@@ -32,8 +32,9 @@ The reported first-EOS position is zero-based. Code and prose categories each co
 two prompts in the full study. The reduced study contains two code prompts and
 zero prose prompts; its prose result is null, not a zero-error measurement. Neither
 is the standard sixteen-prompt release verdict. The teacher
-uses the oMLX streamer, so the unmeasured teacher/student engine floor is explicitly
-part of the quality scope.
+in the original independent study used the oMLX streamer, so its unmeasured
+teacher/student engine floor is part of that study’s quality scope. The completed
+native-reference study below records a separate teacher and numerical profile.
 
 ## Preflight and provenance
 
@@ -178,3 +179,77 @@ counters, budget and cleanup. Private wrapper binary SHA256 is
 teacher logit SHA256 is
 `a0198903f26c8b55d70201d2731bd1fd1a866aadaab430945698c8fec5674831`.
 The public runner's TF32-off contract remains unchanged.
+
+## Completed native reference: four prompts × 512
+
+On 2026-10-04, both students scored the same complete `glm53-sushi-bf16-4x512-raw`
+fixture: two code and two prose prompts, each with 512 full-vocabulary predictions.
+The reference is the original GLM-5.3-Flash BF16 checkpoint through native Sushi:
+indexed BF16/F32 trunk storage and individual BF16 experts remain as stored,
+TF32 is off, and native BF16 head logits are exported exactly to little-endian F32.
+Teacher capture uses dense prefill, synchronous layers and at most 512 tokens per
+chunk, BF16 compressed MLA cache and FP32 KDA state, with no template, assistant,
+DFlash, MTP or prefix reuse. Its total streaming ledger is 100 GiB and allocator
+cache is zero. The previously completed water-cycle capture was preserved; the
+other three prompts were captured in one fresh process using the same immutable CLI.
+
+Native prompt lengths are 242, 261, 190 and 183. These captured IDs are supplied
+unchanged to each student; no comparison re-tokenizes them. Final request offsets
+are 753, 772, 701 and 694. No teacher EOS occurs, so all-position and first-EOS-inclusive
+readings contain the same 2,048 positions.
+
+| Student | Trunk | KLD | Top-1 agreement | Student NLL | Cosine similarity | Peak active GB |
+|---|---|---:|---:|---:|---:|---:|
+| Sushi-2.3bpw | A6g128 | 0.092949788 | 1822/2048 (88.9648%) | 0.432252419 | 0.958994970 | 94.0799 |
+| Sushi-2.4bpw | A8g128 | 0.091518555 | 1820/2048 (88.8672%) | 0.431759671 | 0.959095514 | 96.3018 |
+
+Both use K2.25/W12 experts and the qualified fast target math with TF32 on,
+native B1, dense prefill, async2 prefill and async4 decode. Cache remains BF16 MLA
+and FP32 KDA. There is one resident target per separate process and no assistant,
+DFlash or MTP. Expert-pair and long-index candidates are bound off. Each run records
+22,484 B1 calls, zero B3/pair/long-index calls, 360 HC-prefill calls and 136 KDA
+value-row calls. Packed32, IndexPool, grid, cadence, A6-dense, cluster and MLA-batch
+helpers are unengaged on these short prompts despite their qualified profile flags.
+
+| Population / prompt | Rows | A6 KLD | A8 KLD | A6 top-1 | A8 top-1 |
+|---|---:|---:|---:|---:|---:|
+| Code category | 1024 | 0.046766185 | 0.044096890 | 977/1024 | 974/1024 |
+| Prose category | 1024 | 0.139133391 | 0.138940220 | 845/1024 | 846/1024 |
+| `code-python-topological-sort` | 512 | 0.044647281 | 0.041290212 | 489/512 | 488/512 |
+| `code-zig-byte-reader` | 512 | 0.048885090 | 0.046903569 | 488/512 | 486/512 |
+| `prose-water-cycle` | 512 | 0.127063689 | 0.125459542 | 424/512 | 426/512 |
+| `prose-navigation` | 512 | 0.151203093 | 0.152420898 | 421/512 | 420/512 |
+
+These readings combine stored quantization and TF32-enabled fast target arithmetic
+against the native BF16/F32 source reference. They are a four-prompt study with an
+unmeasured arithmetic/engine floor, not the sixteen-prompt release verdict. The
+previous independent-streamer teacher used different token IDs and continuations;
+its numbers are retained as separate studies above.
+
+The native capture CLI SHA-256 is
+`8d79a29dff04f82e41fd7251e512e1fb5354d4f044aad22f8a0b4273c460b66f`.
+Teacher config/index/tokenizer SHA-256 values are respectively
+`33e63ec7fe607658be712bd6dd3c16c6549960d8e7f0483d34b939881b55f943`,
+`e6007bd58fb7e07f9fe69544257ee2713f252ef5855bbf685b48c991d524ef0f`, and
+`19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d`.
+The complete aggregated baseline SHA-256 is
+`1315e88b79b3326208e898ec27a207792669f5947d3d9ee34dd68d76e52cc729`.
+Both comparisons use one ReleaseFast executable SHA-256
+`f03b71dba0b63211ee1ff13078d07805d022d1aa8f3b4fb457478e6616c6ebf0`,
+from base `3ed533d7` plus the recorded frozen working-tree bytes, including the
+standard-fixture changes. It reuses the public `glm5_kld.scorePrompt`, metrics
+and totals without changing their scoring arithmetic.
+
+Memory and wired limits are 115,448,725,504 bytes; allocator cache is 2 GiB.
+The conservative request/transient/cache bill is 8,499,915,776 bytes for each student,
+including the complete qualified 2048-cap allowances and the full cache allowance.
+Actual admission is checked after binding. `taskpolicy -a`, separate exclusive GPU
+locks and the recorded thermal protocol were used. All 643 compiled dependency
+hashes and all 673 runtime/teacher hashes matched before and after each run; both
+processes exited zero, released their locks and restored fans to auto.
+
+Private artifact `glm53-native-teacher-4x512-20261004` preserves both complete
+per-position reports, category/prompt metrics, native teacher assembly and source
+identities, actual flags, admission, counters and cleanup. Its two source-capture
+artifacts preserve the original native captures separately. No model throughput
+claim is derived from the quality scoring time.

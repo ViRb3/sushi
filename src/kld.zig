@@ -369,8 +369,7 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
             }
         },
         .jsonl => {
-            const body: []const u8 = if (bundled) @embedFile("fixtures/kld-standard4.jsonl") else
-                std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(MAX_JSONL_BYTES)) catch return error.PromptSourceUnreadable;
+            const body: []const u8 = if (bundled) @embedFile("fixtures/kld-standard4.jsonl") else std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(MAX_JSONL_BYTES)) catch return error.PromptSourceUnreadable;
             defer if (!bundled) allocator.free(body);
             var lines = std.mem.splitScalar(u8, body, '\n');
             var seq: usize = 0;
@@ -702,7 +701,7 @@ fn writeAllFd(fd: std.c.fd_t, bytes: []const u8) !void {
     while (done < bytes.len) {
         const got = std.c.write(fd, bytes[done..].ptr, bytes.len - done);
         if (got < 0) {
-            if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
             return error.LogitsWriteFailed;
         }
         if (got == 0) return error.LogitsWriteFailed;
@@ -1844,18 +1843,30 @@ test "kld: prompt sources parse from a fixture dir, a text dir and a jsonl file"
 test "kld: the argument parser reads every flag and refuses an unknown one" {
     const capture = try parseArgs(&.{
         "capture",
-        "--model",         "/models/pack",
-        "--prompts",       "/fixtures/teacher",
-        "--out",           "/out/run",
-        "--tokens",        "32",
-        "--top-k",         "5",
-        "--label",         "run-a",
-        "--limit",         "3",
-        "--no-template",   "--ctx-size",
-        "8192",            "--kv-quant",
-        "8",               "--ssd-budget-gb",
-        "94",              "--expert-cache-gb",
-        "40",              "--no-mtp",
+        "--model",
+        "/models/pack",
+        "--prompts",
+        "/fixtures/teacher",
+        "--out",
+        "/out/run",
+        "--tokens",
+        "32",
+        "--top-k",
+        "5",
+        "--label",
+        "run-a",
+        "--limit",
+        "3",
+        "--no-template",
+        "--ctx-size",
+        "8192",
+        "--kv-quant",
+        "8",
+        "--ssd-budget-gb",
+        "94",
+        "--expert-cache-gb",
+        "40",
+        "--no-mtp",
     });
     try testing.expectEqual(Command.capture, capture.command);
     try testing.expectEqualStrings("/models/pack", capture.model_dir);
@@ -2506,14 +2517,13 @@ test "kld: a pack storing o_proj, lm_head and embed_tokens affine serves them pa
     }
 }
 
-
 test "kld standard4 bundled texts identifiers and limits" {
     const a = testing.allocator;
     var full = try loadPrompts(a, testing.io, "standard4", 0);
     defer full.deinit();
     try testing.expectEqual(@as(usize, 4), full.items.len);
-    const ids = [_][]const u8{"code-python-topological-sort","code-zig-byte-reader","prose-water-cycle","prose-navigation" };
-    const digests = [_][]const u8{"524e3d4590d0935d3a8e40f29bb75f502eba2f39eca0684d3de36a04ddf6fd30","af2dc27bd24d4643ecaf0fd849ade54d56a8eb42c6434fcd61b47db2cd8e1d35","a54cbe6b15eb667b5d87cfff019d5430dd84239d119a9cbf2dfac79d09efe00e","882dd467214d1b696fa5ac04dd1277a3bb7720d2c88ce7e6a278008696adaf09" };
+    const ids = [_][]const u8{ "code-python-topological-sort", "code-zig-byte-reader", "prose-water-cycle", "prose-navigation" };
+    const digests = [_][]const u8{ "524e3d4590d0935d3a8e40f29bb75f502eba2f39eca0684d3de36a04ddf6fd30", "af2dc27bd24d4643ecaf0fd849ade54d56a8eb42c6434fcd61b47db2cd8e1d35", "a54cbe6b15eb667b5d87cfff019d5430dd84239d119a9cbf2dfac79d09efe00e", "882dd467214d1b696fa5ac04dd1277a3bb7720d2c88ce7e6a278008696adaf09" };
     for (full.items, ids, digests) |prompt, id, digest| {
         try testing.expectEqualStrings(id, prompt.id);
         try testing.expect(prompt.ids == null);
@@ -2533,4 +2543,6 @@ test "kld standard4 bundled texts identifiers and limits" {
     try testing.expectEqual(@as(usize, 4), above.items.len);
 }
 
-test { _ = @import("glm5_kld_capture.zig"); }
+test {
+    _ = @import("glm5_kld_capture.zig");
+}

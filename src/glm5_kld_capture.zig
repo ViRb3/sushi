@@ -154,12 +154,12 @@ fn json(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 const teacher_off_flags = [_][:0]const u8{
-        "SUSHI_GLM_LANE_PAIR",            "SUSHI_GLM_DOWN_LANE",        "SUSHI_GLM_KDA_VALUE_ROWS",      "SUSHI_GLM_HC_PREFILL",         "SUSHI_GLM_HC_FUSED",
-        "SUSHI_GLM_A6_DENSE_PREFILL",     "SUSHI_GLM_PREFILL_DIRECT",   "SUSHI_GLM_MLA_PREFILL_BATCH",   "SUSHI_GLM_ATTENTION_PACKED",   "SUSHI_GLM_INDEX_SCORE_NAX",
-        "SUSHI_GLM_INDEX_SCORE_NAX_LONG", "SUSHI_GLM_KDA_KEEP_LEAF",    "SUSHI_GLM_KDA_PREFILL_CLUSTER", "SUSHI_GLM_PREFILL_CADENCE",    "SUSHI_GLM_PREFILL_GRID_TRANSPOSE",
-        "SUSHI_GLM_DECODE_BATCH",         "SUSHI_GLM_PREFILL_PACKED32", "SUSHI_GLM_HC_EXPAND_PREFILL",   "SUSHI_GLM_HC_COLLAPSE_SIMD32", "SUSHI_GLM_PREFILL_EXPERT_PAIR",
-        "SUSHI_GLM_KDA_TREE_CORE",        "SUSHI_EXL3_CLAMPED_MIDDLE",
-    };
+    "SUSHI_GLM_LANE_PAIR",            "SUSHI_GLM_DOWN_LANE",        "SUSHI_GLM_KDA_VALUE_ROWS",      "SUSHI_GLM_HC_PREFILL",         "SUSHI_GLM_HC_FUSED",
+    "SUSHI_GLM_A6_DENSE_PREFILL",     "SUSHI_GLM_PREFILL_DIRECT",   "SUSHI_GLM_MLA_PREFILL_BATCH",   "SUSHI_GLM_ATTENTION_PACKED",   "SUSHI_GLM_INDEX_SCORE_NAX",
+    "SUSHI_GLM_INDEX_SCORE_NAX_LONG", "SUSHI_GLM_KDA_KEEP_LEAF",    "SUSHI_GLM_KDA_PREFILL_CLUSTER", "SUSHI_GLM_PREFILL_CADENCE",    "SUSHI_GLM_PREFILL_GRID_TRANSPOSE",
+    "SUSHI_GLM_DECODE_BATCH",         "SUSHI_GLM_PREFILL_PACKED32", "SUSHI_GLM_HC_EXPAND_PREFILL",   "SUSHI_GLM_HC_COLLAPSE_SIMD32", "SUSHI_GLM_PREFILL_EXPERT_PAIR",
+    "SUSHI_GLM_KDA_TREE_CORE",        "SUSHI_EXL3_CLAMPED_MIDDLE",
+};
 
 fn normalizeTeacherTf32() !void {
     if (std.c.getenv("MLX_ENABLE_TF32")) |value| {
@@ -445,9 +445,14 @@ test "GLM standard4 teacher capture defaults only absent numerical flags" {
     const a = std.testing.allocator;
     const names = [_][:0]const u8{"MLX_ENABLE_TF32"} ++ teacher_off_flags;
     var previous: [names.len]?[:0]u8 = @splat(null);
-    for (names, &previous) |name, *saved| if (std.c.getenv(name)) |value| { saved.* = try a.dupeSentinel(u8, std.mem.span(value), 0); };
+    for (names, &previous) |name, *saved| if (std.c.getenv(name)) |value| {
+        saved.* = try a.dupeSentinel(u8, std.mem.span(value), 0);
+    };
     defer for (names, previous) |name, saved| {
-        if (saved) |value| { _ = setenv(name, value, 1); a.free(value); } else _ = unsetenv(name);
+        if (saved) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
     };
     for (names) |name| _ = unsetenv(name);
     try teacherEnvironment();
