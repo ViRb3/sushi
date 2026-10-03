@@ -15,19 +15,21 @@ The [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-effi
 
 - Completed: KDA preparation, independent layer fixtures, bounded IndexPool/latent attention,
   stored-grid MLA comparisons, complete diagnostic forward, request reset and coherent 512/64 generation.
-- Latest warmed serial 512/64 result: 892.99 tok/s prefill, 25.97 tok/s decode; peak 96.541 GB.
-  Exact C24 HC prefill fusion preserves all 64 output IDs. The 2K/64 workload separately measured
-  1,171.77/21.48 tok/s and 97.366 GB peak before the cheap HC eligibility guard.
-  The new guard avoids unused prefill probes in decode; the small 512 change from
-  881.07/25.69 does not isolate the older decrease from 26.50 tok/s.
+- Current A6-trunk target, warmed native512/64: 888.97 tok/s prefill,31.23 tok/s serial
+  decode,94.314 GB peak. At2K/64 it measured1,159.73/24.42 and95.144 GB peak.
+  Lane pair/down are enabled; dense SDPA prefill and async2/async4 schedules are explicit.
+  Earlier A8-trunk results are separate measurements, not the same quantized model.
 - Completed serial optimizations: async4 scheduling, copy-free QKV, fused KDA body, BF16-storage
   FP32 router and paired cooperative expert gate/up. Dense-prefill SDPA remains opt-in pending KLD.
-- DFlash2: BF16 assistant, layerwise tree verifier and transactional accepted-state commit are
-  implemented. Warmed 512/64 runs at three tree widths preserve every serial output ID and final state.
-  The latest async4 four-row run measured 32.00 tok/s versus matched serial 25.56;
-  target verification remains the dominant cost. Async2 measured 31.68 tok/s; the roughly 1%
-  difference does not establish a general winner. See [scheduling results](glm5-dflash-scheduling.md)
-  and [the DFlash2 plan](plan-glm5-dflash2.md).
+- DFlash2 with the selected A6g128 assistant: N2/children4, async4, lane pair/down and
+  opt-in grouped expert reuse reached45.45 tok/s on512/64 versus matched serial31.42.
+  All64 output IDs and complete committed state match the previous42.43 tok/s N2 arm;
+ 24rounds/40 accepted drafts/72 verification rows are unchanged. Decode-only peak94.979 GB.
+  This clears45 in one run; repeats and broader prompts/contexts remain open. See
+  [grouped expert results](plan-glm5-dflash-expert-reuse.md) and [scheduling](glm5-dflash-scheduling.md).
+- Active quality study: four raw prompts (two code,two prose),512 BF16 teacher-generated
+  continuation rows each, lossless streamed source and100 GiB SSD/RAM budget. Both A6/A8
+  trunk packs will use the same teacher IDs/logits, BF16 cache and FP32 KDA state. Results pending.
 - Remaining: optimize toward at least 1,200 tok/s prefill and 45 tok/s speculative decode
   using MTP or DFlash2; full-model lossless-teacher KLD;
   broader long-context coverage; production loader/lifecycle/server integration. The sections below

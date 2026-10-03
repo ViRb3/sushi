@@ -38,11 +38,13 @@ the truncated prompt and output do not establish coherent English, quality or st
 The current local directory is named `GLM-5.3-Flash-Sushi-2.4bpw`; its stored expert metadata remains
 K2.25/W12. No conversion was repeated and no rate is inferred from the directory name.
 
-Subsequent 512/64 diagnostics produce coherent English. Native prefill reached 892.99 tok/s at
-512 tokens and 1,171.77 tok/s at 2K in separate runs. The opt-in async4 DFlash verifier measured
-32.00 tok/s with all 64 token IDs and complete cache state equal to its matched serial run.
-These use BF16 compressed MLA cache and FP32 KDA state. See the [current execution plan](plan-glm5-native.md)
-for workload distinctions and [DFlash scheduling results](glm5-dflash-scheduling.md) for provenance.
+Subsequent diagnostics produce coherent English. The A6-trunk `Sushi-2.3bpw` target retains
+K2.25/W12 experts and runs with the selected A6g128 DFlash2 assistant. Native prefill measured
+888.97 tok/s at512 and1,159.73 at2K. The opt-in N2/async4/grouped-expert verifier reached45.45 tok/s
+on512/64 with unchanged serial token IDs and complete cache state; this is one measured run.
+Cache remains BF16 compressed MLA with FP32 KDA state. Four-prompt lossless BF16 KLD capture
+and both target comparisons are in progress. See the [current execution plan](plan-glm5-native.md)
+for workload distinctions and remaining validation.
 
 ## Source layout
 
