@@ -24,6 +24,16 @@ pub fn storedBytes(weights: *const model.Weights) u64 {
 }
 
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream) !model.Weights {
+    return loadWeightsBounded(io, allocator, model_dir, s, false, std.math.maxInt(u64));
+}
+
+fn keepLoadKey(name: []const u8, layers: usize, trunk_only: bool) bool {
+    return keepTextKey(name, layers) and (!trunk_only or (std.mem.indexOf(u8, name, ".mlp.experts.") == null and std.mem.indexOf(u8, name, ".mlp.switch_mlp.") == null));
+}
+
+/// The budget is checked on lazy metadata before any retained tensor is evaluated.
+/// Expert-only shards are never opened; mixed shards materialize only trunk tensors.
+pub fn loadWeightsBounded(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream, trunk_only: bool, max_bytes: u64) !model.Weights {
     _ = s; // Safetensors Load has a CPU implementation; unified storage is consumed by GPU ops.
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
@@ -51,7 +61,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var owners = wm.object.iterator();
     var expected: usize = 0;
     while (owners.next()) |entry| {
-        if (!keepTextKey(entry.key_ptr.*, layers)) continue;
+        if (!keepLoadKey(entry.key_ptr.*, layers, trunk_only)) continue;
         const value = entry.value_ptr.*;
         if (value != .string or value.string.len == 0 or std.mem.indexOfAny(u8, value.string, "/\\") != null or std.mem.eql(u8, value.string, "..")) return error.InvalidGlmShardName;
         try files.put(value.string, {});
@@ -83,7 +93,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             }
             const name = std.mem.span(key.?);
             const owner = wm.object.get(name);
-            if (!keepTextKey(name, layers) or owner == null or owner.? != .string or !std.mem.eql(u8, owner.?.string, file.*)) {
+            if (!keepLoadKey(name, layers, trunk_only) or owner == null or owner.? != .string or !std.mem.eql(u8, owner.?.string, file.*)) {
                 _ = mlx.mlx_array_free(value);
                 continue;
             }
@@ -95,6 +105,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         }
     }
     if (result.count() != expected) return error.MissingIndexedGlmWeight;
+    if (storedBytes(&result) > max_bytes) return error.GlmResidentBudgetExceeded;
     // Filter ownership/vision/MTP before materializing any device allocation.
     var values = result.map.valueIterator();
     while (values.next()) |v| try mlx.check(mlx.mlx_array_eval(v.*));
@@ -306,9 +317,14 @@ test "GLM native diagnostic real model" {
     var cfg = try model.parseConfig(io, a, path);
     defer cfg.deinit(a);
     if (!cfg.isGlm5()) return error.InvalidGlmConfig;
-    if (cfg.expert_layout != .exl3_k4) return error.UnsupportedGlmDiagnosticLayout;
+    const stream_budget_gib = try envNumber("SUSHI_GLM_DIAGNOSTIC_STREAM_GIB", 0);
+    const stream_budget = try std.math.mul(usize, stream_budget_gib, 1024 * 1024 * 1024);
+    const streamed_bf16 = stream_budget != 0;
+    if (streamed_bf16) {
+        if (cfg.expert_layout != .bf16_individual or stream_budget > wired_limit or stream_budget > memory_limit) return error.UnsupportedGlmDiagnosticLayout;
+    } else if (cfg.expert_layout != .exl3_k4) return error.UnsupportedGlmDiagnosticLayout;
     try writeJson(io, a, progress, .{ .phase = "preflight", .complete = false });
-    try @import("mimo_source.zig").validateExl3Pack(io, a, path, &cfg);
+    if (!streamed_bf16) try @import("mimo_source.zig").validateExl3Pack(io, a, path, &cfg);
     const tokenizer = @import("tokenizer.zig");
     var tok = try tokenizer.loadTokenizer(io, a, path);
     defer tok.deinit();
@@ -327,18 +343,23 @@ test "GLM native diagnostic real model" {
     defer a.free(ids);
     try writeJson(io, a, progress, .{ .phase = "loading", .complete = false, .memory_limit_bytes = memory_limit, .wired_limit_bytes = wired_limit, .recommended_working_set_bytes = recommended });
     const load_start = std.Io.Timestamp.now(io, .awake);
-    var weights = try loadWeights(io, a, path, s);
+    const streaming = @import("glm5_stream.zig");
+    const reserve = if (streamed_bf16) @max(try streaming.minimumReserve(&cfg, count + steps, chunk), try std.math.mul(usize, try envNumber("SUSHI_GLM_DIAGNOSTIC_STREAM_RESERVE_GIB", 8), 1024 * 1024 * 1024)) else 0;
+    if (streamed_bf16 and reserve >= stream_budget) return error.SsdBudgetBelowResident;
+    var weights = if (streamed_bf16) try loadWeightsBounded(io, a, path, s, true, try streaming.trunkLimit(&cfg, stream_budget, reserve)) else try loadWeights(io, a, path, s);
     defer weights.deinit();
     const payload = storedBytes(&weights);
     try writeJson(io, a, progress, .{ .phase = "modelbind", .complete = false, .stored_tensor_bytes = payload, .tensors = weights.count() });
     const forward = @import("glm5_forward.zig");
-    var net = try forward.Model.load(a, cfg, &weights, s);
+    var expert_store: ?streaming.Bf16 = if (streamed_bf16) try streaming.Bf16.init(a, path, &cfg, stream_budget, payload, reserve, count + steps, chunk, s) else null;
+    defer if (expert_store) |*store| store.deinit();
+    var net = try forward.Model.loadWithBf16Stream(a, cfg, &weights, s, if (expert_store) |*store| store else null);
     defer net.deinit();
     var request = try forward.Request.init(a, cfg.num_hidden_layers);
     defer request.deinit();
-    request.decode_async = (try envNumber("SUSHI_GLM_DIAGNOSTIC_DECODE_ASYNC", 1)) != 0;
+    request.decode_async = !streamed_bf16 and (try envNumber("SUSHI_GLM_DIAGNOSTIC_DECODE_ASYNC", 1)) != 0;
     request.dense_prefill = (try envNumber("SUSHI_GLM_DIAGNOSTIC_DENSE_PREFILL", 0)) != 0;
-    request.prefill_async = (try envNumber("SUSHI_GLM_DIAGNOSTIC_PREFILL_ASYNC", 0)) != 0;
+    request.prefill_async = !streamed_bf16 and (try envNumber("SUSHI_GLM_DIAGNOSTIC_PREFILL_ASYNC", 0)) != 0;
     request.prefill_sync_layers = @intCast(prefill_sync_layers);
     var loaded_active: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&loaded_active));
@@ -443,6 +464,24 @@ test "GLM native diagnostic real model" {
     for (&decode_layer_ns, prefill_layer_ns) |*total, prefill| total.* -= prefill;
     const decoded = decodedOutput(text);
     var rate_buf: [32]u8 = undefined;
-    try writeJson(io, a, out, .{ .complete = true, .model = path, .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = timed_wired_limit, .wired_policy = wired_policy, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = decoded.output_text, .output_bytes = decoded.output_bytes, .output_text_utf8_valid = decoded.output_text_utf8_valid, .warmup_count = warmup, .warmup_decode_forwards_per_round = if (warmup > 0) warmup_decode else 0, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .routing_histogram_enabled = routing_histogram, .profile_enabled = profile, .component_profile_enabled = components, .prefill_component_ns = prefill_component_ns[0..cfg.num_hidden_layers], .decode_component_ns = decode_component_ns[0..cfg.num_hidden_layers], .dense_prefill = request.dense_prefill, .prefill_schedule = if (request.prefill_async and !profile) (if (request.prefill_sync_layers == 2) "async2" else "async-bounded") else "synchronous", .prefill_sync_layers = if (request.prefill_async and !profile) request.prefill_sync_layers else @as(u8, 1), .qkv_dispatches = @import("glm5_decode.zig").dispatchCount(), .kda_post_dispatches = @import("glm5_kda_fused.zig").postDispatchCount(), .kda_prework_dispatches = @import("glm5_kda_prework.zig").dispatchCount(), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .router_calls = @import("glm5_router.zig").callCount(), .hc_dispatches = @import("glm5_hc_fused.zig").dispatchCount(), .hc_prefill_dispatches = @import("glm5_hc_prefill.zig").dispatchCount(), .activation_calls = @import("glm5_activation.zig").callCount(), .clamped_middle_dispatches = @import("sushi_exl3").kernels.clampedMiddleDispatchCount(), .paired_expert_calls = @import("sushi_exl3").kernels.pairedCooperativeCalls(), .lane_pair_calls = @import("sushi_exl3").kernels.lanePairCalls(), .lane_pair_chain_calls = @import("sushi_exl3").kernels.lanePairChainCalls(), .down_lane_calls = @import("sushi_exl3").kernels.downLaneCalls(), .decode_schedule = if (request.decode_async and !profile) "async4" else "synchronous", .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 compressed MLA cache; FP32 KDA state", .public_serving_enabled = false });
+    try writeJson(io, a, out, .{ .complete = true, .model = path, .streamed_bf16 = streamed_bf16, .stream_budget = if (expert_store) |store| store.budget else null, .stream_cache_slots = if (expert_store) |store| store.engine.plan.slots_per_layer else @as(u16, 0), .stream_fill_bytes = if (expert_store) |store| store.engine.fill_bytes_total else @as(u64, 0), .stream_fill_experts = if (expert_store) |store| store.engine.fill_experts_total else @as(u64, 0), .expert_k = cfg.expert_quant_rate.kText(&rate_buf), .expert_window = cfg.expert_quant_window.bits(), .stored_tensor_bytes = payload, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = memory_limit, .cache_limit_bytes = cache_limit, .wired_limit_bytes = timed_wired_limit, .wired_policy = wired_policy, .recommended_working_set_bytes = recommended, .load_seconds = load_seconds, .prefill_tokens = count, .prefill_chunk = chunk, .prefill_seconds = prefill_seconds, .prefill_tokens_per_second = @as(f64, @floatFromInt(count)) / prefill_seconds, .generated_tokens = steps, .decode_forward_tokens = steps - 1, .decode_seconds = decode_seconds, .decode_tokens_per_second = @as(f64, @floatFromInt(steps - 1)) / decode_seconds, .first_token_from_prefill = true, .eos_index = eos_at, .continued_after_eos = eos_at != null and eos_at.? + 1 < steps, .input_ids = ids, .output_ids = generated, .output_text = decoded.output_text, .output_bytes = decoded.output_bytes, .output_text_utf8_valid = decoded.output_text_utf8_valid, .warmup_count = warmup, .warmup_decode_forwards_per_round = if (warmup > 0) warmup_decode else 0, .warmup_seconds = warmup_seconds, .prefix_reuse = false, .routing_histogram_enabled = routing_histogram, .profile_enabled = profile, .component_profile_enabled = components, .prefill_component_ns = prefill_component_ns[0..cfg.num_hidden_layers], .decode_component_ns = decode_component_ns[0..cfg.num_hidden_layers], .dense_prefill = request.dense_prefill, .prefill_schedule = if (request.prefill_async and !profile) (if (request.prefill_sync_layers == 2) "async2" else "async-bounded") else "synchronous", .prefill_sync_layers = if (request.prefill_async and !profile) request.prefill_sync_layers else @as(u8, 1), .qkv_dispatches = @import("glm5_decode.zig").dispatchCount(), .kda_post_dispatches = @import("glm5_kda_fused.zig").postDispatchCount(), .kda_prework_dispatches = @import("glm5_kda_prework.zig").dispatchCount(), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .router_calls = @import("glm5_router.zig").callCount(), .hc_dispatches = @import("glm5_hc_fused.zig").dispatchCount(), .hc_prefill_dispatches = @import("glm5_hc_prefill.zig").dispatchCount(), .activation_calls = @import("glm5_activation.zig").callCount(), .clamped_middle_dispatches = @import("sushi_exl3").kernels.clampedMiddleDispatchCount(), .paired_expert_calls = @import("sushi_exl3").kernels.pairedCooperativeCalls(), .lane_pair_calls = @import("sushi_exl3").kernels.lanePairCalls(), .lane_pair_chain_calls = @import("sushi_exl3").kernels.lanePairChainCalls(), .down_lane_calls = @import("sushi_exl3").kernels.downLaneCalls(), .decode_schedule = if (request.decode_async and !profile) "async4" else "synchronous", .prefill_layer_ns = prefill_layer_ns[0..cfg.num_hidden_layers], .decode_layer_ns = decode_layer_ns[0..cfg.num_hidden_layers], .mtp = false, .kv = "BF16 compressed MLA cache; FP32 KDA state", .public_serving_enabled = false });
     try writeJson(io, a, progress, .{ .phase = "complete", .complete = true });
+}
+
+test "GLM stream CPU trunk loader never opens expert shards and refuses a resident overbudget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture(tmp.dir, "trunk.safetensors", "{\"lm_head.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]}}", &.{ 128, 63 });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"num_hidden_layers\":4}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"lm_head.weight\":\"trunk.safetensors\",\"model.language_model.layers.3.mlp.experts.0.gate_proj.weight\":\"nonexistent.safetensors\",\"model.language_model.layers.4.mlp.gate.weight\":\"mtp-unopened.safetensors\"}}" });
+    const path = try tmpPath(tmp);
+    defer a.free(path);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try std.testing.expectError(error.GlmResidentBudgetExceeded, loadWeightsBounded(std.testing.io, a, path, cpu, true, 1));
+    var weights = try loadWeightsBounded(std.testing.io, a, path, cpu, true, 2);
+    defer weights.deinit();
+    try std.testing.expectEqual(@as(u32, 1), weights.count());
+    try std.testing.expectEqual(@as(u16, 0x3f80), mlx.mlx_array_data_bfloat16(weights.get("lm_head.weight").?).?[0]);
 }

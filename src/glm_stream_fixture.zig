@@ -8,6 +8,10 @@ pub fn value(expert: usize, projection: usize) u16 {
 }
 
 pub fn write(allocator: std.mem.Allocator, dir: std.Io.Dir, fault: Fault) !void {
+    return writeSized(allocator, dir, fault, 32, 16);
+}
+
+pub fn writeSized(allocator: std.mem.Allocator, dir: std.Io.Dir, fault: Fault, hidden: usize, intermediate: usize) !void {
     const io = std.testing.io;
     var index: std.ArrayList(u8) = .empty;
     defer index.deinit(allocator);
@@ -17,7 +21,8 @@ pub fn write(allocator: std.mem.Allocator, dir: std.Io.Dir, fault: Fault) !void 
         var header: std.ArrayList(u8) = .empty;
         defer header.deinit(allocator);
         try header.append(allocator, '{');
-        var payload: [4 * 32 * 16 * 2]u8 = undefined;
+        const payload = try allocator.alloc(u8, 4 * hidden * intermediate * 2);
+        defer allocator.free(payload);
         var offset: usize = 0;
         var count: usize = 0;
         for ([_]usize{ 3, 1, 0, 2 }) |expert| {
@@ -25,8 +30,8 @@ pub fn write(allocator: std.mem.Allocator, dir: std.Io.Dir, fault: Fault) !void 
             const layer: usize = if (fault == .dense_prefix and expert == 2 and pi == 1) 2 else 3;
             const key = try std.fmt.allocPrint(allocator, "model.language_model.layers.{d}.mlp.experts.{d}.{s}_proj.weight", .{ layer, expert, projection });
             defer allocator.free(key);
-            const rows: usize = if (pi == 2) 32 else 16;
-            const cols: usize = if (fault == .wrong_shape and expert == 2 and pi == 1) 31 else if (pi == 2) 16 else 32;
+            const rows: usize = if (pi == 2) hidden else intermediate;
+            const cols: usize = if (fault == .wrong_shape and expert == 2 and pi == 1) hidden - 1 else if (pi == 2) intermediate else hidden;
             const bytes = rows * cols * 2;
             const dtype: []const u8 = if (fault == .fp16 and expert == 2 and pi == 1) "F16" else "BF16";
             const entry = try std.fmt.allocPrint(allocator, "{s}\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}", .{ if (count == 0) "" else ",", key, dtype, rows, cols, offset, offset + bytes });

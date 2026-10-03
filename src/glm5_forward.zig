@@ -218,16 +218,18 @@ const Moe = struct {
     weight: Arr,
     correction: Arr,
     bank: exl3.Bank,
+    streamed: ?*@import("glm5_stream.zig").Bf16 = null,
+    layer_index: u16 = 0,
     shared: ?base.DenseMlp,
-    fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig) !Moe {
-        var projs: [3]exl3.Proj = undefined;
-        for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |p, i| {
+    fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig, streamed: ?*@import("glm5_stream.zig").Bf16, layer_index: u16) !Moe {
+        var projs: [3]exl3.Proj = @splat(.{ .trellis = .{ .ctx = null }, .suh = .{ .ctx = null }, .svh = .{ .ctx = null } });
+        if (streamed == null) for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |p, i| {
             var buf: [256]u8 = undefined;
             const name = try std.fmt.bufPrint(&buf, "{s}.switch_mlp.{s}", .{ prefix, p });
             projs[i] = .{ .trellis = try tensor(weights, name, "trellis"), .suh = try tensor(weights, name, "suh"), .svh = try tensor(weights, name, "svh") };
-        }
+        };
         var buf: [256]u8 = undefined;
-        return .{ .weight = try tensor(weights, prefix, "gate.weight"), .correction = try tensor(weights, prefix, "gate.e_score_correction_bias"), .bank = .{ .gate = projs[0], .up = projs[1], .down = projs[2] }, .shared = if (cfg.shared_expert_intermediate_size > 0) try base.DenseMlp.load(weights, try std.fmt.bufPrint(&buf, "{s}.shared_experts", .{prefix}), cfg.hidden_size, cfg.shared_expert_intermediate_size) else null };
+        return .{ .streamed = streamed, .layer_index = layer_index, .weight = try tensor(weights, prefix, "gate.weight"), .correction = try tensor(weights, prefix, "gate.e_score_correction_bias"), .bank = .{ .gate = projs[0], .up = projs[1], .down = projs[2] }, .shared = if (cfg.shared_expert_intermediate_size > 0) try base.DenseMlp.load(weights, try std.fmt.bufPrint(&buf, "{s}.shared_experts", .{prefix}), cfg.hidden_size, cfg.shared_expert_intermediate_size) else null };
     }
     fn apply(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !Arr {
         return self.applyTracked(ops, x, cfg, null);
@@ -235,7 +237,7 @@ const Moe = struct {
     fn applyTracked(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, component: ?*ComponentTimer) !Arr {
         const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
         try ComponentTimer.mark(component, "router", &.{ routing.indices, routing.scores }, null);
-        const routed = try ops.own(try exl3.moeClamped(ops.s, x, self.bank, routing.indices, routing.scores, .{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window }, @intFromFloat(cfg.glm_swiglu_limit)));
+        const routed = if (self.streamed) |store| try store.apply(self.layer_index, ops, x, routing.indices, routing.scores, cfg.glm_swiglu_limit) else try ops.own(try exl3.moeClamped(ops.s, x, self.bank, routing.indices, routing.scores, .{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window }, @intFromFloat(cfg.glm_swiglu_limit)));
         try ComponentTimer.mark(component, "routed", &.{routed}, null);
         if (self.shared) |shared| {
             const y = try shared.apply(ops, x, cfg.glm_swiglu_limit);
@@ -356,6 +358,7 @@ pub const Request = struct {
     prefill_sync_layers: u8 = 2,
     capture: ?*Capture = null,
     hc_capture: ?*HcCapture = null,
+    stream_owner: ?*@import("glm5_stream.zig").Bf16 = null,
     layer_ns: [128]u64 = @splat(0),
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
@@ -363,10 +366,13 @@ pub const Request = struct {
         return .{ .allocator = allocator, .layers = layers };
     }
     pub fn deinit(self: *Request) void {
+        if (self.stream_owner) |store| store.release(self);
         for (self.layers) |*layer| layer.deinit();
         self.allocator.free(self.layers);
     }
     pub fn reset(self: *Request) void {
+        if (self.stream_owner) |store| store.release(self);
+        self.stream_owner = null;
         for (self.layers) |*layer| {
             layer.deinit();
             layer.* = .init();
@@ -412,9 +418,18 @@ pub const Model = struct {
     head: Linear,
     norm: Arr,
     s: mlx.mlx_stream,
+    expert_stream: ?*@import("glm5_stream.zig").Bf16 = null,
 
     pub fn load(allocator: std.mem.Allocator, cfg: model.ModelConfig, weights: *const model.Weights, s: mlx.mlx_stream) !Model {
+        return loadWithBf16Stream(allocator, cfg, weights, s, null);
+    }
+
+    pub fn loadWithBf16Stream(allocator: std.mem.Allocator, cfg: model.ModelConfig, weights: *const model.Weights, s: mlx.mlx_stream, streamed: ?*@import("glm5_stream.zig").Bf16) !Model {
         if (!cfg.isGlm5()) return error.InvalidGlmConfig;
+        if (streamed) |store| {
+            const g = store.engine.geometry;
+            if (g.layers != cfg.num_hidden_layers or g.experts != cfg.num_experts or g.hidden != cfg.hidden_size or g.intermediate != cfg.moe_intermediate_size or g.first_moe_layer != cfg.first_k_dense_replace) return error.InvalidGlmStreamGeometry;
+        }
         const layers = try allocator.alloc(Layer, cfg.num_hidden_layers);
         var loaded: usize = 0;
         errdefer {
@@ -435,7 +450,7 @@ pub const Model = struct {
             const ffn: Ffn = if (i < cfg.first_k_dense_replace)
                 .{ .dense = try base.DenseMlp.load(weights, try std.fmt.bufPrint(&buf, "{s}.mlp", .{prefix}), cfg.hidden_size, cfg.intermediate_size) }
             else
-                .{ .moe = try Moe.load(weights, try std.fmt.bufPrint(&buf, "{s}.mlp", .{prefix}), &cfg) };
+                .{ .moe = try Moe.load(weights, try std.fmt.bufPrint(&buf, "{s}.mlp", .{prefix}), &cfg, streamed, @intCast(i)) };
             const name = try std.fmt.bufPrint(&buf, "{s}.self_attn", .{prefix});
             const attn: Attention = if ((i + 1) % cfg.full_attention_interval == 0) .{ .mla = try Mla.load(weights, name, &cfg, s) } else blk: {
                 var kda = try base.KdaLayer.load(weights, name, &cfg);
@@ -445,7 +460,7 @@ pub const Model = struct {
             layer.* = .{ .attn = attn, .ffn = ffn, .hc_attn = hc_attn, .hc_ffn = hc_ffn, .norm_attn = norm_attn, .norm_ffn = norm_ffn };
             loaded += 1;
         }
-        return .{ .allocator = allocator, .cfg = cfg, .layers = layers, .embedding = emb, .head = head, .norm = try tensor(weights, cfg.weight_prefix, "norm.weight"), .s = s };
+        return .{ .allocator = allocator, .cfg = cfg, .layers = layers, .expert_stream = streamed, .embedding = emb, .head = head, .norm = try tensor(weights, cfg.weight_prefix, "norm.weight"), .s = s };
     }
 
     pub fn deinit(self: *Model) void {
@@ -495,6 +510,7 @@ pub const Model = struct {
     pub fn forwardLast(self: *const Model, request: *Request, ids: Arr, last_only: bool) !Arr {
         const ish = mlx.getShape(ids);
         if (ish.len != 2 or ish[0] != 1 or ish[1] < 1 or request.layers.len != self.layers.len) return error.InvalidGlmInput;
+        if (self.expert_stream) |store| try store.admit(request.offset, @intCast(ish[1]));
         if (request.capture) |capture| {
             if (capture.ids.len != capture.out.len) return error.InvalidGlmCapture;
             for (capture.ids, 0..) |id, i| {
@@ -508,9 +524,14 @@ pub const Model = struct {
         if (request.prefill_sync_layers == 0 or request.prefill_sync_layers > 8) return error.InvalidGlmPrefillSchedule;
         if (request.failed) return error.GlmRequestNeedsReset;
         if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
+        if (self.expert_stream) |store| {
+            if (request.stream_owner) |owner| if (owner != store) return error.GlmStreamRequestBusy;
+            try store.claim(request);
+            request.stream_owner = store;
+        } else if (request.stream_owner != null) return error.GlmStreamRequestBusy;
         errdefer request.failed = true;
-        const staged_decode = ish[1] == 1 and request.decode_async and !request.profile and !request.profile_components;
-        const staged_prefill = ish[1] > 1 and request.prefill_async and !request.profile and !request.profile_components;
+        const staged_decode = self.expert_stream == null and ish[1] == 1 and request.decode_async and !request.profile and !request.profile_components;
+        const staged_prefill = self.expert_stream == null and ish[1] > 1 and request.prefill_async and !request.profile and !request.profile_components;
         var h: Arr = undefined;
         {
             var ops = Ops{ .s = self.s };
@@ -1418,4 +1439,56 @@ test "GLM KLD native self teacher aligns prediction rows and forced token state"
     for (result.per_position_kld) |value| try std.testing.expectApproxEqAbs(@as(f64, 0), value, 1e-12);
     try std.testing.expectEqual(prompt.len + generated.len - 1, student.offset);
     try expectRequestBits(&teacher, &student);
+}
+
+test "GLM stream GPU native forward binds BF16 experts and releases request admission" {
+    const a = std.testing.allocator;
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    var cfg = try completeFixture(&weights);
+    cfg.num_experts = 4;
+    // Replace only the router; the resident EXL3 banks are deliberately absent.
+    var remove: std.ArrayList([]const u8) = .empty;
+    defer remove.deinit(a);
+    var keys = weights.map.keyIterator();
+    while (keys.next()) |key| if (std.mem.indexOf(u8, key.*, ".switch_mlp.") != null or std.mem.endsWith(u8, key.*, ".mlp.gate.weight") or std.mem.endsWith(u8, key.*, ".mlp.gate.e_score_correction_bias")) {
+        try remove.append(a, key.*);
+    };
+    for (remove.items) |key| {
+        const value = weights.map.fetchRemove(key).?;
+        _ = mlx.mlx_array_free(value.value);
+        a.free(value.key);
+    }
+    try fixtureTensor(&weights, "model.language_model.layers.3.mlp", "gate.weight", &.{ 4, 128 }, .float32, false);
+    try fixtureTensor(&weights, "model.language_model.layers.3.mlp", "gate.e_score_correction_bias", &.{4}, .float32, false);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try @import("glm_stream_fixture.zig").writeSized(a, tmp.dir, .none, 128, 128);
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &path);
+    const streaming = @import("glm5_stream.zig");
+    var store = try streaming.Bf16.init(a, path[0..n], &cfg, 1024 * 1024 * 1024, @import("glm5_diagnostic.zig").storedBytes(&weights), 128 * 1024 * 1024, 8, 3, mlx.gpuStream());
+    defer store.deinit();
+    var net = try Model.loadWithBf16Stream(a, cfg, &weights, mlx.gpuStream(), &store);
+    defer net.deinit();
+    var request = try Request.init(a, cfg.num_hidden_layers);
+    defer request.deinit();
+    var other = try Request.init(a, cfg.num_hidden_layers);
+    defer other.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const y = try net.forward(&request, ids);
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+    try std.testing.expectEqual(@as(usize, 3), request.offset);
+    try std.testing.expect(store.engine.fill_bytes_total > 0);
+    try std.testing.expectError(error.GlmStreamRequestBusy, net.forward(&other, ids));
+    try std.testing.expectEqual(@as(usize, 0), other.offset);
+    request.reset();
+    const z = try net.forward(&other, ids);
+    defer _ = mlx.mlx_array_free(z);
+    try mlx.check(mlx.mlx_array_eval(z));
+    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(y).?[0..12], mlx.mlx_array_data_bfloat16(z).?[0..12]);
+    try std.testing.expectError(error.GlmStreamingSpecUnsupported, @import("glm5_dflash_ffn.zig").apply(&net, 3, undefined, undefined));
+    try std.testing.expectError(error.GlmStreamRequestBudgetExceeded, store.admit(7, 3));
 }

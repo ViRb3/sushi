@@ -5,8 +5,9 @@ It does not register GLM with the public server. The test is skipped unless
 `SUSHI_GLM_DIAGNOSTIC_MODEL` is set. Run a full model only in an exclusive GPU slot,
 after the tiny native layer and model lifecycle fixtures pass.
 
-The dedicated loader requires the checkpoint's index and config. The gated runner validates EXL3 shard stamps and complete bank geometry before
-loading arrays. The loader reads only index-owned text tensors, excludes vision and MTP (including layer indices beyond
+The dedicated loader requires the checkpoint's index and config. The resident runner validates EXL3 shard stamps
+and complete bank geometry before loading arrays; streamed BF16 validates source expert headers. The loader reads
+only index-owned text tensors, excludes vision and MTP (including layer indices beyond
 `num_hidden_layers`), and preserves BF16, FP32, F16 and integer storage exactly.
 Filtering occurs before tensor evaluation. The report counts actual retained
 array bytes and records the configured expert rate/window; the directory name is
@@ -38,11 +39,20 @@ and binary provenance.
 | `PROFILE` | Default 1; record time per model layer |
 | `MEMORY_GIB` / `CACHE_GIB` | Default 110 / 2 GiB |
 | `WIRED_GIB` | Optional; cannot exceed the reported recommended working set |
+| `STREAM_GIB` | Default0; explicit total GiB budget enables individual BF16 expert streaming |
+| `STREAM_RESERVE_GIB` | Default8; request reserve, raised when the computed context/chunk bound needs more |
 
 A smoke run can use prefill 8, decode 4, chunk 8, warmup 0. A 512/64 measurement
 should use the same source-compatible prompt IDs as the reference run. The
 runner rejects short input rather than silently repeating it. It records the
 exact input/output IDs and decoded output text for coherence inspection.
+
+For a short BF16 source smoke, use `STREAM_GIB=100`, `MEMORY_GIB=100`, `WIRED_GIB=100`,
+`CACHE_GIB=0`, `PREFILL=8`, `DECODE=2`, `CHUNK=8`, `WARMUP=0`, `PROFILE=0` and an explicit
+source checkpoint. The lazy trunk must fit after union/bounce/reserve/minimum-cache deductions before
+evaluation. The report includes the total ledger, cache slots and expert fill bytes/counts. Streaming
+supports a single admitted request and chunks at most512, with synchronous layers; CPU execution,
+quantized streamed experts and DFlash targets are refused. Full-model reference parity remains open.
 
 Warmup executes all requested prefill chunk shapes and the configured decode ticks, then
 resets request state. There is no prefix reuse. Load/bind, warmup, prefill and

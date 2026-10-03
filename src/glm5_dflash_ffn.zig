@@ -44,6 +44,7 @@ fn dense(linear: base.DenseMlp, ops: *Ops, x: Arr, limit: f32) !Arr {
 }
 
 pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr {
+    if (target.expert_stream != null) return error.GlmStreamingSpecUnsupported;
     if (index >= target.layers.len) return error.InvalidGlmLayer;
     const shape = mlx.getShape(x);
     if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > 16 or shape[2] != target.cfg.hidden_size) return error.InvalidGlmDraftShape;

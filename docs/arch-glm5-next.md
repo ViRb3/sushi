@@ -1,7 +1,7 @@
 # GLM-5.3-Flash: native engine foundation
 
-The `glm5_next` source adapter preserves official BF16 expert tensors for streaming tests. The native
-text forward now runs the completed EXL3 checkpoint through an opt-in diagnostic harness. It is not
+The `glm5_next` source adapter preserves official BF16 expert tensors for native streaming. The native
+text forward runs resident EXL3 and streamed BF16 checkpoints through an opt-in diagnostic harness. It is not
 registered in `model.served_model_types`: production serving, full reference parity and quality gates
 remain open. See [diagnostic usage](glm5-diagnostic.md) and [attention/cache details](engine-glm5-attention.md).
 
@@ -63,7 +63,7 @@ FP8 expert scale keys are rejected rather than silently treating the FP8 release
 `expert_stream.Engine` imports the three components, returns transposed BF16 views for `gather_mm`, and keeps
 `Prepared.quantized` false. It uses the existing synchronous exact-route path; speculative quantized execution is
 not used. Source BF16 bits are preserved throughout. The optional MTP shard, shared experts and dense trunk
-are not opened by this store; a future model loader must load the trunk separately and resolve MTP explicitly.
+are not opened by this store; the native diagnostic loader loads the text trunk separately and excludes MTP.
 
 ## KDA recurrence
 
@@ -409,6 +409,40 @@ repeated RMS/input work and scheduling costs in this experiment. These are compo
 not full-model timings. The GPU lock and foreground QoS were used with other workers paused and ten
 seconds idle. Fan maximum was requested but reported RPM did not confirm spin-up. The isolated test
 and raw samples were archived and removed from the runtime tree; C24 remains unchanged.
+
+### Native BF16 expert streaming
+
+`glm5_stream.zig` connects the native diagnostic model to the existing individual-expert reader and fixed
+cache/union slabs. The indexed loader retains only text trunk tensors before materialization. Admission
+reserves the stored trunk, request caches/workspaces, full expert union, I/O bounce buffers and at least one
+slot per MoE layer before any retained trunk is evaluated. The engine preserves exact BF16 source bytes;
+router IDs are remapped to slab slots without changing scores, clamping or FP32 weighted reduction.
+
+Execution currently supports one admitted request, BF16 experts, GPU GatherMM and synchronous layer
+completion. The supplied maximum context and chunk bound are enforced; a chunk must be at most 512.
+Reset/deinit releases request ownership. Resident EXL3 operation retains its existing loader and scheduling.
+DFlash pairing, FFN reuse and tree verification refuse a streamed target with
+`GlmStreamingSpecUnsupported`; CPU BF16 GatherMM refuses with `GlmStreamRequiresGpu`.
+
+ReleaseFast reproduction: `zig build test -Doptimize=ReleaseFast -Dtest-filter='GLM stream'`.
+The focused suite passed 17 tests, including raw BF16 parity with resident GatherMM through eviction,
+oversized route unions and retained earlier outputs, native binding without resident expert banks,
+trunk-only loading, budget refusal and request ownership. Separate malformed-source coverage rejects
+missing projections, FP16, wrong shapes, truncated shards, dense-prefix experts and mixed formats.
+
+The 2026-10-03 cold smoke used the original BF16 checkpoint, 8 prefix tokens, 2 generated tokens,
+chunk8, no warmup/profiling or MLX free-buffer cache, a 100 GiB total/memory/wired budget and 8 GiB request
+reserve. The rebuilt test binary SHA256 is `d9ff24214580a6de297f9f9e6bd5830180e48e4ffb350a606a8251c917166acc`
+(base `fe5984de` plus this streaming change, built 07:59:58 local time), with foreground QoS and exclusive
+GPU lock `glm53-native-stream-smoke-v61`.
+It completed with finite logits and IDs 304/279, using 31 cache slots per layer and 98,411,115,340 peak
+active MLX bytes, below 107,374,182,400 budget bytes. This is short-path execution and memory evidence;
+full-model reference parity, teacher capture, quantized streaming and public serving remain open.
+
+The gated diagnostic test accepts `SUSHI_GLM_DIAGNOSTIC_STREAM_GIB` and optional
+`SUSHI_GLM_DIAGNOSTIC_STREAM_RESERVE_GIB`; the former is a total GiB budget and the latter defaults to8.
+Use the existing explicit model, prompt/tokens, output, memory, wired, prefill, decode and chunk controls.
+The computed conservative reserve can raise the requested reserve for longer contexts.
 
 ### Lossless BF16 streamed KLD teacher
 

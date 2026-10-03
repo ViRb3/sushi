@@ -234,6 +234,7 @@ pub const Verified = struct {
 };
 
 pub fn verify(target: *const forward.Model, request: *const forward.Request, tokens: []const u32, parents: []const i32, taps: []const u32, mode: kda.ProjectionMode) !Verified {
+    if (target.expert_stream != null) return error.GlmStreamingSpecUnsupported;
     try tree.validate(tokens, parents);
     if (request.failed) return error.GlmRequestNeedsReset;
     if (request.capture != null or request.layers.len != target.layers.len) return error.InvalidGlmDraftOffset;
