@@ -285,3 +285,9 @@ or broad parameter search belongs in this wave.
   the 8K component preserved every bit and won 11/11 pairs, approximately
   18.6% faster. Long-prefix NAX-selector cadence still requires its 16K guard
   before integration; this is not an HTTP throughput claim.
+
+The follow-up R8 value-row recurrence was also archived: all BF16 outputs and
+FP32 final-state bits matched R4, but the paired median gain was only 1.55%
+(8/11 wins), about 71 µs per layer. Its approximately 2.43 ms cold-prefix ceiling
+does not justify a new runtime arm for this wave. No R16 or scheduling sweep
+was run. See [the recurrence lesson](glm5-kda-prefill-research.md).

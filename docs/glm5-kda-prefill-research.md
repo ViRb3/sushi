@@ -786,3 +786,40 @@ faster. The user explicitly accepted BF16 operands and intermediates with FP32
 accumulators and requested no precision restoration. The prototype and research
 seam were therefore removed and archived; no model hook or default changed.
 These are component findings, with no model-level quality or throughput claim.
+
+## R8 value-row extension: exact but too small for this wave
+
+At `2d43b737`, one isolated fixed-R8 candidate reused the identical unrolled R4
+Metal source. Each lane retained eight independent four-key FP32 state vectors
+instead of four, with unchanged per-member decay, dot, `simd_sum`, update and
+BF16 stores. Threadgroup height remained four SIMD groups; grid Y changed
+32→16 and group count 512→256 at B1/T2048/H64/D128. This was register-resident
+value-row reuse, not a retry of raw threadgroup-height or staged-token schedules.
+The production recurrence policy stayed at R4.
+
+The qualified R4 fixture recipe was regenerated on MLX 0.32.3: BF16 Q/K/V and
+beta, FP32 channel decay, and nonzero FP32 state. No stored actual-prework or
+whole-KDA fixture existed, and no new model capture was run. Every one of
+16,777,216 BF16 output values and 1,048,576 FP32 final-state values matched R4
+bit for bit. The test failed on the missing R8 candidate before implementation
+and passed after it was added.
+
+| Arm | Median ms | Paired result |
+|---|---:|---|
+| Current R4 | 3.622968 | control |
+| Isolated R8 | 3.551583 | 8/11 wins; paired median 1.55% faster |
+
+Median arm difference was 1.97%, or 71.4 µs per recurrence. Three losing pairs
+were 0.27–0.56% slower. Three warmup pairs preceded eleven alternating AB/BA
+pairs, four fresh apply/evaluate/free calls per sample, with both output and
+FP32 final state evaluated. Inputs were materialized before timing. ReleaseFast,
+foreground QoS, exclusive GPU lock, maximum fans requested and ten-second idle
+were recorded; the owned lock was released and fans returned to automatic.
+
+The extrapolated saving across 34 KDA layers is only about 2.43 ms, approximately
+0.14% of the fresh 1.788-second synchronization-perturbed T2048 prompt. This is
+not a whole-KDA or model throughput measurement. The marginal paired result
+and small ceiling do not justify another variant, production knob or full-model
+repetition for the current 1500 tok/s goal. The helper, probe, import root, shared
+source exposure and binary were archived privately and removed from the tree.
+Measurement key: `glm53-kda-r8-value-rows-20261003`.
