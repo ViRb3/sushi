@@ -1,0 +1,170 @@
+//! Opt-in bounded IndexPool NAX scoring; top-512 retrieval policy is unchanged.
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const Ops = @import("glm5_model.zig").Ops;
+const Arr = mlx.mlx_array;
+pub const dot_limit: usize = 2 * 1024 * 1024;
+pub const tile_pools: usize = 2048;
+pub const max_rows: usize = 16;
+threadlocal var enabled_override: ?bool = null;
+var calls: usize = 0;
+pub const Binding = struct {
+    previous: ?bool,
+    pub fn restore(self: Binding) void { enabled_override = self.previous; }
+};
+pub fn bind(on: bool) Binding {
+    const result = Binding{ .previous = enabled_override };
+    enabled_override = on;
+    return result;
+}
+pub fn enabled() bool {
+    return enabled_override orelse @import("transformer.zig").diagEnvOn("SUSHI_GLM_INDEX_SCORE_NAX");
+}
+pub fn resetDispatchCount() void { calls = 0; }
+pub fn dispatchCount() usize { return calls; }
+pub fn dotBytes(rows: usize, pools: usize) !usize {
+    return std.math.mul(usize, try std.math.mul(usize, rows, 32), try std.math.mul(usize, pools, 2));
+}
+pub fn outputBytes(rows: usize, pools: usize) !usize {
+    return std.math.mul(usize, try std.math.mul(usize, rows, pools), 4);
+}
+// Dot output already has the original BF16(dot) boundary. Preserve product
+// rounding, head order, final score rounding, and complete-pool causality.
+const EPILOGUE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint i=thread_position_in_grid.x;
+    \\if(i>=uint(ROWS)*uint(COLS)) return;
+    \\const uint row=i/uint(COLS),col=i%uint(COLS),p=uint(first)+col;
+    \\if((p+1u)*4u>uint(offset)+row+1u) {out[i]=-INFINITY;return;}
+    \\float total=0.0f;
+    \\for(uint h=0u;h<32u;++h) {
+    \\ const float dot=float(dots[(row*32u+h)*uint(COLS)+col]);
+    \\ total+=float(InT(max(dot,0.0f)*float(weights[row*32u+h])));
+    \\}
+    \\out[i]=float(InT(total));
+;
+// Original production SCORE arithmetic, used only as the component reference.
+const REFERENCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint lane=thread_position_in_threadgroup.x;
+    \\const uint p=threadgroup_position_in_grid.y;
+    \\const uint row=threadgroup_position_in_grid.z;
+    \\const uint pools=uint(count);
+    \\if ((p+1u)*4u > uint(offset)+row+1u) { if(lane==0) out[row*pools+p]=-INFINITY; return; }
+    \\float total=0.0f;
+    \\for(uint h=0;h<32u;++h) {
+    \\  float dot=0.0f;
+    \\  for(uint d=lane;d<128u;d+=32u) dot+=float(q[(row*32u+h)*128u+d])*float(keys[p*128u+d]);
+    \\  dot=simd_sum(dot);
+    \\  const float rounded=float(InT(dot));
+    \\  total+=float(InT(max(rounded,0.0f)*float(weights[row*32u+h])));
+    \\}
+    \\if(lane==0) out[row*pools+p]=float(InT(total));
+;
+fn kernel(comptime name: [:0]const u8, ins: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+    const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&.{"out"}, 1);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const result = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, "", true, false);
+    if (result.ctx == null) return error.MetalKernelCompileFailed;
+    return result;
+}
+var epi_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var ref_kernel: ?mlx.mlx_fast_metal_kernel = null;
+fn apply(ops: *Ops, k: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, inputs: []const Arr) !Arr {
+    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, ops.s));
+    const out = try ops.slot();
+    try mlx.check(mlx.mlx_vector_array_get(out, ov, 0));
+    return out.*;
+}
+fn scalar(ops: *Ops, n: usize) !Arr {
+    const value: u32 = @intCast(n);
+    return ops.own(mlx.mlx_array_new_data(&value, &.{}, 0, .uint32));
+}
+fn geometry(q: []const c_int, keys: []const c_int, weights: []const c_int, offset: usize, pools: usize) bool {
+    return q.len == 3 and q[0] > 0 and q[0] <= max_rows and q[1] == 32 and q[2] == 128 and
+        keys.len == 2 and keys[0] >= pools and keys[1] == 128 and weights.len == 2 and weights[0] == q[0] and weights[1] == 32 and
+        pools >= 512 and pools <= 8192 and offset <= pools * 4 and q[0] <= pools * 4 + 3 - offset;
+}
+/// Only the measured long-history prefill geometry is eligible. Decode/verify
+/// and mixed precision retain the original scalar scorer.
+pub fn tryScores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: mlx.mlx_stream) !?Arr {
+    if (!enabled() or !mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported() or pools < 4096) return null;
+    for ([_]Arr{ q, keys, weights }) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return null;
+    const sh = mlx.getShape(q);
+    if (!geometry(sh, mlx.getShape(keys), mlx.getShape(weights), offset, pools) or sh[0] <= 8) return null;
+    const result = try scores(q, keys, weights, offset, pools, s);
+    calls += 1;
+    return result;
+}
+/// Existing BF16 caches/queries/weights; returned FP32 scores contain rounded
+/// BF16 values and -infinity for future pools, as in the original SCORE kernel.
+pub fn scores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: mlx.mlx_stream) !Arr {
+    if (!mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return error.UnsupportedGlmIndexNax;
+    for ([_]Arr{ q, keys, weights }) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return error.UnsupportedGlmIndexNax;
+    if (!geometry(mlx.getShape(q), mlx.getShape(keys), mlx.getShape(weights), offset, pools)) return error.UnsupportedGlmIndexNax;
+    const rows = mlx.getShape(q)[0];
+    if (try outputBytes(@intCast(rows), pools) > dot_limit) return error.GlmIndexNaxScratchBudget;
+    const parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    var first: usize = 0;
+    while (first < pools) {
+        const end = @min(pools, first + tile_pools);
+        const cols: c_int = @intCast(end - first);
+        if (try dotBytes(@intCast(rows), @intCast(cols)) > dot_limit) return error.GlmIndexNaxScratchBudget;
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const flat = try ops.reshape(try ops.contiguous(q), &.{ rows * 32, 128 });
+        const pool = try ops.slice(keys, 0, @intCast(first), @intCast(end));
+        const dots = try ops.binary(.mm, flat, try ops.transpose(pool, &.{ 1, 0 }));
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, cols }, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * cols, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "COLS", cols));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", .bfloat16));
+        if (epi_kernel == null) epi_kernel = try kernel("sushi_glm_index_nax_epilogue", &.{ "dots", "weights", "offset", "first" }, EPILOGUE);
+        const tile = try apply(&ops, epi_kernel.?, cfg, &.{ dots, weights, try scalar(&ops, offset), try scalar(&ops, first) });
+        try mlx.check(mlx.mlx_array_eval(tile));
+        try mlx.check(mlx.mlx_vector_array_append_value(parts, tile));
+        first = end;
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, parts, 1, s));
+    return out;
+}
+pub fn reference(ops: *Ops, q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize) !Arr {
+    const rows = mlx.getShape(q)[0];
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, @as(c_int, @intCast(pools)) }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, @intCast(pools), rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", .bfloat16));
+    if (ref_kernel == null) ref_kernel = try kernel("sushi_glm_index_score_reference", &.{ "q", "keys", "weights", "offset", "count" }, REFERENCE);
+    return apply(ops, ref_kernel.?, cfg, &.{ q, keys, weights, try scalar(ops, offset), try scalar(ops, pools) });
+}
+pub fn topPools(ops: *Ops, values: Arr) !Arr {
+    const rows = mlx.getShape(values)[0];
+    const pools = mlx.getShape(values)[1];
+    const neg = try ops.unary(.negative, values);
+    const partition = try ops.slot();
+    try mlx.check(mlx.mlx_argpartition_axis(partition, neg, @min(pools, 512) - 1, -1, ops.s));
+    const out = try ops.slot();
+    try mlx.check(mlx.mlx_slice(out, partition.*, &.{ 0, 0 }, 2, &.{ rows, @min(pools, 512) }, 2, &.{ 1, 1 }, 2, ops.s));
+    return out.*;
+}
+test "GLM IndexPool NAX dot plane remains within original bound" {
+    try std.testing.expectEqual(dot_limit, try dotBytes(16, 2048));
+    try std.testing.expectEqual(@as(usize, 524288), try outputBytes(16, 8192));
+    try std.testing.expect(geometry(&.{ 16, 32, 128 }, &.{ 8192, 128 }, &.{ 16, 32 }, 32752, 8192));
+    try std.testing.expect(!geometry(&.{ 17, 32, 128 }, &.{ 8192, 128 }, &.{ 17, 32 }, 32751, 8192));
+}

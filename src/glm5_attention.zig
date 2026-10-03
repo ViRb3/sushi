@@ -271,6 +271,8 @@ fn indexScores(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     const sh = mlx.getShape(index_q);
     const rows = sh[0];
     const pools: c_int = @intCast(state.processed / 4);
+    if (try @import("glm5_indexpool_nax.zig").tryScores(index_q, state.pooled, weights, offset, @intCast(pools), scope.s)) |out|
+        return scope.own(out);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, pools }, 2, .float32));
