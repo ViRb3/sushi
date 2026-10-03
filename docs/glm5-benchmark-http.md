@@ -374,7 +374,7 @@ draft/verify/replay/commit times were 6.28/60.53/2.36/1.00 ms; verifier work sti
 dominates the remaining decode gap. The 2K-to-32K decode rates in this wave
 were 47.08 and 42.39 tok/s; neither reaches 60.
 
-A separate fixed-code 32K/64-output gate matched all target IDs and complete
+A separate fixed-prompt 32K/64-output gate matched all target IDs and complete
 final state against serial decoding from the same captured prefix. It engaged
 165 cadence calls and 672 expert-grid calls, with decode peak 96.47 GB.
 This correctness gate's committed-input-token rate is distinct from HTTP.
