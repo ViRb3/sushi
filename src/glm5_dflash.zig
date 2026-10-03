@@ -221,9 +221,12 @@ pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const dr
     const ids = try ops.own(mlx.mlx_array_new_data(&noise, &[_]c_int{ 1, @intCast(assistant.config.block_size) }, 2, .uint32));
     const embeds = try ops.own(try target.rawEmbedding(ids));
     const hidden = try ops.own(try draft.forwardBlock(assistant, &work, embeds, context.absLen()));
-    const projected = try ops.own(try target.projectHead(hidden));
+    const projected = if (assistant.draft_head) |*coarse|
+        try ops.own(try @import("glm5_dflash_mini.zig").project(target.head, coarse, hidden, assistant.s))
+    else
+        try ops.own(try target.projectHead(hidden));
     const transformed = try ops.own(try draft.applyLogitTransforms(projected, assistant.config.output_multiplier, assistant.config.logit_softcap, assistant.s));
-    const logits = try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
+    const logits = if (assistant.draft_head != null) transformed else try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
     var lattice = try tree.lattice(assistant.allocator, &assistant.selector.?, assistant.config.selector_top_k, hidden, logits, pending, assistant.s);
     defer lattice.deinit(assistant.allocator);
     var branches = try tree.bestFirstTree(assistant.allocator, &lattice, .{ .max_nodes = max_nodes, .children = children });
@@ -460,6 +463,15 @@ pub fn loadAssistantStored(io: std.Io, allocator: std.mem.Allocator, directory: 
     errdefer assistant.deinit();
     try validatePair(&assistant, target);
     _ = try assistantStorage(&assistant);
+    if (@import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_MINI_HEAD")) {
+        if (assistant.config.block_size > 8 or assistant.config.selector_top_k > 32 or assistant.config.logit_softcap > 0 or
+            !std.math.isFinite(assistant.config.output_multiplier) or assistant.config.output_multiplier <= 0) return error.UnsupportedGlmMiniHead;
+        const mini = @import("glm5_dflash_mini.zig");
+        assistant.draft_head = try mini.build(target.head, target.s);
+        assistant.draft_head_bits = mini.bits;
+        assistant.draft_head_group = mini.group_size;
+        @import("log.zig").info("[glm-dflash] mini draft readout: {d}-bit/gs{d} -> top-32 -> stored-head re-score; selector top-{d}; {d} resident bytes\n", .{ mini.bits, mini.group_size, assistant.config.selector_top_k, mini.residentBytes(target.head.output, target.head.input) });
+    }
     return assistant;
 }
 
