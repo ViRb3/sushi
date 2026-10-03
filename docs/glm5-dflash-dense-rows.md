@@ -44,6 +44,29 @@ when `SUSHI_GLM_DFLASH_DENSE_ROWS=1`; the default remains off. The independent
 serial-row mode remains unchanged. An integrated three-row test compares all 384
 BF16 output bits and checks dispatch engagement. Diagnostic JSON reports
 `dense_row_dispatches` and mini-head storage/readout counters.
+
+## Rejected ordinary native NAX chain
+
+After the user permitted ordinary BF16 NAX compound rounding, one focused
+three-row FA→FB, GA→GB, beta chain revisited the stock batched alternative on
+MLX v0.32.3 (`64ea011c`). The same independent fixed-seed BF16 fixtures used
+the five actual retained KDA dimensions; no production bank was captured.
+Original BF16 intermediate boundaries and FP32 accumulators were preserved,
+without weight conversion, artificial row padding or restoration math.
+
+Current column-GEMV median was 255.375 µs versus native NAX 270.042 µs
+(+5.74%, 2/11 paired wins). FA changed one of 384 bits, with maximum absolute
+difference 0.00000095367431640625 and relative L2 0.0000000527022; FB changed
+one of 24576 values, maximum 0.00000011920928955078125 and relative L2
+0.00000000243319. GA, GB and beta were exact. The numerical difference was
+acceptable, but the timing did not justify an opt-in caller hook.
+
+Three focused tests passed. Fresh five-projection DAG construction, native
+copies/partials, endpoint evaluation and free were included. Three warmups
+preceded eleven alternating pairs. The exclusive ReleaseFast run used
+interactive QoS, maximum fans requested, 46.76°C initial temperature and ten
+seconds idle. Exact source and raw evidence were archived; helper, probe and
+wrapper were removed. No model run or additional variant was warranted.
 Full-model decode speed, actual-checkpoint state parity, KLD and wider rows remain
 unqualified; the component result alone does not establish those properties.
 
