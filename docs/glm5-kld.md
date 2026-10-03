@@ -1,8 +1,9 @@
 # Native GLM teacher-forced KLD comparison
 
 `src/glm5_kld.zig` is a gated diagnostic, not a serving entry point. It compares
-one native Sushi checkpoint with the completed four-prompt standard-v1 teacher
-fixture. Run the two students in separate processes against the same fixture:
+one native Sushi checkpoint with a completed standard-v1 teacher fixture.
+It supports the original four-prompt study and the explicitly user-truncated
+two-code-prompt study. Run the two students in separate processes against the same fixture:
 A6g128 trunk in the directory named2.3bpw and A8g128 trunk in2.4bpw, both with
 K2.25/W12 experts. Neither comparison loads DFlash or MTP.
 
@@ -28,15 +29,17 @@ Both all512 rows and the first-EOS-inclusive subset are reported. EOS IDs combin
 the target configuration with `<|im_end|>` only when the tokenizer maps it to one
 token, matching the existing KLD method. With no EOS, the subset contains all rows.
 The reported first-EOS position is zero-based. Code and prose categories each contain
-two prompts; this is not the standard sixteen-prompt release verdict. The teacher
+two prompts in the full study. The reduced study contains two code prompts and
+zero prose prompts; its prose result is null, not a zero-error measurement. Neither
+is the standard sixteen-prompt release verdict. The teacher
 uses the oMLX streamer, so the unmeasured teacher/student engine floor is explicitly
 part of the quality scope.
 
 ## Preflight and provenance
 
 Before loading model tensors, the runner explicitly requires `complete=true` in
-`baseline.json`, four
-unique code/prose prompt records,512 generated IDs per prompt and matching declared
+`baseline.json`, the permitted
+unique prompt records,512 generated IDs per prompt and matching declared
 lengths. Safe nested directories such as `prompts/00_code-python-topological-sort`
 are accepted; absolute paths, backslashes, empty components and dot/dotdot
 components are rejected. It checks every token against the student vocabulary, exact F32 file sizes,
@@ -88,3 +91,15 @@ constructs independent teacher rows, then checks self-KLD, row count, EOS count 
 every final cache array after replay. ReleaseFast compile-only validation covers
 that GPU test while the teacher owns the GPU; execution is deferred until release.
 No full-model student result exists until the completed fixture is scored.
+
+
+## Explicit user-truncated study
+
+Two records are accepted only when the completed manifest declares all of:
+`requested_prompt_count=4`, `completed_prompt_count=2`, `actual_positions=1024`,
+`truncated=true`, `stopped_by_user=true`, and a nonempty `stop_reason`. Both IDs must
+be code prompts. Missing or contradictory truncation metadata is rejected; arbitrary
+partial fixtures remain invalid. The report preserves this study provenance and
+labels its scope code-only. The original complete four-record/two-code/two-prose
+contract remains supported without new truncation fields. Each record still needs
+all512 rows. No unfinished prompt is scored.
