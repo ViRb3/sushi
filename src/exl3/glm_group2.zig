@@ -272,8 +272,10 @@ const Owned = struct {
         const input = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
         defer _ = mlx.mlx_array_free(input);
         var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_astype(&out, input, dtype, s));
+        mlx.check(mlx.mlx_astype(&out, input, dtype, s)) catch |err| {
+            _ = mlx.mlx_array_free(out);
+            return err;
+        };
         return self.own(out);
     }
 };
@@ -512,8 +514,10 @@ fn laneInput(owned: *Owned, x: Arr, s: mlx.mlx_stream) !Arr {
     const ids = mlx.mlx_array_new_data(indices.ptr, &[_]c_int{@intCast(width)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     var result = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(result);
-    try mlx.check(mlx.mlx_take_axis(&result, x, ids, 1, s));
+    mlx.check(mlx.mlx_take_axis(&result, x, ids, 1, s)) catch |err| {
+        _ = mlx.mlx_array_free(result);
+        return err;
+    };
     return owned.own(result);
 }
 
