@@ -105,12 +105,12 @@ all BF16 rounding boundaries, head order and negative weights. This is an exact
 scalar scheduling candidate, not another EXL3 three-member decoder.
 
 Strict input geometry is BF16 queries `[3,32,128]`, weights `[3,32]` and
-contiguous BF16 prefix keys with width128. Completed pool count P is a runtime
+contiguous BF16 prefix keys with width 128. Completed pool count P is a runtime
 scalar; never JIT a shader per prefix length. One prefix SIMD group replaces
 three, while all per-query arithmetic remains. Near 32K the scalar baseline
-uses approximately `3 * 8192` groups; the candidate uses approximately8192,
-plus a suffix group. Actual 32K plus192 outputs can exceed8192 pools, so that
-prefill-only cap must not disable the late32K decode path.
+uses approximately `3 * 8192` groups; the candidate uses approximately 8192,
+plus a suffix group. Actual 32K plus 192 outputs can exceed8192 pools, so that
+prefill-only cap must not disable the late 32K decode path.
 
 The suffix group reads each branch's own completed pool key, if present, and
 uses its actual ancestry offset. Do not replace fork offsets with `offset+row`.
@@ -118,24 +118,24 @@ One output plane may be `[3,P0+1]`, but each branch must slice to its original
 `Pbranch` before its original negative/argpartition/top512/expand sequence.
 Keep all three original argpartition calls and their exact dimensions: padding
 the partition itself can change tie ordering even when padded scores are
-negative infinity. The final2051 selected IDs and their order are part of the
+negative infinity. The final 2051 selected IDs and their order are part of the
 bit-equivalence contract, not just the unordered pool set.
 
-The shared FP32 score plane is approximately96KiB at8192 pools, matching the
+The shared FP32 score plane is approximately 96 KiB at 8192 pools, matching the
 aggregate of the original three score planes, plus at most three unused suffix
 slots. There is no pooled-history copy. Small suffix keys/flags and packed
 queries require an explicit bounded bill if the implementation materializes
 extra arrays; reuse original query/weight planes and borrowed prefix views.
 Keep the existing branch scratch limit and fallback when three branch states
 cannot be live under it. This can address a context-growing verification stage;
-the inherited approximately9.14ms 2K-to32K verification increase is only a
+the inherited approximately 9.14 ms 2K-to-32K verification increase is only a
 loose source-prioritization lead, not an indexer-only measured budget.
 
-**Minimal decision test:** reuse the actual16K capture's index queries, weights
+**Minimal decision test:** reuse the actual 16K capture's index queries, weights
 and pooled keys, label constructed fork/suffix fixtures accurately, and compare
 all score bits and ordered selected IDs against three unchanged selectors.
-Cover negative weights, ties near the512 cutoff, odd history, chain/fork actual
-offsets, zero/one suffix and a pool frontier above8192. Then time the whole
+Cover negative weights, ties near the 512 cutoff, odd history, chain/fork actual
+offsets, zero/one suffix and a pool frontier above 8192. Then time the whole
 three-selector graph, including score construction, three original partitions,
 expansion, endpoint evaluation and free: three warmup pairs and eleven fresh
 inclusive alternating pairs. Stop a flat/losing arm; no NAX variation follows.
@@ -152,7 +152,7 @@ consistency plus drift/selection validation. The exact scorer avoids that gate.
 
 **Parked smaller option:** a joint R3 A6 QKV dispatch could emit the existing
 `[1,3,24576]` plane directly, replacing three hoisted calls plus concat with one.
-This would remove68 launches and34 concats per round and approximately4.78MiB
+This would remove 68 launches and 34 concats per round and approximately 4.78 MiB
 of intermediate outputs, without reducing issued dot work. Existing
 [one-row GLM QKV](../src/glm5_decode.zig) demonstrates pointer selection, but
 its older model result did not show a material gain. Prefer the shared-prefix
