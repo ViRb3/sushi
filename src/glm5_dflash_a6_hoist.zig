@@ -1,9 +1,12 @@
-//! Affine6/8/group128 tree projections with each serial qmv row's reduction order.
+//! Isolated exact A6 masked-coefficient hoist; original row arithmetic retained.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
 const Ops = @import("glm5_model.zig").Ops;
 const Linear = @import("glm5_model.zig").Linear;
+pub fn enabled() bool {
+    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_A6_HOIST");
+}
 
 // The per-row dot/update order is inherited from glm5_decode's MLX-derived qmv_fast.
 const SOURCE =
@@ -42,19 +45,31 @@ const SOURCE =
     \\    const float bias = float(biases[group]);
     \\    float quant[8];
     \\    if (BITS == 8) for (int i = 0; i < 8; ++i) quant[i] = float(codes[size_t(output) * K + k + lane * 8 + i]);
+    \\    float coeff[12];
+    \\    if (BITS == 6) {
+    \\      const device uint8_t* packed = codes + size_t(output)*(K*3/4) + (k+lane*8)*3/4;
+    \\      for (int pack = 0; pack < 2; ++pack) {
+    \\        const device uint8_t* q = packed + pack*3;
+    \\        const int c = pack*6;
+    \\        coeff[c] = float(q[0]&0x3f);
+    \\        coeff[c+1] = float(q[0]&0xc0);
+    \\        coeff[c+2] = float(q[1]&0x0f);
+    \\        coeff[c+3] = float(q[1]&0xf0);
+    \\        coeff[c+4] = float(q[2]&0x03);
+    \\        coeff[c+5] = float(q[2]&0xfc);
+    \\      }
+    \\    }
     \\    for (int m = 0; m < R; ++m) {
     \\      float accum = 0.0f;
     \\      if (BITS == 6) {
-    \\        const device uint8_t* packed = codes + size_t(output)*(K*3/4) + (k+lane*8)*3/4;
     \\        for (int pack = 0; pack < 2; ++pack) {
-    \\          const device uint8_t* q = packed + pack*3;
-    \\          const int i = pack*4;
-    \\          accum += (q[0]&0x3f)*local[m][i];
-    \\          accum += (q[0]&0xc0)*local[m][i+1];
-    \\          accum += (q[1]&0x0f)*(local[m][i+1]*256.0f);
-    \\          accum += (q[1]&0xf0)*local[m][i+2];
-    \\          accum += (q[2]&0x03)*(local[m][i+2]*256.0f);
-    \\          accum += (q[2]&0xfc)*local[m][i+3];
+    \\          const int i = pack*4, c = pack*6;
+    \\          accum += coeff[c]*local[m][i];
+    \\          accum += coeff[c+1]*local[m][i+1];
+    \\          accum += coeff[c+2]*(local[m][i+1]*256.0f);
+    \\          accum += coeff[c+3]*local[m][i+2];
+    \\          accum += coeff[c+4]*(local[m][i+2]*256.0f);
+    \\          accum += coeff[c+5]*local[m][i+3];
     \\        }
     \\      } else for (int i = 0; i < 8; ++i) accum += local[m][i] * quant[i];
     \\      result[m][r] += scale * accum + sum[m] * bias;
@@ -90,18 +105,13 @@ fn rowMajorReady(a: Arr) !bool {
 }
 
 pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
-    const hoisted = @import("glm5_dflash_a6_hoist.zig");
-    if (hoisted.enabled()) {
-        if (try hoisted.project(stream, x, linear)) |output| {
-            dispatch_count += 1;
-            return output;
-        }
-    }
     if (!mlx.streamIsGpu(stream) or x.ctx == null or linear.w.ctx == null or linear.scales.ctx == null or linear.biases.ctx == null) return null;
     const sh = mlx.getShape(x);
     const ws = mlx.getShape(linear.w);
-    if (sh.len != 3 or sh[0] != 1 or sh[1] < 1 or sh[1] > 16 or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0) return null;
+    if (sh.len != 3 or sh[0] != 1 or sh[1] != 3 or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0) return null;
+    if (sh[2] != 4096 or ws[0] != 8192) return null;
     const bits: c_int = if (ws[1] == @divExact(sh[2], 4)) 8 else if (@as(i64, ws[1]) * 16 == @as(i64, sh[2]) * 3) 6 else return null;
+    if (bits != 6) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(linear.w) != .uint32 or !(try rowMajorReady(linear.w))) return null;
     for ([_]Arr{ linear.scales, linear.biases }) |grid| {
         if (mlx.mlx_array_dtype(grid) != .bfloat16 or !std.mem.eql(c_int, &.{ ws[0], @divExact(sh[2], 128) }, mlx.getShape(grid)) or !(try rowMajorReady(grid))) return null;
@@ -113,7 +123,7 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        kernel = mlx.mlx_fast_metal_kernel_new("sushi_glm_dflash_affine_rows", iv, ov, SOURCE, "", true, false);
+        kernel = mlx.mlx_fast_metal_kernel_new("sushi_glm_dflash_affine6_hoisted", iv, ov, SOURCE, "", true, false);
         if (kernel.?.ctx == null) {
             kernel = null;
             return error.MetalKernelCompileFailed;
@@ -157,79 +167,4 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     try mlx.check(mlx.mlx_vector_array_get(&output, ov, 0));
     dispatch_count += 1;
     return output;
-}
-
-test "GLM DFlash affine row tiles preserve serial qmv bits" {
-    const s = mlx.gpuStream();
-    const Shape = struct { n: c_int, k: c_int };
-    for ([_]c_int{ 8, 6 }) |bits| for ([_]Shape{ .{ .n = 32, .k = 256 }, .{ .n = 1536, .k = 4096 }, .{ .n = 8192, .k = 4096 }, .{ .n = 4096, .k = 8192 }, .{ .n = 154880, .k = 4096 } }) |shape| {
-        if (shape.n == 154880 and std.c.getenv("SUSHI_GLM_DFLASH_HEAD_FIXTURE") == null) continue;
-        var ops = Ops{ .s = s };
-        defer ops.deinit();
-        const key = try ops.slot();
-        try mlx.check(mlx.mlx_random_key(key, @intCast(shape.n + shape.k)));
-        const codes = try ops.slot();
-        try mlx.check(mlx.mlx_random_bits(codes, &[_]c_int{ shape.n, @divExact(shape.k * bits, 32) }, 2, 4, key.*, s));
-        const scales = try ops.slot();
-        try mlx.check(mlx.mlx_random_uniform(scales, try ops.scalar(0.001, .bfloat16), try ops.scalar(0.02, .bfloat16), &[_]c_int{ shape.n, @divExact(shape.k, 128) }, 2, .bfloat16, key.*, s));
-        const biases = try ops.binary(.mul, scales.*, try ops.scalar(if (bits == 6) -31.5 else -127.5, .bfloat16));
-        const linear = Linear{ .w = codes.*, .scales = scales.*, .biases = biases, .input = shape.k, .output = shape.n };
-        const x = try ops.slot();
-        try mlx.check(mlx.mlx_random_normal(x, &[_]c_int{ 1, 16, shape.k }, 3, .bfloat16, 0, 1, key.*, s));
-        for ([_]Arr{ linear.w, linear.scales, linear.biases, x.* }) |a| try mlx.check(mlx.mlx_array_eval(a));
-        for ([_]c_int{ 1, 2, 3, 4, 5, 8, 16 }) |rows| {
-            var scope = Ops{ .s = s };
-            defer scope.deinit();
-            const input = try scope.slice(x.*, 1, 0, rows);
-            const actual = try scope.own((try project(s, input, linear)) orelse return error.TestExpectedGlmTreeQmm);
-            try mlx.check(mlx.mlx_array_eval(actual));
-            if (rows > 1) {
-                const before = dispatchCount();
-                const integrated = try @import("glm5_dflash_kda.zig").linearRows(&scope, linear, input, .affine_rows);
-                try mlx.check(mlx.mlx_array_eval(integrated));
-                try std.testing.expectEqual(before + 1, dispatchCount());
-                const total: usize = @intCast(rows * shape.n);
-                try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(actual).?[0..total], mlx.mlx_array_data_bfloat16(integrated).?[0..total]);
-            }
-            for (0..@intCast(rows)) |row| {
-                var one = Ops{ .s = s };
-                defer one.deinit();
-                const expected = try linear.apply(&one, try one.slice(input, 1, @intCast(row), @intCast(row + 1)));
-                const got = try one.slice(actual, 1, @intCast(row), @intCast(row + 1));
-                try mlx.check(mlx.mlx_array_eval(expected));
-                try mlx.check(mlx.mlx_array_eval(got));
-                const count: usize = @intCast(shape.n);
-                try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..count], mlx.mlx_array_data_bfloat16(got).?[0..count]);
-            }
-        }
-    };
-}
-
-test "GLM DFlash affine row tiles decline incompatible grids and layouts" {
-    const s = mlx.gpuStream();
-    var ops = Ops{ .s = s };
-    defer ops.deinit();
-    const x = try ops.ones(&.{ 1, 2, 256 }, .bfloat16);
-    const linear = Linear{ .w = try ops.zeros(&.{ 8, 64 }, .uint32), .scales = try ops.ones(&.{ 8, 2 }, .bfloat16), .biases = try ops.zeros(&.{ 8, 2 }, .bfloat16), .input = 256, .output = 8 };
-    for ([_]Arr{ linear.w, linear.scales, linear.biases }) |a| try mlx.check(mlx.mlx_array_eval(a));
-    const before = dispatchCount();
-    var absent = linear;
-    absent.scales = .{ .ctx = null };
-    try std.testing.expect((try project(s, x, absent)) == null);
-    var wrong_group = linear;
-    wrong_group.scales = try ops.ones(&.{ 8, 4 }, .bfloat16);
-    try std.testing.expect((try project(s, x, wrong_group)) == null);
-    var wrong_dtype = linear;
-    wrong_dtype.biases = try ops.zeros(&.{ 8, 2 }, .float32);
-    try std.testing.expect((try project(s, x, wrong_dtype)) == null);
-    var dense = linear;
-    dense.w = try ops.zeros(&.{ 8, 256 }, .bfloat16);
-    try std.testing.expect((try project(s, x, dense)) == null);
-    var strided = linear;
-    strided.w = try ops.transpose(try ops.zeros(&.{ 64, 8 }, .uint32), &.{ 1, 0 });
-    try mlx.check(mlx.mlx_array_eval(strided.w));
-    try std.testing.expect((try project(s, x, strided)) == null);
-    try std.testing.expect((try project(s, try ops.ones(&.{ 1, 17, 256 }, .bfloat16), linear)) == null);
-    try std.testing.expect((try project(s, try ops.cast(x, .float32), linear)) == null);
-    try std.testing.expectEqual(before, dispatchCount());
 }
