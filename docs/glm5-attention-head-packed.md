@@ -116,6 +116,28 @@ temperature and ten seconds idle. Source, raw samples, errors and provenance
 were archived; the candidate/probe/wrapper were removed. No model hook,
 additional variant or full-model run was warranted.
 
+## Rejected exact shared-factor merge
+
+One follow-up kept the existing scalar split8 partials and changed only final
+merge construction. One 256-thread group per row/head computed the eight
+`precise::exp` factors and denominator in thread zero, shared them with the
+columns, and kept the original FP32 part order and output cast. Shared live
+flags retained the `n>0` guard; zero-weight live parts still participated,
+preserving `0*NaN` behavior. BF16 and FP32 outputs matched all tested bits,
+including masked NaNs, empty heads and live underflowed factors.
+
+At a 32K immutable prefix plus two ancestry rows, merge-only medians were
+185.208 µs original versus 194.333 µs shared (+4.93%, 6/11 paired wins). Full
+split8 attention plus merge was 268.667 versus 274.167 µs (+2.05%, 3/11 wins).
+Fewer source exponentials did not produce a useful component gain; this run
+does not separately attribute threadgroup barriers or occupancy costs.
+
+Two focused tests passed. The exclusive ReleaseFast run used MLX v0.32.3,
+interactive QoS, maximum fans requested, 50.99°C initial temperature and ten
+seconds idle. Three warmups preceded eleven alternating pairs, including
+construction, evaluation and free. Exact source and raw evidence were archived;
+helper/probe/wrapper were removed. The existing merge hook remained unchanged.
+
 ## Full-model combination check
 
 Source `a88d8921` combines packed attention with ordinary BF16 head-batched MLA
