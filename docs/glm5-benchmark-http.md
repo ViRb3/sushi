@@ -279,3 +279,37 @@ preserving absolute positions and the previous context until successful
 publication. Ordinary cache growth gives five K/V pairs at 2560 rows, a 50 MiB
 replacement bound. The per-request successful publication counter is recorded.
 See [commit-window qualification](glm5-dflash-commit-window.md).
+
+### Bounded assistant commit publication
+
+Source `2f446c5a` completed the same 29-request llmprobe 0.6.13 bench-only
+protocol with `SUSHI_GLM_DFLASH_COMMIT_WINDOW=1`. The separate selected 32K,
+64-token gate retained exact target IDs and complete committed state.
+
+| Context | Input IDs | Prefill tok/s | Decode tok/s | Assistant commit ms/round |
+|---|---:|---:|---:|---:|
+| 2K | 2036 | 947.64 | 46.85 | 0.95 |
+| 4K | 4059 | 758.10 | 45.76 | 0.93 |
+| 8K | 8225 | 665.03 | 44.20 | 0.93 |
+| 16K | 16278 | 605.59 | 41.41 | 0.92 |
+| 32K | 32747 | 541.33 | 39.88 | 0.97 |
+
+These are the second predictable-context calls, 192 output IDs and 191 decode
+forwards. At 32K, assistant commit fell from 6.23 to 0.97 ms per round; drafting,
+verification and target replay measured 6.68, 64.68 and 2.28 ms. Verification
+consumed 86.4% of decode time. The 64 successful bounded publications and all
+other selected switches engaged. The replacement bound is now independent of
+history length.
+
+Overall rates did not improve consistently across rungs: verification and
+prefill slowed between boots, masking the bounded commit saving. This run
+qualifies the publication bound, not a general throughput improvement. The
+1500 prefill/60 decode targets remain open. Predictable 2K has 2036 input IDs
+and zero prefill cluster calls; ordinary 2K has 2072 IDs and 34 calls. Keep
+these workloads separate when assessing the 2048-row cluster threshold.
+
+The client exited 0, the owned server stopped, the exclusive GPU lock was
+released and fans returned automatic. Binary/runtime/flags and all requests
+are retained under measurement key `glm53-commit-window-llmprobe-20261003`.
+The next candidates and their paired gates are described in
+[the next-wave plan](glm5-next-wave-performance-plan.md).
