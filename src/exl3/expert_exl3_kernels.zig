@@ -10194,15 +10194,23 @@ pub const Group2Support = struct {
     }
 };
 
-/// Isolated prefill scheduling research; no production callsite selects a permutation.
+/// NAX source and helpers shared by the qualified GLM prefill grid permutation.
 pub const PrefillGridSupport = struct {
     pub const source = GEMM_NAX_SOURCE;
     pub const prepare = pairPrepareFromTokens;
     pub const windows = clampedWindowTable;
     pub const middle = midSwigluPrepWithLimit;
     pub const finish = finishMimoSorted;
+    pub fn available() bool {
+        if (!gemmNaxOn()) return false;
+        const had_error = mlx.errorPending();
+        defer mlx.dropLatchedErrorUnless(had_error);
+        _ = getGemmNaxKernel() catch return false;
+        return true;
+    }
     pub fn makeKernel(kernel_source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
-        _ = try getGemmNaxKernel();
+        const had_error = mlx.errorPending();
+        defer mlx.dropLatchedErrorUnless(had_error);
         return buildNaxGemmKernel(kernel_source, naxHeader(.mcg, .w12), "sushi_glm_prefill_grid_transpose") orelse error.MetalKernelCompileFailed;
     }
 };

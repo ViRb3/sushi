@@ -465,8 +465,8 @@ original sorted WIN32 NAX projections: physical X visits routing windows and
 physical Y visits 128-column output stripes. Logical window/output IDs, dot
 body, accumulation order, F16 stores and metadata remain unchanged. It uses
 no new dispatch, weight copy or precision conversion. The candidate admits only
-BF16 B1/T2048/H4096/I2048, top-eight, E288 and n36/MCG/W12. No production caller
-selects the candidate.
+BF16 B1/T2048/H4096/I2048, top-eight, E288 and n36/MCG/W12. The component
+qualification used an isolated call.
 
 An opt-in normal-FFN capture records the first actual L20 T2048 input, indices
 and scores as BF16/U32/F32 arrays, totaling 16.125 MiB plus headers. The capture
@@ -503,3 +503,16 @@ lock `glm-prefill-grid-transpose`, confirmed maximum fans near 5346/5780 RPM,
 `glm53-prefill-grid-transpose-20261003` retains the actual fixture, raw samples,
 source/build/run commands and provenance. Binary SHA-256:
 `e17997486ed69723e1f368dc8a7b6fdf2422e8bb994deb4ce9423ed80f67dc7d`.
+
+
+`SUSHI_GLM_PREFILL_GRID_TRANSPOSE=1` now exposes a default-off normal-FFN
+qualification hook with the same strict geometry, clamp ten and MCG/W12 guards.
+Unsupported shapes or a declined native NAX capability/probe use the existing
+routed path. Both native and candidate kernel probes run before preparing a
+candidate graph. `bind(bool)` provides scoped control, and `dispatchCount()` /
+`resetDispatchCount()` count successful qualified whole-MoE constructions.
+One count represents three transposed GEMMs. Guard/binding tests and the actual
+fixture probe assert that unsupported calls leave this counter unchanged.
+The chain's arrays and bounds are the original chain's, so no new transient
+buffer or resident weight bill is required. This source integration still
+requires the combined full-model qualification; the option remains off.

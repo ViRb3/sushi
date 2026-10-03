@@ -1,10 +1,35 @@
-//! Exact physical grid transpose for an isolated GLM routed prefill comparison.
+//! Opt-in exact physical grid transpose for qualified GLM routed prefill.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const base = @import("expert_exl3_kernels.zig");
 const api = @import("root.zig");
 const support = base.PrefillGridSupport;
 const Arr = mlx.mlx_array;
+threadlocal var enabled_override: ?bool = null;
+var calls: usize = 0;
+pub const Binding = struct {
+    previous: ?bool,
+    pub fn restore(self: Binding) void {
+        enabled_override = self.previous;
+    }
+};
+pub fn bind(on: bool) Binding {
+    const previous = enabled_override;
+    enabled_override = on;
+    return .{ .previous = previous };
+}
+pub fn enabled() bool {
+    return enabled_override orelse blk: {
+        const value = std.c.getenv("SUSHI_GLM_PREFILL_GRID_TRANSPOSE") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.span(value), "1");
+    };
+}
+pub fn dispatchCount() usize {
+    return calls;
+}
+pub fn resetDispatchCount() void {
+    calls = 0;
+}
 fn replace(comptime source: []const u8, comptime old: []const u8, comptime value: []const u8) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     const at = comptime std.mem.indexOf(u8, source, old).?;
@@ -45,14 +70,31 @@ fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, starts: Arr, live: Ar
     try mlx.check(mlx.mlx_vector_array_get(&output, ov, 0));
     return output;
 }
-pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr) !?Arr {
-    for ([_]Arr{ x, indices, scores, bank.gate.trellis, bank.gate.suh, bank.gate.svh, bank.up.trellis, bank.up.suh, bank.up.svh, bank.down.trellis, bank.down.suh, bank.down.svh }) |a| if (a.ctx == null) return null;
-    if (!mlx.streamIsGpu(s) or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, 2048, 4096 }) or !std.mem.eql(c_int, mlx.getShape(indices), &.{ 1, 2048, 8 }) or !std.mem.eql(c_int, mlx.getShape(scores), &.{ 1, 2048, 8 }) or mlx.mlx_array_dtype(indices) != .uint32 or mlx.mlx_array_dtype(scores) != .float32) return null;
+fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr) bool {
+    for ([_]Arr{ x, indices, scores, bank.gate.trellis, bank.gate.suh, bank.gate.svh, bank.up.trellis, bank.up.suh, bank.up.svh, bank.down.trellis, bank.down.suh, bank.down.svh }) |a| if (a.ctx == null) return false;
+    if (!mlx.streamIsGpu(s) or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, 2048, 4096 }) or !std.mem.eql(c_int, mlx.getShape(indices), &.{ 1, 2048, 8 }) or !std.mem.eql(c_int, mlx.getShape(scores), &.{ 1, 2048, 8 }) or mlx.mlx_array_dtype(indices) != .uint32 or mlx.mlx_array_dtype(scores) != .float32) return false;
     inline for (.{ .{ "gate", 4096, 2048 }, .{ "up", 4096, 2048 }, .{ "down", 2048, 4096 } }) |entry| {
         const p = @field(bank, entry[0]);
-        api.validateClampedProjection(p, 288, entry[1], entry[2]) catch return null;
-        if (mlx.getShape(p.trellis)[3] != 36) return null;
+        api.validateClampedProjection(p, 288, entry[1], entry[2]) catch return false;
+        if (mlx.getShape(p.trellis)[3] != 36) return false;
     }
+    return true;
+}
+pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode, limit: c_int) !?Arr {
+    if (!enabled() or dec.codebook != .mcg or dec.window != .w12 or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
+    if (std.c.getenv("SUSHI_EXL3_GEMM_WIN")) |value| if (!std.mem.eql(u8, std.mem.span(value), "32")) return null;
+    if (std.c.getenv("SUSHI_EXL3_WIN_ALIGN")) |value| if (value[0] == '0') return null;
+    base.setDecodeParams(dec);
+    if (!support.available()) return null;
+    if (kernel == null) {
+        kernel = support.makeKernel(SOURCE) catch return null;
+    }
+    const result = try moe(s, x, bank, indices, scores);
+    if (result != null) calls += 1;
+    return result;
+}
+pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr) !?Arr {
+    if (!eligible(s, x, bank, indices, scores)) return null;
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
@@ -98,14 +140,22 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr)
     return shaped;
 }
 
-test "GLM prefill grid transpose is a bijection of production window tiles" {
-    for ([_]usize{ 16, 32 }) |outputs| {
-        var seen: [800 * 32]bool = @splat(false);
-        for (0..800) |physical_x| for (0..outputs) |physical_y| {
-            const index = physical_x * outputs + physical_y;
-            try std.testing.expect(!seen[index]);
-            seen[index] = true;
-        };
-        for (seen[0 .. 800 * outputs]) |covered| try std.testing.expect(covered);
+test "GLM prefill grid opt in restores binding and declines guards before dispatch" {
+    const off = bind(false);
+    defer off.restore();
+    try std.testing.expect(!enabled());
+    const count = dispatchCount();
+    const nil = Arr{ .ctx = null };
+    const p = api.Proj{ .trellis = nil, .suh = nil, .svh = nil };
+    const bank = api.Bank{ .gate = p, .up = p, .down = p };
+    {
+        const on = bind(true);
+        defer on.restore();
+        try std.testing.expect(enabled());
+        try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mul1, .window = .w12 }, 10)) == null);
+        try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 9)) == null);
+        try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 10)) == null);
     }
+    try std.testing.expect(!enabled());
+    try std.testing.expectEqual(count, dispatchCount());
 }

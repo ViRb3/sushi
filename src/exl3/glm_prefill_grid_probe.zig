@@ -57,7 +57,11 @@ const Fixture = struct {
         return f;
     }
     fn run(self: Fixture, transposed: bool) !Arr {
-        if (transposed) return (try grid.moe(mlx.gpuStream(), self.x, self.bank, self.ids, self.scores)) orelse error.ExpectedGlmGridCandidate;
+        if (transposed) {
+            const binding = grid.bind(true);
+            defer binding.restore();
+            return (try grid.tryMoe(mlx.gpuStream(), self.x, self.bank, self.ids, self.scores, .{ .codebook = .mcg, .window = .w12 }, 10)) orelse error.ExpectedGlmGridCandidate;
+        }
         return api.moeClamped(mlx.gpuStream(), self.x, self.bank, self.ids, self.scores, .{ .codebook = .mcg, .window = .w12 }, 10);
     }
 };
@@ -77,6 +81,7 @@ test "GLM prefill grid actual T2048 L20 inclusive parity and timing" {
     if (std.c.getenv("SUSHI_EXL3_WIN_ALIGN")) |value| if (value[0] == '0') return error.ExpectedAlignedNativeWindows;
     var f = try Fixture.init(path, std.mem.span(model_path));
     defer f.deinit();
+    grid.resetDispatchCount();
     const old = try f.run(false);
     defer _ = mlx.mlx_array_free(old);
     const new = try f.run(true);
@@ -84,6 +89,7 @@ test "GLM prefill grid actual T2048 L20 inclusive parity and timing" {
     try mlx.check(mlx.mlx_array_eval(old));
     try mlx.check(mlx.mlx_array_eval(new));
     try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(old).?[0 .. 2048 * 4096], mlx.mlx_array_data_bfloat16(new).?[0 .. 2048 * 4096]);
+    try std.testing.expectEqual(@as(usize, 1), grid.dispatchCount());
     var ns: [2][11]u64 = undefined;
     for (0..3) |_| for ([_]bool{ false, true }) |arm| {
         _ = try timed(f, arm);
@@ -92,6 +98,7 @@ test "GLM prefill grid actual T2048 L20 inclusive parity and timing" {
         const arm = if (round % 2 == 0) position else 1 - position;
         ns[arm][round] = try timed(f, arm == 1);
     };
+    try std.testing.expectEqual(@as(usize, 15), grid.dispatchCount());
     const json = try std.json.Stringify.valueAlloc(a, .{ .layer = 20, .tokens = 2048, .assignments = 16384, .experts = 288, .window_capacity = 800, .bank_layout = "original full 288 expert banks, no compaction", .exact_bf16_values = 2048 * 4096, .arms = .{ "native grid output-stripe then window", "transposed grid window then output-stripe" }, .warmup_pairs = 3, .pairs = 11, .nanoseconds = ns, .timing = "whole routed chain: sort, metadata/inverse, prepare, three unchanged NAX GEMMs, middle, finish, allocation, endpoint eval/free; actual BF16 input/routes/scores; resident original banks", .runtime_hook = false }, .{ .whitespace = .indent_2 });
     defer a.free(json);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
