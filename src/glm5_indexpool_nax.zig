@@ -6,6 +6,7 @@ const Arr = mlx.mlx_array;
 pub const dot_limit: usize = 2 * 1024 * 1024;
 pub const tile_pools: usize = 2048;
 pub const max_rows: usize = 16;
+pub const transient_bytes: usize = 8 * 1024 * 1024;
 threadlocal var enabled_override: ?bool = null;
 var calls: usize = 0;
 pub const Binding = struct {
@@ -22,6 +23,10 @@ pub fn enabled() bool {
 }
 pub fn resetDispatchCount() void { calls = 0; }
 pub fn dispatchCount() usize { return calls; }
+pub fn transientBudget(chunk: usize, pending_layers: usize) !usize {
+    if (!enabled() or chunk <= 8) return 0;
+    return std.math.mul(usize, transient_bytes, pending_layers);
+}
 pub fn dotBytes(rows: usize, pools: usize) !usize {
     return std.math.mul(usize, try std.math.mul(usize, rows, 32), try std.math.mul(usize, pools, 2));
 }
@@ -94,7 +99,7 @@ fn geometry(q: []const c_int, keys: []const c_int, weights: []const c_int, offse
 /// Only the measured long-history prefill geometry is eligible. Decode/verify
 /// and mixed precision retain the original scalar scorer.
 pub fn tryScores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: mlx.mlx_stream) !?Arr {
-    if (!enabled() or !mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported() or pools < 4096) return null;
+    if (!enabled() or !mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported() or pools < 3584) return null;
     for ([_]Arr{ q, keys, weights }) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return null;
     const sh = mlx.getShape(q);
     if (!geometry(sh, mlx.getShape(keys), mlx.getShape(weights), offset, pools) or sh[0] <= 8) return null;
@@ -167,4 +172,18 @@ test "GLM IndexPool NAX dot plane remains within original bound" {
     try std.testing.expectEqual(@as(usize, 524288), try outputBytes(16, 8192));
     try std.testing.expect(geometry(&.{ 16, 32, 128 }, &.{ 8192, 128 }, &.{ 16, 32 }, 32752, 8192));
     try std.testing.expect(!geometry(&.{ 17, 32, 128 }, &.{ 8192, 128 }, &.{ 17, 32 }, 32751, 8192));
+}
+test "GLM IndexPool NAX controls reserve transient copies per pending layer" {
+    const off = bind(false);
+    defer off.restore();
+    try std.testing.expectEqual(@as(usize, 0), try transientBudget(2048, 2));
+    {
+        const on = bind(true);
+        defer on.restore();
+        try std.testing.expect(enabled());
+        try std.testing.expectEqual(transient_bytes * 2, try transientBudget(2048, 2));
+        try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
+        try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));
+    }
+    try std.testing.expect(!enabled());
 }

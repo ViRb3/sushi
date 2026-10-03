@@ -1,8 +1,8 @@
 # IndexPool NAX score proposal
 
 The bounded scorer is opt-in through `SUSHI_GLM_INDEX_SCORE_NAX`. Its initial
-selector hook admits BF16 prefill chunks of 9–16 queries at 4096–8192 pools
-(16K–32K history), with 32 index heads of width 128. Short decode and verify
+selector hook admits BF16 prefill chunks of 9–16 queries at 3584–8192 pools
+(approximately 14K–32K history), with 32 index heads of width 128. Short decode and verify
 rows, other geometries, and lower histories keep the original scalar scorer.
 The top-512 retrieval policy and pool expansion remain unchanged.
 
@@ -73,7 +73,9 @@ The full selector includes scoring, negative, partition, top-512 slice,
 expansion, evaluation and free. Six alternating-order measured rounds followed
 two warmup rounds, using fresh scopes. Full selection improved 32.27% at 16K
 and 31.03% at 32K; the 0.82% difference at 4K is near noise, so the initial hook
-starts at 16K. Score bit mismatches were 0/7/6 over 16384/65536/131072 values;
+starts near 14K to include the benchmark's actual 16K-rung prompt (16274
+tokens, 4068 pools), while remaining in the same two-pool-tile geometry. No
+separate 14K timing is claimed. Score bit mismatches were 0/7/6 over 16384/65536/131072 values;
 relative L2 differences were 0 / 0.00002838 / 0.00003764 and maximum absolute
 differences 0 / 0.015625 / 0.03125. No precision restoration was added.
 
@@ -83,3 +85,8 @@ pool overlap/ties, samples, binary/runtime provenance and telemetry are archived
 privately. The opt-in selector hook and diagnostic control/counter API were
 added after the component run; their integration build remains separate.
 No model-level throughput claim is made by this result.
+
+The admission ledger reserves an additional 8 MiB per pending layer for the
+2 MiB raw dot plane, bounded native copies, query preparation and intermediate
+score planes. Disabled mode and chunks of at most eight rows reserve zero.
+This conservative control API is validated with the integration build.
