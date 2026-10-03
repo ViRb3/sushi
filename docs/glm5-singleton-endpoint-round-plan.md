@@ -47,3 +47,14 @@ a replacement. The existing matched comparison is also within control drift;
 see [stored assistant evidence](glm5-dflash-affine-storage.md). Keep A6 default
 for this round. BF16 compressed MLA, FP32 KDA state and resident embeddings remain
 unchanged. Prefill 1500 and decode 60 tok/s remain open.
+
+## Outcome
+
+Both candidates were rejected. The singleton split passed full-bank stage and
+complete output proofs but lost all 11 pairs: 17.816458 to 18.102708 ms, 1.61%
+slower. All-endpoint retention passed complete-layer numerical comparisons,
+but its 1.262% paired gain won only 6/11 pairs and its separate backing-release
+guard remained unresolved. No matched-model arm or variant followed either
+result. Prototypes were archived and removed; accepted runtime remains
+`e1597cc2`. See the [singleton result](glm5-singleton-current-replay.md) and
+[endpoint result](glm5-kda-all-endpoint-result.md) for evidence and scope.
