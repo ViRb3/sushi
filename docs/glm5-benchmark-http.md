@@ -350,5 +350,37 @@ and [expert-grid qualification](engine-exl3-experts.md) give paired evidence.
 All 27 server requests, flags, binary/runtime provenance and client JSON/HTML
 are retained under key `glm53-prefill-wave-llmprobe-20261003`. The client exited
 0; server stopped, GPU lock released and fans restored automatic. Foreground
-QoS, maximum fans and a cool ten-second idle were used. Final selected 32K
-qualification is pending; routine iterations stay at 2K–16K.
+QoS, maximum fans and a cool ten-second idle were used. The final selected 32K
+qualification is recorded below; routine iterations stay at 2K–16K.
+
+### Selected 32K qualification of the prefill wave
+
+The single selected 32K llmprobe cell used the same flags and binary. Running
+only this rung produced 33595 input IDs, versus 32747 in the inherited
+full-ladder cell: 2.59% longer. Keep that count visible rather than treating
+them as identical workloads.
+
+| Measurement | Before | Prefill wave |
+|---|---:|---:|
+| Input IDs | 32747 | 33595 |
+| Prefill tok/s | 541.33 | 604.18 |
+| Decode tok/s | 39.88 | 42.39 |
+
+The input-normalized prefill rate rose 11.61%, consistent with the independent
+component evidence and the 4K–16K stack gains. Decode was unchanged by the
+implementation; its separate-boot movement is not assigned to these changes.
+The selected cell had 176 cadence calls and 672 expert-grid calls. Per-round
+draft/verify/replay/commit times were 6.28/60.53/2.36/1.00 ms; verifier work still
+dominates the remaining decode gap. The 2K-to-32K decode rates in this wave
+were 47.08 and 42.39 tok/s; neither reaches 60.
+
+A separate fixed-code 32K/64-output gate matched all target IDs and complete
+final state against serial decoding from the same captured prefix. It engaged
+165 cadence calls and 672 expert-grid calls, with decode peak 96.47 GB.
+This correctness gate's committed-input-token rate is distinct from HTTP.
+The ReleaseFast suite, CLI and standalone gate builds passed.
+
+Artifact keys are `glm53-prefill-wave-32k-model-gate-20261003` and
+`glm53-prefill-wave-32k-llmprobe-20261003`. All 21 HTTP requests/client output
+are saved; exit 0, server stopped, GPU lock released and fans automatic.
+No 64K/128K rung was run. Both exact candidates are accepted as opt-ins.
