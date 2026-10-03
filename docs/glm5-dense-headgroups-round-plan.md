@@ -50,3 +50,14 @@ serial output/valid-state proof and measured peak. Runtime wins then qualify
 HTTP2K–16K and selected32K, commit/push; rejected sources are archived/removed.
 Keep BF16 compressed MLA, FP32 KDA state/accumulators, original small tensors,
 resident embeddings and A6 default. No64/128K. Goals1500/60 remain unproven.
+
+## Outcome
+
+Both candidates were rejected. [Head groups](glm5-index-headgroups-component.md)
+were exact but inconsistent: five of eleven paired wins and a paired median
+0.83% slower, despite a favorable arm median. [Cold absorbed MLA](glm5-dense-prefix-packed-result.md)
+passed causal/nonfinite safety and cache-state checks, but complete-layer
+latency rose13.180 to82.054 ms, 522.57% slower, losing every pair. Finite BF16
+output drift was recorded; no quality/model gate or variant followed the loss.
+Prototypes were archived and removed, root seams/reserves restored, and
+accepted runtime remains `af51e72f` with complete2K–32K qualification.
