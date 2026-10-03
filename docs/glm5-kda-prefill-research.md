@@ -645,3 +645,17 @@ command, test root, complete weight/output statistics, FP64 sample errors,
 raw timing, summary, telemetry and hashes. Its gates are
 `SUSHI_GLM_A6_DENSE_PARITY_OUT` and `SUSHI_GLM_A6_DENSE_BENCH_OUT` for the
 `GLM A6 dense once` test filter.
+
+The full-model gate is now exposed through `SUSHI_GLM_A6_DENSE_PREFILL=1`.
+`Linear.apply` uses the candidate only on NAX-capable GPU streams with BF16
+B1/T2048 inputs and the two admitted A6/group128 bank shapes. Decode rows,
+F32/B2/A8/group64 and retained small tensors keep their original path. The
+native diagnostic resets/reports `a6_dense_prefill_dispatches`, reports the
+per-matrix and pending-layer transient bill, and checks enabled-only memory
+headroom before warmup. Async warmup is included in the conservative bill even
+when the timed profile is synchronous. With async2 the bound is 512 MiB, without
+changing stored/resident tensor bytes. Focused opt-in Linear, guard and bill
+tests passed (four including their test root, two gated research skips);
+eligible outputs were exact and three-row decode did not increment the counter.
+This is an opt-in qualification hook; full-model throughput and peak memory
+remain the next gate.

@@ -1,9 +1,51 @@
-//! Isolated runtime A6 dequantization plus dense BF16 GEMM; no persistent weight copy.
+//! Opt-in A6 prefill expansion plus dense BF16 GEMM; no persistent weight copy.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
+
+pub const expanded_weight_bytes: usize = 64 * 1024 * 1024;
+var dispatches: usize = 0;
+pub fn dispatchCount() usize {
+    return dispatches;
+}
+pub fn resetDispatchCount() void {
+    dispatches = 0;
+}
+pub fn enabled() bool {
+    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_A6_DENSE_PREFILL");
+}
+fn geometry(xs: []const c_int, ws: []const c_int, ss: []const c_int, bs: []const c_int, dtypes: [4]mlx.mlx_dtype) bool {
+    if (xs.len != 3 or xs[0] != 1 or xs[1] != 2048 or ws.len != 2) return false;
+    const k = xs[2];
+    const n = ws[0];
+    if (!((k == 4096 and n == 8192) or (k == 8192 and n == 4096)) or ws[1] != @divExact(k * 3, 16)) return false;
+    const scale_shape = [_]c_int{ n, @divExact(k, 128) };
+    return std.mem.eql(c_int, &scale_shape, ss) and std.mem.eql(c_int, &scale_shape, bs) and
+        std.mem.eql(mlx.mlx_dtype, &.{ .bfloat16, .uint32, .bfloat16, .bfloat16 }, &dtypes);
+}
+pub fn tryPrefill(ops: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr) !?Arr {
+    if (!enabled() or !mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
+    const arrays = [_]Arr{ x, w, scales, biases };
+    for (arrays) |v| if (v.ctx == null) return null;
+    var dtypes: [4]mlx.mlx_dtype = undefined;
+    for (arrays, 0..) |v, i| dtypes[i] = mlx.mlx_array_dtype(v);
+    if (!geometry(mlx.getShape(x), mlx.getShape(w), mlx.getShape(scales), mlx.getShape(biases), dtypes)) return null;
+    const result = try apply(ops, .{ .x = x, .w = w, .scales = scales, .biases = biases }, true);
+    dispatches += 1;
+    return result;
+}
+fn bill(pending_layers: usize) !usize {
+    return std.math.mul(usize, expanded_weight_bytes * 4, pending_layers);
+}
+pub fn transientBudget(chunk: usize, pending_layers: usize) !usize {
+    return if (enabled() and chunk == 2048) bill(pending_layers) else 0;
+}
+// The four KDA banks remain live until the pending layer's graph is reclaimed.
+pub fn budgetFits(active: usize, transient: usize, limit: usize) bool {
+    return transient <= limit and active <= limit - transient;
+}
 
 fn fixture(ops: *Ops, k: c_int, n: c_int, seed: u64) !Input {
     const key = try ops.slot();
@@ -193,4 +235,49 @@ test "GLM A6 dense once inclusive isolated timing" {
         .persistent_expanded_weights = false,
         .full_model = false,
     });
+}
+
+test "GLM A6 dense once guard retains decode small tensor and affine8 paths" {
+    const dtype = [_]mlx.mlx_dtype{ .bfloat16, .uint32, .bfloat16, .bfloat16 };
+    try std.testing.expect(geometry(&.{ 1, 2048, 4096 }, &.{ 8192, 768 }, &.{ 8192, 32 }, &.{ 8192, 32 }, dtype));
+    try std.testing.expect(geometry(&.{ 1, 2048, 8192 }, &.{ 4096, 1536 }, &.{ 4096, 64 }, &.{ 4096, 64 }, dtype));
+    for ([_]c_int{ 1, 3, 512, 1024, 2047, 2049 }) |t| try std.testing.expect(!geometry(&.{ 1, t, 4096 }, &.{ 8192, 768 }, &.{ 8192, 32 }, &.{ 8192, 32 }, dtype));
+    try std.testing.expect(!geometry(&.{ 2, 2048, 4096 }, &.{ 8192, 768 }, &.{ 8192, 32 }, &.{ 8192, 32 }, dtype));
+    try std.testing.expect(!geometry(&.{ 1, 2048, 4096 }, &.{ 8192, 1024 }, &.{ 8192, 32 }, &.{ 8192, 32 }, dtype));
+    try std.testing.expect(!geometry(&.{ 1, 2048, 4096 }, &.{ 128, 768 }, &.{ 128, 32 }, &.{ 128, 32 }, dtype));
+    try std.testing.expect(!geometry(&.{ 1, 2048, 4096 }, &.{ 8192, 768 }, &.{ 8192, 64 }, &.{ 8192, 64 }, dtype));
+    try std.testing.expect(!geometry(&.{ 1, 2048, 4096 }, &.{ 8192, 768 }, &.{ 8192, 32 }, &.{ 8192, 32 }, .{ .float32, .uint32, .bfloat16, .bfloat16 }));
+}
+
+test "GLM A6 dense once transient bill covers pending four projection layers" {
+    try std.testing.expectEqual(@as(usize, 268435456), try bill(1));
+    try std.testing.expectEqual(@as(usize, 536870912), try bill(2));
+    try std.testing.expectEqual(@as(usize, 2147483648), try bill(8));
+    try std.testing.expectError(error.Overflow, bill(std.math.maxInt(usize)));
+    try std.testing.expect(budgetFits(1000, 512, 1512));
+    try std.testing.expect(!budgetFits(1000, 512, 1511));
+    try std.testing.expect(!budgetFits(0, 512, 511));
+}
+
+test "GLM A6 dense once opt-in Linear keeps native bits and declines decode rows" {
+    if (!enabled() or !@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    for ([_]c_int{ 4096, 8192 }, 0..) |k, shape| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const n: c_int = if (k == 4096) 8192 else 4096;
+        const input = try fixture(&ops, k, n, @intCast(1031 + shape));
+        const linear = @import("glm5_model.zig").Linear{ .w = input.w, .scales = input.scales, .biases = input.biases, .input = k, .output = n };
+        resetDispatchCount();
+        const actual = try linear.apply(&ops, input.x);
+        const expected = try ops.qmm(input.x, input.w, input.scales, input.biases, true);
+        try std.testing.expectEqual(@as(usize, 0), (try outputStats(expected, actual)).mismatches);
+        try std.testing.expectEqual(@as(usize, 1), dispatchCount());
+        const decode = try ops.slice(input.x, 1, 0, 3);
+        const short_actual = try linear.apply(&ops, decode);
+        const short_expected = try ops.qmm(decode, input.w, input.scales, input.biases, true);
+        try std.testing.expectEqual(@as(usize, 0), (try outputStats(short_expected, short_actual)).mismatches);
+        try std.testing.expectEqual(@as(usize, 1), dispatchCount());
+    }
+    resetDispatchCount();
 }

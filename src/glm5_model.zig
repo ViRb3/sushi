@@ -243,7 +243,10 @@ pub const Linear = struct {
     }
 
     pub fn apply(self: Linear, ops: *Ops, x: Arr) !Arr {
-        if (self.scales.ctx != null) return ops.qmm(x, self.w, self.scales, self.biases, true);
+        if (self.scales.ctx != null) {
+            if (try @import("glm5_a6_dense_once.zig").tryPrefill(ops, x, self.w, self.scales, self.biases)) |result| return result;
+            return ops.qmm(x, self.w, self.scales, self.biases, true);
+        }
         return ops.binary(.mm, x, try ops.transpose(self.w, &.{ 1, 0 }));
     }
 };
