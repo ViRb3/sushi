@@ -34,10 +34,14 @@ part of the quality scope.
 
 ## Preflight and provenance
 
-Before loading model tensors, the runner requires completed `baseline.json`, four
+Before loading model tensors, the runner explicitly requires `complete=true` in
+`baseline.json`, four
 unique code/prose prompt records,512 generated IDs per prompt and matching declared
-lengths. It checks every token against the student vocabulary, exact F32 file sizes,
-finite/nonzero teacher rows and greedy row/token alignment. Nonzero `top_k` metadata
+lengths. Safe nested directories such as `prompts/00_code-python-topological-sort`
+are accepted; absolute paths, backslashes, empty components and dot/dotdot
+components are rejected. It checks every token against the student vocabulary, exact F32 file sizes,
+finite/nonzero teacher rows and greedy row/token alignment. Teacher logits are
+hashed again as they are scored; a change from preflight aborts publication. Nonzero `top_k` metadata
 is allowed: it describes an optional summary, while `logits.f32` must contain the
 entire vocabulary. Missing/partial fixtures never start inference.
 

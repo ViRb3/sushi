@@ -56,6 +56,7 @@ pub const Scored = struct {
     through_eos: Totals = .{},
     first_eos: ?usize,
     per_position_kld: []f64,
+    teacher_sha256: [64]u8 = undefined,
     pub fn deinit(self: Scored, a: std.mem.Allocator) void {
         a.free(self.per_position_kld);
     }
@@ -137,6 +138,7 @@ pub fn scorePrompt(a: std.mem.Allocator, net: *const forward.Model, request: *fo
         logits = next;
         at = end;
     }
+    var teacher_hash = Hash.init(.{});
     const through = if (result.first_eos) |position| position + 1 else generated.len;
     for (generated, 0..) |token, position| {
         if (position > 0) {
@@ -147,12 +149,16 @@ pub fn scorePrompt(a: std.mem.Allocator, net: *const forward.Model, request: *fo
             logits = next;
         }
         try readExact(fd, std.mem.sliceAsBytes(teacher), position * vocab * @sizeOf(f32));
+        teacher_hash.update(std.mem.sliceAsBytes(teacher));
         try copyLogits(net.s, logits, student);
         const row = try kld.scoreRow(teacher, student, token);
         result.all.add(row);
         if (position < through) result.through_eos.add(row);
         result.per_position_kld[position] = row.kld;
     }
+    var teacher_digest: [32]u8 = undefined;
+    teacher_hash.final(&teacher_digest);
+    result.teacher_sha256 = std.fmt.bytesToHex(teacher_digest, .lower);
     return result;
 }
 const Prompt = struct {
@@ -168,8 +174,25 @@ const Prompt = struct {
         _ = std.c.close(self.fd);
     }
 };
+fn safeRelativePromptDir(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '/' or std.mem.indexOfAny(u8, path, "\\\x00") != null) return false;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    return true;
+}
+fn validateManifestComplete(a: std.mem.Allocator, io: std.Io, fixture: []const u8) !void {
+    const path = try std.fmt.allocPrint(a, "{s}/baseline.json", .{fixture});
+    defer a.free(path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 * 1024 * 1024));
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.GlmTeacherIncomplete;
+    const complete = parsed.value.object.get("complete") orelse return error.GlmTeacherIncomplete;
+    if (complete != .bool or !complete.bool) return error.GlmTeacherIncomplete;
+}
 fn validatePrompt(a: std.mem.Allocator, io: std.Io, root: []const u8, record: kld.FixturePrompt, vocab: usize, max_context: usize) !Prompt {
-    if (record.id.len == 0 or record.dir.len == 0 or std.mem.indexOfAny(u8, record.dir, "/\\") != null or std.mem.eql(u8, record.dir, "..")) return error.BadBaselineJson;
+    if (record.id.len == 0 or !safeRelativePromptDir(record.dir)) return error.BadBaselineJson;
     const prefix = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, record.dir });
     defer a.free(prefix);
     const pp = try std.fmt.allocPrint(a, "{s}/prompt_tokens.txt", .{prefix});
@@ -289,6 +312,7 @@ test "GLM KLD real teacher comparison" {
     var cfg = try model.parseConfig(io, a, path);
     defer cfg.deinit(a);
     if (!cfg.isGlm5()) return error.InvalidGlmConfig;
+    try validateManifestComplete(a, io, fixture);
     var baseline = try kld.readBaseline(a, io, fixture);
     defer baseline.deinit();
     if (!std.mem.eql(u8, baseline.schema, kld.SCHEMA) or baseline.prompts.len != 4 or baseline.tokens_per_prompt != 512) return error.BadBaselineJson;
@@ -417,6 +441,7 @@ test "GLM KLD real teacher comparison" {
         scores[i] = try scorePrompt(a, &net, &request, p.ids, p.generated, p.fd, eos.items, chunk);
         scored += 1;
         const value = scores[i];
+        if (!std.mem.eql(u8, &value.teacher_sha256, &p.logits_sha256)) return error.GlmKldSourceChanged;
         all.merge(value.all);
         through.merge(value.through_eos);
         const category: usize = if (std.mem.startsWith(u8, record.id, "code-")) 0 else 1;
@@ -456,25 +481,26 @@ test "GLM KLD preflight rejects incomplete or misaligned fixtures before inferen
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(io, "p", .default_dir);
-    try tmp.dir.writeFile(io, .{ .sub_path = "p/prompt_tokens.txt", .data = "0,2" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "p/generated_tokens.txt", .data = "1,0" });
+    try tmp.dir.createDir(io, "prompts", .default_dir);
+    try tmp.dir.createDir(io, "prompts/00_code-python-topological-sort", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts/00_code-python-topological-sort/prompt_tokens.txt", .data = "0,2" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts/00_code-python-topological-sort/generated_tokens.txt", .data = "1,0" });
     const rows = [_]f32{ 1, 3, -1, 4, 2, 0 };
-    try tmp.dir.writeFile(io, .{ .sub_path = "p/logits.f32", .data = std.mem.sliceAsBytes(&rows) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts/00_code-python-topological-sort/logits.f32", .data = std.mem.sliceAsBytes(&rows) });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = buf[0..try tmp.dir.realPath(io, &buf)];
-    const record = kld.FixturePrompt{ .id = @constCast("fixture"), .dir = @constCast("p"), .prompt_tokens = 2, .generated_tokens = 2 };
+    const record = kld.FixturePrompt{ .id = @constCast("fixture"), .dir = @constCast("prompts/00_code-python-topological-sort"), .prompt_tokens = 2, .generated_tokens = 2 };
     const valid = try validatePrompt(a, io, path, record, 3, 8);
     valid.deinit(a);
     var wrong = record;
     wrong.generated_tokens = 3;
     try std.testing.expectError(error.GlmKldTokenCountMismatch, validatePrompt(a, io, path, wrong, 3, 8));
-    try tmp.dir.writeFile(io, .{ .sub_path = "p/generated_tokens.txt", .data = "1,2" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts/00_code-python-topological-sort/generated_tokens.txt", .data = "1,2" });
     try std.testing.expectError(error.GlmTeacherRowTokenMismatch, validatePrompt(a, io, path, record, 3, 8));
-    try tmp.dir.writeFile(io, .{ .sub_path = "p/generated_tokens.txt", .data = "1,3" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts/00_code-python-topological-sort/generated_tokens.txt", .data = "1,3" });
     try std.testing.expectError(error.InvalidGlmDraftToken, validatePrompt(a, io, path, record, 3, 8));
-    try tmp.dir.writeFile(io, .{ .sub_path = "p/generated_tokens.txt", .data = "1,0" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "p/logits.f32", .data = std.mem.sliceAsBytes(&rows)[0..20] });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts/00_code-python-topological-sort/generated_tokens.txt", .data = "1,0" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts/00_code-python-topological-sort/logits.f32", .data = std.mem.sliceAsBytes(&rows)[0..20] });
     try std.testing.expectError(error.TeacherLogitsSizeMismatch, validatePrompt(a, io, path, record, 3, 8));
 }
 
@@ -487,4 +513,21 @@ test "GLM KLD reuses only complete matching result with all scored rows" {
     try std.testing.expect(!try completedMatches(a, good, "match", 1, 3));
     try std.testing.expect(!try completedMatches(a, "{\"complete\":false}", "match", 1, 2));
     try std.testing.expect(!try completedMatches(a, "{\"complete\":true,\"fingerprint\":\"match\"}", "match", 1, 2));
+}
+
+test "GLM KLD manifest completion and safe nested paths are required" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try std.testing.expect(safeRelativePromptDir("prompts/00_code-python-topological-sort"));
+    for ([_][]const u8{ "", "/prompts/a", "prompts\\a", "prompts//a", "prompts/./a", "prompts/../a", "../prompts", "prompts/", "prompts\x00suffix" }) |path| try std.testing.expect(!safeRelativePromptDir(path));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = buf[0..try tmp.dir.realPath(io, &buf)];
+    for ([_][]const u8{ "{}", "{\"complete\":false}", "{\"complete\":1}" }) |raw| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "baseline.json", .data = raw });
+        try std.testing.expectError(error.GlmTeacherIncomplete, validateManifestComplete(a, io, path));
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "baseline.json", .data = "{\"complete\":true}" });
+    try validateManifestComplete(a, io, path);
 }
