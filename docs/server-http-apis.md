@@ -285,3 +285,5 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   judged by their IPv4); each redirect hop re-checked; no cookies, auth headers or POST.
 - Every failure is a short tool-result string; results are data, never executed. A DuckDuckGo bot check (HTTP 202,
   `anomaly-modal`) reads as "search unavailable", never as zero results.
+
+ZCode launcher command and configuration contract: [server-zcode.md](server-zcode.md).
