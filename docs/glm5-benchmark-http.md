@@ -173,3 +173,48 @@ projection, and bounded draft-readout dispatch counts. The index scorer's new
 bounded dot plane and copies add a conservative 8 MiB per pending layer to
 admission (16 MiB at the current async2 prefill schedule). These settings remain
 explicit diagnostic switches while the combined model pass is pending.
+
+### Stacked optimization qualification through 32K
+
+The selected 2.3bpw + A6 assistant stack completed llmprobe 0.6.13
+bench-only, runs1, reasoning default through 32K. Source `c6b609f4`,
+MLX 0.32.3, N2/children4/async4/group2, BF16 compressed MLA and FP32
+KDA; all prior baseline lane/down/R4/dense settings were retained.
+Packed prefill, MLA head batching, NAX index scores, exact verification
+MLA broadcast, horizon2 readouts and KDA leaf retention were enabled.
+
+| Context | Prefill baseline / stacked tok/s | Decode baseline / stacked tok/s |
+|---|---:|---:|
+| 2K | 968 / 944 | 41.3 / 46.4 |
+| 4K | 435 / 748 | 41.2 / 44.6 |
+| 8K | 323 / 664 | 36.7 / 42.5 |
+| 16K | 285 / 606 | 34.5 / 39.0 |
+| 32K | 253 / 545 | 30.9 / 34.4 |
+
+These are the predictable-context requests with 192 actual output tokens,
+matched to the original completed baseline. Inputs differ by at most 13 tokens
+from that baseline. The unchanged 2K prefill cell is slightly slower; long
+prefill improves by more than 2x. Decode improves at every measured context.
+At 32K the selected stack reaches 545 prefill and 34.4 decode tok/s; the
+1500/60 targets remain unmet. Ordinary-context results and all 29 server
+records remain in the artifact rather than being mixed into this table.
+
+Actual dispatch counts confirmed the selected paths. KDA leaf hits were
+96.9–100% on these predictable requests, above the component 20.6% break-even
+rate. The 32K cell recorded 21120 packed, 14069 index, 704 query/704 value
+verification calls and 64 bounded readouts, with 2176 KDA hits and zero misses.
+The optional retention remains explicit while broader prompt coverage is open.
+
+From 16K to 32K, milliseconds per speculative round changed: drafting
+9.88→14.82, verification 60.85→64.13, replay 1.58→2.23 and commit 3.05→5.59.
+Verification dominates absolute time; drafting and normal accepted-cache
+commit now explain much of the remaining context growth. Branch latent
+prefix replacement is eliminated, but normal accepted-prefix updates and
+assistant context handling still need work.
+
+ReleaseFast full suite, final HTTP tests and CLI build passed. The 16K, 32-row
+same-model prefill drift check matched all 32 top tokens, mean KL 0.00398871.
+The benchmark used foreground server QoS, exclusive GPU lock, confirmed
+maximum fans and ten seconds idle at a cool start. It completed with client
+exit 0, stopped its owned server, released the lock and restored automatic fans.
+Measurement key: `glm53-stacked-llmprobe-20261003`.
