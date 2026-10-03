@@ -204,3 +204,23 @@ composite.
   kept whichever file the directory listed last and leaked the other's name. An owner shard that is not on disk
   claims nothing (a partly stale index); without an owner the later file stands and the earlier is released. The
   served MiMo path reads through `mimo_source`, which refuses a duplicate.
+
+
+## FP16 affine sides
+
+Qwen packs may set top-level `activation_dtype` to `float16` (default `bfloat16`). The loader preserves F16 affine
+`scales`/`biases` and casts BF16 floating weights to F16; text embeddings, constants, PLE output, pooled attention
+keys and GDN state use the selected dtype. Packed integers and EXL3 F16 `suh`/`svh` keep their storage.
+The n-gram table accepts matched BF16 or F16 scales/biases. BF16-only fused kernels decline to their composed
+fallback for FP16 activations. FP16 changes rounding and exponent range; quality and speed require validation.
+
+### Runtime activation selection
+
+`--fp16` overrides a Qwen pack's activation dtype at startup and on-demand load, including loaded affine sides,
+GDN gates and recurrent state, PLE host staging, Qwen vision intermediates, and native MTP embeddings/sidecars.
+Apple M1/M2 automatically select this FP16 path, even for a BF16 checkpoint. `--fp16` forces it on M3 and
+newer chips. `--bf16` forces BF16 and bypasses chip autodetection for a reference or comparison run. Other chips otherwise retain the checkpoint/default dtype. Runtime selection does not rewrite
+checkpoint files.
+MiMo and streamed raw BF16 expert slabs do not support the forced FP16 policy. FP32 reductions, softmax,
+EXL3 and recurrence accumulators remain FP32. BF16-only fused paths fall back; FP16 requires quality and speed
+validation rather than assuming equivalence or a speedup.

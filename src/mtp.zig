@@ -1920,6 +1920,7 @@ pub fn requantizeRows(
     to_bits: u32,
     chunk_rows: c_int,
 ) !QLinear {
+    const dtype: mlx.mlx_dtype = if (mlx.mlx_array_dtype(if (scales.ctx != null) scales else w) == .float16) .float16 else .bfloat16;
     const w_shape = mlx.getShape(w);
     if (w_shape.len != 2) return error.UnsupportedDraftHeadShape;
     const rows: c_int = w_shape[0];
@@ -1941,7 +1942,7 @@ pub fn requantizeRows(
             var raw = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(raw);
             try sliceRows(&raw, w, r0, r1, s);
-            try mlx.check(mlx.mlx_astype(&dense, raw, .bfloat16, s));
+            try mlx.check(mlx.mlx_astype(&dense, raw, dtype, s));
         } else {
             var wq = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wq);
@@ -1961,7 +1962,7 @@ pub fn requantizeRows(
                 mlx.mlx_optional_int.some(@intCast(from_bits)),
                 from_mode,
                 .{}, // global_scale
-                .{ .value = .bfloat16, .has_value = true },
+                .{ .value = dtype, .has_value = true },
                 s,
             ));
         }
@@ -2102,7 +2103,7 @@ fn loadMoeTriple(w: *const Weights, prefix: []const u8) !struct { w: mlx.mlx_arr
 /// lazy/mmapped — pulling a multi-GB shard in costs its header parse; only
 /// the head's tensors ever materialize, and `weights.deinit()` after the
 /// head build releases the rest untouched.
-fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !model_mod.Weights {
+fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, dtype: mlx.mlx_dtype) !model_mod.Weights {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer dir.close(io);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2116,6 +2117,7 @@ fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_
         }
         if (shards.len == 0) return error.MissingMtpWeight;
         var weights = model_mod.Weights.init(allocator);
+        weights.activation_dtype = dtype;
         errdefer weights.deinit();
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
@@ -2128,7 +2130,7 @@ fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_
         return weights;
     }
     const single = try std.fmt.bufPrint(&path_buf, "{s}/model.safetensors", .{model_dir});
-    return model_mod.loadWeightsSingleFile(allocator, single);
+    return model_mod.loadWeightsSingleFileDtype(allocator, single, dtype);
 }
 
 /// Load the MTP head: from the model's sidecar file (any `sidecar_rel_paths`
@@ -2140,6 +2142,10 @@ pub fn loadMtp(
     s: mlx.mlx_stream,
     model_dir: []const u8,
 ) !MtpModel {
+    return loadMtpDtype(io, allocator, s, model_dir, .bfloat16);
+}
+
+pub fn loadMtpDtype(io: std.Io, allocator: std.mem.Allocator, s: mlx.mlx_stream, model_dir: []const u8, dtype: mlx.mlx_dtype) !MtpModel {
     const source = blk: {
         var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
         defer dir.close(io);
@@ -2149,11 +2155,11 @@ pub fn loadMtp(
         .sidecar_file => |rel| blk: {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const sidecar_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, rel });
-            break :blk try model_mod.loadWeightsSingleFile(allocator, sidecar_path);
+            break :blk try model_mod.loadWeightsSingleFileDtype(allocator, sidecar_path, dtype);
         },
         .in_checkpoint => blk: {
             log.info("[mtp] loading in-checkpoint head from the trunk shards\n", .{});
-            break :blk try loadMtpWeightsFromCheckpoint(io, allocator, model_dir);
+            break :blk try loadMtpWeightsFromCheckpoint(io, allocator, model_dir, dtype);
         },
     };
     defer weights.deinit();
@@ -2503,7 +2509,7 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
 }
 
 /// Embed `[n]`-shaped int32 token ids through the TARGET's embedding table
-/// → `[1, n, H]` bf16. Mirrors `Transformer.embedding` (quantized) with a
+/// → `[1, n, H]` in the target activation dtype. Mirrors `Transformer.embedding` (quantized) with a
 /// dense-bf16 fallback. No embed scaling — Qwen does not scale embeddings.
 fn embedTargetTokens(
     target: *Transformer,
@@ -2521,7 +2527,7 @@ fn embedTargetTokens(
     if (target.emb_s.ctx == null) {
         var emb_b = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(emb_b);
-        try mlx.check(mlx.mlx_astype(&emb_b, tw, .bfloat16, s));
+        try mlx.check(mlx.mlx_astype(&emb_b, tw, target.config.activation_dtype, s));
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_reshape(&out, emb_b, &out_shape, 3, s));
         return out;
@@ -2555,7 +2561,7 @@ fn embedTargetTokens(
         mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
         emb_qp.mode.cstr(),
         .{}, // global_scale
-        .{ .value = .bfloat16, .has_value = true },
+        .{ .value = target.config.activation_dtype, .has_value = true },
         s,
     ));
     var out = mlx.mlx_array_new();
@@ -5676,4 +5682,16 @@ test "mtp: row-axis coarse logits equal each solo readout" {
             }
         }
     }
+}
+
+test "FP16 draft head requantization preserves side dtype" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_ones(&dense, &.{ 4, 64 }, 2, .float16, s));
+    var q = try requantizeRows(s, dense, .{}, .{}, 0, 0, "affine", 64, 4, 4);
+    defer q.deinit();
+    try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(q.s));
+    try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(q.b));
 }

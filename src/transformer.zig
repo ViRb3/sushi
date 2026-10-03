@@ -12691,6 +12691,7 @@ test "batched decode mask at verify width: row j of slot n sees its own causal p
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     var xfm: Transformer = undefined;
+    xfm.config = .{};
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     // Two slots, three verify rows each; kv_len is the length AFTER the rows were appended.
@@ -16996,6 +16997,7 @@ pub const Transformer = struct {
     /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
     /// fixture is the tighter bar for the MATH.
     qwen4_stream_f32: bool = false,
+    fp16_gdn_dtype_logged: bool = false,
     qwen4_mixer: ?HcWeights = null,
     /// nb-keyed QSA block constants (`QsaBlockConsts`).
     qsa_consts: QsaBlockConsts = .{},
@@ -17181,7 +17183,7 @@ pub const Transformer = struct {
             };
 
         const emb_scale: ?mlx.mlx_array = if (config.scale_embeddings)
-            bf16Scalar(@sqrt(@as(f32, @floatFromInt(config.hidden_size))), s)
+            try scalarOf(@sqrt(@as(f32, @floatFromInt(config.hidden_size))), config.activation_dtype, s)
         else
             null;
 
@@ -17372,28 +17374,28 @@ pub const Transformer = struct {
         // Gemma 4: logit softcapping scalar
         var softcap_scalar: ?mlx.mlx_array = null;
         if (config.final_logit_softcapping > 0) {
-            softcap_scalar = bf16Scalar(config.final_logit_softcapping, s);
+            softcap_scalar = try scalarOf(config.final_logit_softcapping, config.activation_dtype, s);
         }
 
         // MuseGlimmer: logits scale applied before the softcap.
         var output_mult: ?mlx.mlx_array = null;
         if (config.output_multiplier > 0) {
-            output_mult = bf16Scalar(config.output_multiplier, s);
+            output_mult = try scalarOf(config.output_multiplier, config.activation_dtype, s);
         }
 
         // Gemma 4: v_norm weights (parameter-free: ones vectors)
         var v_norm_weight: ?mlx.mlx_array = null;
         var v_norm_weight_global: ?mlx.mlx_array = null;
         if (config.has_v_norm) {
-            const one_val = bf16Scalar(1.0, s);
+            const one_val = try scalarOf(1.0, config.activation_dtype, s);
             defer _ = mlx.mlx_array_free(one_val);
             const hd_shape = [_]c_int{@intCast(config.head_dim)};
             v_norm_weight = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_full(&v_norm_weight.?, &hd_shape, 1, one_val, .bfloat16, s));
+            try mlx.check(mlx.mlx_full(&v_norm_weight.?, &hd_shape, 1, one_val, config.activation_dtype, s));
             if (config.global_head_dim > 0 and config.global_head_dim != config.head_dim) {
                 const ghd_shape = [_]c_int{@intCast(config.global_head_dim)};
                 v_norm_weight_global = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_full(&v_norm_weight_global.?, &ghd_shape, 1, one_val, .bfloat16, s));
+                try mlx.check(mlx.mlx_full(&v_norm_weight_global.?, &ghd_shape, 1, one_val, config.activation_dtype, s));
             }
         }
 
@@ -17406,11 +17408,11 @@ pub const Transformer = struct {
         // MuseGlimmer's normed embeddings share the diffusion path's
         // ones(hidden_size) vector for their weight-less RMS norm.
         if (config.normed_embeddings or config.isQwen4()) {
-            const one_val = bf16Scalar(1.0, s);
+            const one_val = try scalarOf(1.0, config.activation_dtype, s);
             defer _ = mlx.mlx_array_free(one_val);
             const h_shape = [_]c_int{@intCast(config.hidden_size)};
             ones_hidden = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, .bfloat16, s));
+            try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, config.activation_dtype, s));
         }
         if (config.isDiffusion()) {
             self_cond = .{
@@ -17425,11 +17427,11 @@ pub const Transformer = struct {
                 .down_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.scales", prefix) orelse mlx.mlx_array_new(),
                 .down_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.biases", prefix) orelse mlx.mlx_array_new(),
             };
-            const one_val = bf16Scalar(1.0, s);
+            const one_val = try scalarOf(1.0, config.activation_dtype, s);
             defer _ = mlx.mlx_array_free(one_val);
             const h_shape = [_]c_int{@intCast(config.hidden_size)};
             ones_hidden = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, .bfloat16, s));
+            try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, config.activation_dtype, s));
         }
 
         // Gemma 4: proportional RoPE frequencies for global/full attention layers
@@ -17812,13 +17814,13 @@ pub const Transformer = struct {
             .decode_async_ladder_qwen4 = qwen4DecodeLadderStride(
                 if (std.c.getenv("SUSHI_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
             ),
-            .gelu_coeff = if (need_gelu) bf16Scalar(0.7978845608028654, s) else null,
-            .gelu_inner = if (need_gelu) bf16Scalar(0.044715, s) else null,
-            .half = bf16Scalar(0.5, s),
-            .one = bf16Scalar(1.0, s),
+            .gelu_coeff = if (need_gelu) try scalarOf(0.7978845608028654, config.activation_dtype, s) else null,
+            .gelu_inner = if (need_gelu) try scalarOf(0.044715, config.activation_dtype, s) else null,
+            .half = try scalarOf(0.5, config.activation_dtype, s),
+            .one = try scalarOf(1.0, config.activation_dtype, s),
             .rms_eps_arr = mlx.mlx_array_new_float(config.rms_norm_eps),
-            .three = if (need_gelu) bf16Scalar(3.0, s) else null,
-            .neg_one = if (need_silu) bf16Scalar(-1.0, s) else null,
+            .three = if (need_gelu) try scalarOf(3.0, config.activation_dtype, s) else null,
+            .neg_one = if (need_silu) try scalarOf(-1.0, config.activation_dtype, s) else null,
             .ple_emb_w = ple_emb_w,
             .ple_emb_s = ple_emb_s,
             .ple_emb_b = ple_emb_b,
@@ -18938,7 +18940,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(x32);
         var x = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x);
-        mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, self.s)) catch return;
+        mlx.check(mlx.mlx_astype(&x, x32, self.config.activation_dtype, self.s)) catch return;
 
         var bytes: f64 = 0;
         var eligible: usize = 0;
@@ -19214,7 +19216,7 @@ pub const Transformer = struct {
                     try mlx.check(mlx.mlx_logaddexp(&sp, zero, gf, self.s));
                     var gb = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(gb);
-                    try mlx.check(mlx.mlx_astype(&gb, sp, .bfloat16, self.s));
+                    try mlx.check(mlx.mlx_astype(&gb, sp, self.config.activation_dtype, self.s));
                     const g_shape = [_]c_int{ 1, 1, h_count, 1 };
                     var gr = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(gr);
@@ -19461,7 +19463,7 @@ pub const Transformer = struct {
             const dtype = if (std.mem.eql(u8, self.config.model_type, "mimo_v2"))
                 mlx.mlx_array_dtype(taken_w)
             else
-                mlx.mlx_dtype.bfloat16;
+                self.config.activation_dtype;
             try mlx.check(mlx.mlx_astype(&emb, taken_w, dtype, self.s));
         } else {
             var taken_s = mlx.mlx_array_new();
@@ -19484,7 +19486,7 @@ pub const Transformer = struct {
                 mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
                 emb_qp.mode.cstr(),
                 .{}, // global_scale (null)
-                .{ .value = .bfloat16, .has_value = true },
+                .{ .value = self.config.activation_dtype, .has_value = true },
                 self.s,
             ));
         }
@@ -19543,7 +19545,7 @@ pub const Transformer = struct {
             mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
             emb_qp.mode.cstr(),
             .{}, // global_scale (null)
-            .{ .value = .bfloat16, .has_value = true },
+            .{ .value = self.config.activation_dtype, .has_value = true },
             self.s,
         ));
         return dense;
@@ -19658,10 +19660,10 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(aligned);
         try mlx.check(mlx.mlx_take(&aligned, source_flat, indices_mod, s));
 
-        // Cast aligned to bf16 to match h
+        // Match the residual dtype before merging vision embeddings.
         var aligned_bf = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(aligned_bf);
-        try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, .bfloat16, s));
+        try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, mlx.mlx_array_dtype(h), s));
 
         // input_flat = h.flatten()
         var input_flat = mlx.mlx_array_new();
@@ -19816,7 +19818,7 @@ pub const Transformer = struct {
     }
 
     fn reluSquared(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-        const zero = bf16Scalar(0.0, self.s);
+        const zero = try scalarOf(0.0, self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(zero);
         var relu = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(relu);
@@ -19855,7 +19857,7 @@ pub const Transformer = struct {
             const zero_shape = [_]c_int{ batch, kernel - 1, cdim };
             var zero_state = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(zero_state);
-            try mlx.check(mlx.mlx_zeros(&zero_state, &zero_shape, 3, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_zeros(&zero_state, &zero_shape, 3, mlx.mlx_array_dtype(x), self.s));
             const arr = [_]mlx.mlx_array{ zero_state, x };
             const vec = mlx.mlx_vector_array_new_data(&arr, 2);
             defer _ = mlx.mlx_vector_array_free(vec);
@@ -20741,7 +20743,7 @@ pub const Transformer = struct {
         if (sc.ctx == null) {
             // Dense bf16: gathered rows are the embeddings; no dequantize.
             var result = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&result, tw, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_astype(&result, tw, self.config.activation_dtype, self.s));
             return result;
         }
         var ts = mlx.mlx_array_new();
@@ -20764,7 +20766,7 @@ pub const Transformer = struct {
             mlx.mlx_optional_int.some(@intCast(qp.bits)),
             qp.mode.cstr(),
             .{}, // global_scale (null)
-            .{ .value = .bfloat16, .has_value = true },
+            .{ .value = self.config.activation_dtype, .has_value = true },
             self.s,
         ));
         return result;
@@ -20904,7 +20906,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(ple_emb);
         try mlx.check(mlx.mlx_reshape(&ple_emb, ple_emb_raw, &ple_4d_shape, 4, self.s));
 
-        const emb_scale = bf16Scalar(@sqrt(@as(f32, @floatFromInt(cfg.hidden_size_per_layer_input))), self.s);
+        const emb_scale = try scalarOf(@sqrt(@as(f32, @floatFromInt(cfg.hidden_size_per_layer_input))), self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(emb_scale);
         var ple_emb_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ple_emb_scaled);
@@ -20925,7 +20927,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(proj_raw);
 
         // Scale by hidden_size^-0.5
-        const proj_scale = bf16Scalar(1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))), self.s);
+        const proj_scale = try scalarOf(1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))), self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(proj_scale);
         var proj_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(proj_scaled);
@@ -20946,7 +20948,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(combined);
         try mlx.check(mlx.mlx_add(&combined, proj_normed, ple_emb_scaled, self.s));
 
-        const inv_sqrt2 = bf16Scalar(1.0 / @sqrt(2.0), self.s);
+        const inv_sqrt2 = try scalarOf(1.0 / @sqrt(2.0), self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(inv_sqrt2);
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_multiply(&result, combined, inv_sqrt2, self.s));
@@ -22500,7 +22502,7 @@ pub const Transformer = struct {
         kv_max: c_int,
     ) !mlx.mlx_array {
         const pad_axes = [_]c_int{2};
-        const pad_value = bf16Scalar(0.0, self.s);
+        const pad_value = try scalarOf(0.0, self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(pad_value);
 
         const padded_vec = mlx.mlx_vector_array_new();
@@ -22575,9 +22577,9 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(valid);
         try mlx.check(mlx.mlx_less(&valid, pos_4d, lens_4d, self.s));
 
-        const zero = bf16Scalar(0.0, self.s);
+        const zero = try scalarOf(0.0, self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(zero);
-        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+        const neg_inf = try scalarOf(-std.math.inf(f32), self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(neg_inf);
         var mask = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_where(&mask, valid, zero, neg_inf, self.s));
@@ -22887,7 +22889,7 @@ pub const Transformer = struct {
         entry.ple_prev_valid = true;
     }
 
-    /// Host-side n-gram gather: `[B, S, ple_embed_dim]` bf16 for this chunk's
+    /// Host-side n-gram gather in the activation dtype for this chunk's
     /// token ids, advancing the token history. Serial: `entry`'s history over
     /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
     /// against ITS slot's history (`slots[i].ssm_entries[layer]`), ONE gather
@@ -22930,7 +22932,7 @@ pub const Transformer = struct {
             return emb;
         }
         try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk, capture);
-        return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+        return mlx.mlx_array_new_data(pk.ptr, &shape, 3, self.config.activation_dtype);
     }
 
     /// A build that reads its routing back on the HOST cannot carry a deferred
@@ -22938,6 +22940,7 @@ pub const Transformer = struct {
     /// the fill. The EXL3 sorted GEMM builds its window table from the expert
     /// ids past `DECODE_ROWS_MAX` rows, so those widths gather eagerly.
     fn pleDeferrable(cfg: *const ModelConfig, rows: usize) bool {
+        if (cfg.activation_dtype != .bfloat16) return false;
         if (cfg.expert_layout != .exl3_k4) return true;
         return rows <= expert_exl3_kernels.DECODE_ROWS_MAX;
     }
@@ -23029,7 +23032,7 @@ pub const Transformer = struct {
     }
 
     /// The host side of the n-gram PLE embedding: token ids → hashed rows →
-    /// gathered + bf16-packed into `pk` (`[n][emb_dim]`), advancing the
+    /// gathered + packed in the activation dtype into `pk` (`[n][emb_dim]`), advancing the
     /// entry's n-gram history. `capture` comes from `pleClaimSpecCapture` at
     /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
     /// flush sees already cleared).
@@ -23102,17 +23105,16 @@ pub const Transformer = struct {
         const kv_len: u64 = @intCast(ctx.moe_seq_offset.*);
         if (raw_bf16) {
             try st.table.gatherBf16Checked(self.allocator, rows, pk, kv_len);
+            if (self.config.activation_dtype == .float16) {
+                for (pk) |*word| word.* = packPleWord(qwen4_mod.bf16ToF32(word.*), .float16);
+            }
         } else {
             try st.table.gatherChecked(rows, host, kv_len);
         }
         if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         if (!raw_bf16) {
             std.debug.assert(pk.len == host.len);
-            for (host, 0..) |v, i| {
-                const u: u32 = @bitCast(v);
-                const rounded = u +% 0x7FFF +% ((u >> 16) & 1);
-                pk[i] = @intCast(rounded >> 16);
-            }
+            for (host, 0..) |v, i| pk[i] = packPleWord(v, self.config.activation_dtype);
         }
     }
 
@@ -23197,7 +23199,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_array_set(&prev_state, entry.aux_state));
         } else {
             const zshape = [_]c_int{ batch, state_len, hc * hidden };
-            try mlx.check(mlx.mlx_zeros(&prev_state, &zshape, 3, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_zeros(&prev_state, &zshape, 3, self.config.activation_dtype, self.s));
         }
         const parts = [_]mlx.mlx_array{ prev_state, gvn };
         const vec = mlx.mlx_vector_array_new_data(&parts, 2);
@@ -23605,7 +23607,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
         var pooled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pooled);
-        try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, self.config.activation_dtype, self.s));
         return self.rmsNorm(pooled, norm_w);
     }
 
@@ -25749,7 +25751,7 @@ pub const Transformer = struct {
 
         // Qwen3-VL interleaved M-RoPE: the per-prefill-chunk cos/sin, shared
         // by every full-attn layer this forward.
-        try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), .bfloat16);
+        try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), self.config.activation_dtype);
         defer endMropeChunk(ctx);
 
         // Precompute sliding window masks (Gemma 4 + Laguna + gpt_oss sliding
@@ -26930,7 +26932,7 @@ pub const Transformer = struct {
             const ones_shape = [_]c_int{group_size};
             var ones_w = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(ones_w);
-            try mlx.check(mlx.mlx_ones(&ones_w, &ones_shape, 1, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_ones(&ones_w, &ones_shape, 1, self.config.activation_dtype, self.s));
             try mlx.check(mlx.mlx_fast_rms_norm(&normed, gated_grouped, ones_w, cfg.rms_norm_eps, self.s));
         }
 
@@ -27093,7 +27095,7 @@ pub const Transformer = struct {
     pub fn embedProjection(self: *const Transformer, pooled: mlx.mlx_array) !mlx.mlx_array {
         var x = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x);
-        try mlx.check(mlx.mlx_astype(&x, pooled, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&x, pooled, self.config.activation_dtype, self.s));
         const mid = try self.qmatmul(x, self.dense0_w, self.dense0_s, self.dense0_b);
         defer _ = mlx.mlx_array_free(mid);
         return self.qmatmul(mid, self.dense1_w, self.dense1_s, self.dense1_b);
@@ -27268,7 +27270,7 @@ pub const Transformer = struct {
     /// `positions.base` lets a suffix-only speculative KV cache map its relative
     /// offsets back to the full prompt table.
     pub fn buildMropeCosSin(self: *Transformer, positions: mrope.PositionContext, offset: usize, seq_len: usize) !MropeCosSin {
-        return self.mropeCosSinAt(positions, offset, 1, seq_len, .bfloat16);
+        return self.mropeCosSinAt(positions, offset, 1, seq_len, self.config.activation_dtype);
     }
 
     pub const MropeCosSin = struct { cos: mlx.mlx_array, sin: mlx.mlx_array };
@@ -27392,7 +27394,7 @@ pub const Transformer = struct {
 
         if (hd == rope_dims) {
             var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&out, out_rot, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_astype(&out, out_rot, self.config.activation_dtype, self.s));
             return out;
         }
         var pass = mlx.mlx_array_new();
@@ -27775,7 +27777,7 @@ pub const Transformer = struct {
                         // to every slot in it — the tally is per REQUEST.
                         noteQsaArmForSlots(slots, .mask);
                         if (self.cost_trace_active) self.cost_attention |= 16;
-                        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+                        const neg_inf = try scalarOf(-std.math.inf(f32), self.config.activation_dtype, self.s);
                         defer _ = mlx.mlx_array_free(neg_inf);
                         var narrowed = mlx.mlx_array_new();
                         try mlx.check(mlx.mlx_where(&narrowed, ctx.qsa_mask, stacked_mask, neg_inf, self.s));
@@ -29014,7 +29016,7 @@ pub const Transformer = struct {
             // Cast gate to attn dtype (bf16), then per-head broadcast multiply.
             var g_bf16 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(g_bf16);
-            try mlx.check(mlx.mlx_astype(&g_bf16, g_sp, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_astype(&g_bf16, g_sp, self.config.activation_dtype, self.s));
             const g_shape = [_]c_int{ batch, seq_len, h_count, 1 };
             var g_r = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(g_r);
@@ -29711,8 +29713,8 @@ pub const Transformer = struct {
         // used to be rebuilt every layer every decode step.
         if (self.gdn_q_scale == null) {
             const inv_scale = 1.0 / @as(f32, @floatFromInt(cfg.linear_key_head_dim));
-            self.gdn_q_scale = bf16Scalar(inv_scale, self.s);
-            self.gdn_k_scale = bf16Scalar(@sqrt(inv_scale), self.s);
+            self.gdn_q_scale = try scalarOf(inv_scale, self.config.activation_dtype, self.s);
+            self.gdn_k_scale = try scalarOf(@sqrt(inv_scale), self.config.activation_dtype, self.s);
         }
         const inv_scale_sq = self.gdn_q_scale.?;
         const inv_sqrt_sc = self.gdn_k_scale.?;
@@ -29819,7 +29821,7 @@ pub const Transformer = struct {
             const cold = !ssm.initialized;
             if (cold) {
                 zero_conv = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_zeros(&zero_conv, &[_]c_int{ batch, 3, conv_dim }, 3, .bfloat16, self.s));
+                try mlx.check(mlx.mlx_zeros(&zero_conv, &[_]c_int{ batch, 3, conv_dim }, 3, self.config.activation_dtype, self.s));
             }
             const incoming_conv = if (cold) zero_conv else ssm.conv_state;
             const pre = (gdnPreworkFused(self.s, .{
@@ -29937,7 +29939,7 @@ pub const Transformer = struct {
             if (self.gdn_ones_w == null) {
                 const ones_shape = [_]c_int{dk};
                 var w = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_ones(&w, &ones_shape, 1, .bfloat16, self.s));
+                try mlx.check(mlx.mlx_ones(&w, &ones_shape, 1, self.config.activation_dtype, self.s));
                 self.gdn_ones_w = w;
             }
             const ones_w = self.gdn_ones_w.?;
@@ -29987,7 +29989,7 @@ pub const Transformer = struct {
         if (ssm.ssm_state.ctx == null) {
             const state_shape = [_]c_int{ batch, num_v_heads, dv, dk };
             ssm.ssm_state = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_zeros(&ssm.ssm_state, &state_shape, 4, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_zeros(&ssm.ssm_state, &state_shape, 4, self.config.activation_dtype, self.s));
         }
 
         // Fused Metal kernel: runs the full T-step delta recurrence in one dispatch.
@@ -29999,22 +30001,22 @@ pub const Transformer = struct {
 
         const y_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
 
-        // The kernels specialize on the ACTUAL widths, never an assumed one.
-        // bf16 checkpoints land here as bf16, but an f16 checkpoint promotes
-        // its activations to f32 (f16 ⊕ f32-scalar → f32) and a hardcoded
-        // bf16 pointer type then fails to COMPILE, which is an uncatchable
-        // MLX error that kills the server mid-request. `g`/`beta` are read
-        // through their raw buffer names with an explicit float cast, so they
-        // are width-agnostic and need no template arg. Outputs are ours: we
-        // declare y and the state buffers bf16, so OutT/StT follow that
-        // declaration rather than the input.
+        // Specialize reads on their actual dtypes; outputs and persistent
+        // state follow the selected activation dtype. Accumulators stay FP32.
         const gdn_in_dtype = mlx.mlx_array_dtype(q_scaled);
         const gdn_in_itemsize = mlx.mlx_array_itemsize(q_scaled);
         const gdn_state_dtype = mlx.mlx_array_dtype(ssm.ssm_state);
+        if (cfg.activation_dtype == .float16 and !self.fp16_gdn_dtype_logged) {
+            log.info("[dtype] GDN q={s} gate={s} beta={s} conv={s} state={s}\n", .{
+                @tagName(gdn_in_dtype), @tagName(mlx.mlx_array_dtype(g)), @tagName(mlx.mlx_array_dtype(beta)),
+                @tagName(mlx.mlx_array_dtype(ssm.conv_state)), @tagName(gdn_state_dtype),
+            });
+            self.fp16_gdn_dtype_logged = true;
+        }
 
         const config = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, self.config.activation_dtype));
 
         var y_bthd = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_bthd);
@@ -30025,14 +30027,14 @@ pub const Transformer = struct {
             // (last row unwritten — capture-tail trim), final state as its
             // own [B, Hv, Dv, Dk] output.
             const state_seq_shape = [_]c_int{ seq_len, batch, num_v_heads, dv, dk };
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_seq_shape, 5, .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_seq_shape, 5, self.config.activation_dtype));
             const state_out_shape = [_]c_int{ batch, num_v_heads, dv, dk };
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_out_shape, 4, .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_out_shape, 4, self.config.activation_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", gdn_in_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", gdn_state_dtype));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", self.config.activation_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
@@ -30067,7 +30069,7 @@ pub const Transformer = struct {
             ssm.ssm_state = final_state;
         } else {
             const state_shape_out = [_]c_int{ batch, num_v_heads, dv, dk };
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, self.config.activation_dtype));
             // Blocked-seq kernel at prefill widths on the 128-Dk/32-aligned-Dv
             // geometry (oMLX port, ~2x per GDN layer at 16K). Decode (T==1),
             // spec verify widths, and off-geometry shapes keep the stock
@@ -30084,7 +30086,7 @@ pub const Transformer = struct {
             try gdnSetGrid(config, prefill.route, dv, num_v_heads, batch);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", gdn_in_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", gdn_state_dtype));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", self.config.activation_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
@@ -32639,16 +32641,16 @@ pub const Transformer = struct {
         const shape = [_]c_int{ q_len, kv_len };
         var ones = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ones);
-        try mlx.check(mlx.mlx_full(&ones, &shape, 2, self.one, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_full(&ones, &shape, 2, self.one, self.config.activation_dtype, self.s));
         var upper = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(upper);
         try mlx.check(mlx.mlx_triu(&upper, ones, offset_val + 1, self.s));
         var bool_upper = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(bool_upper);
         try mlx.check(mlx.mlx_astype(&bool_upper, upper, .bool_, self.s));
-        const zero = bf16Scalar(0.0, self.s);
+        const zero = try scalarOf(0.0, self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(zero);
-        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+        const neg_inf = try scalarOf(-std.math.inf(f32), self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(neg_inf);
         var mask = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_where(&mask, bool_upper, neg_inf, zero, self.s));
@@ -32689,9 +32691,9 @@ pub const Transformer = struct {
         var too_far = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(too_far);
         try mlx.check(mlx.mlx_greater_equal(&too_far, dist, window_arr, self.s));
-        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+        const neg_inf = try scalarOf(-std.math.inf(f32), self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(neg_inf);
-        const zero = bf16Scalar(0.0, self.s);
+        const zero = try scalarOf(0.0, self.config.activation_dtype, self.s);
         defer _ = mlx.mlx_array_free(zero);
         var sw_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sw_mask);
@@ -35017,9 +35019,15 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
 /// owned `inds` (int32, [..., k]) and `norm_scores` (bf16, [..., k]) — caller
 /// must free both.
 /// GatedDeltaNet gating chain: g = exp(-exp(A_log) * softplus(a + dt_bias)),
-/// computed in float32 for stability and returned as bfloat16. Mirrors
+/// computed in float32 for stability and returned in the activation dtype. Mirrors
 /// mlx-lm's `compute_g` (which is `@mx.compile`d). Pure — serves as both the
 /// compiled-closure body and the uncompiled fallback. Returns owned array.
+fn packPleWord(v: f32, dtype: mlx.mlx_dtype) u16 {
+    if (dtype == .float16) return @bitCast(@as(f16, @floatCast(v)));
+    const u: u32 = @bitCast(v);
+    return @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
+}
+
 fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var A_log_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(A_log_f32);
@@ -35053,7 +35061,7 @@ fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, 
     try mlx.check(mlx.mlx_exp(&g_f32, neg_neg, s));
     var g = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(g);
-    try mlx.check(mlx.mlx_astype(&g, g_f32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&g, g_f32, if (mlx.mlx_array_dtype(a) == .float16) .float16 else .bfloat16, s));
     return g;
 }
 
@@ -35102,7 +35110,7 @@ fn kdaGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, 
     try mlx.check(mlx.mlx_exp(&g_f32, g_log, s));
     var g = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(g);
-    try mlx.check(mlx.mlx_astype(&g, g_f32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&g, g_f32, if (mlx.mlx_array_dtype(a) == .float16) .float16 else .bfloat16, s));
     return g;
 }
 
@@ -47612,6 +47620,7 @@ fn conv1dBitCopy(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int, compact: 
     defer compact_conv_state_override = saved;
 
     var xfm: Transformer = undefined;
+    xfm.config = .{};
     xfm.s = s;
     xfm.spec_capture_ssm = false;
     var prng = std.Random.DefaultPrng.init(0xB17E_C0DE);
@@ -75804,4 +75813,33 @@ test "the GPU expert pick declines a shape its threadgroup cannot hold" {
     const a_starved = mlx.mlx_array_new_data(&starved, &[_]c_int{2048}, 1, .uint8);
     defer _ = mlx.mlx_array_free(a_starved);
     try testing.expectError(error.UnsupportedShape, expertPickGpu(a_ids, a_logits, a_map, a_starved, 0.2, s));
+}
+
+test "FP16 GDN gate preserves activation dtype and finite decay" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 0, 1, -1, 0.5 };
+    const raw = mlx.mlx_array_new_data(&data, &.{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(raw);
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    try mlx.check(mlx.mlx_astype(&a, raw, .float16, s));
+    const zero = try scalarOf(0, .float16, s);
+    defer _ = mlx.mlx_array_free(zero);
+    const gate = try gdnGateChain(zero, a, zero, s);
+    defer _ = mlx.mlx_array_free(gate);
+    try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(gate));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, gate, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const values = mlx.mlx_array_data_float32(f) orelse return error.Unreadable;
+    for (data, 0..) |v, i| try std.testing.expectApproxEqAbs(1 / (1 + @exp(v)), values[i], 0.001);
+}
+
+test "FP16 PLE host packing avoids BF16 rounding" {
+    const v: f32 = 0.33325;
+    const expected: u16 = @bitCast(@as(f16, @floatCast(v)));
+    try std.testing.expectEqual(expected, packPleWord(v, .float16));
+    try std.testing.expectEqual(@as(u16, 0x3eab), packPleWord(v, .bfloat16));
 }

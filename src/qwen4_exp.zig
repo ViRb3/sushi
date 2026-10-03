@@ -6,7 +6,7 @@
 //! host and only the [T, 2560] result is sent. Memory cost = page cache.
 //! Format: `ngram_table.bin` is a safetensors-format file holding one merged
 //! table, written by sashimi: affine at
-//! `bits` 2..8 (`weight` U32 [R, dim*bits/32], `scales`/`biases` BF16
+//! `bits` 2..8 (`weight` U32 [R, dim*bits/32], `scales`/`biases` BF16 or F16
 //! [R, dim/gs]) or, at `bits` 16, one raw `weight` BF16 [R, dim] region.
 
 const std = @import("std");
@@ -207,6 +207,7 @@ pub const NgramTable = struct {
     bits: u32,
     group_size: u32,
     w_off: usize,
+    side_fp16: bool = false,
     s_off: usize,
     b_off: usize,
     wcols: u32,
@@ -375,8 +376,12 @@ pub const NgramTable = struct {
         if (gs == 0 or gs > 1024) return error.NgramTableBits;
 
         const w = try headerRegion(obj, "weight", "U32", 4, map.len, data_off);
-        const sc = try headerRegion(obj, "scales", "BF16", 2, map.len, data_off);
-        const bi = try headerRegion(obj, "biases", "BF16", 2, map.len, data_off);
+        const sc_obj = obj.get("scales") orelse return error.NgramTableHeader;
+        if (sc_obj != .object) return error.NgramTableHeader;
+        const side_dt = sc_obj.object.get("dtype") orelse return error.NgramTableHeader;
+        if (side_dt != .string or (!std.mem.eql(u8, side_dt.string, "BF16") and !std.mem.eql(u8, side_dt.string, "F16"))) return error.NgramTableHeader;
+        const sc = try headerRegion(obj, "scales", side_dt.string, 2, map.len, data_off);
+        const bi = try headerRegion(obj, "biases", side_dt.string, 2, map.len, data_off);
         // The three regions describe the same rows and may not overlap.
         if (sc.rows != w.rows or bi.rows != w.rows or sc.cols != bi.cols) return error.NgramTableRegion;
         if (w.overlaps(sc) or w.overlaps(bi) or sc.overlaps(bi)) return error.NgramTableRegion;
@@ -387,6 +392,7 @@ pub const NgramTable = struct {
 
         return .{
             .map = map,
+            .side_fp16 = std.mem.eql(u8, side_dt.string, "F16"),
             .rows = w.rows,
             .dim = @intCast(dim),
             .bits = bits,
@@ -581,6 +587,10 @@ pub const NgramTable = struct {
         return if (self.bits == 16) self.dim * 2 else self.wcols * 4 + self.scols * 4;
     }
 
+    fn sideToF32(self: *const NgramTable, word: u16) f32 {
+        return if (self.side_fp16) @as(f32, @as(f16, @bitCast(word))) else bf16ToF32(word);
+    }
+
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         var i: u32 = 0;
@@ -592,8 +602,8 @@ pub const NgramTable = struct {
             if (shift + self.bits > 32) v |= @as(u64, std.mem.readInt(u32, words[w * 4 + 4 ..][0..4], .little)) << 32;
             const q: u32 = @truncate((v >> @intCast(shift)) & mask);
             const g = i / self.group_size;
-            const sc = bf16ToF32(std.mem.readInt(u16, scales[g * 2 ..][0..2], .little));
-            const bi = bf16ToF32(std.mem.readInt(u16, biases[g * 2 ..][0..2], .little));
+            const sc = self.sideToF32(std.mem.readInt(u16, scales[g * 2 ..][0..2], .little));
+            const bi = self.sideToF32(std.mem.readInt(u16, biases[g * 2 ..][0..2], .little));
             out[i] = @as(f32, @floatFromInt(q)) * sc + bi;
         }
     }
@@ -1248,6 +1258,44 @@ test "ngram table row dequant follows the MLX affine nibble layout" {
     std.mem.writeInt(u16, data[34..36], 0x4000, .little);
     std.mem.writeInt(u16, data[36..38], 0x3F80, .little);
     std.mem.writeInt(u16, data[38..40], 0xBF80, .little);
+    const aligned = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), buf.len);
+    defer std.heap.page_allocator.free(aligned);
+    @memcpy(aligned, &buf);
+    const t = try NgramTable.parse(aligned, aligned[8..520], 520);
+    try testing.expectEqual(@as(u32, 32), t.dim);
+    var out: [32]f32 = undefined;
+    t.row(0, &out);
+    try testing.expectEqual(@as(f32, 1.0), out[0]);
+    try testing.expectEqual(@as(f32, 0.5 * 7 + 1.0), out[7]);
+    try testing.expectEqual(@as(f32, 0.5 * 15 + 1.0), out[31]);
+    t.row(1, &out);
+    try testing.expectEqual(@as(f32, 5.0), out[13]);
+}
+
+test "ngram FP16 sides row dequant follows the MLX affine nibble layout" {
+    // Two rows, dim 32, 4-bit, one group: word k packs elements 8k..8k+7,
+    // element i at nibble i % 8.
+    var buf: [8 + 512 + 2 * 16 + 2 * 2 + 2 * 2]u8 = undefined;
+    const header = "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"},\"weight\":{\"dtype\":\"U32\",\"shape\":[2,4],\"data_offsets\":[0,32]},\"scales\":{\"dtype\":\"F16\",\"shape\":[2,1],\"data_offsets\":[32,36]},\"biases\":{\"dtype\":\"F16\",\"shape\":[2,1],\"data_offsets\":[36,40]}}";
+    var hdr: [512]u8 = @splat(' ');
+    @memcpy(hdr[0..header.len], header);
+    std.mem.writeInt(u64, buf[0..8], 512, .little);
+    @memcpy(buf[8..520], &hdr);
+    const data = buf[520..];
+    // row 0: elements 0..31 = i % 16; row 1: all 3
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        var w: u32 = 0;
+        var j: u32 = 0;
+        while (j < 8) : (j += 1) w |= ((i * 8 + j) % 16) << @intCast(j * 4);
+        std.mem.writeInt(u32, data[i * 4 ..][0..4], w, .little);
+        std.mem.writeInt(u32, data[16 + i * 4 ..][0..4], 0x33333333, .little);
+    }
+    // scales: row0 = 0.5 (fp16 0x3800), row1 = 2.0 (0x4000); biases: row0 = 1.0 (0x3c00), row1 = -1 (0xbc00)
+    std.mem.writeInt(u16, data[32..34], 0x3800, .little);
+    std.mem.writeInt(u16, data[34..36], 0x4000, .little);
+    std.mem.writeInt(u16, data[36..38], 0x3c00, .little);
+    std.mem.writeInt(u16, data[38..40], 0xbc00, .little);
     const aligned = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), buf.len);
     defer std.heap.page_allocator.free(aligned);
     @memcpy(aligned, &buf);

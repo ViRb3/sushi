@@ -162,6 +162,10 @@ fn printUsage(io: std.Io) void {
         \\                      "But", "Alternatively", ...) by f inside the reasoning
         \\                      span (default 0 = off). Request think_penalty > this
         \\                      flag > model-settings.json
+        \\  --bf16              Force BF16 activations, overriding M1/M2 autodetection.
+        \\  --fp16              Use FP16 Qwen activations and affine sides (lossy).
+        \\                      Automatic on M1/M2; forces FP16 on newer chips.
+        \\                      FP32 accumulations stay FP32.
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
@@ -667,6 +671,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--bf16")) {
+            model_mod.setActivationPolicy(.bf16);
+        } else if (std.mem.eql(u8, args[i], "--fp16")) {
+            model_mod.setActivationPolicy(.fp16);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
             // Module global so on-demand /v1/load-model cold loads honor the
@@ -1553,7 +1561,7 @@ pub fn main(init: std.process.Init) !void {
         if (mtp_choice.on and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
-            if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
+            if (mtp_mod.loadMtpDtype(io, allocator, xfm.s, model_dir, config.activation_dtype)) |loaded| {
                 mtp_head = loaded;
                 mtp_head.?.bind(&xfm) catch |err| {
                     log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});

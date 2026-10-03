@@ -3683,6 +3683,13 @@ fn fingerprintFile(h: *std.hash.XxHash64, io: std.Io, dir: std.Io.Dir, name: []c
     h.update(std.mem.asBytes(&mt));
 }
 
+pub fn modelFingerprintForDtype(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, dtype: mlx.mlx_dtype) ![]u8 {
+    const fp = try modelFingerprint(allocator, io, model_dir);
+    if (dtype == .bfloat16) return fp;
+    defer allocator.free(fp);
+    return std.fmt.allocPrint(allocator, "{s}-{s}", .{ fp, @tagName(dtype) });
+}
+
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
@@ -8084,4 +8091,21 @@ test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+test "FP16 disk fingerprint isolates recurrent and KV state from BF16" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    const bf = try modelFingerprintForDtype(testing.allocator, io, base, .bfloat16);
+    defer testing.allocator.free(bf);
+    const fp = try modelFingerprintForDtype(testing.allocator, io, base, .float16);
+    defer testing.allocator.free(fp);
+    const old = try modelFingerprint(testing.allocator, io, base);
+    defer testing.allocator.free(old);
+    try testing.expectEqualStrings(old, bf);
+    try testing.expect(!std.mem.eql(u8, fp, bf));
 }

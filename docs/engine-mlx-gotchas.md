@@ -36,6 +36,11 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 
 ## Dtypes
 
+- Qwen `activation_dtype: "float16"` or `--fp16` keeps affine sides, activations, GDN gates/state and constants together in F16; mixed F16/BF16 affine matmul promotes to F32.
+- Apple M1/M2 automatically select F16 for Qwen; `--fp16` forces it on newer chips. Other chips and MiMo otherwise retain their checkpoint/default dtype.
+- PLE host staging packs F32 dequantized rows directly to the selected half format; an F16 activation must not round through BF16 first.
+- FP16 mode retains FP32 softmax/reductions, EXL3 accumulators and GDN recurrence arithmetic; BF16-only fused kernels decline to composed paths.
+
 - **An f32 SCALAR array promotes every bf16 operand it touches**: scalars go through `scalarOf(v, dtype)`; a chain
   that returns f32 BY DESIGN makes the CALLER own the dtype; `[dtype-trace] residual widened` is the tell.
 - A load-time constant table in the WRONG DTYPE silently widens every read (`constTableAs`).

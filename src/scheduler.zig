@@ -4155,7 +4155,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
     if (mtp_enabled and !params.config.isMimo() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
-            if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
+            if (mtp_mod.loadMtpDtype(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir, params.config.activation_dtype)) |loaded| {
                 h.* = loaded;
                 if (h.bind(xfm_ptr)) {
                     mtp_ptr = h;
@@ -4380,7 +4380,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.full_attention_interval > 0;
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+            const fp = kv_disk_cache.modelFingerprintForDtype(sch.allocator, sch.io, entry.path, params.config.activation_dtype) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };

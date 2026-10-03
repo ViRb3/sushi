@@ -147,3 +147,7 @@ Existing tools:
   Unicode marks, Thai/Arabic/Hebrew/Indic, Unicode numbers/whitespace and optional `TOKENIZER_CASES_JSON` prompts.
   Requires Python `tokenizers` and `SUSHI_MODELS_DIR`; normalizes synthetic inputs to isolate Split/BPE parity.
   Hermetic class guard: `format corpus: tokenizer rules are model-local across Unicode scripts`.
+
+`tests/test_fp16_affine.sh`: a Qwen EXL3 pack forced to FP16 by `--fp16` over SSD streaming (`QWEN4_MODEL`), finite log probabilities, repeated cached requests, FP16 residual and GDN gate/conv/state engagement.
+
+Set `SUSHI_FORCE_FP16=0` for the same integration check through automatic M1/M2 activation selection.

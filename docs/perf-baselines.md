@@ -1185,3 +1185,26 @@ pick code), `taskpolicy -a`, GPU lock per boot, fans max + 10 s, 2026-10-01:
 The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per token the exact arm spends ~85 ms waiting
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
+
+## Qwen q6 BF16 versus FP16 prefill on M1 Max, SSD 18 GiB
+
+2026-10-03, `19ab4f9b` + local FP16 activation patch and `--bf16` override, ReleaseFast binary SHA256
+`76297fb59a57`. Same q6 packed experts; BF16 uses the original affine-side files, FP16 uses the converted sides
+and FP16 intermediate path. M1 Max 32 GB, AC power, `taskpolicy -a`, one GPU lock per boot, A B B A order.
+SSD budget 18 GiB, wired margin 4 GiB (`iogpu.wired_limit_mb=27000`), ctx 8192, kv8, prefill chunk 2048,
+MTP/PLD/vision and prefix caches off. Both modes allocate the same 232 expert slots/layer (13.90 GB cache).
+
+llmprobe 0.6.13 prefill-only adapter retains its `timedRun` and warmup/median measurement code; the code
+prompt is calibrated with its context fitter. The cache-busting tags are fixed across arms and every measured
+request has 2051 input tokens, zero cached input tokens, and 8 output tokens. One discarded warmup plus
+three measured requests per boot, six measured requests per mode; these cells are not comparable to the
+probe's default long-prefill scenario. Throughput is input tokens / client time to first token, including SSD work.
+
+| mode | prefill tok/s, median (min–max) | TTFT median | boot medians, tok/s |
+|---|---:|---:|---:|
+| BF16 | 240.9 (240.5–241.5) | 8.514 s | 241.2, 240.8 |
+| FP16 | 250.4 (249.4–252.1) | 8.192 s | 251.0, 249.5 |
+
+FP16 is 3.9% faster in this paired test, with 0.323 s less TTFT.
+Fan/die-temperature controls were unavailable; macOS reported no thermal/performance warning and each boot
+started after a 10 s idle. Both reverse-order pairs retain the gain; this is a timing result, without a KLD quality gate.

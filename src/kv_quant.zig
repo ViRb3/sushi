@@ -338,7 +338,7 @@ pub fn quantAttention(
             const shape2 = [_]c_int{ T_q, t_k };
             var ones2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(ones2);
-            try mlx.check(mlx.mlx_ones(&ones2, &shape2, 2, .bfloat16, s));
+            try mlx.check(mlx.mlx_ones(&ones2, &shape2, 2, mlx.mlx_array_dtype(scaled), s));
             var upper = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(upper);
             // triu(ones, k=offset+1) yields 1s strictly above the causal
@@ -348,7 +348,7 @@ pub fn quantAttention(
             defer _ = mlx.mlx_array_free(neg_inf);
             var neg_inf_bf16 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(neg_inf_bf16);
-            try mlx.check(mlx.mlx_astype(&neg_inf_bf16, neg_inf, .bfloat16, s));
+            try mlx.check(mlx.mlx_astype(&neg_inf_bf16, neg_inf, mlx.mlx_array_dtype(scaled), s));
             // mask = where(upper, -inf, 0). NEVER `upper * -inf`: the
             // below-diagonal zeros make 0 x -inf = NaN, which poisons the
             // whole softmax (live symptom: gemma answered "<pad><pad>" —
@@ -362,7 +362,7 @@ pub fn quantAttention(
             defer _ = mlx.mlx_array_free(zero_f);
             var zero_bf16 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(zero_bf16);
-            try mlx.check(mlx.mlx_astype(&zero_bf16, zero_f, .bfloat16, s));
+            try mlx.check(mlx.mlx_astype(&zero_bf16, zero_f, mlx.mlx_array_dtype(scaled), s));
             var add_mask = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(add_mask);
             try mlx.check(mlx.mlx_where(&add_mask, upper_bool, neg_inf_bf16, zero_bf16, s));

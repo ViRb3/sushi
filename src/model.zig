@@ -129,6 +129,7 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 pub const isExpertStreamingArch = expert_quant.isExpertStreamingArch;
 
 pub const ModelConfig = struct {
+    activation_dtype: mlx.mlx_dtype = .bfloat16,
     // Architecture identity
     model_type: []const u8 = "gemma3",
     weight_prefix: []const u8 = "language_model.model",
@@ -1497,6 +1498,31 @@ pub const ModelConfig = struct {
     }
 };
 
+pub const ActivationPolicy = enum { checkpoint, bf16, fp16, auto_m1_m2 };
+var activation_policy: ActivationPolicy = .auto_m1_m2;
+
+pub fn setActivationPolicy(policy: ActivationPolicy) void {
+    activation_policy = policy;
+}
+
+fn applyActivationPolicy(config: *ModelConfig, policy: ActivationPolicy, chip: []const u8) !void {
+    if (policy == .checkpoint) return;
+    if (policy == .bf16) {
+        config.activation_dtype = .bfloat16;
+        return;
+    }
+    const older_chip = for ([_][]const u8{ "Apple M1", "Apple M2" }) |prefix| {
+        if (std.mem.eql(u8, chip, prefix) or (std.mem.startsWith(u8, chip, prefix) and chip.len > prefix.len and chip[prefix.len] == ' ')) break true;
+    } else false;
+    if (policy == .auto_m1_m2 and (!older_chip or !config.isQwen4())) return;
+    if (!config.isQwen4()) return error.Fp16ArchitectureUnsupported;
+    if (config.expert_streaming and config.expert_layout == .bf16_individual) {
+        if (policy == .auto_m1_m2) return;
+        return error.Fp16ExpertLayoutUnsupported;
+    }
+    config.activation_dtype = .float16;
+}
+
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
     defer allocator.free(path);
@@ -1639,6 +1665,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
     }
 
+    try applyActivationPolicy(&config, activation_policy, @import("ane.zig").chipBrand());
+    log.info("[dtype] activations={s}; policy={s}; chip={s}\n", .{ @tagName(config.activation_dtype), @tagName(activation_policy), @import("ane.zig").chipBrand() });
     return config;
 }
 
@@ -2201,6 +2229,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
 
     const root = try cfgObject(parsed.value);
     var config = ModelConfig{};
+    if (cfgField(root, "activation_dtype")) |v| {
+        const name = try cfgString(v);
+        config.activation_dtype = if (std.mem.eql(u8, name, "float16")) .float16 else if (std.mem.eql(u8, name, "bfloat16")) .bfloat16 else return error.InvalidConfigField;
+    }
 
     // Detect model_type from top-level (always present)
     const model_type = if (cfgField(root, "model_type")) |v| try cfgString(v) else "gemma3";
@@ -4121,6 +4153,7 @@ fn cfgString(v: std.json.Value) ![]const u8 {
 
 /// Holds all loaded weights as mlx arrays, keyed by name.
 pub const Weights = struct {
+    activation_dtype: mlx.mlx_dtype = .bfloat16,
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
 
@@ -4399,6 +4432,12 @@ pub fn loadWeightsForConfig(
         return error.ArchitectureUnsupported;
     }
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
+    if (config.activation_dtype == .float16) {
+        if (!config.isQwen4()) return error.InvalidConfigField;
+        var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+        defer dir.close(io);
+        return loadWeightsFromOpenDirDtype(io, allocator, dir, model_dir, load_vision, if (config.expert_streaming) config.expert_layout else null, .float16);
+    }
     if (config.expert_streaming and config.usesMimoSourceTrunk()) {
         logMimoSourceLoad(config, false);
         return @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
@@ -4420,7 +4459,12 @@ pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir:
 /// sidecar files that live beside the trunk shards (e.g. a root-level
 /// `mtp.safetensors`), where a directory scan would sweep in the trunk.
 pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8) !Weights {
+    return loadWeightsSingleFileDtype(allocator, abs_path, .bfloat16);
+}
+
+pub fn loadWeightsSingleFileDtype(allocator: std.mem.Allocator, abs_path: []const u8, dtype: mlx.mlx_dtype) !Weights {
     var weights = Weights.init(allocator);
+    weights.activation_dtype = dtype;
     errdefer weights.deinit();
 
     const s = mlx.mlx_default_cpu_stream_new();
@@ -4457,7 +4501,12 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
 }
 
 fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?expert_quant.Layout) !Weights {
+    return loadWeightsFromOpenDirDtype(io, allocator, dir, model_dir, load_vision, streaming, .bfloat16);
+}
+
+fn loadWeightsFromOpenDirDtype(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?expert_quant.Layout, dtype: mlx.mlx_dtype) !Weights {
     var weights = Weights.init(allocator);
+    weights.activation_dtype = dtype;
     errdefer weights.deinit();
 
     const s = mlx.mlx_default_cpu_stream_new();
@@ -4760,15 +4809,16 @@ fn loadSafetensorsFileMode(
         errdefer if (final_value.ctx != null) {
             _ = mlx.mlx_array_free(final_value);
         };
-        if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
-            (ndim != 1 or narrow1dEnabled()))
+        const fp16_cast = weights.activation_dtype == .float16 and mlx.mlx_array_dtype(value) == .bfloat16;
+        if (fp16_cast or (weights.activation_dtype == .bfloat16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
+            (ndim != 1 or narrow1dEnabled())))
         {
             var cast = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(cast);
-            try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
+            try mlx.check(mlx.mlx_astype(&cast, value, weights.activation_dtype, s));
             _ = mlx.mlx_array_free(value);
             final_value = cast;
-            if (ndim == 1) narrowed_1d += 1;
+            if (ndim == 1 and !fp16_cast) narrowed_1d += 1;
         }
 
         if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.gate_up_proj")) {
@@ -4925,6 +4975,31 @@ test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-pa
     // quant side tensors force the mixed-dtype qmm path).
     try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.up_proj.weight").?));
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.down_proj.scales").?));
+
+    // An explicit FP16 load must preserve side tensors and avoid FP32 qmm promotion.
+    var fp16_weights = Weights.init(allocator);
+    fp16_weights.activation_dtype = .float16;
+    defer fp16_weights.deinit();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try loadSafetensorsFile(allocator, &fp16_weights, st_path.ptr, cpu, false);
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(fp16_weights.get("model.layers.0.mlp.gate_proj.scales").?));
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(fp16_weights.get("model.layers.0.mlp.gate_proj.biases").?));
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(fp16_weights.get("model.layers.0.mlp.down_proj.scales").?));
+    const data: [128]f16 = @splat(1.0);
+    const x = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 128 }, 2, .float16);
+    defer _ = mlx.mlx_array_free(x);
+    const packed_words: [64]u32 = @splat(0);
+    const w = mlx.mlx_array_new_data(&packed_words, &[_]c_int{ 4, 16 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const side = fp16_weights.get("model.layers.0.mlp.gate_proj.scales").?;
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_quantized_matmul(&y, x, w, side, side, true, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", s));
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(y));
+    try mlx.check(mlx.mlx_array_eval(y));
+    const values = mlx.mlx_array_data_float16(y).?;
+    for (values[0..4]) |v| try testing.expectEqual(@as(f16, 64.0), v);
 }
 
 test "loadWeights on a weightless dir (incomplete download) errors clearly, not empty map" {
@@ -9315,4 +9390,47 @@ test "GLM config preserves optional shared expert counts" {
         const config = try parseConfigFromJson(testing.allocator, raw);
         try testing.expectEqual(count * 2048, config.shared_expert_intermediate_size);
     }
+}
+
+
+test "FP16 activation dtype config is explicit and validates its value" {
+    var c = try parseConfigFromJson(testing.allocator, "{\"activation_dtype\":\"float16\"}");
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(mlx.mlx_dtype.float16, c.activation_dtype);
+    var d = try parseConfigFromJson(testing.allocator, "{}");
+    defer d.deinit(testing.allocator);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, d.activation_dtype);
+    try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, "{\"activation_dtype\":\"float32\"}"));
+}
+
+test "FP16 activation policy selects M1 M2 automatically and forces newer chips" {
+    const t = std.testing;
+    for ([_][]const u8{ "Apple M1", "Apple M1 Pro", "Apple M1 Max", "Apple M2", "Apple M2 Ultra" }) |chip| {
+        var c: ModelConfig = .{ .model_type = "qwen4_exp" };
+        try applyActivationPolicy(&c, .auto_m1_m2, chip);
+        try t.expectEqual(mlx.mlx_dtype.float16, c.activation_dtype);
+    }
+    for ([_][]const u8{ "", "Apple M3 Max", "Apple M10", "Apple M20", "Intel" }) |chip| {
+        var c: ModelConfig = .{ .model_type = "qwen4_exp" };
+        try applyActivationPolicy(&c, .auto_m1_m2, chip);
+        try t.expectEqual(mlx.mlx_dtype.bfloat16, c.activation_dtype);
+    }
+    var explicit = try parseConfigFromJson(t.allocator, "{\"activation_dtype\":\"bfloat16\"}");
+    defer explicit.deinit(t.allocator);
+    explicit.model_type = "qwen4_exp";
+    try applyActivationPolicy(&explicit, .auto_m1_m2, "Apple M1 Max");
+    try t.expectEqual(mlx.mlx_dtype.float16, explicit.activation_dtype);
+    explicit.activation_dtype = .bfloat16;
+    try applyActivationPolicy(&explicit, .fp16, "Apple M3 Max");
+    try t.expectEqual(mlx.mlx_dtype.float16, explicit.activation_dtype);
+    var mimo: ModelConfig = .{ .model_type = "mimo_v2" };
+    try applyActivationPolicy(&mimo, .auto_m1_m2, "Apple M1 Max");
+    try t.expectEqual(mlx.mlx_dtype.bfloat16, mimo.activation_dtype);
+    try t.expectError(error.Fp16ArchitectureUnsupported, applyActivationPolicy(&mimo, .fp16, "Apple M1 Max"));
+}
+
+test "BF16 activation policy overrides automatic FP16 for comparison" {
+    var c: ModelConfig = .{ .model_type = "qwen4_exp", .activation_dtype = .float16 };
+    try applyActivationPolicy(&c, .bf16, "Apple M1 Max");
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, c.activation_dtype);
 }

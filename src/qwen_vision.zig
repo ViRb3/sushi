@@ -486,6 +486,7 @@ const QBlock = struct {
 };
 
 pub const QwenVision = struct {
+    activation_dtype: mlx.mlx_dtype = .bfloat16,
     s: mlx.mlx_stream,
     allocator: std.mem.Allocator,
     /// Evaluate the stream after every block and the output at the end, so one
@@ -586,6 +587,7 @@ pub const QwenVision = struct {
 
         return QwenVision{
             .s = s,
+            .activation_dtype = config.activation_dtype,
             .allocator = allocator,
             .depth = depth,
             .hidden = config.qv_hidden,
@@ -616,7 +618,7 @@ pub const QwenVision = struct {
         const f = mlx.mlx_array_new_float(v);
         defer _ = mlx.mlx_array_free(f);
         var out = mlx.mlx_array_new();
-        _ = mlx.mlx_astype(&out, f, .bfloat16, self.s);
+        _ = mlx.mlx_astype(&out, f, self.activation_dtype, self.s);
         return out;
     }
 
@@ -812,9 +814,9 @@ pub const QwenVision = struct {
         const sin_f = mlx.mlx_array_new_data(sin_buf.ptr, &shape, 3, .float32);
         defer _ = mlx.mlx_array_free(sin_f);
         var cos = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&cos, cos_f, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&cos, cos_f, self.activation_dtype, self.s));
         var sin = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&sin, sin_f, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&sin, sin_f, self.activation_dtype, self.s));
         return .{ .cos = cos, .sin = sin };
     }
 
@@ -916,13 +918,13 @@ pub const QwenVision = struct {
             defer _ = mlx.mlx_array_free(wf);
             var wbf = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wbf);
-            try mlx.check(mlx.mlx_astype(&wbf, wf, .bfloat16, self.s));
+            try mlx.check(mlx.mlx_astype(&wbf, wf, self.activation_dtype, self.s));
             var weighted = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(weighted);
             try mlx.check(mlx.mlx_multiply(&weighted, gathered, wbf, self.s));
             if (first) {
                 // astype-copy so `acc` owns an array independent of `weighted`'s defer.
-                try mlx.check(mlx.mlx_astype(&acc, weighted, .bfloat16, self.s));
+                try mlx.check(mlx.mlx_astype(&acc, weighted, self.activation_dtype, self.s));
                 first = false;
             } else {
                 var sum = mlx.mlx_array_new();
@@ -1007,7 +1009,7 @@ pub const QwenVision = struct {
         try mlx.check(mlx.mlx_matmul(&ctx32, probs, vh, self.s)); // [heads, N, hd] f32
         var ctx = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ctx);
-        try mlx.check(mlx.mlx_astype(&ctx, ctx32, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&ctx, ctx32, self.activation_dtype, self.s));
 
         // [heads, N, hd] → [N, heads*hd]
         const operm = [_]c_int{ 1, 0, 2 };
@@ -1025,7 +1027,7 @@ pub const QwenVision = struct {
     pub fn forward(self: *QwenVision, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         const n: c_int = @intCast(grid_h * grid_w);
         var x = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&x, patches, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&x, patches, self.activation_dtype, self.s));
 
         // patch_embed (Linear) + interpolated pos_embed.
         {
@@ -1924,4 +1926,24 @@ test "qwen vision ubench: encode time and scratch peak per image and video" {
         if (bill < peak) under_billed = true;
     }
     try std.testing.expect(!under_billed);
+}
+
+test "FP16 Qwen vision constants and rotary storage preserve dtype" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var qv: QwenVision = undefined;
+    qv.s = mlx.gpuStream();
+    qv.allocator = std.testing.allocator;
+    qv.activation_dtype = .float16;
+    qv.head_dim = 4;
+    qv.merge = 1;
+    qv.rope_theta = 10000;
+    const c = qv.bf16Scalar(0.5);
+    defer _ = mlx.mlx_array_free(c);
+    try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(c));
+    const rope = try qv.buildVisionRope(2, 2);
+    defer _ = mlx.mlx_array_free(rope.cos);
+    defer _ = mlx.mlx_array_free(rope.sin);
+    try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(rope.cos));
+    try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(rope.sin));
+    try mlx.check(mlx.mlx_array_eval(rope.cos));
 }

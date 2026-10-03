@@ -36,6 +36,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 - `server.kvDequantScratchBytes` bills a dense rebuild as ONE layer at the rows that layer stores (per forward width
   on QSA).
 
+FP16 Qwen uses F16 dense K/V and quantized-KV affine sides, plus F16 convolution and recurrent state.
+FP16 disk-cache fingerprints carry the activation dtype so a runtime override cannot restore BF16 state.
+
 ## Growth and lifetime
 
 - Affine scales and biases retain the quantizer's activation dtype at allocation and growth; dense reconstruction returns that same dtype, so f16 attention does not widen through bf16 K/V.
