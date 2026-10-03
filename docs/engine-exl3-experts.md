@@ -305,6 +305,50 @@ Its gated output variable was
 `SUSHI_GLM_PREFILL_SHUFFLE_BENCH_OUT`, with replay counts supplied through
 `SUSHI_GLM_PREFILL_SHUFFLE_COUNTS`.
 
+## Rejected GLM three-row forced NAX chain
+
+On 2026-10-03, an isolated experiment sent GLM verification's three rows through
+the existing sorted prefill NAX body instead of the group2 serial lane pair and
+grouped lane down chain. The existing body already executes M16/N32/K16 for an
+expert run of one to three rows: clamped input pointers keep dummy reads valid,
+and masked stores emit only live rows. No physical padding buffer or expanded
+weight bank was needed. Operands and original coefficient storage remained F16;
+destination accumulators remained FP32.
+
+The component replay used selected original K2.25/MCG/w12 bank bytes and the
+three-row prefixes of captured four-row routes at layers 3/20/34, hidden 4096,
+intermediate 2048, top-8, clamp 10. Activations and scores were fixed synthetic
+values, identical to the earlier lane replay. This was not a model request.
+Although the fixture banks compact selected experts, GPU metadata retained
+the production logical E=288 count and 289-window capacity. All sorting,
+metadata, preparation, GEMMs, middle, finish, evaluation and free were included.
+Empty windows return before any bank read. No dispatch default changed.
+
+There were 23/17/15 active experts across 24 assignments, giving 1472/1088/960 live
+GEMM threadgroups across the three projections and 18496 total dispatched groups.
+Implicit M16 work was 15.33/11.33/10 times the live assignment count. Compared
+with the current chain, BF16 output relative L2 differences were
+0.00083037/0.00074590/0.00082764; maximum absolute differences were
+0.00390625/0.001953125/0.00390625. The independent scalar FP32 format reference,
+including clamping and routed reduction, gave nearly equal RMS error for both
+arms (roughly 0.00037–0.00046). No bit-exact claim was made.
+
+| Layer | Group2 serial lane chain, µs | Forced NAX, µs | Latency change | Paired wins |
+| --- | ---: | ---: | ---: | ---: |
+| 3 | 661.180 | 868.583 | +31.37% | 0/11 |
+| 20 | 574.611 | 759.888 | +32.24% | 0/11 |
+| 34 | 589.430 | 655.194 | +11.16% | 0/11 |
+
+The ReleaseFast binary used MLX v0.32.3 (`64ea011c`), base `59149d82` plus the
+isolated candidate/research exports. The exclusive run used interactive QoS,
+maximum fans, a 50.76°C initial temperature and ten seconds idle. Five warmups
+preceded eleven alternating AB/BA pairs, with three fresh executions per sample.
+The candidate was rejected and removed, including its exports and test wrapper.
+Raw source, full parity/reference errors, samples, build command, binary hashes
+and telemetry are archived privately. No full-model run was warranted.
+This experiment does not distinguish the cost of M16 padding from the cost of
+empty metadata windows, so it establishes no gain for a different capacity.
+
 ## Kernels
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
