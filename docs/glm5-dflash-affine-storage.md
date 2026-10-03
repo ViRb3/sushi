@@ -93,6 +93,14 @@ Evidence key: `glm53-a4g64-matched-2k-20261003`.
 
 ## Memory interpretation
 
+An independent A4/group64 side study also ran the HTTP 2K–32K ladder.
+Its draft phase was approximately 11–14% faster, but ordinary 8K decode
+regressed 3.44% as speculative rounds increased from 70 to 76. Predictable
+32K decode was approximately tied. Those A6 controls came from separate
+boots, and the A4 32K inputs were about 2.5% shorter. The ladder supports
+optional A4 consumption and faster drafting; it does not establish an
+overall default replacement. Evidence key: `glm53-dflash-a4g64-side-20261003`.
+
 | Stored assistant tensor payload | Bytes | Decimal MB |
 |---|---:|---:|
 | A6/group 128 | 1,013,090,816 | 1013.1 |
