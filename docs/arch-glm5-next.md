@@ -9,6 +9,11 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),
 [serial decode kernels](engine-glm5-decode.md),
 [head-packed NAX attention](glm5-attention-head-packed.md),
+[bounded IndexPool scoring](glm5-indexpool-nax-score.md),
+[bounded draft readouts](glm5-dflash-readout-horizon.md),
+[verification latent overlays](glm5-dflash-latent-overlay.md),
+[verification projection batching](glm5-mla-verify-batch.md),
+[KDA leaf retention](glm5-dflash-kda-leaf.md),
 [external runtime comparison](glm5-external-efficiency-comparison.md), and
 [internal reuse comparison](glm5-internal-efficiency-comparison.md). This document is the GLM documentation index.
 

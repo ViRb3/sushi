@@ -8,6 +8,7 @@ const scores = @import("glm5_kld.zig");
 const kld = @import("kld.zig");
 const batch = @import("glm5_mla_prefill_batch.zig");
 const headpack = @import("glm5_attention_nax_packed.zig");
+const indexer = @import("glm5_indexpool_nax.zig");
 const Arr = mlx.mlx_array;
 fn number(comptime name: [:0]const u8, fallback: usize) !usize {
     return if (std.c.getenv(name)) |raw| std.fmt.parseInt(usize, std.mem.span(raw), 10) else fallback;
@@ -47,11 +48,14 @@ test "GLM long prefix headbatch kernel drift real checkpoint" {
     const raw_out = std.c.getenv("SUSHI_GLM_PREFILL_DRIFT_OUT") orelse return error.MissingGlmDiagnosticOutput;
     const kind = if (std.c.getenv("SUSHI_GLM_PREFILL_DRIFT_KIND")) |v| std.mem.span(v) else "headbatch";
     const direct_kind = std.mem.eql(u8, kind, "direct");
-    const packed_kind = std.mem.eql(u8, kind, "packed") or std.mem.eql(u8, kind, "packed_headbatch");
-    const batch_kind = std.mem.eql(u8, kind, "headbatch") or std.mem.eql(u8, kind, "packed_headbatch");
+    const index_kind = std.mem.eql(u8, kind, "packed_headbatch_index");
+    const packed_kind = index_kind or std.mem.eql(u8, kind, "packed") or std.mem.eql(u8, kind, "packed_headbatch");
+    const batch_kind = index_kind or std.mem.eql(u8, kind, "headbatch") or std.mem.eql(u8, kind, "packed_headbatch");
     if (!direct_kind and !packed_kind and !batch_kind) return error.InvalidGlmDiagnosticCandidate;
     const packed_baseline = headpack.bind(false);
     defer packed_baseline.restore();
+    const index_baseline = indexer.bind(false);
+    defer index_baseline.restore();
     const direct_module = @import("glm5_attention_prefill.zig");
     const previous_direct = direct_module.override;
     defer direct_module.override = previous_direct;
@@ -133,14 +137,18 @@ test "GLM long prefix headbatch kernel drift real checkpoint" {
     var query_calls: usize = 0;
     var value_calls: usize = 0;
     var packed_calls: usize = 0;
+    var index_calls: usize = 0;
     {
         direct_module.override = direct_kind;
         const packed_mode = headpack.bind(packed_kind);
         defer packed_mode.restore();
+        const index_mode = indexer.bind(index_kind);
+        defer index_mode.restore();
         const mode = batch.bind(batch_kind);
         defer mode.restore();
         batch.resetDispatchCount();
         headpack.resetDispatchCount();
+        indexer.resetDispatchCount();
         const timer = @import("io_util.zig").Stopwatch.init(io);
         var logits = try prefix(&net, &candidate, ids, chunk);
         defer _ = mlx.mlx_array_free(logits);
@@ -148,8 +156,10 @@ test "GLM long prefix headbatch kernel drift real checkpoint" {
         query_calls = batch.dispatchCount(.query);
         value_calls = batch.dispatchCount(.value);
         packed_calls = headpack.dispatchCount();
+        index_calls = indexer.dispatchCount();
         if (batch_kind and (query_calls == 0 or value_calls == 0)) return error.GlmHeadbatchNotEngaged;
         if (packed_kind and packed_calls == 0) return error.GlmPackedAttentionNotEngaged;
+        if (index_kind and index_calls == 0) return error.GlmIndexScoreNotEngaged;
         for (0..rows) |i| {
             try scores.copyLogits(s, logits, student);
             for (teacher[i * cfg.vocab_size ..][0..cfg.vocab_size], student) |x, y| {
@@ -167,7 +177,7 @@ test "GLM long prefix headbatch kernel drift real checkpoint" {
     }
     var peak: usize = 0;
     try mlx.check(mlx.mlx_get_peak_memory(&peak));
-    const data = try std.json.Stringify.valueAlloc(a, .{ .complete = true, .scope = "same quantized model kernel drift; not a lossless BF16 pack teacher", .candidate = kind, .model = path, .prefix_tokens = count, .chunk = chunk, .positions = rows, .teacher_ids = tokens, .metrics = totals.metrics(), .logit_bit_mismatches = logit_bit_mismatches, .first_position_kld = per_row[0], .per_position_kld = per_row, .reference_prefill_ns = reference_ns, .candidate_prefill_ns = candidate_ns, .timing = "cold reference then candidate; diagnostic only, not interleaved benchmark", .query_calls = query_calls, .value_calls = value_calls, .packed_calls = packed_calls, .peak_bytes = peak, .cache = "BF16 MLA, FP32 KDA" }, .{ .whitespace = .indent_2 });
+    const data = try std.json.Stringify.valueAlloc(a, .{ .complete = true, .scope = "same quantized model kernel drift; not a lossless BF16 pack teacher", .candidate = kind, .model = path, .prefix_tokens = count, .chunk = chunk, .positions = rows, .teacher_ids = tokens, .metrics = totals.metrics(), .logit_bit_mismatches = logit_bit_mismatches, .first_position_kld = per_row[0], .per_position_kld = per_row, .reference_prefill_ns = reference_ns, .candidate_prefill_ns = candidate_ns, .timing = "cold reference then candidate; diagnostic only, not interleaved benchmark", .query_calls = query_calls, .value_calls = value_calls, .packed_calls = packed_calls, .index_calls = index_calls, .peak_bytes = peak, .cache = "BF16 MLA, FP32 KDA" }, .{ .whitespace = .indent_2 });
     defer a.free(data);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(raw_out), .data = data });
 }

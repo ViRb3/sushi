@@ -167,3 +167,9 @@ A during-run sample reached 95.1 C. Measurement key:
 `glm53-packed-headbatch-llmprobe-20261003`. A fresh 32K qualification is deferred
 until the selector and verification-cache fixes are integrated, to avoid
 repeating expensive long-context runs for intermediate candidates.
+
+The next stacked candidate also exposes per-request index-score, verification
+projection, and bounded draft-readout dispatch counts. The index scorer's new
+bounded dot plane and copies add a conservative 8 MiB per pending layer to
+admission (16 MiB at the current async2 prefill schedule). These settings remain
+explicit diagnostic switches while the combined model pass is pending.

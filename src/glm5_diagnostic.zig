@@ -368,7 +368,8 @@ test "GLM native diagnostic real model" {
     const mla_batch = @import("glm5_mla_prefill_batch.zig");
     const mla_batch_transient = try mla_batch.transientBudget(chunk, if (request.prefill_async) prefill_sync_layers else 1);
     const packed_transient = try @import("glm5_attention_nax_packed.zig").transientBudget(chunk, if (request.prefill_async) prefill_sync_layers else 1);
-    const prefill_transient = try std.math.add(usize, try std.math.add(usize, dense_once_transient, mla_batch_transient), packed_transient);
+    const index_transient = try @import("glm5_indexpool_nax.zig").transientBudget(chunk, if (request.prefill_async) prefill_sync_layers else 1);
+    const prefill_transient = try std.math.add(usize, try std.math.add(usize, dense_once_transient, mla_batch_transient), try std.math.add(usize, packed_transient, index_transient));
     if (prefill_transient != 0 and (!dense_once.budgetFits(loaded_active, prefill_transient, memory_limit) or
         (wired_limit != 0 and !dense_once.budgetFits(loaded_active, prefill_transient, wired_limit)))) return error.GlmPrefillTransientBudgetExceeded;
     const load_seconds = @as(f64, @floatFromInt(load_start.untilNow(io, .awake).nanoseconds)) / 1e9;
