@@ -42,3 +42,15 @@ All builds and quiet GPU/full-model runs are scheduled sequentially; take and
 release the GPU lock per job, foreground QoS and thermal protocol. Production
 source stays WIP until component and real-model acceptance, then commit/push
 only accepted runtime. Routine HTTP remains 2K–16K and selected32K once.
+
+
+## Outcome
+
+Both candidates were rejected and all owned runtime source was restored.
+[Indexed prefill](glm5-indexed-nax-prefill.md) was85.15% slower in its inclusive
+component, despite exact outputs and selected IDs.
+[Optimized N3](glm5-optimized-n3-result.md) passed complete target token/state
+proof, but gained0.56% against1.46% control timing drift. Component wins did
+not overcome higher whole-model verifier cost. No further variants or ladders
+followed. Runtime remains `e1597cc2`: optional A4 format and native B1/B3
+attention, with A6/default N2 unchanged. Goals remain open.

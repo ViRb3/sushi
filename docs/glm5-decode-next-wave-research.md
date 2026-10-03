@@ -43,11 +43,12 @@ decode slots needed to complete T4. No other verifier variant is proposed.
 | Worker | One bounded scope | Owned files |
 |---|---|---|
 | 1: prefill | Direct indexed native K/V loads, preserving T16 selector/cadence and same native arithmetic; unchanged-loader clone first | New indexed-prefill helper/probe and reproducible native D512 header clone; no decode files |
-| 2: N3 assistant/MLA | Horizon3 from the original full eight-row assistant block; four-row ancestry overlay; exact M1 broadcast4; native B4 equivalent to B1 | `glm5_dflash.zig`, `glm5_attention_overlay.zig`, `glm5_attention_decode_batch.zig`, `glm5_mla_verify_batch.zig`, dedicated probe/doc |
+| 2: N3 assistant/MLA | Horizon3 from the original full eight-row assistant block; four-row ancestry overlay; exact M1 broadcast4; native B4 equivalent to B1 | `glm5_dflash.zig`, `glm5_attention_overlay.zig`, `glm5_attention_decode_batch.zig`, `glm5_mla_verify_batch.zig`, MLA-only `glm5_dflash_model.zig` seam, dedicated probe/doc |
 | 3: T4 KDA | Extend existing QKV hoist and retained endpoint to four rows, preserving original arithmetic and one retained FP32 endpoint | `glm5_dflash_a6_hoist.zig`, `glm5_dflash_kda.zig`, dedicated probe/doc |
 
 Root owns the shared `dflash.zig` readout seam if needed, `attention.zig`,
-`glm5_dflash_model.zig`, HTTP/diagnostic policy, counters and all admission bills.
+HTTP/diagnostic policy, counters and all admission bills. Worker2 owns only the
+MLA verifier seam in `glm5_dflash_model.zig`; worker3 does not edit that file.
 Workers prepare isolated proofs and request narrow delegation after passing.
 Do not overlap root callsites or the prefill worker's indexed-loader files.
 No joint-QKV prototype, group-three retry, recurrence variant or width sweep is
@@ -85,10 +86,12 @@ matched format proof, but keep the assistant identical in policy controls.
 
 After all T4 guards engage and strict serial token/complete valid-state gates
 pass, run one matched192-output ABBA job at fixed8192 input IDs (the existing
-official2048-ID fixture repeated4). Load one target/assistant, warm both policies,
+official2048-ID prompt with WATER filler repeated4, not a pure-code fixture).
+Load one target/assistant, warm both policies,
 and clone the same immutable prefix into fresh requests. Compare current fully
 optimized N2/children4 against complete N3/children4; hold native-mode and A6/A4
-assistant settings identical. No other context or child-count sweep.
+assistant settings identical: native target mode ON and A6 assistant fixed.
+No other context or child-count sweep.
 
 Use the server's192-output/191-forward rate convention; include all draft,
 verify, replay, commit and endpoint cleanup costs. Record tokens and accepted
