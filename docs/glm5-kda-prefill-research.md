@@ -764,4 +764,25 @@ The fixed ReleaseFast diagnostic and settings are retained in private artifact
 `glm5_prefill_drift.zig`, with direct attention disabled to isolate projections.
 Peak was95,500,874,808 bytes. Reference/candidate prefill was10.192/8.969 seconds,
 but cold reference followed by candidate is not an interleaved throughput gate.
-A precision-restoring projection variant requires separate qualification.
+The user subsequently accepted ordinary NAX compound rounding with BF16
+operands/intermediates and FP32 accumulators, and requested no precision
+restoration. The measurement above remains the numerical drift record.
+
+
+### Archived MLA precision boundary audit
+
+A stopped, isolated experiment on MLX v0.32.3 split FP32 affine weights into
+BF16 high/low parts and used two FP32-output NAX GEMMs. All 8,388,608 weights per
+direction reconstructed exactly. Query output relative L2 difference versus
+native M=1 fell to 0.00002153. Value required restoring the native classic-qmv
+BF16 four-input sum before group-bias multiplication; that reduced its relative
+L2 difference from 0.00251971 to 0.00002420. Neither result was bit-exact.
+
+At 2,048 rows / 64 heads, quiet inclusive medians were query 13.926770 to
+6.360979 ms and value 19.757021 to 15.079562 ms, with 11/11 paired wins each.
+Decoding, splitting, copying, both GEMMs, the value bias correction, evaluation,
+and free were included. The ordinary BF16 head-batched path is substantially
+faster. The user explicitly accepted BF16 operands and intermediates with FP32
+accumulators and requested no precision restoration. The prototype and research
+seam were therefore removed and archived; no model hook or default changed.
+These are component findings, with no model-level quality or throughput claim.
