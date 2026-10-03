@@ -207,10 +207,11 @@ The optional retention remains explicit while broader prompt coverage is open.
 
 From 16K to 32K, milliseconds per speculative round changed: drafting
 9.88→14.82, verification 60.85→64.13, replay 1.58→2.23 and commit 3.05→5.59.
-Verification dominates absolute time; drafting and normal accepted-cache
-commit now explain much of the remaining context growth. Branch latent
-prefix replacement is eliminated, but normal accepted-prefix updates and
-assistant context handling still need work.
+Verification dominates absolute time; assistant drafting and assistant
+context publication explain much of the remaining context growth. The
+commit timer covers assistant clone/append/evaluation; target accepted-cache
+updates are inside replay. Branch latent replacement is eliminated. See
+[the ownership audit](glm5-dflash-accepted-commit-copy.md).
 
 ReleaseFast full suite, final HTTP tests and CLI build passed. The 16K, 32-row
 same-model prefill drift check matched all 32 top tokens, mean KL 0.00398871.
@@ -218,3 +219,20 @@ The benchmark used foreground server QoS, exclusive GPU lock, confirmed
 maximum fans and ten seconds idle at a cool start. It completed with client
 exit 0, stopped its owned server, released the lock and restored automatic fans.
 Measurement key: `glm53-stacked-llmprobe-20261003`.
+
+### Bounded assistant-block and affine projection candidates
+
+`SUSHI_GLM_DFLASH_BLOCK_TAIL=1` uses only the visible sliding-window prefix
+for the temporary eight-row assistant block; persistent assistant state keeps
+its existing format. Shape-dependent assistant rounding is reported in the
+[block-tail qualification](glm5-dflash-block-tail.md). It remains opt-in until
+full target-token/state and proposal-acceptance checks pass.
+
+`SUSHI_GLM_DFLASH_A6_HOIST=1` hoists repeated coefficient decoding for the
+three-row, affine6/group128, 4096-to-8192 target projections. Production-bank
+outputs were bit-identical. `SUSHI_GLM_KDA_PREFILL_CLUSTER=1` groups retained
+FA/GA/beta products on 2048-row normal prefill, including compact output copies.
+Prepared banks are evaluated during load and included in measured resident
+memory; their actual byte count is exposed. Admission adds only the new joined
+activation plane: 1.25 MiB per pending layer, 2.5 MiB for async2. Per-request
+cluster, block-tail, and affine-hoist dispatch counters confirm engagement.

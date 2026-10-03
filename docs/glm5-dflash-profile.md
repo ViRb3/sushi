@@ -154,3 +154,19 @@ Capturing explicitly evaluates and reads route IDs, so JSON marks the entire run
 speedup ratio even if component profiling is off. The normal output/state oracle
 still runs. Capacity, ordering, odd multiplicities, bounds, disabled lazy behavior,
 serialization, one-row skipping and full-state parity pass focused tests.
+
+## Current N2 stack attribution
+
+A fresh 512-prefix/12-output probe at `c8b03ba2` with the measured N2/A6
+stack retained exact output tokens and complete final target state. Six rounds
+were profiled; there were zero intermediate MLA branch flushes at this context.
+The existing scratch plan also admits all three branches at 32K, so removing a
+hypothetical branch flush is not a useful optimization there.
+
+Synchronization-perturbed child totals were routed experts 145.49 ms, shared
+FFN 62.70 ms, KDA Q/K/V 79.97 ms, KDA output 48.34 ms, recurrence 59.85 ms, and
+lowrank/beta 35.61 ms. Tiny norm/expand markers each accumulated about 39–40 ms,
+showing the forced-evaluation tax. Routed experts and large KDA projections
+remain the largest arithmetic leads. A small retained-projection change must
+be judged in its own paired component rather than treating the entire marker
+as available compute savings. Measurement key: `glm53-current-verify-profile-20261003`.
