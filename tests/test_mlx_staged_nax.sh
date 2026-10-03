@@ -22,7 +22,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-STAGE="lib/mlx"
+STAGE="${MLX_STAGE:-lib/mlx}"
 PASS=0
 FAIL=0
 
@@ -35,6 +35,24 @@ for f in "$STAGE/lib/libmlx.dylib" "$STAGE/lib/libmlxc.dylib" "$STAGE/lib/mlx.me
 done
 if [ -f "$STAGE/.version" ]; then
   ok ".version stamp present ($(tr '\n' ' ' < "$STAGE/.version"))"
+  for module in mlx mlxc; do
+    source="lib/$module-src"
+    if [ -e "$source/.git" ]; then
+      pinned=$(git -C "$source" rev-parse --short=12 HEAD)
+    else
+      pinned=$(git ls-tree HEAD "$source" | awk '{print substr($3,1,12)}')
+    fi
+    stamp=" $(cat "$STAGE/.version") "
+    case "$stamp" in
+      *" $module=$pinned "*) ok "$module staged revision matches source pin" ;;
+      *) fail "$module staged revision differs from source pin $pinned" ;;
+    esac
+  done
+  patch_sha=$(shasum patches/mlxc-gather-qmm-global-scale.patch | cut -c1-12)
+  case "$stamp" in
+    *" patch=$patch_sha "*) ok "staged mlx-c patch matches source" ;;
+    *) fail "staged mlx-c patch differs from source $patch_sha" ;;
+  esac
 else
   fail "$STAGE/.version missing (run scripts/build-mlx.sh)"
 fi

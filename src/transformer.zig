@@ -73345,16 +73345,49 @@ test "a streamed quantized slab matches the resident bank through the same kerne
             var gate_hashes: [2]u64 = undefined;
             var down_hashes: [2]u64 = undefined;
             for (arms, [_][]const u32{ bank_ids, slab_ids }, 0..) |arm, ids_host, i| {
-                const ids = sqIds(ids_host, n);
+                // Repacking changes expert IDs; each sorted arm needs its own row order.
+                const permutation = try alloc.alloc(u32, @intCast(n));
+                defer alloc.free(permutation);
+                const inverse = try alloc.alloc(u32, @intCast(n));
+                defer alloc.free(inverse);
+                for (permutation, 0..) |*slot, j| slot.* = @intCast(j);
+                std.mem.sort(u32, permutation, ids_host, struct {
+                    fn less(ids_: []const u32, a: u32, b: u32) bool {
+                        return ids_[a] < ids_[b];
+                    }
+                }.less);
+                const sorted_ids = try alloc.alloc(u32, @intCast(n));
+                defer alloc.free(sorted_ids);
+                for (permutation, 0..) |slot, j| {
+                    sorted_ids[j] = ids_host[slot];
+                    inverse[slot] = @intCast(j);
+                }
+                const perm = sqIds(permutation, n);
+                defer _ = mlx.mlx_array_free(perm);
+                const inv = sqIds(inverse, n);
+                defer _ = mlx.mlx_array_free(inv);
+                const ids = sqIds(sorted_ids, n);
                 defer _ = mlx.mlx_array_free(ids);
+                var sorted_x = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(sorted_x);
+                var sorted_act = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(sorted_act);
+                try mlx.check(mlx.mlx_take_axis(&sorted_x, x, perm, 0, s));
+                try mlx.check(mlx.mlx_take_axis(&sorted_act, act, perm, 0, s));
                 var gate_out = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(gate_out);
-                try gatherExpertMm(&gate_out, x, arm.gate_w, arm.gate_s, arm.gate_b, .{ .ctx = null }, ids, bits, gs, .affine, true, s);
-                gate_hashes[i] = try seHash(gate_out);
+                var gate_restored = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(gate_restored);
+                try gatherExpertMm(&gate_out, sorted_x, arm.gate_w, arm.gate_s, arm.gate_b, .{ .ctx = null }, ids, bits, gs, .affine, true, s);
+                try mlx.check(mlx.mlx_take_axis(&gate_restored, gate_out, inv, 0, s));
+                gate_hashes[i] = try seHash(gate_restored);
                 var down_out = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(down_out);
-                try gatherExpertMm(&down_out, act, arm.down_w, arm.down_s, arm.down_b, .{ .ctx = null }, ids, bits, gs, .affine, true, s);
-                down_hashes[i] = try seHash(down_out);
+                var down_restored = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(down_restored);
+                try gatherExpertMm(&down_out, sorted_act, arm.down_w, arm.down_s, arm.down_b, .{ .ctx = null }, ids, bits, gs, .affine, true, s);
+                try mlx.check(mlx.mlx_take_axis(&down_restored, down_out, inv, 0, s));
+                down_hashes[i] = try seHash(down_restored);
             }
             try std.testing.expectEqual(gate_hashes[0], gate_hashes[1]);
             try std.testing.expectEqual(down_hashes[0], down_hashes[1]);

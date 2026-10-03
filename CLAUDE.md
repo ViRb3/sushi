@@ -67,7 +67,7 @@ Skills: `/release` (SemVer, CHANGELOG), `/bench` (llmprobe methodology, comparis
 ## Stack
 
 Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES
-(`lib/mlx-src` d73eb752, `lib/mlxc-src` 56b2d39: mlx-serve's pins) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/`
+(`lib/mlx-src` 64ea011c / v0.32.3, `lib/mlxc-src` 56b2d39: mlx-serve's pins) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/`
 (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0) as `lib/jinja_cpp/libjinja.a`; safetensors; BPE; `stb_image`
 + libwebp decode image INPUT. Min macOS 26.2; NAX kernels need the 26.2 deployment target (asserted by
 `tests/test_mlx_staged_nax.sh`). The served binary's only non-system dylibs are `libmlxc` and Homebrew's `libwebp`

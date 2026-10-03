@@ -7,6 +7,19 @@ building code or anything that crosses the mlx-c boundary.
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-kernels.md),
 [engine-memory-admission](engine-memory-admission.md), [server-lifecycle](server-lifecycle.md).
 
+## Runtime revision and C wrapper
+
+Sushi follows mlx-serve's MLX0.32.3 pin `64ea011c` and mlx-c `56b2d39`.
+The C wrapper patch supplies the new optional global-scale argument in its
+C++ `gather_qmm` call; the C ABI stays unchanged. The build stamp includes
+both source revisions and the patch hash. `tests/test_mlx_staged_nax.sh`
+checks those fields against the source, along with NAX symbols and min-OS.
+An older staged library can load successfully while retaining a sorted-row
+overflow bug above32K; library presence alone does not qualify the runtime.
+Sorted `gather_qmm` requires ascending expert IDs in that bank's own ID space.
+After slab remapping, sort each reference arm separately and invert its output
+permutation before comparing bytes; grouping by the other arm's IDs is invalid.
+
 ## The one MLX thread
 
 The inference thread is the SOLE mlx caller (even frees). `Slot.deinit` runs on conn threads: it stores marks, the

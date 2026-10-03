@@ -39,7 +39,9 @@ die() { echo "[build-mlx] ERROR: $*" >&2; exit 1; }
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA target=$DEPLOYMENT_TARGET"
+MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
+PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
+WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
 if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.dylib" ] \
@@ -76,6 +78,10 @@ cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_INSTALL_PREFIX="$STAGE"
 cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
+
+# The pinned C wrapper needs the optional global-scale slot added by MLX 0.32.3.
+git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3)
+git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
