@@ -100,8 +100,25 @@ difference is within noise and does not establish a decode speedup. It used Rele
 with sensors below 90 C on 2026-10-03. The test binary was built at 08:25:16+07, and the run ended
 at 08:25:52+07. Measurement key: `glm53-mini-head-component-20261003`.
 
-Full-model acceptance and throughput are still pending. That run must use the selected A6g128
-assistant and the unchanged Sushi target, compare emitted IDs and complete target state against
-serial, record accepted drafts and draft/verify/replay/commit times, and inherit the existing
-matched baseline under [`docs/process-measurement.md`](process-measurement.md). The readout remains
-default off while that result is unresolved.
+## Full checkpoint qualification
+
+One ReleaseFast binary built from `e4be4673` compared the selected A6g128 assistant
+and 2.3bpw A6-trunk target with dense rows enabled, N2/children4, async4, group2 and
+lane/down enabled. Both arms used prefix512/chunk128,64 committed inputs, one warmup,
+BF16 compressed MLA cache and FP32 KDA state; profiling and route capture were off.
+Each matched all64 output IDs and complete target state against its serial reference.
+The mini head engaged24 times, used277,544,960 additional resident bytes and retained
+the same24 rounds/40 accepted drafts/72 verification rows on this prompt.
+
+| Readout | Decode tok/s | Draft ms | Verify ms | Replay ms | Commit ms | Decode peak bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| Original A6 | 45.8676 | 146.348 | 1,189.197 | 43.211 | 15.760 | 94,978,758,176 |
+| 3-bit shortlist + A6 re-score | 46.0117 | 144.003 | 1,186.961 | 42.663 | 16.391 | 95,256,386,336 |
+
+The0.31% overall difference is provisional and within run-to-run noise; this
+establishes real-prompt acceptance and correctness, not a robust speed advantage.
+The head remains default off. Broader prompts and contexts remain unqualified,
+and the60 tok/s goal is unmet. Each arm acquired its own exclusive GPU lock,
+used foreground `taskpolicy -a`, maximum fans and ten seconds idle below90°C,
+with no overlapping compiler/GPU work. Private artifact `glm53-dense-mini-20261003`
+contains the fixed binary hash, exact settings, tokens, state checks and telemetry.
