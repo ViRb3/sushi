@@ -151,20 +151,29 @@ fn json(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u
     try dir.rename(tmp, dir, name, io);
 }
 
-fn teacherEnvironment() !void {
-    const tf32 = std.c.getenv("MLX_ENABLE_TF32") orelse return error.NativeGlmTeacherRequiresTf32Off;
-    if (!std.mem.eql(u8, std.mem.span(tf32), "0")) return error.NativeGlmTeacherRequiresTf32Off;
-    if (model.getConfigOverrides() != null) return error.NativeGlmTeacherOverrides;
-    for ([_][:0]const u8{
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+const teacher_off_flags = [_][:0]const u8{
         "SUSHI_GLM_LANE_PAIR",            "SUSHI_GLM_DOWN_LANE",        "SUSHI_GLM_KDA_VALUE_ROWS",      "SUSHI_GLM_HC_PREFILL",         "SUSHI_GLM_HC_FUSED",
         "SUSHI_GLM_A6_DENSE_PREFILL",     "SUSHI_GLM_PREFILL_DIRECT",   "SUSHI_GLM_MLA_PREFILL_BATCH",   "SUSHI_GLM_ATTENTION_PACKED",   "SUSHI_GLM_INDEX_SCORE_NAX",
         "SUSHI_GLM_INDEX_SCORE_NAX_LONG", "SUSHI_GLM_KDA_KEEP_LEAF",    "SUSHI_GLM_KDA_PREFILL_CLUSTER", "SUSHI_GLM_PREFILL_CADENCE",    "SUSHI_GLM_PREFILL_GRID_TRANSPOSE",
         "SUSHI_GLM_DECODE_BATCH",         "SUSHI_GLM_PREFILL_PACKED32", "SUSHI_GLM_HC_EXPAND_PREFILL",   "SUSHI_GLM_HC_COLLAPSE_SIMD32", "SUSHI_GLM_PREFILL_EXPERT_PAIR",
         "SUSHI_GLM_KDA_TREE_CORE",        "SUSHI_EXL3_CLAMPED_MIDDLE",
-    }) |name| {
+    };
+
+fn normalizeTeacherTf32() !void {
+    if (std.c.getenv("MLX_ENABLE_TF32")) |value| {
+        if (!std.mem.eql(u8, std.mem.span(value), "0")) return error.NativeGlmTeacherRequiresTf32Off;
+    } else if (setenv("MLX_ENABLE_TF32", "0", 0) != 0) return error.NativeGlmTeacherEnvironmentFailed;
+}
+
+fn teacherEnvironment() !void {
+    try normalizeTeacherTf32();
+    if (model.getConfigOverrides() != null) return error.NativeGlmTeacherOverrides;
+    for (teacher_off_flags) |name| {
         if (std.c.getenv(name)) |v| {
             if (!std.mem.eql(u8, std.mem.span(v), "0")) return error.NativeGlmTeacherOverrides;
-        } else return error.NativeGlmTeacherRequiresExplicitFlags;
+        } else if (setenv(name, "0", 0) != 0) return error.NativeGlmTeacherEnvironmentFailed;
     }
 }
 
@@ -430,4 +439,22 @@ test "GLM native KLD capture CPU rejects zero norm logits" {
     defer _ = mlx.mlx_array_free(x);
     var row: [2]f32 = undefined;
     try std.testing.expectError(error.NativeGlmTeacherZeroNormLogits, exportRow(s, x, &row));
+}
+
+test "GLM standard4 teacher capture defaults only absent numerical flags" {
+    const a = std.testing.allocator;
+    const names = [_][:0]const u8{"MLX_ENABLE_TF32"} ++ teacher_off_flags;
+    var previous: [names.len]?[:0]u8 = @splat(null);
+    for (names, &previous) |name, *saved| if (std.c.getenv(name)) |value| { saved.* = try a.dupeSentinel(u8, std.mem.span(value), 0); };
+    defer for (names, previous) |name, saved| {
+        if (saved) |value| { _ = setenv(name, value, 1); a.free(value); } else _ = unsetenv(name);
+    };
+    for (names) |name| _ = unsetenv(name);
+    try teacherEnvironment();
+    for (names) |name| try std.testing.expectEqualStrings("0", std.mem.span(std.c.getenv(name).?));
+    _ = setenv("MLX_ENABLE_TF32", "1", 1);
+    try std.testing.expectError(error.NativeGlmTeacherRequiresTf32Off, teacherEnvironment());
+    _ = setenv("MLX_ENABLE_TF32", "0", 1);
+    _ = setenv("SUSHI_GLM_HC_PREFILL", "1", 1);
+    try std.testing.expectError(error.NativeGlmTeacherOverrides, teacherEnvironment());
 }
