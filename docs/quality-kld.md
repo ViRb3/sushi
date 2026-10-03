@@ -21,6 +21,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 - `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4, including boundary zero.
 - A `--prompts` jsonl line may carry `prompt_ids` (token ids, used as given, no template) instead of `prompt`.
 
+Native GLM capture uses the diagnostic forward through `sushi kld capture` with individual BF16 expert streaming,
+`--no-template --kv-quant off --no-mtp --ssd-budget-gb <total GiB>`. It audits indexed text headers before loading:
+the trunk must be BF16/F32 and routed experts BF16. Set `MLX_ENABLE_TF32=0` and explicitly disable the experimental
+GLM kernel switches listed in `glm5_kld_capture.zig`; conflicting settings are refused. The total ledger includes
+the trunk, full expert union, I/O bounce slabs, per-layer LRU and at least8 GiB request reserve; allocator cache is0.
+Dense prefill uses at most512 tokens per chunk and synchronous layers, with BF16 compressed MLA and FP32 KDA state.
+All requested greedy full-vocabulary rows are captured through EOS, with native logits dtype recorded and exact
+F32 export. Output first stays in `<out>.partial`; only a full capture publishes a completed baseline and native
+identity atomically, without replacing existing output. A one-prompt study is not the standard release verdict.
+
 ## The standard reading
 
 - **16 prompts x 512 tokens, scored to the first EOS, for every model** (Flash-Next's 16 wikitext prompts, raw text,

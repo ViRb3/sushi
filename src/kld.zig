@@ -961,10 +961,10 @@ fn readLastRow(xfm: *transformer_mod.Transformer, logits: mlx.mlx_array, dst: []
     @memcpy(dst, data[0..dst.len]);
 }
 
-const Out = struct {
+pub const Out = struct {
     silent: bool = false,
 
-    fn print(self: *Out, comptime fmt: []const u8, args: anytype) void {
+    pub fn print(self: *Out, comptime fmt: []const u8, args: anytype) void {
         if (self.silent) return;
         var buf: [32 * 1024]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
@@ -1460,6 +1460,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         opts.hidden_out = dir;
         log.info("[kld] {s}: appending every prompt forward's block boundaries to {s}\n", .{ hidden_capture.ENV_VAR, dir });
     };
+    if (try @import("glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.wired_margin_bytes > 0) server_mod.wired_limit_margin_bytes = opts.wired_margin_bytes;
     const loaded = try loadModel(io, allocator, opts);

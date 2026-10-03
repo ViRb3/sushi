@@ -5,6 +5,9 @@ It does not register GLM with the public server. The test is skipped unless
 `SUSHI_GLM_DIAGNOSTIC_MODEL` is set. Run a full model only in an exclusive GPU slot,
 after the tiny native layer and model lifecycle fixtures pass.
 
+`sushi kld capture` also reaches this native streamed BF16 path, with strict lossless teacher settings and staged
+fixture publication. See [quality capture](quality-kld.md) for its header audit, budget and output contract.
+
 The dedicated loader requires the checkpoint's index and config. The resident runner validates EXL3 shard stamps
 and complete bank geometry before loading arrays; streamed BF16 validates source expert headers. The loader reads
 only index-owned text tensors, excludes vision and MTP (including layer indices beyond
