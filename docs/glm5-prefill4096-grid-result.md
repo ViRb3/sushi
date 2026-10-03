@@ -119,3 +119,7 @@ Exact runtime acceptance failed. The declared unchanged code/prose numerical
 gate must pass before any performance acceptance; no quality, HTTP, retry or
 row-policy variant was run by this worker. The exact expert-component win does
 not establish exactness of the complete widened model schedule.
+
+The subsequent [fixed numerical screen](glm5-steady4096-quality-result.md)
+rejected both prompt populations. The component win was never an actual-model
+throughput win; the entire batching candidate was archived and removed.

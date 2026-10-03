@@ -125,3 +125,16 @@ the original 2048 chunk at that offset has only 3072 pools and uses scalar
 scores. Causal masks and guard code remain unchanged. This is a plausible
 mechanism, not a measured cause or a quality result. Preserve the threshold
 and existing flags in the fixed screen; no scalar restoration follows.
+
+## Final round decision
+
+The [unchanged numerical screen](glm5-steady4096-quality-result.md) completed
+all 432 positions with zero new nonfinite values. Code mean/max KL were
+0.03371849/1.27872750, failing both bounds; prose max KL was 0.18176161, failing
+its bound. Both prompt populations therefore rejected the fixed schedule.
+No throughput arm, threshold adjustment or repeat followed. Root verified
+148 model and 13 quality compiled source snapshots, archived all 16 owned
+candidate files, then restored only the six public modules and removed the
+helper/private probes. Runtime, assistant default, installed libraries and
+qualified CLI remain unchanged. The next round starts with two source reports;
+1500 prefill/60 decode and longer-context stability remain unmet.

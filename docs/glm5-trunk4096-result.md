@@ -41,3 +41,7 @@ flags, source/binary hashes, failures, results and telemetry. All eight frozen
 dependency hashes remained identical after compilation/execution, including the
 default-off tree-core seam/helper; that recheck occurred after execution rather
 than before launch. Green binary SHA256 is `433c693ce8396944a9e8bdfd094f28b1123c9426482562ae08cc9ff4cc232175`.
+
+The combined schedule subsequently failed the [fixed numerical gate](glm5-steady4096-quality-result.md).
+Root archived the compiled source snapshots and restored these helpers; no
+4096 runtime capability was accepted from this round.

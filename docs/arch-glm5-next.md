@@ -30,6 +30,7 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [4096 expert component result](glm5-prefill4096-grid-result.md),
 [4096 trunk proof](glm5-trunk4096-result.md),
 [T3 core rejection](glm5-t3-kda-core-result.md),
+[steady-4096 quality rejection](glm5-steady4096-quality-result.md),
 [current decode system trace](glm5-current-gpu-profile-result.md),
 [bounded draft readouts](glm5-dflash-readout-horizon.md),
 [verification latent overlays](glm5-dflash-latent-overlay.md),
