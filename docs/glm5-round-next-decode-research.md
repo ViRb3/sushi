@@ -1,4 +1,4 @@
-# Next GLM decode research: canonical KDA trees and joint QKV dispatch
+# Next GLM decode research: canonical KDA trees and shared-prefix scoring
 
 Source-only audit at `f9f4c8d2`, 2026-10-03. No implementation, build, GPU job
 or additional model load was performed. The selected precision remains BF16
@@ -8,9 +8,13 @@ requires precision restoration or an additional persistent weight bank.
 
 ## Cost and engagement evidence
 
-The last completed HTTP ledger is measurement key
-`glm53-commit-window-llmprobe-20261003`. The coordinator's current 2K–16K ladder
-is still running; these inherited cells must not be presented as its result.
+The inherited HTTP ledger is measurement key
+`glm53-commit-window-llmprobe-20261003`. The accepted `f9f4c8d2` wave subsequently
+measured 2K/4K/8K/16K prefill 931.71/802.82/727.81/655.06 tok/s and decode
+47.08/45.48/44.44/43.04 tok/s. At 16K it recorded 64 rounds and
+6.334/60.336/1.503/0.986 ms draft/verify/replay/commit per round. This wave
+changed prefill, not decode; do not attribute across-boot decode differences
+to those kernels. The final 32K HTTP cell is still running.
 At predictable 32K, 191 timed forwards in 64 rounds measured 39.880 tok/s:
 draft/verify/replay/commit were 6.680/64.680/2.277/0.971 ms per round. Verification
 consumed about 86.4% of decode time. At unchanged tokens per round, 60 tok/s
@@ -82,44 +86,77 @@ This may remove a per-layer execution penalty across 34 KDA layers and is the
 higher-priority decode experiment. It has no established latency saving yet;
 even a recurrence win cannot by itself be credited with the full 25 ms gap.
 
-## Candidate 2: one exact R3 QKV dispatch with the joined destination
+## Candidate 2: exact three-query scoring over the shared committed pool prefix
 
-Current [KDA verification](../src/glm5_dflash_kda.zig) constructs three
-`linearRows` projections and then concatenates their BF16 results. The selected
-[A6 hoist](../src/glm5_dflash_a6_hoist.zig) applies independently to Q/K/V.
-Use one projection-selection grid dimension to run that unchanged hoisted body
-against the three original banks, writing directly to `[1,3,24576]` in the
-existing Q-then-K-then-V order.
+Current [IndexPool selection](../src/glm5_attention.zig) computes scores separately
+for each MLA tree branch. Its scalar SCORE kernel loops 32 heads and four
+128-wide key elements per lane, rounds each dot to BF16, clamps it, rounds the
+weighted term to BF16, accumulates heads in order, then rounds the total.
+The [prefill NAX scorer](../src/glm5_indexpool_nax.zig) explicitly declines
+queries of eight rows or fewer, so current W3 verification stays on this scalar
+path. The short 512-prefix MLA profile does not measure this sparse indexer.
 
-Strict geometry is BF16 `[1,3,4096]`, three U32 `[8192,768]` A6/group128 banks
-and their original BF16 `[8192,32]` scale/bias grids. Each bank is about 25 MiB;
-the original three-bank fixture totals about 75 MiB. This remains 3072
-64-thread threadgroups per KDA layer, with identical input/weight reads and
-per-output arithmetic. It does not share weights across distinct projections,
-change the output GEMV, or retry the inconclusive output-hoist experiment.
+All three branches share the committed `P0 = source.processed / 4` completed
+pools. With at most three ancestry tokens, each branch adds zero or one pool.
+Use one fixed three-query SCORE shader over that prefix, retaining three
+independent FP32 dot/total chains while loading each shared key coefficient
+once. Preserve `#pragma clang fp contract(off)`, lane traversal, `simd_sum`,
+all BF16 rounding boundaries, head order and negative weights. This is an exact
+scalar scheduling candidate, not another EXL3 three-member decoder.
 
-Three projection commands plus concatenation become one command. Across
-34 layers this removes 68 projection launches and 34 concatenations per full
-W3 verifier round. The existing three 48 KiB intermediate planes disappear;
-the final 144 KiB raw plane remains. This saves about 4.78 MiB of intermediate
-outputs across the round, with no expanded/repacked weights and no increased
-live bound. The expected gain is command/allocation/copy overhead; there is no
-claim that the old 79.968 ms QKV marker becomes available to remove.
+Strict input geometry is BF16 queries `[3,32,128]`, weights `[3,32]` and
+contiguous BF16 prefix keys with width128. Completed pool count P is a runtime
+scalar; never JIT a shader per prefix length. One prefix SIMD group replaces
+three, while all per-query arithmetic remains. Near 32K the scalar baseline
+uses approximately `3 * 8192` groups; the candidate uses approximately8192,
+plus a suffix group. Actual 32K plus192 outputs can exceed8192 pools, so that
+prefill-only cap must not disable the late32K decode path.
 
-[One-row GLM QKV](../src/glm5_decode.zig) already selects three original banks
-inside one dispatch. Reuse that pointer-selection pattern, while retaining the
-R3 hoisted arithmetic, rather than broadening its one-row dot implementation.
-The old serial fused-QKV model result did not show material speed gain, so a
-new R3 result must decide adoption independently.
+The suffix group reads each branch's own completed pool key, if present, and
+uses its actual ancestry offset. Do not replace fork offsets with `offset+row`.
+One output plane may be `[3,P0+1]`, but each branch must slice to its original
+`Pbranch` before its original negative/argpartition/top512/expand sequence.
+Keep all three original argpartition calls and their exact dimensions: padding
+the partition itself can change tie ordering even when padded scores are
+negative infinity. The final2051 selected IDs and their order are part of the
+bit-equivalence contract, not just the unordered pool set.
 
-**Minimal decision test:** actual L0 Q/K/V stored banks, one fixed nonzero
-normalized R3 BF16 input, current three hoisted calls plus concat as control.
-Compare all 73728 BF16 joined-output values. Time fresh full QKV-stage graphs,
-including concat/allocation/eval/free, with three warmups and eleven alternating
-pairs. A single joint-stage dispatch counter must prove engagement. Unsupported
-bank, row count or storage takes the existing path before graph construction.
-Only a consistent inclusive win proceeds to the same three-node model oracle;
-there is no standalone output-projection variant or broad geometry sweep.
+The shared FP32 score plane is approximately96KiB at8192 pools, matching the
+aggregate of the original three score planes, plus at most three unused suffix
+slots. There is no pooled-history copy. Small suffix keys/flags and packed
+queries require an explicit bounded bill if the implementation materializes
+extra arrays; reuse original query/weight planes and borrowed prefix views.
+Keep the existing branch scratch limit and fallback when three branch states
+cannot be live under it. This can address a context-growing verification stage;
+the inherited approximately9.14ms 2K-to32K verification increase is only a
+loose source-prioritization lead, not an indexer-only measured budget.
+
+**Minimal decision test:** reuse the actual16K capture's index queries, weights
+and pooled keys, label constructed fork/suffix fixtures accurately, and compare
+all score bits and ordered selected IDs against three unchanged selectors.
+Cover negative weights, ties near the512 cutoff, odd history, chain/fork actual
+offsets, zero/one suffix and a pool frontier above8192. Then time the whole
+three-selector graph, including score construction, three original partitions,
+expansion, endpoint evaluation and free: three warmup pairs and eleven fresh
+inclusive alternating pairs. Stop a flat/losing arm; no NAX variation follows.
+An exact winner proceeds to coordinator-owned `mlaTree` integration and the
+existing target token/full-state oracle.
+
+**Rejected-probe scope:** the archived decode-NAX probe's `timed()` loop created
+and evaluated a fresh Ops scope for EACH node. Its helper admitted only
+`[1,64,512]`, with SDPA Q `[1,1,64,512]` and KV `[1,1,2051,512]`. Therefore its
+T1/T2/T3 measurements were one/two/three serial node calls, not one B3 gather or
+SDPA. True B3 is distinct but remains parked: native attention would still have
+only about six tensor groups, and any changed-order mode needs serial-target
+consistency plus drift/selection validation. The exact scorer avoids that gate.
+
+**Parked smaller option:** a joint R3 A6 QKV dispatch could emit the existing
+`[1,3,24576]` plane directly, replacing three hoisted calls plus concat with one.
+This would remove68 launches and34 concats per round and approximately4.78MiB
+of intermediate outputs, without reducing issued dot work. Existing
+[one-row GLM QKV](../src/glm5_decode.zig) demonstrates pointer selection, but
+its older model result did not show a material gain. Prefer the shared-prefix
+scorer's context-growing opportunity this round; do not implement both.
 
 ## Existing infrastructure and scope limits
 
@@ -158,11 +195,19 @@ from contended runs.
 
 1. Canonical R3 KDA recurrence: isolated helper/probe, then coordinator-owned
    delegation in `glm5_dflash_kda.zig` after an exact paired win.
-2. Joint R3 A6 QKV: isolated helper/probe and a tiny hoist-source seam; the
-   coordinator owns its separate delegation in the same KDA caller.
+2. Exact shared-prefix SCORE: isolated `glm5_indexpool_shared_prefix` helper/probe
+   and a tiny SCORE-source export. The coordinator owns the later `mlaTree`
+   delegation, only after an inclusive three-selector win.
 3. Researcher 1's bounded NAX pool-dot tile cadence: independent index-scoring
    helper/control and existing actual 16K attention fixture, on top of the
    current packed cadence. It requires its own declared scratch delta.
+
+N3 policy is also parked: HTTP fixes two draft nodes, bounded readout handles
+only N2, and the exact QKV hoist and MLA broadcast guards require three rows.
+Group2 already admits four rows, but a wider policy falls back in those other
+paths. The old N3/children1 chain did not improve acceptance and N4 lost; changing
+N3 now requires a complete round-cost/acceptance comparison, not row-count
+arithmetic. It is not a third implementation recommendation.
 
 Workers 1/2 share no implementation file until coordinator integration.
 Schedule their small component timings, retain the latest HTTP baseline, then
