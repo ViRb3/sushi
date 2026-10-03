@@ -64,3 +64,21 @@ accumulators, original stored small tensors and resident embeddings. No checkpoi
 conversion, precision restoration or64K/128K. Rejected helpers/seams are archived
 and removed. Runtime wins receive full required checks, HTTP2K–16K and selected
 32K once, then commit/push. The1500/60 goals remain active and unmet.
+
+## Completed prefill and capture work
+
+[Route6's complete L20 component](glm5-prefill-route6-component.md) passed
+independent proofs and reduced latency20.23% in all eleven pairs, but the
+[frozen quality screen](glm5-route6-quality-result.md) rejected both prompts.
+All432 declared rows were scored; mean KL was0.3340 code and0.05216 prose,
+above0.01, with additional max-KL/top1/NLL failures. No throughput trial or
+policy variant followed. Production seams and extra bill were restored, and
+owned prototype files were hash-archived and removed.
+
+The [real activation capture](glm5-mini2-activation-capture.md) produced exactly
+six trained eight-row assistant blocks from the frozen nominal8K inputs. It
+is perturbed shadow-forward evidence, not performance or duplicate parity.
+The [mini2 component](glm5-mini2-component.md) preserved selected source-head
+logits/masks/proposals and retained all12 real top1 plus192/192 top16 candidates.
+Complete proposal latency decreased26.13% in all eleven pairs. Only the fixed
+full-model full2/mini2 ABBA can decide runtime acceptance; it remains pending.
