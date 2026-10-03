@@ -408,6 +408,7 @@ pub const KdaLayer = struct {
     out_norm: Arr,
     prepared_conv: Arr = .{ .ctx = null },
     prepared_decay: Arr = .{ .ctx = null },
+    prepared_cluster: Arr = .{ .ctx = null },
 
     pub fn prepare(self: *KdaLayer, stream: mlx.mlx_stream) !void {
         if (self.prepared_conv.ctx != null and self.prepared_decay.ctx != null) return;
@@ -428,8 +429,25 @@ pub const KdaLayer = struct {
     pub fn deinit(self: *KdaLayer) void {
         if (self.prepared_conv.ctx != null) _ = mlx.mlx_array_free(self.prepared_conv);
         if (self.prepared_decay.ctx != null) _ = mlx.mlx_array_free(self.prepared_decay);
+        if (self.prepared_cluster.ctx != null) _ = mlx.mlx_array_free(self.prepared_cluster);
         self.prepared_conv = .{ .ctx = null };
         self.prepared_decay = .{ .ctx = null };
+        self.prepared_cluster = .{ .ctx = null };
+    }
+
+    pub fn preparePrefillCluster(self: *KdaLayer, stream: mlx.mlx_stream) !void {
+        const cluster = @import("glm5_kda_prefill_cluster.zig");
+        if (self.prepared_cluster.ctx != null or !cluster.enabled() or !mlx.streamIsGpu(stream) or
+            !@import("glm5_kda_fused.zig").hardwareSupported() or !cluster.eligible(.{ self.fa, self.ga, self.beta })) return;
+        var ops = Ops{ .s = stream };
+        defer ops.deinit();
+        const bank = try cluster.prepare(&ops, .{ self.fa, self.ga, self.beta });
+        try mlx.check(mlx.mlx_array_eval(bank));
+        self.prepared_cluster = try ops.result(bank);
+    }
+
+    pub fn prefillCluster(self: KdaLayer, ops: *Ops, x: Arr) !?[3]Arr {
+        return @import("glm5_kda_prefill_cluster.zig").tryProject(ops, self.prepared_cluster, x);
     }
 
     pub fn load(weights: *const model.Weights, prefix: []const u8, cfg: *const model.ModelConfig) !KdaLayer {
@@ -520,8 +538,9 @@ pub const KdaLayer = struct {
         const prework_mod = @import("glm5_kda_prework.zig");
         const conv_weight = if (self.prepared_conv.ctx != null) self.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
         const exp_decay = if (self.prepared_decay.ctx != null) self.prepared_decay else try ops.unary(.exp, self.a_log);
-        const raw_a = try self.fb.apply(ops, try self.fa.apply(ops, x));
-        const raw_beta = try self.beta.apply(ops, x);
+        const clustered = try self.prefillCluster(ops, x);
+        const raw_a = try self.fb.apply(ops, if (clustered) |banks| banks[0] else try self.fa.apply(ops, x));
+        const raw_beta = if (clustered) |banks| banks[2] else try self.beta.apply(ops, x);
         const prework: ?prework_mod.Result = if (sh[1] > 1) try prework_mod.apply(ops.s, .{
             .qkv = joined,
             .a = raw_a,
@@ -567,7 +586,7 @@ pub const KdaLayer = struct {
         try mlx.check(mlx.mlx_array_set(&state.conv_state, prepared.conv));
         try mlx.check(mlx.mlx_array_set(&state.ssm_state, result.state));
         state.initialized = true;
-        const gate = try ops.reshape(try self.gb.apply(ops, try self.ga.apply(ops, x)), &dims);
+        const gate = try ops.reshape(try self.gb.apply(ops, if (clustered) |banks| banks[1] else try self.ga.apply(ops, x)), &dims);
         const candidate = if (sh[1] > 1) try @import("glm5_kda_fused.zig").post(ops.s, result.y, gate, self.out_norm, cfg.rms_norm_eps) else null;
         const gated = if (candidate) |value| try ops.own(value) else blk: {
             const y = try ops.cast(result.y, .float32);

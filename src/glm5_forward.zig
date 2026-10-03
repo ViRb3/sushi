@@ -460,7 +460,9 @@ pub const Model = struct {
             const name = try std.fmt.bufPrint(&buf, "{s}.self_attn", .{prefix});
             const attn: Attention = if ((i + 1) % cfg.full_attention_interval == 0) .{ .mla = try Mla.load(weights, name, &cfg, s) } else blk: {
                 var kda = try base.KdaLayer.load(weights, name, &cfg);
+                errdefer kda.deinit();
                 if (@hasDecl(base.KdaLayer, "prepare")) try kda.prepare(s);
+                try kda.preparePrefillCluster(s);
                 break :blk .{ .kda = kda };
             };
             layer.* = .{ .attn = attn, .ffn = ffn, .hc_attn = hc_attn, .hc_ffn = hc_ffn, .norm_attn = norm_attn, .norm_ffn = norm_ffn };
@@ -472,6 +474,17 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         for (self.layers) |*layer| layer.deinit();
         self.allocator.free(self.layers);
+    }
+
+    pub fn kdaPrefillClusterBytes(self: *const Model) usize {
+        var bytes: usize = 0;
+        for (self.layers) |layer| switch (layer.attn) {
+            .kda => |kda| if (kda.prepared_cluster.ctx != null) {
+                bytes += mlx.mlx_array_size(kda.prepared_cluster) * mlx.mlx_array_itemsize(kda.prepared_cluster);
+            },
+            .mla => {},
+        };
+        return bytes;
     }
 
     pub fn routeLayer(self: *const Model, index: usize, ops: *Ops, x: Arr) !Routed {

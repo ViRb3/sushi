@@ -88,6 +88,60 @@ test "GLM prefill cluster production qualification" {
     const x = try setup.slot();
     try mlx.check(mlx.mlx_random_normal(x, &.{ 1, 2048, 4096 }, 3, .bfloat16, 0, 1, key.*, s));
     try mlx.check(mlx.mlx_array_eval(x.*));
+    // Exercise the exact first-stage caller helper and owned preparation, without
+    // another complete recurrence or timing sweep. Other KDA fields are unused.
+    if (std.c.getenv("SUSHI_GLM_CLUSTER_CALLER_ONLY") != null) {
+        var layer: native.KdaLayer = undefined;
+        layer.fa = bank[0];
+        layer.ga = bank[1];
+        layer.beta = bank[2];
+        layer.prepared_conv = .{ .ctx = null };
+        layer.prepared_decay = .{ .ctx = null };
+        layer.prepared_cluster = .{ .ctx = null };
+        defer layer.deinit();
+        const off = cluster.bind(false);
+        try layer.preparePrefillCluster(s);
+        try std.testing.expect(layer.prepared_cluster.ctx == null);
+        try std.testing.expectEqual(@as(usize, 0), try cluster.transientBudget(2048, 2));
+        off.restore();
+        const on = cluster.bind(true);
+        defer on.restore();
+        try layer.preparePrefillCluster(s);
+        const owned = layer.prepared_cluster.ctx;
+        try std.testing.expect(owned != null);
+        try std.testing.expectEqual(cluster.weight_bytes, mlx.mlx_array_size(layer.prepared_cluster) * mlx.mlx_array_itemsize(layer.prepared_cluster));
+        var net: @import("glm5_forward.zig").Model = undefined;
+        var layers: [1]std.meta.Child(@TypeOf(net.layers)) = undefined;
+        layers[0].attn = .{ .kda = layer };
+        net.layers = &layers;
+        try std.testing.expectEqual(cluster.weight_bytes, net.kdaPrefillClusterBytes());
+        try layer.preparePrefillCluster(s);
+        try std.testing.expectEqual(owned, layer.prepared_cluster.ctx);
+        try std.testing.expectEqual(2 * cluster.transient_bytes, try cluster.transientBudget(2048, 2));
+        try std.testing.expectEqual(@as(usize, 0), try cluster.transientBudget(2047, 2));
+        var scope = Ops{ .s = s };
+        defer scope.deinit();
+        cluster.resetDispatchCount();
+        try std.testing.expect((try layer.prefillCluster(&scope, try scope.slice(x.*, 1, 0, 3))) == null);
+        try std.testing.expectEqual(@as(usize, 0), cluster.dispatchCount());
+        const actual = (try layer.prefillCluster(&scope, x.*)) orelse return error.TestExpectedClusterCaller;
+        const expected = try products(&scope, bank, cluster_weight, x.*, false, false);
+        try eval(&actual);
+        try eval(&expected);
+        for (expected, actual) |a, b| try std.testing.expectEqual(@as(usize, 0), (try compare(a, b)).mismatches);
+        try std.testing.expectEqual(@as(usize, 1), cluster.dispatchCount());
+        const disable = cluster.bind(false);
+        try std.testing.expect((try layer.prefillCluster(&scope, x.*)) == null);
+        disable.restore();
+        layer.deinit();
+        try std.testing.expect(layer.prepared_cluster.ctx == null);
+        layers[0].attn = .{ .kda = layer };
+        try std.testing.expectEqual(@as(usize, 0), net.kdaPrefillClusterBytes());
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .caller = "KdaLayer.preparePrefillCluster/prefillCluster/deinit", .raw_bf16_equal = true, .prepared_weight_bytes = cluster.weight_bytes, .two_pending_transient_bytes = 2 * cluster.transient_bytes, .unsupported_t3_fallback = true, .disabled_fallback = true, .ownership_idempotent = true, .timing_repeated = false, .full_model = false }, .{ .whitespace = .indent_2 });
+        defer std.testing.allocator.free(json);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
+        return;
+    }
     var drifts: [2][3]Drift = undefined;
     for ([_]bool{ false, true }, 0..) |downstream, mode| {
         var ops = Ops{ .s = s };
