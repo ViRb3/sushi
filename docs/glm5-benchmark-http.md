@@ -384,3 +384,28 @@ Artifact keys are `glm53-prefill-wave-32k-model-gate-20261003` and
 `glm53-prefill-wave-32k-llmprobe-20261003`. All 21 HTTP requests/client output
 are saved; exit 0, server stopped, GPU lock released and fans automatic.
 No 64K/128K rung was run. Both exact candidates are accepted as opt-ins.
+
+
+### Optional native B1/B3 decode attention
+
+`SUSHI_GLM_DECODE_BATCH=1` selects mode-matched native B1 serial/replay and
+B3 verification attention. It reserves 32 MiB at async4 and reports B1/B3
+engagement. BF16 cache/output and FP32 accumulators remain; numerical drift
+against the old scalar target is measured separately from speculative parity.
+Default is off, and A6g128 remains the selected assistant.
+
+Predictable 2K/4K/8K/16K decode measured 46.04/46.19/46.57/44.20 tok/s;
+ordinary measured 42.16/41.33/42.09/41.71. Small-context performance is mixed.
+Selected 32K used exactly 33595/33631 predictable/ordinary input IDs and
+measured 608.77/614.65 prefill and 43.00/38.08 decode tok/s. The inherited
+32K scalar-attention rates were 42.39/37.42 decode. These small separate-boot
+changes are not assigned wholly to the attention kernel.
+
+[Native attention qualification](glm5-decode-attention-batch.md) records the
+14.68% paired complete-component win, exact B1/B3 outputs, strict 8K64 serial
+token/state gate, old-target mean KL0.00323446 and full warmed tables.
+Artifacts `glm53-native-decode-llmprobe-20261003` and
+`glm53-native-decode-32k-20261003` ran at `39f8693d` plus hashed WIP, binary
+`e825e47bb24c5697`, MLX0.32.3, foreground QoS and exclusive locks. Both exited
+0, with server stopped, lock released and fans auto. Full ReleaseFast suite
+and CLI passed. This opt-in does not attain the 1500/60 goals.

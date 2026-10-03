@@ -88,6 +88,8 @@ test {
     _ = @import("glm5_hc_capture.zig");
     _ = @import("glm5_attention.zig");
     _ = @import("glm5_attention_prefill_cadence_probe.zig");
+    _ = @import("glm5_attention_decode_batch.zig");
+    _ = @import("glm5_attention_decode_batch_probe.zig");
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");

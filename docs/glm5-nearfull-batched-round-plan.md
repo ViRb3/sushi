@@ -53,3 +53,29 @@ quality/state gates and pushes. Commit only accepted runtime changes; preserve
 rejection evidence privately and document the lesson. Then two researchers
 start the next round. Routine HTTP iterations remain 2K–16K, with one selected
 32K qualification. Original small tensors and resident embeddings remain intact.
+
+## Outcome
+
+Both near-full prefill candidates were rejected after their real-model gates.
+The exact expert-grid extension was 1.24% slower on the fixed 2037-ID ABBA;
+the A6 extension was 3.115% slower in its equal-memory ABBA. Their component
+wins did not carry through to the model. Production helpers remain restricted
+to the accepted 2048-row geometry; documentation commits `d24b440c` and
+`39f8693d` retain the rejection evidence.
+
+True B3 native decode passed its component and coupled token/state proof.
+Its warmed 2K–16K HTTP run is mixed at short contexts and faster at 8K/16K.
+It remains default-off after the selected 32K qualification passed: 43.00
+predictable and 38.08 ordinary tok/s, both using matched input counts.
+[Native decode qualification](glm5-decode-attention-batch.md) records numerical
+drift against the old scalar target separately from exact mode-matched
+serial/speculative equality. No precision restoration is used.
+
+A user-supplied A4/gs64 assistant study prompted a separate stored-format
+consumer extension and matched A6/A4 test. Both precisions matched the target's
+192 serial tokens and valid final state on fixed 1176-ID ordinary and 1140-ID
+predictable inputs. A4 reduced drafting time about 11%, while total decode
+gains of 1.53%/0.96% were smaller than control timing drift. Retain optional
+A4 support, keep A6 as default, and do not expand this into another ladder.
+The next two researchers address larger prefill and verifier costs before
+allocating the next three implementation workers. Goals remain unmet.

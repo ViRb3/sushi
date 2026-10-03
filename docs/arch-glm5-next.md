@@ -9,6 +9,7 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),
 [serial decode kernels](engine-glm5-decode.md),
 [head-packed NAX attention](glm5-attention-head-packed.md),
+[native batched decode attention](glm5-decode-attention-batch.md),
 [bounded IndexPool scoring](glm5-indexpool-nax-score.md),
 [stored affine assistant formats](glm5-dflash-affine-storage.md),
 [bounded draft readouts](glm5-dflash-readout-horizon.md),

@@ -107,6 +107,12 @@ fn forkAttention(source: *const attention.State) !attention.State {
 }
 
 fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, mode: kda.ProjectionMode) !struct { output: Arr, tape: MlaTape } {
+    const native = @import("glm5_attention_decode_batch.zig");
+    const native_mode = native.enabled();
+    if (native_mode) {
+        try native.admit(cfg, .bfloat16, ops.s);
+        if (parents.len > 3) return error.GlmDecodeNativeTreeUnsupported;
+    }
     const t: c_int = @intCast(parents.len);
     const heads: c_int = @intCast(cfg.num_attention_heads);
     const kd: c_int = @intCast(cfg.mla_qk_nope_head_dim);
@@ -115,7 +121,14 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     const iw: c_int = @intCast(cfg.indexer_head_dim);
     const latent_capacity: usize = if (state.latent.ctx != null) @intCast(mlx.getShape(state.latent)[0]) else 0;
     const pool_capacity: usize = if (state.pooled.ctx != null) @intCast(mlx.getShape(state.pooled)[0]) else 0;
-    const scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(x));
+    var scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(x));
+    if (native_mode) {
+        const limit = @import("glm5_dflash_memory.zig").limit_bytes;
+        if (scratch.common_bytes >= limit - native.scratch_limit) return error.GlmTreeScratchLimit;
+        scratch.branches = @min(parents.len, (limit - scratch.common_bytes - native.scratch_limit) / scratch.per_branch_bytes);
+        if (scratch.branches == 0) return error.GlmTreeScratchLimit;
+        scratch.live_bytes = scratch.common_bytes + scratch.branches * scratch.per_branch_bytes + native.scratch_limit;
+    }
     mla_scratch_bound = @max(mla_scratch_bound, scratch.live_bytes);
     var profile = profiling.Timer.start(parents.len);
     const qr = try ops.rms(try kda.linearRows(ops, layer.qa, x, mode), layer.qa_norm, cfg.rms_norm_eps);
@@ -149,6 +162,9 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     var attention_rows: [16]Arr = undefined;
     var pending: [16]Arr = undefined;
     var pending_count: usize = 0;
+    const batched_native = native_mode and parents.len == 3 and scratch.branches == 3;
+    var native_ids: [3]Arr = undefined;
+    var native_branches: [3]native.Branch = undefined;
     for (0..parents.len) |row| {
         var branch = try forkAttention(state);
         defer branch.deinit();
@@ -165,6 +181,12 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         const weights = try ops.slice(index_weights, 0, from, from + 1);
         const offset = state.processed + kept.len - 1;
         const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
+        if (batched_native) {
+            native_ids[row] = try ops.own(try attention.decodeSelected(&branch, index_query, weights, offset, ops.s));
+            native_branches[row] = .{ .offset = offset, .length = branch.processed, .path = .{ 0, 0, 0 } };
+            @memcpy(native_branches[row].path[0..kept.len], kept);
+            continue;
+        }
         const y = try ops.own(if (overlay)
             try attention.attendOverlay(&branch, query, index_query, weights, offset, scale, .{ .prefix = state.latent, .prefix_rows = state.processed, .tail = tail }, ops.s)
         else
@@ -184,6 +206,21 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         if (broadcast_q == null) {
             const values = if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
             result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
+        }
+    }
+    if (batched_native) {
+        const prefix = if (state.processed == 0) latent else state.latent;
+        const selected = try ops.concat(&native_ids, 0);
+        const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
+        const batched = try native.run(ops, qa, prefix, state.processed, latent, &native_branches, selected, scale);
+        for (0..parents.len) |row| {
+            const y = if (batched) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else (try native.run(ops, try ops.slice(qa, 0, @intCast(row), @intCast(row + 1)), prefix, state.processed, latent, native_branches[row .. row + 1], native_ids[row], scale)) orelse return error.GlmDecodeNativeUnsupported;
+            const y4 = try ops.reshape(y, &.{ 1, heads, 1, width });
+            attention_rows[row] = y4;
+            if (broadcast_q == null) {
+                const values = if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
+                result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
+            }
         }
     }
     if (broadcast_q != null) {

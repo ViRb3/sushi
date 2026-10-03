@@ -377,6 +377,27 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     return kernelOutput(scope, ev, 0);
 }
 
+/// Isolated probes retain the original ordered selector without changing dispatch.
+pub fn probeSelect(state: *const State, index_q: Arr, weights: Arr, offset: usize, s: mlx.mlx_stream) !Arr {
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    return scope.result(try selectChunk(&scope, state, index_q, weights, offset));
+}
+
+/// The same per-node rule is used for serial decode and verifier ancestry.
+pub fn decodeSelected(state: *const State, index_q: Arr, weights: Arr, offset: usize, s: mlx.mlx_stream) !Arr {
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    if (offset + 1 > pool_size * (pool_budget + 1) - 1) {
+        var node = state.*;
+        node.processed = offset + 1;
+        return scope.result(try selectChunk(&scope, &node, index_q, weights, offset));
+    }
+    const ids = try scope.slot();
+    try mlx.check(mlx.mlx_arange(ids, 0, selected_width, 1, .int32, s));
+    return scope.result(try scope.shape(ids.*, &.{ 1, selected_width }));
+}
+
 fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, direct: bool, headpack: bool, overlay: ?latent_overlay.View) !Arr {
     if (headpack) {
         var ops = @import("glm5_model.zig").Ops{ .s = scope.s };
@@ -443,6 +464,15 @@ pub fn attendOverlay(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, 
     try view.validate(q);
     if (state.processed != view.length() or offset + 1 != state.processed) return error.InvalidGlmOverlay;
     return attendImpl(state, q, index_q, weights, offset, scale, view, s);
+}
+
+/// Scalar split-eight control on common selected IDs and immutable branch views.
+pub fn probeSelectedOverlay(state: *const State, q: Arr, selected: Arr, offset: usize, scale: f32, view: latent_overlay.View, s: mlx.mlx_stream) !Arr {
+    try view.validate(q);
+    if (state.processed != view.length() or offset + 1 != state.processed) return error.InvalidGlmOverlay;
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    return scope.result(try attentionChunk(&scope, state, q, selected, offset, scale, 8, false, false, view));
 }
 
 const PackedTile = struct {
@@ -517,6 +547,8 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
             !std.mem.eql(c_int, is[0..2], mlx.getShape(w)) or mlx.mlx_array_dtype(iq) != mlx.mlx_array_dtype(state.pooled) or
             mlx.mlx_array_dtype(w) != mlx.mlx_array_dtype(iq)) return error.InvalidGlmAttentionShape;
     }
+    if (@import("glm5_attention_decode_batch.zig").enabled() and sh[0] <= 8)
+        return attendNativeDecode(state, q, index_q, weights, offset, scale, overlay, s);
     const splits: c_int = if (sh[0] <= 8) 8 else 1;
     const headpack = overlay == null and sparse and splits == 1 and sh[1] == 64 and sh[2] == 512 and
         mlx.mlx_array_dtype(q) == .bfloat16 and packed_nax.enabled();
@@ -552,6 +584,40 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_concatenate_axis(&out, parts, 0, s));
     return out;
+}
+
+fn attendNativeDecode(state: *const State, q: Arr, iq: ?Arr, weights: ?Arr, offset: usize, scale: f32, view: ?latent_overlay.View, s: mlx.mlx_stream) !Arr {
+    const native = @import("glm5_attention_decode_batch.zig");
+    const rows: usize = @intCast(mlx.getShape(q)[0]);
+    const parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    var first: usize = 0;
+    while (first < rows) {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const end = @min(rows, first + 3);
+        const outputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs);
+        for (first..end) |row| {
+            const pos = offset + row;
+            const query = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
+            const indices = try ops.own(try decodeSelected(state, if (iq) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil, if (weights) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil, pos, s));
+            const prefix = if (view) |v| v.storage() else state.latent;
+            const prefix_rows = if (view) |v| v.prefix_rows else pos;
+            const tail = if (view) |v| v.tail else try ops.slice(state.latent, 0, @intCast(pos), @intCast(pos + 1));
+            const branch = native.Branch{ .offset = pos, .length = pos + 1, .path = .{ 0, 1, 2 } };
+            const out = (try native.run(&ops, query, prefix, prefix_rows, tail, &.{branch}, indices, scale)) orelse return error.GlmDecodeNativeUnsupported;
+            try mlx.check(mlx.mlx_vector_array_append_value(outputs, out));
+            try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
+        }
+        // Ordinary short chunks cannot retain more than three gathered B1 banks.
+        if (rows > 3) try mlx.check(mlx.mlx_eval(outputs));
+        first = end;
+    }
+    var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
+    try mlx.check(mlx.mlx_concatenate_axis(&result, parts, 0, s));
+    return result;
 }
 
 fn array(data: []const f32, shape: []const c_int) Arr {
