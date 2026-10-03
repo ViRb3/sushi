@@ -548,6 +548,7 @@ const Runtime = struct {
         assistant_block_tail: bool,
         kda_prefill_cluster_resident_bytes: usize,
         affine6_hoist: bool,
+        assistant_commit_window: bool,
         kda_value_rows: usize,
         benchmark_ignore_eos_enabled: bool,
     } {
@@ -576,6 +577,7 @@ const Runtime = struct {
             .assistant_block_tail = diag.diagEnvOn("SUSHI_GLM_DFLASH_BLOCK_TAIL"),
             .kda_prefill_cluster_resident_bytes = self.target.kdaPrefillClusterBytes(),
             .affine6_hoist = @import("glm5_dflash_a6_hoist.zig").enabled(),
+            .assistant_commit_window = diag.diagEnvOn("SUSHI_GLM_DFLASH_COMMIT_WINDOW"),
             .kda_value_rows = (@import("glm5_kda_value_rows.zig").configuredRows() catch null) orelse 0,
             .benchmark_ignore_eos_enabled = self.options.allow_ignore_eos,
         };
@@ -677,6 +679,7 @@ const Runtime = struct {
         @import("glm5_kda_prefill_cluster.zig").resetDispatchCount();
         @import("glm5_dflash_a6_hoist.zig").resetDispatchCount();
         const block_tail_before = dflash.blockTailCalls();
+        const commit_window_before = adapter.commitWindowCalls();
         const horizon_before = adapter.readoutHorizonCalls();
         request.dense_prefill = true;
         request.prefill_async = true;
@@ -755,7 +758,7 @@ const Runtime = struct {
         const finish = if (stopped) "stop" else "length";
         const counts = usage(ids.len, emit.ids.items.len);
         const stats = .{ .prompt_n = ids.len, .prompt_ms = @as(f64, @floatFromInt(prefill_ns)) / 1e6, .predicted_n = emit.ids.items.len, .predicted_ms = @as(f64, @floatFromInt(decode_ns)) / 1e6 };
-        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
+        const diagnostic = .{ .reserved_cache_growth_bytes = reserve_bytes, .settings = self.metadata(), .packed_attention_calls = @import("glm5_attention_nax_packed.zig").dispatchCount(), .nax_index_score_calls = @import("glm5_indexpool_nax.zig").dispatchCount(), .verify_mla_query_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.query), .verify_mla_value_calls = @import("glm5_mla_verify_batch.zig").dispatchCount(.value), .bounded_draft_readout_calls = adapter.readoutHorizonCalls() - horizon_before, .kda_leaf_hits = @import("glm5_dflash_kda.zig").leafHits(), .kda_leaf_misses = @import("glm5_dflash_kda.zig").leafMisses(), .kda_cluster_calls = @import("glm5_kda_prefill_cluster.zig").dispatchCount(), .assistant_block_tail_calls = dflash.blockTailCalls() - block_tail_before, .affine6_hoist_calls = @import("glm5_dflash_a6_hoist.zig").dispatchCount(), .assistant_commit_window_calls = adapter.commitWindowCalls() - commit_window_before, .output_ids = emit.ids.items, .ignore_eos = completion.ignore_eos, .speculative_rounds = rounds, .accepted_drafts = accepted, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = commit_ns };
         if (completion.stream) {
             const last = try frameJson(a, id, self.name, emit.created, null, finish, false);
             defer a.free(last);
@@ -763,7 +766,7 @@ const Runtime = struct {
             if (completion.include_usage) try sendEvent(a, conn, .{ .id = id, .object = "chat.completion.chunk", .created = emit.created, .model = self.name, .choices = [_]Frame.Choice{}, .usage = counts, .timings = stats, .sushi_diagnostic = diagnostic });
             try conn.writeAll("data: [DONE]\n\n");
         } else try sendJson(a, conn, "200 OK", .{ .id = id, .object = "chat.completion", .created = emit.created, .model = self.name, .choices = [_]@TypeOf(.{ .index = @as(usize, 0), .message = .{ .role = "assistant", .content = emit.text.items }, .finish_reason = finish }){.{ .index = 0, .message = .{ .role = "assistant", .content = emit.text.items }, .finish_reason = finish }}, .usage = counts, .timings = stats, .sushi_diagnostic = diagnostic });
-        @import("log.zig").info("[glm-bench] request={d} backend={s} prompt={d} output={d} prefill_ms={d:.2} decode_ms={d:.2} rounds={d} ignore_eos={} packed={d} index_nax={d} mla_q={d} mla_v={d} horizon={d} kda_hit={d} kda_miss={d} draft_ns={d} verify_ns={d} replay_ns={d} commit_ns={d} cluster={d} block_tail={d} a6_hoist={d}\n", .{ self.sequence, self.backend(), ids.len, emit.ids.items.len, stats.prompt_ms, stats.predicted_ms, rounds, completion.ignore_eos, diagnostic.packed_attention_calls, diagnostic.nax_index_score_calls, diagnostic.verify_mla_query_calls, diagnostic.verify_mla_value_calls, diagnostic.bounded_draft_readout_calls, diagnostic.kda_leaf_hits, diagnostic.kda_leaf_misses, draft_ns, verify_ns, replay_ns, commit_ns, diagnostic.kda_cluster_calls, diagnostic.assistant_block_tail_calls, diagnostic.affine6_hoist_calls });
+        @import("log.zig").info("[glm-bench] request={d} backend={s} prompt={d} output={d} prefill_ms={d:.2} decode_ms={d:.2} rounds={d} ignore_eos={} packed={d} index_nax={d} mla_q={d} mla_v={d} horizon={d} kda_hit={d} kda_miss={d} draft_ns={d} verify_ns={d} replay_ns={d} commit_ns={d} cluster={d} block_tail={d} a6_hoist={d} commit_window={d}\n", .{ self.sequence, self.backend(), ids.len, emit.ids.items.len, stats.prompt_ms, stats.predicted_ms, rounds, completion.ignore_eos, diagnostic.packed_attention_calls, diagnostic.nax_index_score_calls, diagnostic.verify_mla_query_calls, diagnostic.verify_mla_value_calls, diagnostic.bounded_draft_readout_calls, diagnostic.kda_leaf_hits, diagnostic.kda_leaf_misses, draft_ns, verify_ns, replay_ns, commit_ns, diagnostic.kda_cluster_calls, diagnostic.assistant_block_tail_calls, diagnostic.affine6_hoist_calls, diagnostic.assistant_commit_window_calls });
     }
     fn handle(self: *Runtime, a: std.mem.Allocator, conn: *net.Conn) !void {
         const http = try readHttp(a, conn);

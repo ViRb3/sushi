@@ -272,3 +272,10 @@ All 29 server requests/client JSON/HTML are saved. The owned server stopped,
 GPU lock released, fans returned automatic, and client exited 0. Foreground
 server QoS, confirmed maximum fan spin-up, exclusive lock and cool ten-second
 idle were used. Measurement key: `glm53-tail-hoist-llmprobe-20261003`.
+
+`SUSHI_GLM_DFLASH_COMMIT_WINDOW=1` requires the bounded block-tail arm. It crops
+only the staged next assistant context before appending accepted features,
+preserving absolute positions and the previous context until successful
+publication. Ordinary cache growth gives five K/V pairs at 2560 rows, a 50 MiB
+replacement bound. The per-request successful publication counter is recorded.
+See [commit-window qualification](glm5-dflash-commit-window.md).
