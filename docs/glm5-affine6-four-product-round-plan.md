@@ -71,3 +71,12 @@ fixed working limit115448725504, FP32 persistent KDA/accumulators, BF16 compress
 MLA, resident embeddings and A6 default. Rejected helper/seams are archived and
 removed. Accepted runtime gains alone receive required checks and commit/push.
 No precision restoration or64K/128K. Goals1500/60 remain active and unmet.
+
+## Closure
+
+The [fixed component result](glm5-affine6-four-product-result.md) rejected this
+candidate: complete median was 1.2779% slower, paired median 0.1482% slower,
+with 5/11 wins. Normal synthetic raw and serial/tree state proofs passed, but
+the directed GPU audit, quality/model and HTTP gates did not run. Compiled
+sources were archived and the helper, private harnesses and caller seams were
+removed. Accepted runtime and A6 default remain unchanged.
