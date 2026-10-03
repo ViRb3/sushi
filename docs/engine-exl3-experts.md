@@ -349,6 +349,28 @@ and telemetry are archived privately. No full-model run was warranted.
 This experiment does not distinguish the cost of M16 padding from the cost of
 empty metadata windows, so it establishes no gain for a different capacity.
 
+A single capacity-only retry retained all 288 expert threads and changed the
+window allocation from 289 to 25. For each positive count c and WIN≥1,
+ceil(c/WIN)≤c; summing across experts bounds the live windows by the 24 slots.
+The extra entry remains zero. The actual cases had 23/17/15 live windows.
+All start/live-count prefixes and inverse indices matched the original table,
+and all 36,864 BF16 chain output bits matched the 289-entry NAX arm. The NAX
+math, original stored banks and implicit padding were unchanged.
+
+| Layer | Group2 control, µs | NAX 289, µs | NAX 25, µs | NAX 25 vs control | Wins vs control |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 3 | 667.250 | 811.847 | 758.027 | +13.60% | 2/11 |
+| 20 | 596.791 | 733.708 | 709.180 | +18.83% | 1/11 |
+| 34 | 602.639 | 678.819 | 643.528 | +6.78% | 2/11 |
+
+This quiet retry used the same runtime and replay, base `b0d5644e` plus the
+isolated capacity variant, maximum fans, a 50.42°C initial temperature and ten
+seconds idle. Five warmups preceded eleven alternating ABC/CBA rounds, with
+three fresh executions per sample. The smaller capacity reduced NAX latency
+by 3.34–6.63%, but all three medians still lost to the current chain. Both
+variants, the research helpers and wrapper were archived and removed.
+No further NAX padding experiment or model-level run was warranted.
+
 ## Kernels
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
