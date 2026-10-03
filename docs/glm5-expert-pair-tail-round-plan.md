@@ -92,3 +92,38 @@ resident embeddings and A6 assistant remain. No precision restoration or64K/128K
 Actual-model winners alone receive required ReleaseFast checks, final CLI,
 documents and accepted runtime commit/push. Archive compiled sources before
 removing a rejected candidate. The next round begins with two source reports.
+
+## Component progression
+
+The [expert join](glm5-prefill-expert-pair-result.md) matched retained stages and
+views, then the [complete original L20 layer](glm5-expert-pair-layer-result.md)
+matched routes, outputs, captures and states and won2.47431% with11/11 pairs.
+A private short-router assumption failed before characterization; the corrected
+adapter uses a temporary alias of the unchanged production dispatcher and its
+Ops-owned results. The Model null-stub red is genuine after correcting only
+the tiny fixture's context limit. Root delegates writing just the Model/Moe
+seam to the expert worker, retaining final review/admission and DFlash/HTTP
+transaction integration. Actual Model/capture/context gates remain pending.
+
+The [original real tail capture](glm5-tail-actual-input-capture.md) qualified the
+P8394/T811 fixture. An unsupported GPU fixture Load failed before actual proof/
+timing; CPU-stream loading repaired only the adapter. The [complete tail
+component](glm5-indexpool-tail-component.md) won9.6546% with11/11 pairs and
+zero new nonfinite outputs, but changed some selected pools/output bits.
+Frozen32K quality and actual-model acceptance remain required. No source
+default or accepted runtime changed.
+
+The user requested one full2K/4K/8K/16K/32K bench table this round. Run one
+pinned llmprobe0.6.13 bench-only ladder with the best passing configuration,
+or the unchanged accepted runtime if no candidate passes. Retain predictable
+and ordinary server counts/timings/IDs, A6/BF16 cache and explicit configuration.
+Memory from accepted CLI is run-level props before/after, never a per-cell peak.
+No64K/128K or duplicate full ladder.
+
+The [single requested bench table](glm5-round35666-bench-table.md) is complete
+on the immutable accepted runtime4fcb541e: no experimental mode had passed
+actual-model gates when the user requested the table. Both modes were off.
+The one ladder contains all ten ordinary/predictable cells; ordinary16K ended
+at177 outputs, recorded truthfully with176-forward denominator. No second
+full ladder is authorized this round. Future candidate validation remains
+separate from this baseline table; no speed claim follows component wins.
