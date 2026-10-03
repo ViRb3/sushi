@@ -90,3 +90,14 @@ The admission ledger reserves an additional 8 MiB per pending layer for the
 2 MiB raw dot plane, bounded native copies, query preparation and intermediate
 score planes. Disabled mode and chunks of at most eight rows reserve zero.
 This conservative control API is validated with the integration build.
+
+The combined prefill arm (packed attention, head-batched MLA and this scorer)
+was checked on the actual 2.3bpw model at 16384 prefix tokens and 32 forced
+reference continuation positions. The 2048-token fixture was repeated eight
+times. It retained the reference top token at all 32 positions, with mean
+same-model kernel KL 0.00398871 and maximum row KL 0.0676651. This is a drift
+check against the same quantized model, not the original BF16 teacher.
+Source `c6b609f4` recorded 77 query/77 value projection calls, 9856 packed calls
+and 2816 NAX score calls. Peak active memory was 95,647,921,208 bytes.
+Cold reference/candidate times 59.562/25.110 seconds are diagnostic only.
+Measurement key: `glm53-stacked-drift-16k-20261003`.
