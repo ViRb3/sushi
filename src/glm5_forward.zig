@@ -199,7 +199,10 @@ pub const Mla = struct {
         const qr = try ops.rms(try self.qa.apply(ops, x), self.qa_norm, cfg.rms_norm_eps);
         const q = try ops.reshape(try self.qb.apply(ops, qr), &.{ t, h, 1, kd });
         const dense = densePrefillEligible(dense_prefill, t, state.processed, cfg, mlx.mlx_array_dtype(q));
-        const absorbed: Arr = if (dense) .{ .ctx = null } else if (self.quantized) try ops.qmm(q, self.wk, self.sk, self.bk, false) else try ops.binary(.mm, q, self.wk);
+        const absorbed: Arr = if (dense) .{ .ctx = null } else if (self.quantized) blk: {
+            if (try @import("glm5_mla_prefill_batch.zig").run(ops, .{ .x = q, .w = self.wk, .scales = self.sk, .biases = self.bk }, .query)) |batched| break :blk batched;
+            break :blk try ops.qmm(q, self.wk, self.sk, self.bk, false);
+        } else try ops.binary(.mm, q, self.wk);
         const kv = try ops.rms(try self.kva.apply(ops, x), self.kv_norm, cfg.rms_norm_eps);
         const iq = try ops.reshape(try self.iq.apply(ops, qr), &.{ t, @intCast(cfg.indexer_n_heads), @intCast(cfg.indexer_head_dim) });
         const ik = try ops.layerNorm(try self.ik.apply(ops, x), self.ik_norm, self.ik_bias, 1e-6);
@@ -209,7 +212,10 @@ pub const Mla = struct {
         if (dense) return self.densePrefill(ops, q, cfg, state);
         const y = try ops.own(try @import("glm5_attention.zig").attend(state, try ops.reshape(absorbed, &.{ t, h, latent }), iq, try ops.reshape(iw, &.{ t, @intCast(cfg.indexer_n_heads) }), offset, 1 / @sqrt(@as(f32, @floatFromInt(kd))), ops.s));
         const y4 = try ops.reshape(y, &.{ t, h, 1, latent });
-        const values = if (self.quantized) try ops.qmm(y4, self.wv, self.sv, self.bv, true) else try ops.binary(.mm, y4, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
+        const values = if (self.quantized) blk: {
+            if (try @import("glm5_mla_prefill_batch.zig").run(ops, .{ .x = y4, .w = self.wv, .scales = self.sv, .biases = self.bv }, .value)) |batched| break :blk batched;
+            break :blk try ops.qmm(y4, self.wv, self.sv, self.bv, true);
+        } else try ops.binary(.mm, y4, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
         return self.out.apply(ops, try ops.reshape(values, &.{ 1, t, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) }));
     }
 };

@@ -62,10 +62,12 @@ context. This remains an admission result, not a throughput value.
 
 ```sh
 npx llmprobe@0.6.13 localhost:8094 --bench-only \
-  --rungs 2k,4k,8k,16k,32k,64k,128k --runs 1
+  --rungs 2k,4k,8k,16k,32k --runs 1
 ```
 
-Run that full ladder once for the selected runtime/backend baseline. Subsequent
+The owner-requested baseline completed through 32K. The later 64K/128K rungs
+were cancelled and are not recorded as completed results. Run the selected
+ladder once for a runtime/backend baseline. Subsequent
 optimization iterations use only `--rungs 2k,4k,8k,16k` with the same settings.
 The caller must hold the GPU lock for the loaded model and benchmark, restore
 foreground QoS, pause competing compute and follow the fan/cooldown protocol in

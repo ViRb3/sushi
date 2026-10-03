@@ -674,3 +674,78 @@ paired win, but does not establish broader contexts, a default policy or the
 1,500 tok/s goal. The option remains off by default. Private artifact
 `glm53-a6-dense-full-20261003` retains source diff, binary hash, settings, raw
 result, ID comparison and telemetry.
+
+## Head-batched absorbed MLA projections on MLX v0.32.3
+
+The new runtime (MLX `64ea011cb65f14d9ce2737e60db9a4ae91ed7441`) changes an earlier
+audit conclusion: `qmm` now admits NAX for both transposed weights and affine
+non-transposed weights. The cached absorbed path still supplies `[T,64,1,D]`,
+so its matrix row count is one and it selects qvm/qmv. The isolated
+`glm5_mla_prefill_batch` helper permutes this to contiguous `[64,T,D]`, calls the
+same native affine QMM with the original banks, then restores contiguous
+`[T,64,1,N]`. Query uses K256→N512/non-transposed; value uses K512→N256/transposed.
+For T2048 the two dispatches drop from 5,242,880 vector groups to 24,576 NAX groups.
+This is a scheduling/implementation change, not a claim of identical arithmetic.
+
+No weights are expanded or repacked. Input/output permutation planes add
+384 MiB across both projections per T2048 MLA layer. The conservative async2
+copy bill is 768 MiB; it is separate from and added to the A6 dense-expansion bill.
+The compressed MLA cache remains BF16 and KDA state remains FP32. The public
+helper guard is NAX-capable GPU, BF16, H64, T128–2048 and the actual A6/group128
+U32 bank plus BF16 scale/bias grids. F32 is researched for drift but declined
+by the runtime guard.
+
+Qualification recorded full raw output differences at T128/512/2048 for both
+orientations and BF16/F32 inputs, without a relaxed tolerance. At T2048 the BF16
+query comparison differed in 42.7% of bits, relative L2 0.2576% and maximum
+absolute difference 0.03125; value differed in 52.5%, relative L2 0.3193% and
+maximum absolute difference 0.03125. Very large ULP distances occurred around
+zero/sign crossings; raw ULP bins remain in the artifact and are not concealed
+by an output-magnitude tolerance.
+
+A 256-position FP64 dot reference separates two weight interpretations. Native
+vector arithmetic is closer to the original FP32 decoded coefficients; NAX is
+closer to coefficients rounded to BF16 before multiplication. This weight
+boundary changes along with the contraction order. F32 research differences
+had relative L2 about 0.0654%; native reference RMS was around 1e-7 while NAX RMS
+was 5e-4–7e-4. It is not an exact-layout optimization.
+
+The exclusive paired microbenchmark included native QMM, all contiguous copies,
+construction, evaluation and frees. Six warmups per arm preceded eleven AB/BA
+rounds with two repetitions each. Inputs were evaluated first. Interactive QoS,
+lock owner `glm-mla-headbatch-v61`, maximum-fan request, 47.81°C initial temperature
+and ten seconds idle isolated the run; no model was loaded. Every cell had 11/11
+paired wins. This compares one synthetic bank per geometry, not full-checkpoint
+traffic.
+
+| T / projection | Original M1 ms | Head-batched ms | Reduction |
+|---|---:|---:|---:|
+| 128 / query | 1.033062 | 0.254646 | 75.35% |
+| 512 / query | 3.593270 | 0.538916 | 85.00% |
+| 2048 / query | 13.689042 | 1.685020 | 87.69% |
+| 128 / value | 1.407166 | 0.264021 | 81.24% |
+| 512 / value | 5.020729 | 0.537646 | 89.29% |
+| 2048 / value | 19.445646 | 1.639083 | 91.57% |
+
+At T2048 the combined primitive cost is 33.135→3.324 ms, suggesting roughly
+328 ms across eleven MLA layers before pipeline/attention effects. The whole
+wide-prefill cliff also includes index selection and latent attention; this
+table does not assign their cost or establish a whole-model gain.
+
+`SUSHI_GLM_MLA_PREFILL_BATCH=1` enables the default-off qualification hook only
+in the absorbed branch of `Mla.applyMode`; the existing cold dense-SDPA branch
+is unchanged. `bind(false|true)` returns a scoped binding with `restore()`, so
+one process can compare independent Requests using the same loaded weights.
+Query/value dispatch counters and the native diagnostic copy bill identify
+engagement. Focused guard/binding/bill tests passed, with research tests gated.
+A meaningful next gate is old/new same-model logits after long 4K prefill plus
+the same teacher-forced continuation. That kernel-drift comparison is distinct
+from quantization KLD against a lossless BF16 teacher. The earlier 512-token
+teacher capture does not exercise this changed prefill path and cannot qualify
+it. Defaults must stay unchanged until the long-prefill drift/quality gates pass.
+
+The private `glm53-mla-headbatch-20261003` artifact retains exact source, test
+root/command, complete BF16 ULP/F32 differences, both FP64 reference errors,
+timing samples/summary, telemetry and source/binary/runtime hashes. Its gates
+are `SUSHI_GLM_MLA_BATCH_PARITY_OUT` and `SUSHI_GLM_MLA_BATCH_BENCH_OUT` under
+`GLM MLA headbatch prefill`. No model quality or throughput claim is made here.
