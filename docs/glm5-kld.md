@@ -135,3 +135,46 @@ there is no prose coverage and this does not establish a general quality ranking
 The independent oMLX-teacher/native-student engine floor remains unmeasured.
 Private artifact `glm53-kld-students-20261003` preserves both full reports and
 input/source fingerprints. The incomplete second teacher prompt was excluded.
+
+## Qualified fast configuration: one existing teacher prompt
+
+The current qualified `4fcb541e` profile (accepted CLI `102cb8d5`) scored the same
+existing 240-ID topological-sort prompt and all 512 forced teacher predictions.
+A private ReleaseFast wrapper reused the unchanged native scoring function and
+teacher/token/tokenizer preflight. Student TF32 was explicitly **on** (`1`),
+matching the fast profile; the stored lossless oMLX teacher used TF32 **off** (`0`).
+Native B1 attention, HC prefill, packed32 and the other qualified settings remained
+on. Experimental expert pairing and long-pool scoring were bound off. There was
+one target load, with no assistant, DFlash, MTP or teacher recapture.
+
+| Current target/profile | Rows | KLD | Top1 agreement | Student NLL | Cosine similarity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Sushi-2.3bpw, qualified fast | 512 | 0.097402907 | 460/512 (89.8438%) | 0.375250070 | 0.958274905 |
+
+There was no teacher EOS, so the all-position and first-EOS-inclusive readings
+are identical. All 512 row values were finite. The final state offset was 751:
+the last teacher token was scored rather than forwarded. Actual native engagement
+was 5,621 B1 calls (511 forwards × 11 MLA layers), with B3=0. HC prefill dispatched 90
+times and KDA value-row scheduling 34 times. Other measured prefill helpers were
+unengaged on this short fixture, including packed32 and IndexPool; both experimental
+counters were zero. Enabled settings therefore do not imply long-context coverage.
+
+Peak active memory was 94,045,849,768 bytes and final active memory 93,692,787,448;
+the conservative full-recipe allowance was 6,340,176,896 bytes, without credits.
+Peak plus allowance 100,386,026,664 stayed below both fixed memory/wired limits
+115,448,725,504. All seven diagnostic/preflight tests passed. Frozen source,
+installed-library and binary hashes matched before and after the single run;
+PID 62730 exited 0, its GPU lock released and fans returned to auto.
+
+The earlier A6 reading above (0.092928863 KLD, 462/512, NLL 0.370006442) used an
+older runtime and TF32 off. The difference combines runtime/numerical-profile
+changes; it is not attribution to TF32 alone. This remains one code prompt without
+prose or a measured teacher/student engine floor, not a release quality verdict.
+
+Artifact `glm53-qualified-fast-kld-1x512-20261004` retains the complete per-row
+report, source/library/teacher/tokenizer identities, actual numerical flags,
+counters, budget and cleanup. Private wrapper binary SHA256 is
+`4c9692f777c891ce95a920e64e4718d3a11f628d51ec9cb247eaac21ac13ffa9`;
+teacher logit SHA256 is
+`a0198903f26c8b55d70201d2731bd1fd1a866aadaab430945698c8fec5674831`.
+The public runner's TF32-off contract remains unchanged.
