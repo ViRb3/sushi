@@ -138,3 +138,32 @@ The owner permits ordinary BF16 NAX compound rounding with FP32 accumulators
 and canceled precision-restoration work. The component qualification is in
 [the packed-attention report](glm5-attention-head-packed.md). Full-model throughput
 and long-prefix output drift must be measured before promoting this candidate.
+
+### Packed attention and head-batched MLA: short ladder
+
+Source `a88d8921`, MLX 0.32.3, 2.3bpw target and A6 DFlash2 assistant,
+N2/children4/async4/group2, BF16 compressed MLA and FP32 KDA. Both
+`SUSHI_GLM_ATTENTION_PACKED=1` and `SUSHI_GLM_MLA_PREFILL_BATCH=1` were
+enabled; direct attention and the mini head were disabled. All other baseline
+settings and the llmprobe 0.6.13 bench-only protocol were retained.
+
+| Context | Prefill before / candidate tok/s | Decode before / candidate tok/s |
+|---|---:|---:|
+| 2K | 968 / 972 | 41.3 / 41.7 |
+| 4K | 435 / 771 | 41.2 / 40.9 |
+| 8K | 323 / 653 | 36.7 / 35.2 |
+| 16K | 285 / 577 | 34.5 / 32.1 |
+
+These are the second, predictable-context requests, matched to the completed
+baseline table above. Nonce-dependent input lengths differ by at most four
+tokens. The unchanged 2K cell is stable; prefill improves substantially from
+4K through 16K. Decode did not improve and was about 7% slower at 16K in this
+run. This prefill candidate remains opt-in. The 1500/60 targets are unmet.
+
+The standalone process completed all 27 requests, saved client JSON/HTML and
+server timers, and released its server and GPU lock. Foreground server QoS,
+exclusive lock, confirmed maximum fan spin-up and ten seconds idle were used.
+A during-run sample reached 95.1 C. Measurement key:
+`glm53-packed-headbatch-llmprobe-20261003`. A fresh 32K qualification is deferred
+until the selector and verification-cache fixes are integrated, to avoid
+repeating expensive long-context runs for intermediate candidates.
