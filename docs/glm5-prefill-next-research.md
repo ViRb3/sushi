@@ -85,3 +85,13 @@ forced-prediction screen/bounds before acceptance; compare each prefix's own
 serial/spec state, without precision restoration. Root owns bills/model/HTTP
 qualification and default decisions. No helper, build, GPU/model/capture or
 runtime change accompanies this research, and no 1500/60 prediction is made.
+
+## Observed numerical-boundary follow-up
+
+The actual model exactness gate failed before performance timing. One unchanged
+guard can nevertheless change per-query arithmetic with wider chunks: IndexPool
+NAX eligibility requires at least 3584 total appended pools. At offset 10240,
+4096 appends through 14336 and enables NAX for queries that the original 2048
+chunk scores with 3072 pools on the scalar path. This source mechanism is not
+a causal measurement. The fixed numerical screen, with all thresholds and
+flags unchanged, must decide whether the schedule is an acceptable tradeoff.

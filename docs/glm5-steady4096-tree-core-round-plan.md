@@ -92,3 +92,36 @@ or 64K/128K. BF16 compressed MLA cache and FP32 persistent KDA state/accumulator
 remain. Actual model winners receive full required ReleaseFast checks, final CLI
 build, documents and commit/push to Sushi main. Archive rejected compiled sources
 before removing only owned changes. Run the next two-researcher round after closure.
+
+## Component decisions
+
+The [expert component](glm5-prefill4096-grid-result.md) passed every retained
+stage/output bit and reduced the constructed complete-chain median 8.3626%,
+with 11/11 wins. The [trunk proof](glm5-trunk4096-result.md) passed original
+L0 coefficients/projections and complete 4096-versus-two-2048 KDA output,
+convolution and FP32 state; MLA projection banks were explicitly synthetic.
+These qualify the combined schedule for one actual-model gate, not acceptance.
+
+The [T3 core](glm5-t3-kda-core-result.md) passed direct/complete special-value,
+serial/tree and ownership proofs, but its 0.6867% median/0.6610% paired gain
+and 6/11 wins were inconclusive. No model or repeat followed; compiled sources
+were verified/archived before the helper/private probes and caller were removed.
+All prefill changes remain separate; accepted runtime is still `4fcb541e`.
+
+## Actual-model exactness stop
+
+The frozen 16384-ID code gate changed final logits and valid prefix states.
+The evaluator stopped before candidate continuation, warmups or ABBA; no actual
+model speed was measured. All compiled sources and binary remained unchanged.
+The existing numerical screen above is the next gate for the same fixed
+schedule, after checking for any missed enabled path. No input, threshold or
+precision variant is permitted. A numerical pass alone would not establish
+performance; matched own-mode references and model timing would still be needed.
+
+Source inspection identifies one numerical boundary: IndexPool NAX eligibility
+uses total appended pools, with a minimum of 3584. The 4096 chunk beginning
+at offset 10240 appends through 14336, enabling NAX for queries 10240–12287;
+the original 2048 chunk at that offset has only 3072 pools and uses scalar
+scores. Causal masks and guard code remain unchanged. This is a plausible
+mechanism, not a measured cause or a quality result. Preserve the threshold
+and existing flags in the fixed screen; no scalar restoration follows.
