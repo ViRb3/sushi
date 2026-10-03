@@ -78,8 +78,8 @@ control for the v0.32.3 baseline.
 ## Completed 2K–32K baseline
 
 The user stopped the wider ladder after32K, dropping64K and128K. All five
-measured calls below completed after their warmups in `llmprobe0.6.13 --bench-only
---runs1 --reasoning default`. Rates use the native server's timers and usage
+measured calls below completed after their warmups in `llmprobe 0.6.13 --bench-only
+--runs 1 --reasoning default`. Rates use the native server's timers and usage
 counts; the interrupted client did not emit its final aggregate report.
 
 | Rung | Actual input tokens | Prefill seconds | Prefill tok/s | Decode tok/s |
@@ -177,7 +177,7 @@ explicit diagnostic switches while the combined model pass is pending.
 ### Stacked optimization qualification through 32K
 
 The selected 2.3bpw + A6 assistant stack completed llmprobe 0.6.13
-bench-only, runs1, reasoning default through 32K. Source `c6b609f4`,
+bench-only, runs 1, reasoning default through 32K. Source `c6b609f4`,
 MLX 0.32.3, N2/children4/async4/group2, BF16 compressed MLA and FP32
 KDA; all prior baseline lane/down/R4/dense settings were retained.
 Packed prefill, MLA head batching, NAX index scores, exact verification
@@ -236,3 +236,39 @@ Prepared banks are evaluated during load and included in measured resident
 memory; their actual byte count is exposed. Admission adds only the new joined
 activation plane: 1.25 MiB per pending layer, 2.5 MiB for async2. Per-request
 cluster, block-tail, and affine-hoist dispatch counters confirm engagement.
+
+### Bounded draft tail, exact A6 hoist and prefill cluster
+
+Source `f45103ef` completed the same llmprobe 0.6.13 bench-only protocol,
+runs 1, reasoning default, with the three new opt-ins enabled on the previous
+measured stack. The 32K rung is one final selected-candidate qualification;
+normal iterations remain 2K–16K. Actual target tokens and complete final state
+passed the separate 32K, 64-token serial gate.
+
+| Context | Prefill before / candidate tok/s | Decode before / candidate tok/s |
+|---|---:|---:|
+| 2K | 944 / 965 | 46.4 / 47.9 |
+| 4K | 748 / 774 | 44.6 / 46.7 |
+| 8K | 664 / 681 | 42.5 / 45.3 |
+| 16K | 606 / 628 | 39.0 / 43.5 |
+| 32K | 545 / 566 | 34.4 / 39.4 |
+
+These are second predictable-context calls with 192 outputs. Inputs differ
+from the previous table by at most 7 tokens. The unchanged 2K prefill cell also
+improved, so the small 2–4% prefill increase cannot be attributed entirely to
+clustering. Decode improved at every rung; the32K gain is 14.5%, with measured
+39.44 tok/s. The 1500 prefill/60 decode targets remain open.
+
+At 16K/32K, milliseconds per speculative round were drafting 6.12/6.22,
+verification 57.99/60.83, target replay 1.36/2.28 and assistant commit 3.11/6.23.
+The bounded block makes drafting almost independent of context over these
+rungs. Assistant accepted-context publication still grows with history; the
+transaction keeps its full cloned buffers until successful evaluation.
+
+The 32K measured cell confirmed 64 block-tail calls, 6528 exact affine-hoist
+calls, 510 prefill cluster calls, and 100% KDA leaf hits. Prepared banks occupy
+85 MiB; BF16 compressed MLA and FP32 KDA storage remain unchanged.
+All 29 server requests/client JSON/HTML are saved. The owned server stopped,
+GPU lock released, fans returned automatic, and client exited 0. Foreground
+server QoS, confirmed maximum fan spin-up, exclusive lock and cool ten-second
+idle were used. Measurement key: `glm53-tail-hoist-llmprobe-20261003`.
