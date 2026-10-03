@@ -1,0 +1,192 @@
+//! Lossless request-owned MLA capacity reservation before speculative cloning.
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const attention = @import("glm5_attention.zig");
+const Ops = @import("glm5_model.zig").Ops;
+const Arr = mlx.mlx_array;
+
+pub const Plan = struct { latent_capacity: usize, pool_capacity: usize, additional_peak_bytes: usize };
+fn add(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.GlmReserveOverflow;
+}
+fn mul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch error.GlmReserveOverflow;
+}
+pub fn capacity(rows: usize) !usize {
+    const value = try mul((try add(rows, 255)) / 256, 256);
+    if (value > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
+    return value;
+}
+fn growthBill(old: usize, target: usize, width: usize, bytes: usize) !usize {
+    if (target == old) return 0;
+    return mul(try mul(try add(target, target - old), width), bytes);
+}
+pub fn plan(processed: usize, lc: usize, pc: usize, width: usize, iw: usize, lb: usize, ib: usize, total: usize) !Plan {
+    if (width == 0 or iw == 0 or lc < processed or pc < processed / 4 or total < processed or
+        (lb != 2 and lb != 4) or (ib != 2 and ib != 4)) return error.InvalidGlmReserveShape;
+    if (lc > std.math.maxInt(c_int) or pc > std.math.maxInt(c_int) or width > std.math.maxInt(c_int) or iw > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
+    const latent = @max(lc, try capacity(total));
+    const pool = @max(pc, try capacity(total / 4));
+    return .{ .latent_capacity = latent, .pool_capacity = pool, .additional_peak_bytes = try add(try growthBill(lc, latent, width, lb), try growthBill(pc, pool, iw, ib)) };
+}
+fn supported(a: Arr) bool {
+    return a.ctx != null and (mlx.mlx_array_dtype(a) == .bfloat16 or mlx.mlx_array_dtype(a) == .float32);
+}
+fn statePlan(st: *const attention.State, total: usize) !Plan {
+    if (!supported(st.latent) or !supported(st.tail_keys) or !supported(st.tail_gates)) return error.InvalidGlmReserveShape;
+    const ls = mlx.getShape(st.latent);
+    const ts = mlx.getShape(st.tail_keys);
+    if (ls.len != 2 or ls[0] <= 0 or ls[1] <= 0 or ts.len != 2 or ts[0] < 0 or ts[1] <= 0 or
+        @as(usize, @intCast(ts[0])) != st.processed % 4 or
+        !std.mem.eql(c_int, ts, mlx.getShape(st.tail_gates)) or
+        mlx.mlx_array_dtype(st.tail_keys) != mlx.mlx_array_dtype(st.tail_gates)) return error.InvalidGlmReserveShape;
+    var pc: usize = 0;
+    if (st.pooled.ctx != null) {
+        const ps = mlx.getShape(st.pooled);
+        if (!supported(st.pooled) or ps.len != 2 or ps[0] < 0 or ps[1] != ts[1] or
+            mlx.mlx_array_dtype(st.pooled) != mlx.mlx_array_dtype(st.tail_keys)) return error.InvalidGlmReserveShape;
+        pc = @intCast(ps[0]);
+    }
+    return plan(st.processed, @intCast(ls[0]), pc, @intCast(ls[1]), @intCast(ts[1]), mlx.mlx_array_itemsize(st.latent), mlx.mlx_array_itemsize(st.tail_keys), total);
+}
+fn grow(buffer: *Arr, rows: usize, width: c_int, dtype: mlx.mlx_dtype, stream: mlx.mlx_stream) !void {
+    const old: usize = if (buffer.ctx == null) 0 else @intCast(mlx.getShape(buffer.*)[0]);
+    if (rows == old) return;
+    var ops = Ops{ .s = stream };
+    defer ops.deinit();
+    const padding = try ops.zeros(&.{ @intCast(rows - old), width }, dtype);
+    const joined = if (old == 0) padding else try ops.concat(&.{ buffer.*, padding }, 0);
+    try mlx.check(mlx.mlx_array_eval(joined));
+    const result = try ops.result(joined);
+    if (buffer.ctx != null) _ = mlx.mlx_array_free(buffer.*);
+    buffer.* = result;
+}
+/// Call on the inference owner after prefill, before taking any request clone.
+/// Available bytes are additional peak headroom above the currently live state.
+pub fn reserve(request: anytype, total_tokens: usize, available_peak_bytes: usize, stream: mlx.mlx_stream) !usize {
+    if (request.failed) return error.InvalidGlmReserveShape;
+    var bill: usize = 0;
+    for (request.layers) |*layer| {
+        if (layer.attention.processed == 0) continue;
+        if (layer.attention.processed != request.offset) return error.InvalidGlmReserveShape;
+        bill = try add(bill, (try statePlan(&layer.attention, total_tokens)).additional_peak_bytes);
+    }
+    if (bill > available_peak_bytes) return error.GlmReserveMemoryLimit;
+    for (request.layers) |*layer| {
+        const st = &layer.attention;
+        if (st.processed == 0) continue;
+        const p = try statePlan(st, total_tokens);
+        const width = mlx.getShape(st.latent)[1];
+        const iw = mlx.getShape(st.tail_keys)[1];
+        const dtype = mlx.mlx_array_dtype(st.tail_keys);
+        try grow(&st.latent, p.latent_capacity, width, mlx.mlx_array_dtype(st.latent), stream);
+        try grow(&st.pooled, p.pool_capacity, iw, dtype, stream);
+    }
+    return bill;
+}
+
+test "GLM reserve ledger admits the 128K verifier without changing scratch policy" {
+    const scratch = @import("glm5_dflash_memory.zig");
+    try std.testing.expectError(error.GlmTreeScratchLimit, scratch.plan(131072, 131072, 32768, 512, 128, 64, 3, 2));
+    const p = try plan(131072, 131072, 32768, 512, 128, 2, 2, 131072 + 256 + 3);
+    try std.testing.expectEqual(@as(usize, 131584), p.latent_capacity);
+    try std.testing.expectEqual(@as(usize, 33024), p.pool_capacity);
+    try std.testing.expectEqual(@as(usize, 143785984), p.additional_peak_bytes);
+    const admitted = try scratch.plan(131328, p.latent_capacity, p.pool_capacity, 512, 128, 64, 3, 2);
+    try std.testing.expectEqual(@as(usize, 1), admitted.branches);
+    try std.testing.expect(admitted.live_bytes <= scratch.limit_bytes);
+    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 3, 1, 512, 128, 2, 2, 16));
+    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 4, 1, 512, 128, 1, 2, 16));
+    try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 4, 1, 512, 128, 2, 2, 3));
+    try std.testing.expectError(error.GlmReserveOverflow, plan(4, 4, 1, std.math.maxInt(usize), 128, 2, 2, 16));
+    try std.testing.expectError(error.GlmReserveOverflow, capacity(std.math.maxInt(usize)));
+}
+
+fn equal(a: Arr, b: Arr, _: mlx.mlx_stream) !void {
+    try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    try mlx.check(mlx.mlx_array_eval(a));
+    try mlx.check(mlx.mlx_array_eval(b));
+    const n = mlx.mlx_array_size(a);
+    if (mlx.mlx_array_dtype(a) == .bfloat16) {
+        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(a).?[0..n], mlx.mlx_array_data_bfloat16(b).?[0..n]);
+    } else {
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(a).?[0..n]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(b).?[0..n]));
+    }
+}
+
+fn prefixes(a: *const attention.State, b: *const attention.State, ops: *Ops) !void {
+    try std.testing.expectEqual(a.processed, b.processed);
+    try equal(try ops.slice(a.latent, 0, 0, @intCast(a.processed)), try ops.slice(b.latent, 0, 0, @intCast(b.processed)), ops.s);
+    try equal(try ops.slice(a.pooled, 0, 0, @intCast(a.processed / 4)), try ops.slice(b.pooled, 0, 0, @intCast(b.processed / 4)), ops.s);
+    try equal(a.tail_keys, b.tail_keys, ops.s);
+    try equal(a.tail_gates, b.tail_gates, ops.s);
+}
+
+test "GLM reserve preserves cache bits and subsequent append and attention on BF16 and FP32" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const stream = mlx.gpuStream();
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dtype| for ([_]usize{ 1023, 2047 }) |n| {
+        var ops = Ops{ .s = stream };
+        defer ops.deinit();
+        const Layer = struct { attention: attention.State = .init() };
+        var layers: [2]Layer = @splat(.{});
+        defer for (&layers) |*layer| layer.attention.deinit();
+        var request = struct { layers: []Layer, offset: usize, failed: bool = false }{ .layers = &layers, .offset = n };
+        var baseline = attention.State.init();
+        defer baseline.deinit();
+        const total = n + 33;
+        const data = try std.testing.allocator.alloc(f32, n * 8);
+        defer std.testing.allocator.free(data);
+        for (data, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 31)) / 16 - 1;
+        data[0] = -0.0;
+        data[7] = -0.0;
+        const source = try ops.own(mlx.mlx_array_new_data(data.ptr, &.{ @intCast(n), 8 }, 2, .float32));
+        const latent = try ops.cast(source, dtype);
+        const keys = try ops.slice(latent, 1, 0, 4);
+        const gates = try ops.binary(.mul, keys, try ops.scalar(0.5, dtype));
+        const ape = try ops.ones(&.{ 4, 4 }, dtype);
+        for (&layers) |*layer| {
+            _ = try layer.attention.append(latent, keys, gates, ape, stream);
+            try layer.attention.evaluate();
+        }
+        _ = try baseline.append(latent, keys, gates, ape, stream);
+        try baseline.evaluate();
+        const p = try statePlan(&layers[0].attention, total);
+        const bill = p.additional_peak_bytes * 2;
+        const old = layers[0].attention.latent.ctx;
+        const tail = layers[0].attention.tail_keys.ctx;
+        try std.testing.expectError(error.GlmReserveMemoryLimit, reserve(&request, total, bill - 1, stream));
+        try std.testing.expect(layers[0].attention.latent.ctx == old);
+        const valid = layers[1].attention.pooled;
+        layers[1].attention.pooled = try ops.result(try ops.zeros(&.{ @intCast(mlx.getShape(valid)[0]), 4 }, .int32));
+        try std.testing.expectError(error.InvalidGlmReserveShape, reserve(&request, total, bill, stream));
+        _ = mlx.mlx_array_free(layers[1].attention.pooled);
+        layers[1].attention.pooled = valid;
+        try std.testing.expect(layers[0].attention.latent.ctx == old);
+        try std.testing.expectEqual(bill, try reserve(&request, total, bill, stream));
+        try std.testing.expectEqual(@as(c_int, @intCast(p.latent_capacity)), mlx.getShape(layers[0].attention.latent)[0]);
+        try std.testing.expectEqual(@as(c_int, @intCast(p.pool_capacity)), mlx.getShape(layers[0].attention.pooled)[0]);
+        try std.testing.expect(layers[0].attention.tail_keys.ctx == tail);
+        try std.testing.expectEqual(n, request.offset);
+        try prefixes(&layers[0].attention, &baseline, &ops);
+        const reserved = layers[0].attention.latent.ctx;
+        try std.testing.expectEqual(@as(usize, 0), try reserve(&request, total, 0, stream));
+        try std.testing.expect(layers[0].attention.latent.ctx == reserved);
+        const next = try ops.cast(try ops.slice(source, 0, 7, 13), dtype);
+        const next_keys = try ops.slice(next, 1, 0, 4);
+        const next_gates = try ops.binary(.mul, next_keys, try ops.scalar(0.5, dtype));
+        _ = try layers[0].attention.append(next, next_keys, next_gates, ape, stream);
+        _ = try baseline.append(next, next_keys, next_gates, ape, stream);
+        try layers[0].attention.evaluate();
+        try baseline.evaluate();
+        try prefixes(&layers[0].attention, &baseline, &ops);
+        const q = try ops.ones(&.{ 1, 2, 8 }, dtype);
+        const iq = try ops.ones(&.{ 1, 1, 4 }, dtype);
+        const weights = try ops.ones(&.{ 1, 1 }, dtype);
+        const got = try ops.own(try attention.attend(&layers[0].attention, q, iq, weights, n + 5, 1.0 / 16.0, stream));
+        const want = try ops.own(try attention.attend(&baseline, q, iq, weights, n + 5, 1.0 / 16.0, stream));
+        try equal(got, want, stream);
+    };
+}
