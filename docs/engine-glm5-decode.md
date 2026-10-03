@@ -133,3 +133,26 @@ values, forward/transposed matmul and gathered embedding rows, and reject malfor
 grids or unsupported widths. MLA tests cover both absorbed-key and value projection
 orientations with nonzero A6 banks. Runtime measurements for the A6 trunk are
 separate from historical A8 trunk results.
+
+## Joined short-row QKV experiment
+
+A standalone candidate combined the three existing affine-row projections and
+joined QKV output into one dispatch for 2–4 BF16 verification rows. Packed A6/A8
+banks remained resident and separate; bank selection used the output-row range.
+The candidate preserved every tested serial qmv output bit, including unequal
+small banks and the production 4096-input/8192-output banks at all three widths.
+It was not integrated because the current row-tiled chain was already as fast.
+
+A quiet, foreground-QoS comparison of the `98c1a0ff` affine-row baseline used
+eight warmups per arm and
+31 alternating forward/reverse pairs, with three apply/eval/free repetitions per
+sample. Both arms included the joined output; the baseline used the unchanged
+three affine-row kernels plus concatenation. Production A6 medians were
+424.49 versus427.56 microseconds at three rows and470.88 versus485.04 at four
+rows. The candidate won15/31 and14/31 pairs respectively. These results establish
+no dispatch-fusion gain and do not support a verifier integration or throughput
+claim. The run held an exclusive GPU lock, requested maximum fans and idled ten
+seconds before timing; cleanup restored automatic fans and released the lock.
+Private artifact `glm53-qkv-rows-20261003` preserves source, exact-output tests,
+binary and all samples. Timing binary SHA-256:
+`6d4144462a9e0bd73d70d1df5a20ba72e63b7b55a3e0e4b6cc3aad75fd18a46a`.
