@@ -106,6 +106,8 @@ fn printUsage(io: std.Io) void {
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider, zcode). `sushi launch <agent> -h`
         \\                      for options
+        \\  glm-bench <dir>      Loopback native GLM diagnostic benchmark HTTP
+        \\                      --assistant <dir> selects DFlash2; tools unsupported.
         \\  kld capture|compare Write a teacher fixture (full-vocab logits at
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
@@ -434,7 +436,10 @@ pub fn main(init: std.process.Init) !void {
     var run_opts: cli_mod.ReplOptions = .{};
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
         const cmd = args[1];
-        if (std.mem.eql(u8, cmd, "pull")) {
+        if (std.mem.eql(u8, cmd, "glm-bench")) {
+            try @import("glm5_bench_http.zig").run(allocator, io, args[2..]);
+            return;
+        } else if (std.mem.eql(u8, cmd, "pull")) {
             if (args.len < 3) {
                 log.err("usage: sushi pull <model>\n", .{});
                 std.process.exit(1);
