@@ -73,6 +73,38 @@ foreground QoS, pause competing compute and follow the fan/cooldown protocol in
 raw llmprobe artifacts. Old 1f8 runtime measurements are not a same-runtime
 control for the v0.32.3 baseline.
 
+## Completed 2K–32K baseline
+
+The user stopped the wider ladder after32K, dropping64K and128K. All five
+measured calls below completed after their warmups in `llmprobe0.6.13 --bench-only
+--runs1 --reasoning default`. Rates use the native server's timers and usage
+counts; the interrupted client did not emit its final aggregate report.
+
+| Rung | Actual input tokens | Prefill seconds | Prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|---:|
+| 2K | 2,036 | 2.103 | 968.2 | 41.33 |
+| 4K | 4,059 | 9.341 | 434.5 | 41.21 |
+| 8K | 8,225 | 25.496 | 322.6 | 36.72 |
+| 16K | 16,278 | 57.118 | 285.0 | 34.48 |
+| 32K | 32,747 | 129.610 | 252.7 | 30.89 |
+
+Every measured call emitted192 tokens. Configuration:2.3bpw A6-trunk target,
+A6g128 DFlash2, N2/children4, async4 verification, group2/lane/down/dense rows,
+R4 recurrence and A6 dense prefill, chunk2048 with dense SDPA/async2 prefill,
+mini head off, BF16 compressed MLA and FP32 KDA. The ReleaseFast binary's
+source equals `d054bac0`; MLX was0.32.3/`64ea011c`, mlx-c `56b2d39` with its
+global-scale compatibility patch. Exclusive GPU lock, foreground QoS, max fans
+and ten-second cooldown were recorded. No competing compile/GPU work occurred.
+Private artifact `glm53-llmprobe-baseline-20261003` retains exact command,
+completed request IDs/times, props, binary/runtime provenance and truncation.
+
+The source investigation identifies query absorption and value unembedding
+as M1 quantized projections during indexed prefill. Head batching can admit
+NAX on this runtime, but changes coefficient rounding and reduction order;
+precision and meaningful long-prefix KLD checks are required before promotion.
+The scalar attention loop's query batching/evaluation cadence is a separate
+optimization candidate. Neither is a measured improvement in this baseline.
+
 The initial v0.32.3 qualification passed 15 focused tests with one gated native
 server skip. A live target+A6-assistant smoke then calibrated exactly 2048
 prompt IDs through the tokenizer/template and generated eight native output IDs.
