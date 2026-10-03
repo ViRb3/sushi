@@ -60,3 +60,14 @@ Workers prepare isolated source/tests first and request CPU/GPU slots.
 Schedule heavy builds and fixture/model jobs sequentially, foreground QoS,
 thermal protocol and per-job GPU lock. Commit/push only accepted runtime.
 RoutineHTTP2K–16K; selected32K once for a final winner. No width/group sweep.
+
+
+## Outcome
+
+Both candidates were rejected and owned runtime changes restored.
+[Short-row scoring](glm5-indexpool-decode-nax.md) matched all mode bits but
+slowed complete three-branch attention14.03%, losing11/11pairs.
+Shared-bank prefill won its53.27% inclusive component and exact seam/safety
+proofs, but [failed the fixed long-prefix quality screen](glm5-shared-bank-quality-result.md)
+on both inputs. No approximation/default, native port or new bill was retained.
+The runtime remains `e1597cc2`;1500/60 and stable2K–32K remain open.
