@@ -35,3 +35,21 @@ fans, and an exclusive GPU lock, four alternating warmed pairs measured median
 assistant-forward time 11.361 ms for full-context append versus 4.569 ms for bounded
 block input (59.8% lower). These are component timings; full-model distribution,
 acceptance, and throughput qualification remain required. The switch stays off.
+
+## Full target-state gate
+
+At source `f45103ef`, the actual 2.3bpw target and A6 assistant completed a
+32768-token prefix and 64 generated tokens with the candidate enabled. The
+2048-token code fixture was repeated 16 times. Every generated token and the
+complete committed target state matched independent serial decoding exactly.
+The block-tail path engaged 24 times; the exact affine hoist engaged 2448 times,
+and normal prefill clustering 544 times with 85 MiB prepared banks. Decode peak
+active memory was 97,690,811,914 bytes, below the 110 GiB budget.
+
+The synthetic assistant hidden drift is therefore not a demonstrated target
+correctness loss. Proposal acceptance and normal HTTP throughput remain distinct
+performance checks. The native code-prompt gate measured 21.623 tok/s with 39
+accepted drafts across 25 rounds; its prompt, committed-token denominator, and
+held serial snapshot differ from llmprobe's predictable-context table. Do not
+compare those rates directly. Measurement key: `glm53-block-tail-model-gate-20261003`.
+ReleaseFast full suite and rebuilt CLI also passed. Default remains opt-in.
