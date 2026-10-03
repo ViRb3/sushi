@@ -426,3 +426,11 @@ a substantial primitive reduction could address the remaining overall gap;
 the measured fraction and end-to-end effect must be rechecked after qualification.
 All GPU tests and runtime/default changes remain deferred while teacher capture
 owns the GPU.
+
+Preparation status: the isolated R1/R2/R4 prototype and its test binary were
+CPU-compiled with `--test-no-exec`. The Metal source has **not** been compiled by
+MLX, run, or parity/timing-qualified. Explicitly unrolled member/key loops preserve
+independent accumulations and avoid relying on dynamic private-array indexing.
+The private `glm53-kda-value-rows-20261003` artifact retains the exact source,
+build recipe and binary hashes; production dispatch and comparison binaries remain
+unchanged. GPU qualification waits for teacher capture to release the device.
