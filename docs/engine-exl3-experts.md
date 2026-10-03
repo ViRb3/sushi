@@ -260,6 +260,51 @@ full-model benefit. The prototype and reproducibility hashes were archived, the 
 and production remains on group 128. The fan maximum was requested but spin-up was not confirmed;
 initial temperature was below 38°C, followed by ten seconds idle. No full-model arm was run.
 
+
+### GLM n36 SIMD word sharing: retain direct reads
+
+An isolated reader changed only how the existing NAX body obtains its packed
+words. Each SIMD/K16 step consumes two adjacent 72-byte n36 tiles, or 36 U32
+values. The original four funnels issue eight overlapping U32 reads per lane.
+The candidate loaded words 0–31 once across the SIMD and words 32–35 in lanes
+0–3, then shuffled the original indices into the unchanged funnel/codebook
+operations. Tile shape 16×32×16, K order, two-accumulator WIN32 reuse and F16
+stores stayed unchanged. No threadgroup memory or barrier was added.
+
+Exact native F16 parity passed at 4096→2048 and 2048→4096 with E288/n36/MCG/W12,
+run lengths 1/7/15/16/17/31/32/33/65 and an active expert287. The subsequent
+replay also passed exact output bits. It used the captured 512-token layer7
+counts multiplied by four, **synthetic 2K routing**, and synthetic banks:
+16384 assignments, 210 active experts, 633 live WIN32 windows, 1128 M16 tiles
+and a routing-independent capacity of 800. This is not an actual 2K capture.
+
+The exclusive run used interactive QoS (`taskpolicy -a`), GPU lock owner
+`glm-prefill-shuffle-v61`, maximum fans requested, 53.67°C initial temperature
+and ten seconds idle. Twelve warmups per arm preceded eleven alternating AB/BA
+rounds with four fresh apply/evaluate/free repetitions per sample. Inputs and
+metadata were materialized before timing. No model was loaded.
+
+| Projection | Native NAX ms | Shuffle ms | Change | Paired wins |
+|---|---:|---:|---:|---:|
+| Gate/up 4096→2048 | 5.752270 | 10.670541 | +85.50% | 0/11 |
+| Down 2048→4096 | 5.722843 | 10.461010 | +82.79% | 0/11 |
+
+The candidate was rejected and removed, including its research seam and module
+import. Fewer source reads do not establish fewer physical transactions; cache
+coalescing can serve overlapping addresses, while shuffles add instructions
+and register dependencies. No full-model arm was warranted. Both explicit
+qualification/timing tests passed. An earlier host-root-only run executed no
+dependency-module tests and was excluded from the qualification evidence.
+
+The private `glm53-prefill-shuffle-20261003` artifact preserves exact source,
+seam/import snapshots, explicit test root, build command, replay counts, logs,
+samples and provenance. The base was `99b62c52` plus the isolated module/seam;
+no production dispatch was changed. The timing binary SHA-256 was
+`2f3ec51565414fe61b87f4a048a9063f2b5babd9216be9b55f17c31b601f7d08`.
+Its gated output variable was
+`SUSHI_GLM_PREFILL_SHUFFLE_BENCH_OUT`, with replay counts supplied through
+`SUSHI_GLM_PREFILL_SHUFFLE_COUNTS`.
+
 ## Kernels
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
