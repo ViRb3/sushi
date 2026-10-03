@@ -208,14 +208,15 @@ fn studyContract(a: std.mem.Allocator, value: std.json.Value, count: usize) !Stu
         if (value.object.get("truncated")) |flag| if (flag != .bool or flag.bool) return error.BadBaselineJson;
         return .{ .completed_prompt_count = 4, .actual_positions = 2048 };
     }
-    if (count != 2 or try jsonInt(value, "requested_prompt_count") != 4 or try jsonInt(value, "completed_prompt_count") != 2 or try jsonInt(value, "actual_positions") != 1024) return error.BadBaselineJson;
+    if ((count != 1 and count != 2) or try jsonInt(value, "requested_prompt_count") != 4 or try jsonInt(value, "completed_prompt_count") != count or try jsonInt(value, "actual_positions") != count * 512) return error.BadBaselineJson;
     for ([_][]const u8{ "truncated", "stopped_by_user" }) |key| {
         const flag = value.object.get(key) orelse return error.BadBaselineJson;
         if (flag != .bool or !flag.bool) return error.BadBaselineJson;
     }
     const reason = value.object.get("stop_reason") orelse return error.BadBaselineJson;
     if (reason != .string or reason.string.len == 0 or reason.string.len > 4096) return error.BadBaselineJson;
-    return .{ .completed_prompt_count = 2, .actual_positions = 1024, .truncated = true, .stopped_by_user = true, .stop_reason = try a.dupe(u8, reason.string) };
+    if (count == 1 and !std.mem.eql(u8, reason.string, "user_requested_one_completed_prompt")) return error.BadBaselineJson;
+    return .{ .completed_prompt_count = count, .actual_positions = count * 512, .truncated = true, .stopped_by_user = true, .stop_reason = try a.dupe(u8, reason.string) };
 }
 fn readStudy(a: std.mem.Allocator, io: std.Io, fixture: []const u8, count: usize) !Study {
     const path = try std.fmt.allocPrint(a, "{s}/baseline.json", .{fixture});
@@ -379,7 +380,8 @@ test "GLM KLD real teacher comparison" {
         prompts[i] = try validatePrompt(a, io, fixture, record, cfg.vocab_size, cfg.max_position_embeddings);
         made += 1;
     }
-    if (code_prompts != 2 or prose_prompts != (if (study.truncated) @as(usize, 0) else 2)) return error.BadBaselineJson;
+    if (code_prompts != (if (study.truncated) study.completed_prompt_count else 2) or prose_prompts != (if (study.truncated) @as(usize, 0) else 2)) return error.BadBaselineJson;
+    if (study.completed_prompt_count == 1 and !std.mem.eql(u8, baseline.prompts[0].id, "code-python-topological-sort")) return error.BadBaselineJson;
     const config_path = try std.fmt.allocPrint(a, "{s}/config.json", .{path});
     defer a.free(config_path);
     const index_path = try std.fmt.allocPrint(a, "{s}/model.safetensors.index.json", .{path});
@@ -496,7 +498,7 @@ test "GLM KLD real teacher comparison" {
     try mlx.check(mlx.mlx_get_cache_memory(&cached));
     const final_shards = try shardIdentity(a, io, path, index_path);
     if (!std.mem.eql(u8, &shards_sha, &final_shards)) return error.GlmKldSourceChanged;
-    try atomicJson(a, io, output, .{ .schema = schema, .complete = true, .student = path, .teacher = baseline.model, .fixture = fixture, .fingerprint = &fingerprint, .source_revision = revision, .binary_sha256 = binary_sha, .student_config_sha256 = &config_sha, .student_index_sha256 = &index_sha, .student_tokenizer_sha256 = &tokenizer_sha, .student_shard_stat_sha256 = &shards_sha, .variant = variant, .baseline_sha256 = &baseline_sha, .teacher_identity_sha256 = &identity_sha, .teacher_identity = identity.value, .teacher_study = study, .quality_scope = if (study.truncated) "two completed code prompts; no prose; explicitly user-truncated from four requested prompts; not a release verdict; teacher/student engine floor unmeasured" else "four mixed prompts (two code/two prose); not the standard sixteen-prompt release verdict; teacher/student engine floor unmeasured", .kv = "BF16 compressed MLA cache; FP32 KDA state", .vocab_size = cfg.vocab_size, .teacher_logits = "full-vocabulary little-endian float32", .student_logits = "native logits widened to float32 without requantization", .teacher_forcing = true, .mtp = false, .dflash = false, .dense_prefill = true, .prefill_chunk = chunk, .prefill_async_layers = 2, .decode_async_layers = 4, .tf32 = false, .eos_ids = eos.items, .eos_inclusive = true, .all_positions = all.metrics(), .through_first_eos = through.metrics(), .categories = .{ .code = CategoryReport{ .all_positions = category_all[0].metrics(), .through_first_eos = category_eos[0].metrics(), .prompts = code_prompts }, .prose = if (prose_prompts == 0) @as(?CategoryReport, null) else CategoryReport{ .all_positions = category_all[1].metrics(), .through_first_eos = category_eos[1].metrics(), .prompts = prose_prompts } }, .prompts = reports, .score_seconds = @as(f64, @floatFromInt(timer.read())) / 1e9, .memory = .{ .peak_bytes = peak, .active_bytes = active, .cache_bytes = cached, .stored_tensor_bytes = native.storedBytes(&weights), .limit_bytes = limit, .wired_bytes = wired }, .partial_resume = false });
+    try atomicJson(a, io, output, .{ .schema = schema, .complete = true, .student = path, .teacher = baseline.model, .fixture = fixture, .fingerprint = &fingerprint, .source_revision = revision, .binary_sha256 = binary_sha, .student_config_sha256 = &config_sha, .student_index_sha256 = &index_sha, .student_tokenizer_sha256 = &tokenizer_sha, .student_shard_stat_sha256 = &shards_sha, .variant = variant, .baseline_sha256 = &baseline_sha, .teacher_identity_sha256 = &identity_sha, .teacher_identity = identity.value, .teacher_study = study, .quality_scope = if (study.completed_prompt_count == 1) "one completed code prompt; no prose; explicitly user-truncated from four requested prompts; not a release verdict; teacher/student engine floor unmeasured" else if (study.truncated) "two completed code prompts; no prose; explicitly user-truncated from four requested prompts; not a release verdict; teacher/student engine floor unmeasured" else "four mixed prompts (two code/two prose); not the standard sixteen-prompt release verdict; teacher/student engine floor unmeasured", .kv = "BF16 compressed MLA cache; FP32 KDA state", .vocab_size = cfg.vocab_size, .teacher_logits = "full-vocabulary little-endian float32", .student_logits = "native logits widened to float32 without requantization", .teacher_forcing = true, .mtp = false, .dflash = false, .dense_prefill = true, .prefill_chunk = chunk, .prefill_async_layers = 2, .decode_async_layers = 4, .tf32 = false, .eos_ids = eos.items, .eos_inclusive = true, .all_positions = all.metrics(), .through_first_eos = through.metrics(), .categories = .{ .code = CategoryReport{ .all_positions = category_all[0].metrics(), .through_first_eos = category_eos[0].metrics(), .prompts = code_prompts }, .prose = if (prose_prompts == 0) @as(?CategoryReport, null) else CategoryReport{ .all_positions = category_all[1].metrics(), .through_first_eos = category_eos[1].metrics(), .prompts = prose_prompts } }, .prompts = reports, .score_seconds = @as(f64, @floatFromInt(timer.read())) / 1e9, .memory = .{ .peak_bytes = peak, .active_bytes = active, .cache_bytes = cached, .stored_tensor_bytes = native.storedBytes(&weights), .limit_bytes = limit, .wired_bytes = wired }, .partial_resume = false });
     try atomicJson(a, io, progress, .{ .complete = true, .phase = "complete", .positions = all.positions });
 }
 
@@ -596,4 +598,19 @@ test "GLM KLD accepts only explicit user-truncated two-code study" {
     wrong.value.object.getPtr("actual_positions").?.* = .{ .integer = 1024 };
     wrong.value.object.getPtr("stopped_by_user").?.* = .{ .bool = false };
     try std.testing.expectError(error.BadBaselineJson, studyContract(a, wrong.value, 2));
+}
+
+test "GLM KLD single completed prompt requires exact human stop contract" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"requested_prompt_count\":4,\"completed_prompt_count\":1,\"actual_positions\":512,\"truncated\":true,\"stopped_by_user\":true,\"stop_reason\":\"user_requested_one_completed_prompt\"}", .{});
+    defer parsed.deinit();
+    const study = try studyContract(a, parsed.value, 1);
+    defer study.deinit(a);
+    try std.testing.expectEqual(@as(usize, 512), study.actual_positions);
+    try std.testing.expect(study.truncated and study.stopped_by_user);
+    parsed.value.object.getPtr("actual_positions").?.* = .{ .integer = 1024 };
+    try std.testing.expectError(error.BadBaselineJson, studyContract(a, parsed.value, 1));
+    parsed.value.object.getPtr("actual_positions").?.* = .{ .integer = 512 };
+    parsed.value.object.getPtr("stop_reason").?.* = .{ .string = "other" };
+    try std.testing.expectError(error.BadBaselineJson, studyContract(a, parsed.value, 1));
 }

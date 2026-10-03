@@ -103,3 +103,13 @@ partial fixtures remain invalid. The report preserves this study provenance and
 labels its scope code-only. The original complete four-record/two-code/two-prose
 contract remains supported without new truncation fields. Each record still needs
 all512 rows. No unfinished prompt is scored.
+
+
+### Latest one-prompt override
+
+A single completed record is accepted only with requested4/completed1/512positions,
+truncated and stopped-by-user flags, and the exact reason
+`user_requested_one_completed_prompt`. Its ID must be
+`code-python-topological-sort`, the first completed prompt. The report states
+one code prompt/no prose. An incomplete second prompt is never scored. The prior
+explicit two-prompt and original four-prompt contracts remain supported.
