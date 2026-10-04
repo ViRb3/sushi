@@ -27,6 +27,8 @@ Existing tools:
 - Unit tests OK; integration tests with real models are the real tests.
 - Live scripts and real-pack unit tests find packs at `${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/<pack>` (a per-script
   override variable wins); run outputs land in `~/.sushi/runs/`. No tracked file names a box's own directories.
+- A real-pack unit test SKIPs silently when its pack is absent, so a green suite without `SUSHI_MODELS_DIR` proves nothing
+  about them; zig does not key its test cache on the env, so read `--summary all` for a `skip` count.
 - After big features: build `sushi` and run the agentic harness.
 - Always run `zig build test` before submitting.
 
