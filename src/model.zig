@@ -4506,6 +4506,14 @@ fn thinkFlagArm(model_type: []const u8) ?EffortArm {
     return armForWord(effortArms(model_type) orelse return null, @tagName(e));
 }
 
+/// The budget `--think` selects on this arch; fallback leaves the server on its own default.
+pub fn thinkFlagBudget(model_type: []const u8, fallback: i32) i32 {
+    if (thinkFlagArm(model_type)) |arm| {
+        if (arm.budget) |b| return b;
+    }
+    return fallback;
+}
+
 pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
     if (thinkFlagArm(config.model_type)) |arm| return @tagName(arm.effort);
     return if (config.isGlm5()) "high" else null;
@@ -9625,6 +9633,21 @@ test "thinking policy: default_reasoning_effort is the word a request naming non
     try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
     try testing.expectEqualStrings("on", defaultReasoningEffort(&mimo_off).?);
     try testing.expectEqualStrings("xhigh", defaultReasoningEffort(&qwen).?);
+}
+
+test "thinking policy: thinkFlagBudget resolves budget on archs with budgets" {
+    const saved = think_effort_flag;
+    defer think_effort_flag = saved;
+    think_effort_flag = null;
+    try testing.expectEqual(@as(i32, -1), thinkFlagBudget("qwen4_exp", -1));
+    think_effort_flag = .medium;
+    try testing.expectEqual(@as(i32, 8192), thinkFlagBudget("qwen4_exp", -1));
+    think_effort_flag = .xhigh;
+    try testing.expectEqual(@as(i32, 32768), thinkFlagBudget("qwen4_exp", -1));
+    think_effort_flag = .off;
+    try testing.expectEqual(@as(i32, 0), thinkFlagBudget("qwen4_exp", -1));
+    think_effort_flag = .low;
+    try testing.expectEqual(@as(i32, -1), thinkFlagBudget("qwen4_exp", -1));
 }
 
 test "GLM vision config rejects unsupported tower geometry and accepts a text-only checkpoint" {
