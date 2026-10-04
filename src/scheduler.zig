@@ -902,6 +902,16 @@ pub const Slot = struct {
         return items.len;
     }
 
+    /// Connection thread: take ownership of the first `limit` logprob entries. A slot cancelled
+    /// mid-decode may hold entries for tokens the caller never read; those are freed here.
+    pub fn takeLogprobs(self: *Slot, limit: usize) ?[]generate_mod.LogprobResult {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        while (self.logprobs_buf.items.len > limit) self.allocator.free(self.logprobs_buf.pop().?.top_logprobs);
+        if (self.logprobs_buf.items.len == 0) return null;
+        return self.logprobs_buf.toOwnedSlice(self.allocator) catch null;
+    }
+
     /// Inference thread: signal normal completion. Safe to call multiple
     /// times (idempotent on `finished`).
     fn markFinished(self: *Slot, reason: []const u8) void {

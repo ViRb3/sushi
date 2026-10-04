@@ -9846,7 +9846,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, null, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -10132,6 +10132,78 @@ fn reasoningWithinBudget(allocator: std.mem.Allocator, tok: *const Tokenizer, re
     return .{ .text = try tok.decode(allocator, ids[0..n], false), .owned = true };
 }
 
+/// Client stop sequences a non-stream surface hands the scheduler wait, so generation ends when one completes.
+const StopSpec = struct {
+    stops: []const []const u8 = &.{},
+    /// Completions decode the raw continuation (null = chat decode); true drops flagged special tokens.
+    completion_skip_special: ?bool = null,
+};
+
+/// Feeds the stream path's `Gate` token by token. The answer is still cut by `stop_sequences.earliest`
+/// over the whole decoded text, so generation ends only on a stop that text also contains.
+const EarlyStop = struct {
+    tok: *const Tokenizer,
+    gate: stop_seq_mod.Gate,
+    completion_skip_special: ?bool,
+    strip_leading: bool,
+    spent: bool = false,
+
+    /// `ids` holds every token so far; the last one is new. True once the generation can end.
+    fn observe(self: *EarlyStop, allocator: std.mem.Allocator, ids: []const u32) !bool {
+        if (self.spent) return false;
+        const id = ids[ids.len - 1];
+        if (self.completion_skip_special) |skip| if (!completionShowsToken(self.tok, id, skip)) return false;
+        const piece = try self.tok.decode(allocator, &[_]u32{id}, false);
+        defer allocator.free(piece);
+        allocator.free(try self.gate.push(allocator, piece));
+        if (self.gate.matched == null) return false;
+        self.spent = true;
+        const text = if (self.completion_skip_special) |skip|
+            try completionText(allocator, self.tok, ids, skip)
+        else
+            try self.tok.decode(allocator, ids, self.strip_leading);
+        defer allocator.free(text);
+        return stop_seq_mod.earliest(text, self.gate.stops) != null;
+    }
+};
+
+const DrainEnd = enum { done, client_gone, stopped, failed };
+
+/// Connection thread: collect the slot's tokens until it ends, the client leaves or `early` sees a stop complete.
+fn drainSlotTokens(slot: anytype, conn: ?*Conn, allocator: std.mem.Allocator, output_ids: *std.ArrayList(u32), early: ?*EarlyStop) !DrainEnd {
+    while (true) {
+        const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
+            // Idle (long prefill). If the client is gone, cancel and serve
+            // whatever accumulated — the response write will fail upstream,
+            // which is fine; the win is freeing the GPU.
+            if (conn) |c| {
+                if (c.peerClosed()) {
+                    log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
+                    slot.cancel();
+                    return .client_gone;
+                }
+            }
+            continue;
+        };
+        switch (nr) {
+            .token => |t| try output_ids.append(allocator, t),
+            .done => return .done,
+            .err => return .failed,
+        }
+        if (conn) |c| {
+            if (c.peerClosed()) {
+                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
+                slot.cancel();
+                return .client_gone;
+            }
+        }
+        if (early) |e| if (try e.observe(allocator, output_ids.items)) {
+            slot.cancel();
+            return .stopped;
+        };
+    }
+}
+
 /// Run a non-streaming generation through the scheduler. Returns the same
 /// shape as `generate.generate` so the calling handler's response builder
 /// is unchanged.
@@ -10170,6 +10242,7 @@ fn nonStreamingViaScheduler(
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
     conn: ?*Conn,
+    stop: StopSpec,
 ) !generate_mod.GenerationResult {
     var slot = try sch.submit(.{
         .model = lm,
@@ -10209,36 +10282,16 @@ fn nonStreamingViaScheduler(
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
 
-    var client_gone = false;
-    wait: while (true) {
-        const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
-            // Idle (long prefill). If the client is gone, cancel and serve
-            // whatever accumulated — the response write will fail upstream,
-            // which is fine; the win is freeing the GPU.
-            if (conn) |c| {
-                if (c.peerClosed()) {
-                    log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
-                    slot.cancel();
-                    client_gone = true;
-                    break :wait;
-                }
-            }
-            continue :wait;
-        };
-        switch (nr) {
-            .token => |t| try output_ids.append(allocator, t),
-            .done => break :wait,
-            .err => return slotFailure(slot),
-        }
-        if (conn) |c| {
-            if (c.peerClosed()) {
-                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
-                slot.cancel();
-                client_gone = true;
-                break :wait;
-            }
-        }
-    }
+    var early: ?EarlyStop = if (stop.stops.len > 0) .{
+        .tok = tok,
+        .gate = .{ .stops = stop.stops },
+        .completion_skip_special = stop.completion_skip_special,
+        .strip_leading = tok.tok_type == .sentencepiece_bpe and (sampling.constraint == null or sampling.constraint.?.proto == null),
+    } else null;
+    defer if (early) |*e| e.gate.deinit(allocator);
+    const end = try drainSlotTokens(slot, conn, allocator, &output_ids, if (early) |*e| e else null);
+    if (end == .failed) return slotFailure(slot);
+    const client_gone = end == .client_gone;
 
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
     // those instead of the old single-wall-clock approximation, which
@@ -10280,10 +10333,7 @@ fn nonStreamingViaScheduler(
     // Phase A5: take ownership of the slot's accumulated logprobs. After
     // `toOwnedSlice` the slot's list is empty, so `Slot.deinit` doesn't try
     // to free what we just transferred to the caller.
-    const logprobs_slice: ?[]generate_mod.LogprobResult = if (slot.logprobs_buf.items.len > 0)
-        slot.logprobs_buf.toOwnedSlice(slot.allocator) catch null
-    else
-        null;
+    const logprobs_slice: ?[]generate_mod.LogprobResult = slot.takeLogprobs(if (end == .stopped) token_ids.len else std.math.maxInt(usize));
 
     return .{
         .text = text,
@@ -10446,7 +10496,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -16387,7 +16437,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -18492,7 +18542,7 @@ fn handleResponsesInner(
         const slot_mrope_ns = req_media.mrope;
         req_media.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences.items });
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -26677,4 +26727,62 @@ test "a request refused after its media was encoded hands the embeddings to the 
         try std.testing.expectEqual(@as(usize, 1), Probe.frees);
         try std.testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
     }
+}
+
+const FakeSlot = struct {
+    tokens: []const u32,
+    next: usize = 0,
+    cancelled: bool = false,
+
+    fn waitNextTimeout(self: *FakeSlot, _: i64) ?scheduler_mod.NextResult {
+        if (self.cancelled or self.next == self.tokens.len) return .{ .done = {} };
+        defer self.next += 1;
+        return .{ .token = self.tokens[self.next] };
+    }
+
+    fn cancel(self: *FakeSlot) void {
+        self.cancelled = true;
+    }
+};
+
+fn expectNonStreamStopsAt(stop: []const u8, pieces: []const []const u8, stop_token: usize) !void {
+    const a = std.testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var ids: [16]u32 = undefined;
+    for (pieces, 0..) |p, i| {
+        ids[i] = @intCast(i + 1);
+        try tok.id_to_token.put(ids[i], p);
+    }
+    var slot = FakeSlot{ .tokens = ids[0..pieces.len] };
+    const stops = [_][]const u8{stop};
+    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null, .strip_leading = false };
+    defer early.gate.deinit(a);
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(a);
+    const end = try drainSlotTokens(&slot, null, a, &out, &early);
+    try std.testing.expectEqual(DrainEnd.stopped, end);
+    try std.testing.expectEqual(stop_token, out.items.len);
+    try std.testing.expect(slot.cancelled);
+}
+
+test "a non-stream generation ends on the token that completes a stop" {
+    try expectNonStreamStopsAt("END", &.{ "a", "b", "E", "N", "D", "c", "d", "e" }, 5);
+    try expectNonStreamStopsAt("\n\n", &.{ "x", "\n", "\n", "y", "z" }, 3);
+}
+
+test "a non-stream generation without a stop in its text runs to the end" {
+    const a = std.testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    try tok.id_to_token.put(1, "E");
+    try tok.id_to_token.put(2, "N");
+    var slot = FakeSlot{ .tokens = &.{ 1, 2, 1 } };
+    const stops = [_][]const u8{"END"};
+    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null, .strip_leading = false };
+    defer early.gate.deinit(a);
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(a);
+    try std.testing.expectEqual(DrainEnd.done, try drainSlotTokens(&slot, null, a, &out, &early));
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
 }

@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Non-streaming requests with `stop` sequences now stop generating when the stop completes**, instead of running to
+  `max_tokens` or end of text and trimming afterwards; the returned text and finish reason are unchanged.
 - **GLM-5.3 prefix-cache commits no longer overrun memory on long generations**: a finished request copies only the
   MLA rows its checkpoints can restore and its cache tier will keep, and admission bills that copy and the checkpoints a prefill really takes.
 - **Cancelling a GLM-5.3 request while it decodes no longer races the scheduler's list of running requests**, and its
