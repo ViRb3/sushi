@@ -97,8 +97,9 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
   output exact); an A6 cache from the earlier policy is regenerated.
 - **Tree**: two draft nodes plus the root, up to four children per node; the verifier runs all rows layerwise.
   KDA replays only the accepted path from a prework tape; IndexPool builds branch-local pools from the committed prefix
-  plus each node's ancestry (pooling flattened tree rows would pool siblings together); MLA reads the committed prefix
-  plus the ancestry tail. Commit publishes target state and assistant context together; a commit that fails after
+  plus each node's ancestry (pooling flattened tree rows would pool siblings together), held beside the reserved
+  pooled buffer and never written into it ([kernels](engine-glm5-kernels.md#dflash2-verification)); MLA reads the
+  committed prefix plus the ancestry tail. Commit publishes target state and assistant context together; a commit that fails after
   taking over the request's MLA buffers leaves the request failed.
 - **Decisions**: greedy follows the target argmax; sampled requests draw only the visited target path with the
   request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included). Both

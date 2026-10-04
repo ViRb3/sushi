@@ -144,6 +144,9 @@ pub const State = struct {
     pooled: Arr = nil,
     tail_keys: Arr = nil,
     tail_gates: Arr = nil,
+    /// Pools an index-only append completed past `pooled`'s rows: sibling branches share the
+    /// reserved buffer, so writing it would copy it whole for every branch.
+    pool_tail: Arr = nil,
     processed: usize = 0,
     /// 0 stores BF16 latent rows, 8 stores kv8; kept across reset.
     latent_bits: u8 = 0,
@@ -160,8 +163,14 @@ pub const State = struct {
     pub fn reset(self: *State) void {
         self.deinit();
     }
-    pub fn arrays(self: *const State) [6]Arr {
-        return .{ self.latent, self.latent_scales, self.latent_biases, self.pooled, self.tail_keys, self.tail_gates };
+    pub fn arrays(self: *const State) [7]Arr {
+        return .{ self.latent, self.latent_scales, self.latent_biases, self.pooled, self.tail_keys, self.tail_gates, self.pool_tail };
+    }
+    fn poolTailRows(self: *const State) usize {
+        return if (self.pool_tail.ctx == null) 0 else @intCast(mlx.getShape(self.pool_tail)[0]);
+    }
+    fn indexKeys(self: *const State) Arr {
+        return if (self.pooled.ctx != null) self.pooled else self.pool_tail;
     }
     pub fn latentView(self: *const State) Latent {
         return .{ .data = self.latent, .scales = self.latent_scales, .biases = self.latent_biases };
@@ -170,7 +179,7 @@ pub const State = struct {
     pub fn share(self: *const State) !State {
         var copy = State{ .processed = self.processed, .latent_bits = self.latent_bits };
         errdefer copy.deinit();
-        inline for (.{ "latent", "latent_scales", "latent_biases", "pooled", "tail_keys", "tail_gates" }) |name| {
+        inline for (.{ "latent", "latent_scales", "latent_biases", "pooled", "tail_keys", "tail_gates", "pool_tail" }) |name| {
             const value = @field(self.*, name);
             if (value.ctx != null) {
                 @field(copy, name) = mlx.mlx_array_new();
@@ -204,7 +213,8 @@ pub const State = struct {
             @mod(ls[1], @as(c_int, latent_store.group_size)) != 0)) return error.InvalidGlmAttentionShape;
         if (self.processed != 0 and (self.latentView().width() != ls[1] or self.latentView().dtype() != mlx.mlx_array_dtype(latent))) return error.InvalidGlmAttentionShape;
         if (self.tail_keys.ctx != null and (mlx.getShape(self.tail_keys)[1] != ks[1] or mlx.mlx_array_dtype(self.tail_keys) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
-        if (self.pooled.ctx != null and (mlx.getShape(self.pooled)[1] != ks[1] or mlx.mlx_array_dtype(self.pooled) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
+        for ([_]Arr{ self.pooled, self.pool_tail }) |a| if (a.ctx != null and (mlx.getShape(a)[1] != ks[1] or mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
+        if (store_latent and self.pool_tail.ctx != null) return error.InvalidGlmAttentionShape;
         const next = try std.math.add(usize, self.processed, @intCast(ls[0]));
         var scope = Scope{ .s = s };
         defer scope.deinit();
@@ -222,7 +232,9 @@ pub const State = struct {
         const k = try scope.join(self.tail_keys, keys);
         const g = try scope.join(self.tail_gates, gates);
         const ready = @divTrunc(mlx.getShape(k)[0], 4) * 4;
-        const p = if (ready > 0) try scope.appendRows(self.pooled, self.processed / 4, try compress(&scope, k, g, ape, ready)) else self.pooled;
+        const fresh = if (ready > 0) try compress(&scope, k, g, ape, ready) else nil;
+        const p = if (ready > 0 and store_latent) try scope.appendRows(self.pooled, self.processed / 4, fresh) else self.pooled;
+        const pt = if (ready > 0 and !store_latent) try scope.join(self.pool_tail, fresh) else self.pool_tail;
         const tail_k = try scope.copy(try scope.cut(k, ready, mlx.getShape(k)[0]));
         const tail_g = try scope.copy(try scope.cut(g, ready, mlx.getShape(g)[0]));
         var new = State{ .processed = next, .latent_bits = self.latent_bits };
@@ -231,6 +243,7 @@ pub const State = struct {
         if (l_scales.ctx != null) new.latent_scales = try scope.result(l_scales);
         if (l_biases.ctx != null) new.latent_biases = try scope.result(l_biases);
         if (p.ctx != null) new.pooled = try scope.result(p);
+        if (pt.ctx != null) new.pool_tail = try scope.result(pt);
         new.tail_keys = try scope.result(tail_k);
         new.tail_gates = try scope.result(tail_g);
         const before = self.processed;
@@ -241,6 +254,7 @@ pub const State = struct {
 };
 
 var score_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var score_tail_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attention_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -288,6 +302,8 @@ const SCORE_HEADER: [:0]const u8 =
     \\  if ((l & 16u) == 0u) s4 = c; else dot = s4 + c; } } } } }
     \\
 ;
+const SCORE_KEYS: [:0]const u8 = "#define SUSHI_POOL_KEYS(p) (keys + size_t(p) * uint(I))\n";
+const SCORE_TAIL_KEYS: [:0]const u8 = "#define SUSHI_POOL_KEYS(p) ((p) < uint(tail_base) ? keys + size_t(p) * uint(I) : tail + size_t((p) - uint(tail_base)) * uint(I))\n";
 const SCORE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint lane = thread_position_in_threadgroup.x;
@@ -308,7 +324,7 @@ const SCORE: [:0]const u8 =
     \\  for (uint j = 0; j < block; ++j) {
     \\    const uint p = base + j;
     \\    if ((p + 1u) * 4u > limit) continue;
-    \\    const device InT* kp = keys + size_t(p) * uint(I);
+    \\    const device InT* kp = SUSHI_POOL_KEYS(p);
     \\    float s0, s1, s2, s3, s4, dot;
     \\    #pragma unroll
     \\    for (uint l = 0; l < 32u; ++l) {
@@ -373,12 +389,21 @@ var tree_score_calls: usize = 0;
 
 fn indexScores(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
     const pools: c_int = @intCast(state.processed / 4);
+    if (state.pool_tail.ctx != null) {
+        const base: c_int = pools - @as(c_int, @intCast(state.poolTailRows()));
+        return treeScoresTail(scope, state.indexKeys(), state.pool_tail, base, index_q, weights, offset, pools);
+    }
     if (try @import("glm5_indexpool_nax.zig").tryScores(index_q, state.pooled, weights, offset, @intCast(pools), scope.s)) |out|
         return scope.own(out);
     return treeScores(scope, state.pooled, index_q, weights, offset, pools);
 }
 
 fn treeScores(scope: *Scope, pooled: Arr, index_q: Arr, weights: Arr, offset: usize, pools: c_int) !Arr {
+    return treeScoresTail(scope, pooled, nil, 0, index_q, weights, offset, pools);
+}
+
+/// `tail` nil reads every pool from `pooled`; otherwise pools from `tail_base` on come from `tail`.
+fn treeScoresTail(scope: *Scope, pooled: Arr, tail: Arr, tail_base: c_int, index_q: Arr, weights: Arr, offset: usize, pools: c_int) !Arr {
     const sh = mlx.getShape(index_q);
     const rows = sh[0];
     if (sh[1] > 32 or sh[2] > 128) return error.InvalidGlmAttentionShape;
@@ -394,8 +419,14 @@ fn treeScores(scope: *Scope, pooled: Arr, index_q: Arr, weights: Arr, offset: us
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", mlx.mlx_array_dtype(index_q)));
     const off = try scope.own(mlx.mlx_array_new_int(@intCast(offset)));
     const count = try scope.own(mlx.mlx_array_new_int(pools));
-    const k = try kernelWithHeader(&score_kernel, "sushi_glm_index_scores_tree", &.{ "q", "keys", "weights", "offset", "count" }, &.{"out"}, SCORE, SCORE_HEADER);
-    const ov = try apply(k, &.{ index_q, pooled, weights, off, count }, cfg, scope.s);
+    const ov = if (tail.ctx == null) blk: {
+        const k = try kernelWithHeader(&score_kernel, "sushi_glm_index_scores_tree", &.{ "q", "keys", "weights", "offset", "count" }, &.{"out"}, SCORE, SCORE_HEADER ++ SCORE_KEYS);
+        break :blk try apply(k, &.{ index_q, pooled, weights, off, count }, cfg, scope.s);
+    } else blk: {
+        const first = try scope.own(mlx.mlx_array_new_int(tail_base));
+        const k = try kernelWithHeader(&score_tail_kernel, "sushi_glm_index_scores_tree_tail", &.{ "q", "keys", "tail", "weights", "offset", "count", "tail_base" }, &.{"out"}, SCORE, SCORE_HEADER ++ SCORE_TAIL_KEYS);
+        break :blk try apply(k, &.{ index_q, pooled, tail, weights, off, count, first }, cfg, scope.s);
+    };
     defer _ = mlx.mlx_vector_array_free(ov);
     tree_score_calls += 1;
     if (tree_score_calls == 1) @import("log.zig").info("[glm-index] tree scorer engaged\n", .{});
@@ -723,12 +754,12 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
         offset > state.processed or @as(usize, @intCast(sh[0])) > state.processed - offset) return error.InvalidGlmAttentionShape;
     const sparse = offset + @as(usize, @intCast(sh[0])) > pool_size * (pool_budget + 1) - 1;
     if (sparse) {
-        if (state.pooled.ctx == null) return error.InvalidGlmAttentionShape;
+        if (state.indexKeys().ctx == null) return error.InvalidGlmAttentionShape;
         const iq = index_q orelse return error.MissingGlmIndexQuery;
         const w = weights orelse return error.MissingGlmIndexQuery;
         const is = mlx.getShape(iq);
-        if (is.len != 3 or is[0] != sh[0] or is[1] <= 0 or is[2] != mlx.getShape(state.pooled)[1] or
-            !std.mem.eql(c_int, is[0..2], mlx.getShape(w)) or mlx.mlx_array_dtype(iq) != mlx.mlx_array_dtype(state.pooled) or
+        if (is.len != 3 or is[0] != sh[0] or is[1] <= 0 or is[2] != mlx.getShape(state.indexKeys())[1] or
+            !std.mem.eql(c_int, is[0..2], mlx.getShape(w)) or mlx.mlx_array_dtype(iq) != mlx.mlx_array_dtype(state.indexKeys()) or
             mlx.mlx_array_dtype(w) != mlx.mlx_array_dtype(iq)) return error.InvalidGlmAttentionShape;
     }
     const native = @import("glm5_attention_decode_batch.zig");

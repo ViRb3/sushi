@@ -20,10 +20,11 @@ pub fn plan(processed: usize, latent_capacity: usize, pool_capacity: usize, widt
     const pool_needed = needed / 4;
     const latent_rows = @max(latent_capacity, try capacity(needed));
     const pool_rows = @max(pool_capacity, try capacity(pool_needed));
-    // Growth can retain both concatenation storage and the slice-update copy. Overlay
-    // branches never write the shared latent; their pooled append still copies.
-    const latent_copy = if (rows <= overlay_rows) 0 else try mul(try mul(try mul(latent_rows, width), bytes), if (needed > latent_capacity) 2 else 1);
-    const pool_copy = try mul(try mul(try mul(pool_rows, index_width), bytes), if (pool_needed > pool_capacity) 2 else 1);
+    // Growth can retain both concatenation storage and the slice-update copy. Overlay branches
+    // write neither shared buffer; their completed pools ride in `compression`.
+    const overlay = rows <= overlay_rows;
+    const latent_copy = if (overlay) 0 else try mul(try mul(try mul(latent_rows, width), bytes), if (needed > latent_capacity) 2 else 1);
+    const pool_copy = if (overlay) 0 else try mul(try mul(try mul(pool_rows, index_width), bytes), if (pool_needed > pool_capacity) 2 else 1);
     const partials = try mul(try mul(try mul(heads, 8), try add(width, 2)), 4);
     const scores = try mul(pool_needed, 12);
     const selected = try mul(try add(try mul(@min(pool_needed, 512), 4), 3), 4);
@@ -48,6 +49,14 @@ test "GLM DFlash overlay trees keep every overlay branch at a full-context reser
     const three = try plan(7585, 946432, 236608, 512, 128, 64, 3, 2);
     try std.testing.expect(three.live_bytes + @import("glm5_attention_decode_batch.zig").scratchLimit() <= limit_bytes);
     try std.testing.expectError(error.GlmTreeScratchLimit, plan(7585, 946432, 236608, 512, 128, 64, overlay_rows + 1, 2));
+}
+
+test "GLM DFlash overlay branch scratch does not grow with the reservation" {
+    for (1..overlay_rows + 1) |rows| {
+        const full = try plan(7585, 946432, 236608, 512, 128, 64, rows, 2);
+        const tight = try plan(7585, 7680, 1920, 512, 128, 64, rows, 2);
+        try std.testing.expectEqual(tight.per_branch_bytes, full.per_branch_bytes);
+    }
 }
 
 test "GLM DFlash MLA scratch covers cache copies and batches only what fits" {

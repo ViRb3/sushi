@@ -124,9 +124,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - **MLA**: trees of at most four nodes read the committed buffer plus a ≤4-row ancestry tail instead of a replaced
   latent buffer (1.97× at 32K); the native gather and the overlay both read four-row tails (`max_tail`), exact against
   those rows committed. Query and value projections broadcast the one-row geometry over three rows (exact, −3.6%).
-  Accepted rows append at commit. Live branch scratch is capped at 256 MiB; overlay trees bill only the branch
-  pooled copy, so three branches fit beside the B1/B3 scratch even at a full-context reservation (B3 intact; a
-  four-node tree settles its fourth branch separately there), while wider trees still bill a latent copy per branch. Branch groups that do not fit settle in turn and B3 falls back to per-node B1.
+  Accepted rows append at commit. An overlay branch writes no shared buffer: the pools its ancestry completes stay in
+  `State.pool_tail`, and the tree scorer reads pools from `tail_base` on from it (same per-pool arithmetic, exact).
+  Writing them into the reserved pooled buffer copied the whole reservation per branch and MLA layer: at 32K with a
+  512K-token budget verify cost 56.27 vs 54.90 ms per round at a 287-token budget; branch-local, 54.97 vs 55.17 (kv8,
+  Sushi-2.5bpw + A4, `da9882fb` without and with it, same greedy bytes). Live branch scratch is capped at 256 MiB;
+  overlay branches bill no buffer copy, so every branch fits beside the B1/B3 scratch at any reservation, while wider trees
+  still bill a latent and pooled copy per branch. Branch groups that do not fit settle in turn and B3 falls back to
+  per-node B1.
 - **Commit**: the commit hands the request's latent (kv8: codes, scales, biases) and pooled buffers to the accepted
   state before evaluating, so MLX appends in place; a buffer the committed request still shares is copied whole,
   reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,

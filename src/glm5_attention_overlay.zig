@@ -189,7 +189,14 @@ test "GLM latent overlay branch outputs index state and commit match full append
             try virtual.evaluate();
             try std.testing.expectEqual(prefix + path.len, virtual.processed);
             try std.testing.expectEqual(prefix, source.processed);
-            for ([_]Arr{ original.pooled, original.tail_keys, original.tail_gates }, [_]Arr{ virtual.pooled, virtual.tail_keys, virtual.tail_gates }) |left, right| if (left.ctx != null) try exact(left, right);
+            for ([_]Arr{ original.tail_keys, original.tail_gates }, [_]Arr{ virtual.tail_keys, virtual.tail_gates }) |left, right| try exact(left, right);
+            if (source.pooled.ctx != null) try std.testing.expectEqual(mlx.mlx_array_data_uint8(source.pooled), mlx.mlx_array_data_uint8(virtual.pooled)) else try std.testing.expect(virtual.pooled.ctx == null);
+            const pools: c_int = @intCast(virtual.processed / 4);
+            const fresh: c_int = if (virtual.pool_tail.ctx == null) 0 else mlx.getShape(virtual.pool_tail)[0];
+            if (fresh > 0) {
+                const joined = if (pools == fresh) virtual.pool_tail else try ops.concat(&.{ try ops.slice(source.pooled, 0, 0, pools - fresh), virtual.pool_tail }, 0);
+                try exact(try ops.contiguous(try ops.slice(original.pooled, 0, 0, pools)), try ops.contiguous(joined));
+            } else if (pools > 0) try exact(try ops.contiguous(try ops.slice(original.pooled, 0, 0, pools)), try ops.contiguous(try ops.slice(source.pooled, 0, 0, pools)));
             if (dtype == .bfloat16) try std.testing.expectEqual(mlx.mlx_array_data_bfloat16(source.latent), mlx.mlx_array_data_bfloat16(virtual.latent)) else try std.testing.expectEqual(mlx.mlx_array_data_float32(source.latent), mlx.mlx_array_data_float32(virtual.latent));
             const row: c_int = @intCast(path[path.len - 1]);
             const q = try ops.slice(queries, 0, row, row + 1);
@@ -250,5 +257,51 @@ test "GLM kv8 latent overlay reads round-tripped tails exactly as the committed 
             const candidate = try ops.own(try attention.attendOverlay(&virtual, q, index_q, weights, offset, 1.0 / 16.0, view, s));
             try attention.expectSameBits(baseline, candidate);
         }
+    }
+}
+
+test "GLM overlay branch completing a pool reads a reserved pooled buffer without copying it" {
+    const attention = @import("glm5_attention.zig");
+    const s = mlx.gpuStream();
+    for ([_]u8{ 0, latent_store.kv8_bits }) |bits| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        var source = attention.State{ .latent_bits = bits };
+        defer source.deinit();
+        const prefix = 2050;
+        const ape = try ops.zeros(&.{ 4, 128 }, .bfloat16);
+        _ = try source.append(try normal(&ops, &.{ prefix, 64 }, .bfloat16, 61), try normal(&ops, &.{ prefix, 128 }, .bfloat16, 62), try ops.zeros(&.{ prefix, 128 }, .bfloat16), ape, s);
+        // A whole-context reservation: 64 MiB of pooled keys, far past the 512 committed pools.
+        const reserved = try ops.concat(&.{ source.pooled, try ops.zeros(&.{ 262144 - mlx.getShape(source.pooled)[0], 128 }, .bfloat16) }, 0);
+        _ = mlx.mlx_array_free(source.pooled);
+        source.pooled = try ops.result(reserved);
+        try source.evaluate();
+        const latents = try normal(&ops, &.{ 2, 64 }, .bfloat16, 63);
+        const readable = try ops.own(try latent_store.readable(latents, bits, s));
+        const keys = try normal(&ops, &.{ 2, 128 }, .bfloat16, 64);
+        const gates = try ops.zeros(&.{ 2, 128 }, .bfloat16);
+        const q = try normal(&ops, &.{ 1, 4, 64 }, .bfloat16, 65);
+        const iq = try normal(&ops, &.{ 1, 4, 128 }, .bfloat16, 66);
+        const iw = try ops.ones(&.{ 1, 4 }, .bfloat16);
+        const offset = prefix + 1;
+        var committed = try source.share();
+        defer committed.deinit();
+        _ = try committed.append(latents, keys, gates, ape, s);
+        const baseline = try ops.own(try attention.attend(&committed, q, iq, iw, offset, 0.125, s));
+        try mlx.check(mlx.mlx_array_eval(baseline));
+        try mlx.check(mlx.mlx_array_eval(readable));
+        var before: usize = 0;
+        try mlx.check(mlx.mlx_get_active_memory(&before));
+        try mlx.check(mlx.mlx_reset_peak_memory());
+        var branch = try source.share();
+        defer branch.deinit();
+        _ = try branch.appendIndexOnly(latents, keys, gates, ape, s);
+        const view = View{ .prefix = source.latentView(), .prefix_rows = prefix, .tail = readable };
+        const candidate = try ops.own(try attention.attendOverlay(&branch, q, iq, iw, offset, 0.125, view, s));
+        try mlx.check(mlx.mlx_array_eval(candidate));
+        var peak: usize = 0;
+        try mlx.check(mlx.mlx_get_peak_memory(&peak));
+        try std.testing.expect(peak -| before < 8 * 1024 * 1024);
+        try attention.expectSameBits(baseline, candidate);
     }
 }

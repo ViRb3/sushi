@@ -61,7 +61,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A weights MAP outliving the model pins every buffer; mlx-c `iterator_next` hands a +1; `mlx_array_new_data`
   COPIES shape-worth of bytes.
 - **A refcount-shared snapshot makes every later write copy the whole buffer** (MLX donates only a sole owner's
-  buffer): a spec rollback that can truncate by offset takes no `KVCache.snapshot`.
+  buffer): a spec rollback that can truncate by offset takes no `KVCache.snapshot`. Speculative branches that share
+  a reserved buffer keep their new rows in a small array beside it (GLM `State.pool_tail`).
 - **`mlx_eval` returns before its command buffer lets go of the outputs**, so a write right after one can find its
   buffer shared and copy it: a chain of in-place writes drains the stream (`mlx_synchronize`) between evals.
 - MLX releases an IMPORTED host buffer asynchronously ([engine-expert-streaming](engine-expert-streaming.md#io)).

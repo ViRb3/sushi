@@ -519,19 +519,26 @@ fn expectArrayBits(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
 }
 
 test "GLM latent overlay three-node verifier commits independent serial ancestry" {
-    try verifierCommitCase(0);
+    try verifierCommitCase(0, 3);
 }
 
 test "GLM kv8 latent overlay verifier commits independent serial ancestry" {
-    try verifierCommitCase(8);
+    try verifierCommitCase(8, 3);
 }
 
-fn verifierCommitCase(latent_bits: u8) !void {
+test "GLM overlay verifier past the sparse threshold on a reserved request commits serial ancestry" {
+    // 2050 committed rows: the tree's later rows select pools, and their paths complete pool 512.
+    try verifierCommitCase(0, 2050);
+    try verifierCommitCase(8, 2050);
+}
+
+fn verifierCommitCase(latent_bits: u8, prompt: usize) !void {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);
     defer weights.deinit();
-    const cfg = try forward.completeFixture(&weights);
+    var cfg = try forward.completeFixture(&weights);
+    cfg.max_position_embeddings = @max(cfg.max_position_embeddings, @as(u32, @intCast(prompt + 16)));
     var iterator = weights.map.iterator();
     var seed: usize = 23;
     while (iterator.next()) |entry| {
@@ -548,11 +555,16 @@ fn verifierCommitCase(latent_bits: u8) !void {
     var request = try forward.Request.init(a, target.layers.len);
     defer request.deinit();
     try request.setLatentBits(latent_bits);
-    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32);
+    const prompt_ids = try a.alloc(u32, prompt);
+    defer a.free(prompt_ids);
+    var rng = std.Random.DefaultPrng.init(prompt);
+    for (prompt_ids, 0..) |*id, i| id.* = if (prompt <= 3) @intCast(i + 1) else rng.random().uintLessThan(u32, @intCast(cfg.vocab_size));
+    const ids = mlx.mlx_array_new_data(prompt_ids.ptr, &.{ 1, @intCast(prompt) }, 2, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     const logits = try target.forwardLast(&request, ids, true);
     defer _ = mlx.mlx_array_free(logits);
     try mlx.check(mlx.mlx_array_eval(logits));
+    if (prompt > 3) _ = try @import("glm5_dflash_reserve.zig").reserve(&request, prompt + 65536, std.math.maxInt(usize), s);
     var tokens = [_]u32{ 1, 0, 0 };
     const taps = [_]u32{ 0, 3 };
     for ([_][3]i32{ .{ -1, 0, 1 }, .{ -1, 0, 0 } }) |parents| {
