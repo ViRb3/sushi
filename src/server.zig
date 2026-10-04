@@ -9967,8 +9967,6 @@ fn handleStreamingCompletion(
     defer stop_gate.deinit(allocator);
     var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
     var stopped = false;
-    var utf8_carry_c: [3]u8 = undefined;
-    var utf8_carry_c_len: u8 = 0;
     var client_gone = false;
 
     while (true) {
@@ -10005,50 +10003,20 @@ fn handleStreamingCompletion(
             client_gone = true;
             break;
         }
-        // Handle incomplete UTF-8 sequences across token boundaries
-        var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+        const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
             try lps.note(token_id);
             if (!completionShowsToken(tok, token_id, skip_special)) continue;
             const strip = tok.tok_type == .sentencepiece_bpe;
             const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
-            const with_carry = if (utf8_carry_c_len > 0) cc: {
-                const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
-                @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
-                @memcpy(combined[utf8_carry_c_len..], raw_decoded_c);
-                allocator.free(raw_decoded_c);
-                utf8_carry_c_len = 0;
-                break :cc combined;
-            } else raw_decoded_c;
-
-            const tail = utf8TrailingIncomplete(with_carry);
-            if (tail > 0) {
-                @memcpy(utf8_carry_c[0..tail], with_carry[with_carry.len - tail ..]);
-                utf8_carry_c_len = @intCast(tail);
-            }
-            if (with_carry.len == tail) {
-                allocator.free(with_carry);
-                continue;
-            }
-            if (tail > 0) {
-                const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
-                allocator.free(with_carry);
-                break :blk trimmed;
-            }
-            break :blk with_carry;
+            defer allocator.free(raw_decoded_c);
+            break :blk try stop_gate.push(allocator, raw_decoded_c);
         };
         defer allocator.free(token_text);
 
-        if (stop_sequences.len > 0) {
-            if (!tail_flush) {
-                const released = try stop_gate.push(allocator, token_text);
-                allocator.free(token_text);
-                token_text = released;
-            }
-            stopped = stop_gate.matched != null;
-            if (token_text.len == 0) {
-                if (stopped) break;
-                continue;
-            }
+        stopped = stop_gate.matched != null;
+        if (token_text.len == 0) {
+            if (stopped) break;
+            continue;
         }
 
         const escaped = try jsonEscape(allocator, token_text);
@@ -11209,10 +11177,6 @@ fn handleStreamingGeneration(
     var stopped = false;
     var client_gone = false;
 
-    // Buffer for incomplete UTF-8 sequences split across BPE tokens
-    var utf8_carry: [3]u8 = undefined;
-    var utf8_carry_len: u8 = 0;
-
     // Thinking state for real-time streaming of reasoning_content vs content
     // Supports both <think>...</think> and Gemma 4's <|channel>thought\n...<channel|>
     // Starts true when thinking is enabled (model outputs <think> first) OR
@@ -11304,60 +11268,21 @@ fn handleStreamingGeneration(
             client_gone = true;
             break;
         }
-        // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
-        // then strip any new trailing incomplete bytes into the carry buffer.
-        var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+        // The gate delivers the bytes before a match and holds back any tail that could still become
+        // one, or a character the token left unfinished.
+        const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
             try lps.note(token_id);
             const strip = tok.tok_type == .sentencepiece_bpe;
             const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+            defer allocator.free(raw_decoded);
             if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
-            // Step 1: prepend carry-over from previous token
-            const with_carry = if (utf8_carry_len > 0) cc: {
-                const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
-                @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
-                @memcpy(combined[utf8_carry_len..], raw_decoded);
-                allocator.free(raw_decoded);
-                utf8_carry_len = 0;
-                break :cc combined;
-            } else raw_decoded;
-
-            // Step 2: check for trailing incomplete UTF-8 sequence
-            const tail = utf8TrailingIncomplete(with_carry);
-            if (tail > 0) {
-                @memcpy(utf8_carry[0..tail], with_carry[with_carry.len - tail ..]);
-                utf8_carry_len = @intCast(tail);
-            }
-
-            // Step 3: if everything was incomplete, skip this iteration
-            if (with_carry.len == tail) {
-                allocator.free(with_carry);
-                continue;
-            }
-
-            // Step 4: if we trimmed trailing bytes, reallocate to the complete prefix
-            if (tail > 0) {
-                const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
-                allocator.free(with_carry);
-                break :blk trimmed;
-            }
-
-            break :blk with_carry;
+            break :blk try stop_gate.push(allocator, raw_decoded);
         };
-
-        // The gate delivers the bytes before a match and holds back any tail that could still become one.
-        if (stop_sequences.len > 0) {
-            if (!tail_flush) {
-                const released = try stop_gate.push(allocator, token_text);
-                allocator.free(token_text);
-                token_text = released;
-            }
-            stopped = stop_gate.matched != null;
-            if (token_text.len == 0) {
-                allocator.free(token_text);
-                if (stopped) break;
-                continue;
-            }
+        stopped = stop_gate.matched != null;
+        if (token_text.len == 0) {
+            allocator.free(token_text);
+            if (stopped) break;
+            continue;
         }
 
         // Accumulate for tool call detection
@@ -11442,7 +11367,7 @@ fn handleStreamingGeneration(
                         // after it: everything buffered so far was reasoning,
                         // and leaving it pending hands it to the NEXT chunk
                         // (measured: 42 entries on a 1-char delta).
-                        if (split.content.len > 0) lps.skipToContent(buf, split.content, utf8_carry_len) else lps.dropPending();
+                        if (split.content.len > 0) lps.skipToContent(buf, split.content, stop_gate.carry_len) else lps.dropPending();
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
@@ -11699,7 +11624,7 @@ fn handleStreamingGeneration(
                 if (content_after.len > 0) {
                     // The reasoning above this point never reaches the client,
                     // so its entries stop here rather than riding the answer.
-                    lps.skipToContent(think_buf.items, content_after, utf8_carry_len);
+                    lps.skipToContent(think_buf.items, content_after, stop_gate.carry_len);
                     const vis_content_after = chat_mod.streamContentLead(content_after, content_started);
                     if (vis_content_after.len > 0) {
                         content_started = true;
@@ -11905,7 +11830,7 @@ fn handleStreamingGeneration(
                     // normalized rewrite. If the content cannot be found there
                     // (normalization moved it) nothing is skipped, which is the
                     // old behaviour rather than a wrong boundary.
-                    lps.skipToContent(full_text.items, think_split.content, utf8_carry_len);
+                    lps.skipToContent(full_text.items, think_split.content, stop_gate.carry_len);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null, null, .{ .logprobs_json = try lps.take() });
                 } else {
                     // All reasoning, no content: those entries describe text the
@@ -13273,32 +13198,6 @@ fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []cons
     , .{ escaped_msg, err_type, code_str });
     defer allocator.free(body);
     try sendResponse(stream, status, "application/json", body);
-}
-
-/// Returns the number of trailing bytes that form an incomplete UTF-8 sequence.
-/// If the string ends with a complete codepoint (or is empty), returns 0.
-fn utf8TrailingIncomplete(s: []const u8) usize {
-    if (s.len == 0) return 0;
-    // Walk backwards to find the last leading byte (one with bit pattern 11xxxxxx or 0xxxxxxx)
-    var i: usize = s.len;
-    // Check up to 3 trailing continuation bytes (10xxxxxx)
-    var cont: usize = 0;
-    while (cont < 3 and i > 0) {
-        i -= 1;
-        if (s[i] & 0xC0 != 0x80) break; // found a non-continuation byte
-        cont += 1;
-    }
-    // i now points to the last leading byte (or the byte that broke the loop)
-    if (i >= s.len) return 0;
-    const lead = s[i];
-    // Determine expected sequence length from leading byte
-    const expected: usize = if (lead & 0x80 == 0) 1 // 0xxxxxxx — ASCII
-        else if (lead & 0xE0 == 0xC0) 2 // 110xxxxx
-        else if (lead & 0xF0 == 0xE0) 3 // 1110xxxx
-        else if (lead & 0xF8 == 0xF0) 4 // 11110xxx
-        else return 0; // invalid leading byte, don't buffer
-    const actual = s.len - i;
-    return if (actual < expected) actual else 0;
 }
 
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
@@ -16827,8 +16726,6 @@ fn handleAnthropicStreaming(
     defer stop_gate.deinit(allocator);
     var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
     var client_gone = false;
-    var utf8_carry: [3]u8 = undefined;
-    var utf8_carry_len: u8 = 0;
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
@@ -16864,51 +16761,20 @@ fn handleAnthropicStreaming(
             client_gone = true;
             break;
         }
-        // UTF-8 carry handling
-        var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
-            const strip = tok.tok_type == .sentencepiece_bpe;
-            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
-            const with_carry = if (utf8_carry_len > 0) cc: {
-                const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
-                @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
-                @memcpy(combined[utf8_carry_len..], raw_decoded);
-                allocator.free(raw_decoded);
-                utf8_carry_len = 0;
-                break :cc combined;
-            } else raw_decoded;
-            const tail = utf8TrailingIncomplete(with_carry);
-            if (tail > 0) {
-                @memcpy(utf8_carry[0..tail], with_carry[with_carry.len - tail ..]);
-                utf8_carry_len = @intCast(tail);
-            }
-            if (with_carry.len == tail) {
-                allocator.free(with_carry);
-                continue;
-            }
-            if (tail > 0) {
-                const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
-                allocator.free(with_carry);
-                break :blk trimmed;
-            }
-            break :blk with_carry;
-        };
-
         // The gate remembers WHICH stop matched (reported as stop_reason "stop_sequence" + the
         // echoed `stop_sequence` field in message_delta).
-        if (stop_sequences.len > 0) {
-            if (!tail_flush) {
-                const released = try stop_gate.push(allocator, token_text);
-                allocator.free(token_text);
-                token_text = released;
-            }
-            stopped = stop_gate.matched != null;
-            if (token_text.len == 0) {
-                allocator.free(token_text);
-                if (stopped) break;
-                continue;
-            }
+        const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+            defer allocator.free(raw_decoded);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+            break :blk try stop_gate.push(allocator, raw_decoded);
+        };
+        stopped = stop_gate.matched != null;
+        if (token_text.len == 0) {
+            allocator.free(token_text);
+            if (stopped) break;
+            continue;
         }
 
         if (gated_stream) {
@@ -18313,8 +18179,6 @@ fn handleResponsesInner(
         var token_ids_buf = std.ArrayList(u32).empty;
         defer token_ids_buf.deinit(allocator);
 
-        var utf8_carry: [3]u8 = undefined;
-        var utf8_carry_len: u8 = 0;
         var stopped = false;
         var stop_gate = stop_seq_mod.Gate{ .stops = stop_sequences.items };
         defer stop_gate.deinit(allocator);
@@ -18371,49 +18235,19 @@ fn handleResponsesInner(
                 client_gone = true;
                 break;
             }
-            // UTF-8 carry across BPE-token boundaries (matches chat-completion).
-            var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+            const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
                 try token_ids_buf.append(allocator, token_id);
                 const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, false);
+                defer allocator.free(raw_decoded);
                 if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
-                const with_carry = if (utf8_carry_len > 0) cc: {
-                    const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
-                    @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
-                    @memcpy(combined[utf8_carry_len..], raw_decoded);
-                    allocator.free(raw_decoded);
-                    utf8_carry_len = 0;
-                    break :cc combined;
-                } else raw_decoded;
-                const tail = utf8TrailingIncomplete(with_carry);
-                if (tail > 0) {
-                    @memcpy(utf8_carry[0..tail], with_carry[with_carry.len - tail ..]);
-                    utf8_carry_len = @intCast(tail);
-                }
-                if (with_carry.len == tail) {
-                    allocator.free(with_carry);
-                    continue;
-                }
-                if (tail > 0) {
-                    const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
-                    allocator.free(with_carry);
-                    break :blk trimmed;
-                }
-                break :blk with_carry;
+                break :blk try stop_gate.push(allocator, raw_decoded);
             };
             defer allocator.free(token_text);
 
-            if (stop_sequences.items.len > 0) {
-                if (!tail_flush) {
-                    const released = try stop_gate.push(allocator, token_text);
-                    allocator.free(token_text);
-                    token_text = released;
-                }
-                stopped = stop_gate.matched != null;
-                if (token_text.len == 0) {
-                    if (stopped) break;
-                    continue;
-                }
+            stopped = stop_gate.matched != null;
+            if (token_text.len == 0) {
+                if (stopped) break;
+                continue;
             }
 
             try raw_buf.appendSlice(allocator, token_text);
@@ -20114,33 +19948,6 @@ test "jsonEscape empty string" {
     const result = try jsonEscape(allocator, "");
     defer allocator.free(result);
     try testing.expectEqualStrings("\"\"", result);
-}
-
-test "utf8TrailingIncomplete complete ASCII" {
-    try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete("hello"));
-}
-
-test "utf8TrailingIncomplete complete multibyte" {
-    // 🎉 = F0 9F 8E 89 (4-byte sequence, complete)
-    try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete("\xF0\x9F\x8E\x89"));
-}
-
-test "utf8TrailingIncomplete partial 4-byte" {
-    // First 3 bytes of a 4-byte sequence
-    try testing.expectEqual(@as(usize, 3), utf8TrailingIncomplete("\xF0\x9F\x8E"));
-    // First 2 bytes
-    try testing.expectEqual(@as(usize, 2), utf8TrailingIncomplete("\xF0\x9F"));
-    // First 1 byte
-    try testing.expectEqual(@as(usize, 1), utf8TrailingIncomplete("\xF0"));
-}
-
-test "utf8TrailingIncomplete partial after complete" {
-    // "hi" + first 2 bytes of emoji
-    try testing.expectEqual(@as(usize, 2), utf8TrailingIncomplete("hi\xF0\x9F"));
-}
-
-test "utf8TrailingIncomplete empty" {
-    try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
 }
 
 test "repeat_penalty: 0 or below is unset, then frequency_penalty, then off, on chat and completions alike" {

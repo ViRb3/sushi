@@ -3186,6 +3186,38 @@ test "format corpus: a streamed stop cut is the non-stream cut, whatever the tok
     }
 }
 
+test "format corpus: a stream cut off inside a character delivers the non-stream bytes, with or without a stop" {
+    // Every recorded output can hit its token budget mid-character, with a stop's prefix held.
+    const allocator = testing.allocator;
+    const tails = [_][]const u8{ "\xC3", "\xE2\x82", "\xF0\x9F\x8E" };
+    const no_stops = [_][]const u8{};
+    for (corpus) |e| {
+        if (e.raw.len < 16) continue;
+        const mid = e.raw.len / 2;
+        const stop = [_][]const u8{e.raw[mid .. mid + 3]};
+        for (tails) |tail| {
+            for ([_][]const []const u8{ &stop, &no_stops }) |stops| {
+                const text = try std.mem.concat(allocator, u8, &.{ e.raw[0 .. mid + 2], tail });
+                defer allocator.free(text);
+                var want_stop: ?[]const u8 = null;
+                const want = stop_sequences.nonStreamDelivered(text, stops, &want_stop);
+                for ([_]usize{ 1, 2, 3, 5 }) |width| {
+                    var fragments = std.ArrayList([]const u8).empty;
+                    defer fragments.deinit(allocator);
+                    var at: usize = 0;
+                    while (at < text.len) : (at += width) try fragments.append(allocator, text[at..@min(at + width, text.len)]);
+                    var got_stop: ?[]const u8 = null;
+                    const got = try stop_sequences.streamDelivered(allocator, fragments.items, stops, &got_stop);
+                    defer allocator.free(got);
+                    errdefer std.debug.print("\nentry: {s}\nwidth: {d}\n", .{ e.name, width });
+                    try testing.expectEqualStrings(want, got);
+                    try testing.expectEqualStrings(want_stop orelse "", got_stop orelse "");
+                }
+            }
+        }
+    }
+}
+
 test "format corpus: tokenizer rules are model-local across Unicode scripts" {
     try @import("tokenizer.zig").checkTokenizerRuleFixtures();
 }

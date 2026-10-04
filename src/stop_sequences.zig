@@ -34,12 +34,33 @@ fn pendingStart(text: []const u8, stops: []const []const u8) usize {
     return text.len;
 }
 
+/// Number of trailing bytes of `s` that start a UTF-8 sequence the string ends before completing
+/// (0 when it ends on a character boundary or in bytes no continuation can repair).
+pub fn utf8TrailingIncomplete(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    var i: usize = s.len;
+    var cont: usize = 0;
+    while (cont < 3 and i > 0) {
+        i -= 1;
+        if (s[i] & 0xC0 != 0x80) break;
+        cont += 1;
+    }
+    if (i >= s.len) return 0;
+    const lead = s[i];
+    const expected: usize = if (lead & 0x80 == 0) 1 else if (lead & 0xE0 == 0xC0) 2 else if (lead & 0xF0 == 0xE0) 3 else if (lead & 0xF8 == 0xF0) 4 else return 0;
+    const actual = s.len - i;
+    return if (actual < expected) actual else 0;
+}
+
 /// Sits between the decoded token text and every delivery path (reasoning, content, tool buffer):
 /// bytes that may still become part of a stop are held back until resolved, so a streamed delta is
-/// never retracted by a stop that completes a token later.
+/// never retracted by a stop that completes a token later. A token may also end inside a
+/// character: those bytes wait in `carry` for the next token, so no delta ends mid-character.
 pub const Gate = struct {
     stops: []const []const u8,
     held: std.ArrayList(u8) = .empty,
+    carry: [3]u8 = undefined,
+    carry_len: u8 = 0,
     /// Set once a stop fired; nothing is pushed after that.
     matched: ?[]const u8 = null,
 
@@ -48,17 +69,26 @@ pub const Gate = struct {
     }
 
     pub fn hasHeld(self: *const Gate) bool {
-        return self.held.items.len > 0;
+        return self.held.items.len > 0 or self.carry_len > 0;
     }
 
-    /// Feed one token's text; the result is the text safe to deliver now (caller frees).
+    /// Feed one token's decoded bytes; the result is the text safe to deliver now (caller frees).
     pub fn push(self: *Gate, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        try self.held.appendSlice(allocator, self.carry[0..self.carry_len]);
+        self.carry_len = 0;
         try self.held.appendSlice(allocator, text);
+        const tail = utf8TrailingIncomplete(self.held.items);
+        @memcpy(self.carry[0..tail], self.held.items[self.held.items.len - tail ..]);
+        self.carry_len = @intCast(tail);
+        self.held.shrinkRetainingCapacity(self.held.items.len - tail);
         return self.release(allocator, false);
     }
 
-    /// The generation ended: resolve what is held (a stop that completed, else the plain tail).
+    /// The generation ended: resolve what is held (a stop that completed, else the plain tail) with
+    /// the unfinished character after it, delivered as the bytes the model produced.
     pub fn finish(self: *Gate, allocator: std.mem.Allocator) ![]u8 {
+        try self.held.appendSlice(allocator, self.carry[0..self.carry_len]);
+        self.carry_len = 0;
         return self.release(allocator, true);
     }
 
@@ -205,4 +235,35 @@ test "a stop inside reasoning cuts the raw stream where it falls" {
 test "a stop that overlaps itself resolves at its first occurrence" {
     try expectParityAtEverySplit("aaab", &.{"aab"});
     try expectParityAtEverySplit("ababab", &.{"abab"});
+}
+
+test "utf8TrailingIncomplete reports only a sequence the string ends before completing" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+    try t.expectEqual(@as(usize, 0), utf8TrailingIncomplete("hello"));
+    try t.expectEqual(@as(usize, 0), utf8TrailingIncomplete("\xF0\x9F\x8E\x89"));
+    try t.expectEqual(@as(usize, 3), utf8TrailingIncomplete("\xF0\x9F\x8E"));
+    try t.expectEqual(@as(usize, 2), utf8TrailingIncomplete("\xF0\x9F"));
+    try t.expectEqual(@as(usize, 1), utf8TrailingIncomplete("\xF0"));
+    try t.expectEqual(@as(usize, 2), utf8TrailingIncomplete("hi\xF0\x9F"));
+}
+
+// Chat, Anthropic, Responses and completions all deliver through this Gate, so one parity run
+// covers the four streaming loops.
+test "a stream that ends inside a character delivers the same bytes as the non-stream text" {
+    const tails = [_][]const u8{ "\xC3", "\xE2\x82", "\xE2", "\xF0\x9F\x8E", "\xF0\x9F", "\xF0" };
+    for (tails) |tail| {
+        for ([_][]const u8{ "alpha", "alphaST", "alphaSTO", "" }) |head| {
+            const text = try std.mem.concat(std.testing.allocator, u8, &.{ head, tail });
+            defer std.testing.allocator.free(text);
+            try expectParityAtEverySplit(text, &.{"STOP"});
+            try expectParityAtEverySplit(text, &.{});
+        }
+    }
+}
+
+test "an incomplete character completed by the next token is delivered whole, around a held stop prefix" {
+    try expectParityAtEverySplit("alphaST\xC3\xA9tail", &.{"STOP"});
+    try expectParityAtEverySplit("alpha\xF0\x9F\x8E\x89STO", &.{"STOP"});
+    try expectParityAtEverySplit("alpha\xF0\x9F\x8E\x89STOP", &.{"STOP"});
 }

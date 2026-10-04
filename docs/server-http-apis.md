@@ -67,6 +67,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   listed): `stop_sequences.earliest` on every non-stream surface, `stop_sequences.Gate` on every stream, ahead of the
   reasoning/content/tool paths. The gate HOLDS back a tail that could still complete a stop (or an earlier match) and
   flushes it at the end; the `format corpus` stop test pins stream == non-stream for any token split and stop order.
+  The gate also owns the UTF-8 carry (a token ending mid-character), and the end of the generation releases carry and
+  held tail together, so a stream cut off inside a character ends with the same bytes the escaper sanitizes in a
+  non-stream answer.
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
