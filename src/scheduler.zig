@@ -551,6 +551,8 @@ pub const Slot = struct {
     /// echo is not published twice (`takeHandoverEcho`).
     handover_token: ?u32 = null,
     cancelled: std.atomic.Value(bool),
+    /// Inference thread only: the request's outcome has been counted in `Metrics`.
+    metrics_recorded: bool = false,
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
     /// the pass reads (`think_bound`, `constraint`) and frees it once `complete` returns.
@@ -5379,6 +5381,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
             }
+            recordSlotCleanup(sch.metrics, s);
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
@@ -6446,6 +6449,51 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
     )});
 }
 
+/// Outcome of a slot that reached `finishSlot`. A latched MLX failure turns the finish into an error.
+fn finishOutcome(reason: []const u8, latched: ?[]const u8) metrics_mod.Outcome {
+    if (latched != null) return .failed;
+    if (std.mem.eql(u8, reason, "cancelled")) return .cancelled;
+    return .success;
+}
+
+/// Outcome of a slot the cleanup drain sees without `finishSlot` having recorded it, read only from
+/// state the inference thread set. `cancelled` is never consulted: `Scheduler.complete` sets it on
+/// every completion, normal ones included.
+fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
+    if (slot.error_code != null) return .failed;
+    if (slot.finished) return finishOutcome(slot.finish_reason, null);
+    return .cancelled;
+}
+
+/// Count a slot's outcome once; the first path to reach the slot wins.
+fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) void {
+    const m = metrics orelse return;
+    if (slot.metrics_recorded) return;
+    slot.metrics_recorded = true;
+    m.recordRequest(
+        outcome,
+        slot.first_token_ns,
+        slot.prefill_ns,
+        slot.decode_ns,
+        slot.prompt_tokens,
+        slot.completion_tokens,
+        slot.cached_tokens,
+    );
+}
+
+/// The cleanup drain's count: a slot refused before its first forward is a rejection; anything
+/// `finishSlot` already counted is skipped.
+fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
+    const m = metrics orelse return;
+    if (slot.metrics_recorded) return;
+    if (slot.error_code) |name| if (std.mem.eql(u8, name, "PrefillDoesNotFit")) {
+        slot.metrics_recorded = true;
+        m.recordRejected();
+        return;
+    };
+    recordSlotEnd(m, slot, cleanupOutcome(slot));
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -6477,23 +6525,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         if (slot.model.prefix_cache) |*p| p else null;
     const stream_opt: ?mlx.mlx_stream =
         if (slot.model.transformer) |x| x.s else null;
-    // Record per-request metrics while slot fields are still live (before
-    // markFinished broadcasts — the conn thread may complete()+free the slot
-    // immediately after). Off the per-token path; a null sink (metrics off) is
-    // a single per-request branch. real_ttft = first_token_ns (queue+prefill,
-    // captured exactly at prefill completion); recordRequest derives
-    // e2e = first_token_ns + decode_ns.
-    if (sch.metrics) |m| {
-        m.recordRequest(
-            if (latched != null) "error" else reason,
-            slot.first_token_ns,
-            slot.prefill_ns,
-            slot.decode_ns,
-            slot.prompt_tokens,
-            slot.completion_tokens,
-            slot.cached_tokens,
-        );
-    }
+    // Record per-request metrics while slot fields are still live (before markFinished broadcasts:
+    // the conn thread may complete()+free the slot immediately after). real_ttft = first_token_ns
+    // (queue+prefill, captured at prefill completion); recordRequest derives e2e = first_token_ns + decode_ns.
+    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -8258,7 +8293,7 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // buffers; after deinit they are freed).
     const source = @embedFile("scheduler.zig");
     const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
-    const region = source[drain_start..@min(drain_start + 1600, source.len)];
+    const region = source[drain_start..@min(drain_start + 1800, source.len)];
     const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
     const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
     try testing.expect(commit_pos < deinit_pos);
@@ -10468,6 +10503,156 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     a.finished = true;
     b.finished = true;
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
+}
+
+const OutcomeStub = struct {
+    finished: bool = false,
+    error_code: ?[]const u8 = null,
+    finish_reason: []const u8 = "",
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    metrics_recorded: bool = false,
+    first_token_ns: u64 = 5_000_000,
+    prefill_ns: u64 = 4_000_000,
+    decode_ns: u64 = 20_000_000,
+    prompt_tokens: u32 = 100,
+    completion_tokens: u32 = 10,
+    cached_tokens: u32 = 0,
+
+    /// `finishSlot` on the inference thread: records, then publishes the terminator.
+    fn finish(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
+        recordSlotEnd(m, self, finishOutcome(reason, null));
+        self.finished = true;
+        self.finish_reason = reason;
+    }
+    /// `Slot.markError` mid-decode: no finishSlot follows.
+    fn fail(self: *OutcomeStub, name: []const u8) void {
+        if (self.error_code != null or self.finished) return;
+        self.error_code = name;
+    }
+    /// The connection thread's `Scheduler.complete`: sets `cancelled` on EVERY completion.
+    fn complete(self: *OutcomeStub) void {
+        self.cancelled.store(true, .release);
+    }
+};
+
+fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u64, failed: u64, rejected: u64) !void {
+    try testing.expectEqual(success, m.requests_success_total.load());
+    try testing.expectEqual(cancelled, m.requests_cancelled_total.load());
+    try testing.expectEqual(failed, m.requests_failed_total.load());
+    try testing.expectEqual(rejected, m.requests_rejected_total.load());
+}
+
+test "outcome: a disconnect while the request waits in pending counts cancelled once" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+}
+
+test "outcome: a disconnect during prefill is counted once, not again by the drain" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.complete();
+    s.finish(&m, "cancelled");
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+}
+
+test "outcome: a disconnect during decode never reaches finishSlot and the drain counts it" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.completion_tokens = 7;
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "outcome: a normal completion is success once even though complete() sets cancelled, with its totals" {
+    var m = metrics_mod.Metrics.init();
+    for ([_][]const u8{ "stop", "length" }) |reason| {
+        var s = OutcomeStub{};
+        s.finish(&m, reason);
+        s.complete();
+        recordSlotCleanup(&m, &s);
+    }
+    try expectOutcomes(&m, 2, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 20), m.generation_tokens_total.load());
+    try testing.expectEqual(@as(u64, 200), m.prompt_tokens_total.load());
+    try testing.expectEqual(@as(u64, 2), m.e2e_latency_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 50_000_000), m.e2e_latency_ns.sum.load(.monotonic));
+}
+
+test "outcome: a mid-decode generation error counts failed and leaves the histograms alone" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("MlxFailure");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.e2e_latency_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "outcome: a finish over a latched MLX failure counts failed, not success" {
+    try testing.expectEqual(metrics_mod.Outcome.failed, finishOutcome("stop", "OutOfMemory"));
+    try testing.expectEqual(metrics_mod.Outcome.success, finishOutcome("stop", null));
+    try testing.expectEqual(metrics_mod.Outcome.cancelled, finishOutcome("cancelled", null));
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    recordSlotEnd(&m, &s, finishOutcome("stop", "OutOfMemory"));
+    s.fail("OutOfMemory");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+}
+
+test "outcome: an error followed by a client disconnect is one failure, never two outcomes" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("MlxFailure");
+    recordSlotCleanup(&m, &s);
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+}
+
+test "outcome: a slot refused by admission before its first forward is a rejection, not a failure" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("PrefillDoesNotFit");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 0, 1);
+}
+
+test "outcome: metrics off does no work and leaves the slot untouched" {
+    var s = OutcomeStub{};
+    s.complete();
+    recordSlotCleanup(null, &s);
+    s.finish(null, "stop");
+    try testing.expect(!s.metrics_recorded);
+}
+
+test "outcome: a real Slot's fields satisfy the recorder, and a cancelled GLM slot counts once" {
+    var m = metrics_mod.Metrics.init();
+    var slot: Slot = undefined;
+    slot.metrics_recorded = false;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.first_token_ns = 1;
+    slot.prefill_ns = 1;
+    slot.decode_ns = 1;
+    slot.prompt_tokens = 4;
+    slot.completion_tokens = 2;
+    slot.cached_tokens = 0;
+    slot.finish_reason = "";
+    recordSlotCleanup(&m, &slot);
+    recordSlotCleanup(&m, &slot);
+    try expectOutcomes(&m, 0, 1, 0, 0);
 }
 
 test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {

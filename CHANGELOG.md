@@ -8,6 +8,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **GLM-5.3-Flash prompts tokenize exactly like Hugging Face**: the plain Llama-3 pre-tokenizer no longer takes Muse's
   case-splitting grammar (`iPhone`, `McDonald`, `//!`, `½`), and the BPE `ignore_merges` flag is honoured.
+- **`/metrics` and `/metrics.json` count every request outcome exactly once**: a client that disconnects mid-decode shows in
+  `request_cancelled_total`, generation errors in the new `sushi:request_failed_total`, and requests refused before they
+  start in `sushi:request_rejected_total`.
 - **A finished request no longer stalls decoding to probe disk free space for prefixes the SSD cache already holds.**
 - **Qwen attention reads exact values from a K/V view whose base is not 16-byte aligned**: the fused prefill and QSA
   gather kernels decline such a view and the stock attention serves it.
