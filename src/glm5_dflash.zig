@@ -478,6 +478,98 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     }
 }
 
+test "GLM DFlash bounds proposal depth by budget and remaining context before verify" {
+    const allocator = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = @import("model.zig").Weights.init(allocator);
+    defer weights.deinit();
+    const cfg = try forward.completeFixture(&weights);
+    var iter = weights.map.iterator();
+    var seed: usize = 5;
+    while (iter.next()) |entry| {
+        const value = entry.value_ptr;
+        const shape = mlx.getShape(value.*);
+        if (shape.len < 2 or mlx.mlx_array_dtype(value.*) != .bfloat16 or std.mem.endsWith(u8, entry.key_ptr.*, ".scales") or std.mem.endsWith(u8, entry.key_ptr.*, ".biases")) continue;
+        const replacement = try draft.TinyFix.bf16ArrShaped(shape, seed, s);
+        _ = mlx.mlx_array_free(value.*);
+        value.* = replacement;
+        seed += 1;
+    }
+    var target = try forward.Model.load(allocator, cfg, &weights, s);
+    defer target.deinit();
+    try std.testing.expectEqual(@as(u32, 16), target.cfg.max_position_embeddings);
+    var request = try forward.Request.init(allocator, 4);
+    defer request.deinit();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    var taps = [_]u32{ 0, 3 };
+    const norm = try ops.ones(&.{128}, .bfloat16);
+    const lin = try fixtureLinear(&ops, 128, 128);
+    const conv = draft.DynConv{ .base_kernel = try ops.ones(&.{ 2, 2, 128 }, .bfloat16), .kernel_projection = try fixtureLinear(&ops, 128, 32) };
+    var layers = [_]draft.DflashLayer{.{ .layer_type = .sliding_attention, .input_norm = norm, .post_attn_norm = norm, .q = lin, .q_norm = norm, .k = lin, .k_norm = norm, .v = lin, .o = lin, .gate = lin, .up = lin, .down = lin, .attention_conv = conv, .mlp_conv = conv }};
+    var types = [_]draft.LayerType{.sliding_attention};
+    var assistant = draft.DflashModel{
+        .allocator = allocator,
+        .s = s,
+        .config = .{ .hidden_size = 128, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .head_dim = 128, .intermediate_size = 128, .rms_norm_eps = 1e-5, .rope_theta = 10000, .sliding_window = 8, .layer_types = &types, .block_size = 4, .mask_token_id = 3, .target_layer_ids = &taps, .selector_rank = 2, .selector_top_k = 2, .conv_kernel_size = 2, .conv_group_size = 16 },
+        .fc = try fixtureLinear(&ops, 256, 128),
+        .enc_norm = norm,
+        .final_norm = norm,
+        .layers = &layers,
+        .selector = .{ .pred_codebook = try ops.ones(&.{ 4, 2 }, .bfloat16), .succ_codebook = try ops.ones(&.{ 4, 2 }, .bfloat16), .hidden_projection = try fixtureLinear(&ops, 128, 2) },
+    };
+    var context = try draft.DflashCtx.init(allocator, &assistant, 0);
+    defer context.deinit();
+    var prefix: [14]u32 = undefined;
+    for (&prefix, 0..) |*t, i| t.* = @intCast(i % 4);
+    const prefix_ids = try ops.own(mlx.mlx_array_new_data(&prefix, &[_]c_int{ 1, 14 }, 2, .uint32));
+    const pending = try prefill(&assistant, &context, &target, &request, prefix_ids);
+    try std.testing.expectEqual(@as(usize, 14), request.offset);
+    try std.testing.expectEqual(request.offset, context.absLen());
+
+    for ([_]usize{ 1, 4 }) |children| {
+        for ([_]usize{ 1, 2, 3 }) |budget| {
+            var req = try cloneRequest(&request);
+            defer req.deinit();
+            var ctx = try cloneContext(&assistant, &context);
+            defer ctx.deinit();
+            const limit = @min(budget, 2);
+            const proposal = try proposeRound(&assistant, &ctx, &target, &req, pending, 2, budget, &.{}, children);
+            var rows: [16]usize = undefined;
+            for (proposal.parents[0..proposal.count], 0..) |parent, i| {
+                rows[i] = if (parent < 0) 1 else rows[@intCast(parent)] + 1;
+                try std.testing.expect(rows[i] <= limit);
+            }
+            const result = try roundTreeLayerwiseWithDecisions(std.Io.Threaded.global_single_threaded.io(), &assistant, &ctx, &target, &req, pending, 2, budget, &.{}, .serial_rows, children, null);
+            try std.testing.expectEqual(result.count, req.offset - 14);
+            try std.testing.expect(result.count >= 1 and result.count <= limit);
+            try std.testing.expectEqual(req.offset, ctx.absLen());
+
+            var serial = try cloneRequest(&request);
+            defer serial.deinit();
+            for (result.tokens[0..result.count]) |token| {
+                const input = mlx.mlx_array_new_data(&token, &[_]c_int{ 1, 1 }, 2, .uint32);
+                defer _ = mlx.mlx_array_free(input);
+                const logits = try target.forwardLast(&serial, input, true);
+                defer _ = mlx.mlx_array_free(logits);
+                try mlx.check(mlx.mlx_array_eval(logits));
+            }
+            try sameRequest(&serial, &req, s);
+        }
+    }
+}
+
+test "trimToDepth keeps the rows within the depth and re-indexes their parents" {
+    var proposal = Proposal{ .count = 5 };
+    proposal.tokens[0..5].* = .{ 10, 11, 12, 13, 14 };
+    proposal.parents[0..5].* = .{ -1, 0, 1, 0, 3 };
+    trimToDepth(&proposal, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 11, 13 }, proposal.tokens[0..proposal.count]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 0 }, proposal.parents[0..proposal.count]);
+    trimToDepth(&proposal, 1);
+    try std.testing.expectEqual(@as(usize, 1), proposal.count);
+}
+
 /// Stored assistant matrices are used directly: no load-time requantization.
 pub fn loadAssistantStored(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, target: *const forward.Model) !draft.DflashModel {
     var dir = try std.Io.Dir.openDirAbsolute(io, directory, .{});
@@ -629,20 +721,40 @@ pub fn roundTreeLayerwiseWithDecisions(io: std.Io, assistant: *draft.DflashModel
     return result;
 }
 
-/// A round's draft: the assistant's tree, or the pending token alone at the last budgeted
-/// token or an EOS.
+/// A round's draft: the assistant's tree cut to the tokens the budget and the target's remaining
+/// positions can still take, or the pending token alone at the last one or an EOS.
 pub fn proposeRound(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, request: *const forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, children: usize) !Proposal {
     if (children == 0 or children > 16) return error.InvalidGlmDraftTree;
     try validatePair(assistant, target);
     if (budget == 0) return error.InvalidGlmDraftBudget;
     if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
-    if (max_nodes == 0 or budget == 1 or std.mem.indexOfScalar(u32, eos, pending) != null) {
+    const depth = @min(budget, target.cfg.max_position_embeddings -| request.offset);
+    if (max_nodes == 0 or depth <= 1 or std.mem.indexOfScalar(u32, eos, pending) != null) {
         var one = Proposal{ .count = 1 };
         one.tokens[0] = pending;
         one.parents[0] = -1;
         return one;
     }
-    return proposeTreeWithChildren(assistant, context, target, pending, max_nodes, children);
+    var proposal = try proposeTreeWithChildren(assistant, context, target, pending, max_nodes, children);
+    trimToDepth(&proposal, depth);
+    return proposal;
+}
+
+/// Drops the nodes whose chain from the root is longer than `depth` rows; parents precede children.
+fn trimToDepth(proposal: *Proposal, depth: usize) void {
+    var rows: [16]usize = undefined;
+    var moved: [16]i32 = undefined;
+    var kept: usize = 0;
+    for (0..proposal.count) |i| {
+        const parent = proposal.parents[i];
+        rows[i] = if (parent < 0) 1 else rows[@intCast(parent)] + 1;
+        if (rows[i] > depth) continue;
+        moved[i] = @intCast(kept);
+        proposal.tokens[kept] = proposal.tokens[i];
+        proposal.parents[kept] = if (parent < 0) -1 else moved[@intCast(parent)];
+        kept += 1;
+    }
+    proposal.count = kept;
 }
 
 /// Commits a verified round (decisions already applied): target state and assistant context

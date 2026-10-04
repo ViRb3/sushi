@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3 DFlash2 no longer fails a request that ends within a few positions of the context limit**, and a request
+  cancelled just after its prefill releases its GLM state at once.
 - **`/v1/completions` honours a per-request `kv_quant`** instead of always running at the process default, and a hybrid
   model's prefix checkpoint keeps the sign of negative zero.
 - **Source builds use the Zig 0.17.0 release** instead of a 0.17 nightly; `scripts/fetch-zig.sh` checks its sha256.

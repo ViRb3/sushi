@@ -101,6 +101,8 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
   request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included). Both
   verify through the same batched rows, whose logits equal per-row serial projections bit for bit.
   Constrained, forced-tool-call, penalized, logprobs or explicitly budgeted-thinking requests decode serially.
+- **A round's tree is cut to `min(output budget, positions left)` rows deep** (`proposeRound`): the verifier refuses an
+  ancestry past the context, so a two-token tail never carries a three-row chain.
 - **Bills**: assistant weights at load; per request the sliding window ×4, captures per prefill row, three recurrent
   checkpoints, the 256 MiB verification-scratch cap and 64 MiB. The MLA reservation is input + max_tokens + 3 rows:
   a request without max_tokens reserves its whole context window (946K rows: 11.3 GB BF16, 6.3 GB kv8).

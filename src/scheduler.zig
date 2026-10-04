@@ -5380,7 +5380,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     };
                     break :prefill;
                 }
-                if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
+                if (postPrefillTerminal(slot)) continue;
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
                     slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
@@ -5436,6 +5436,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         cullDecoding(sch);
     }
     flushImatrixCaptures(sch);
+}
+
+fn postPrefillTerminal(slot: *Slot) bool {
+    if (slot.state == .errored) return true;
+    if (!slot.cancelled.load(.acquire)) return false;
+    releaseNativeState(slot);
+    return true;
 }
 
 /// The slot still belongs to its connection thread until that thread calls `complete`; the
@@ -11746,6 +11753,35 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     try testing.expectEqual(@as(usize, 0), slots[0].glm5_request.?.offset);
     try testing.expectEqual(@as(usize, 0), slots[1].glm5_request.?.offset);
     try testing.expectEqual(@as(usize, 4), slots[2].glm5_request.?.offset);
+}
+
+test "postPrefillTerminal releases native GLM state for a cancelled slot but not a live one" {
+    var cancelled_slot: Slot = undefined;
+    cancelled_slot.state = .decoding;
+    cancelled_slot.cancelled = .init(true);
+    cancelled_slot.glm5_request = try glm5_forward_mod.Request.init(testing.allocator, 2);
+    cancelled_slot.glm5_request.?.offset = 4;
+    defer cancelled_slot.glm5_request.?.deinit();
+
+    var live_slot: Slot = undefined;
+    live_slot.state = .decoding;
+    live_slot.cancelled = .init(false);
+    live_slot.glm5_request = try glm5_forward_mod.Request.init(testing.allocator, 2);
+    live_slot.glm5_request.?.offset = 4;
+    defer live_slot.glm5_request.?.deinit();
+
+    var errored_slot: Slot = undefined;
+    errored_slot.state = .errored;
+    errored_slot.cancelled = .init(false);
+    errored_slot.glm5_request = null;
+
+    try testing.expect(postPrefillTerminal(&cancelled_slot));
+    try testing.expectEqual(@as(usize, 0), cancelled_slot.glm5_request.?.offset);
+
+    try testing.expect(!postPrefillTerminal(&live_slot));
+    try testing.expectEqual(@as(usize, 4), live_slot.glm5_request.?.offset);
+
+    try testing.expect(postPrefillTerminal(&errored_slot));
 }
 
 test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" {

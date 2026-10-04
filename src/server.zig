@@ -26484,7 +26484,7 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
     const ctx: u64 = getEffectiveContextLength(&cfg);
     const mla_layers: usize = cfg.num_hidden_layers / cfg.full_attention_interval;
     const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
-    const shapes = [_][2]u64{ .{ 18, 32 }, .{ 100, 920 }, .{ 1000, 24 }, .{ 1022, 2 }, .{ 2008, 2400 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 2008, std.math.maxInt(u32) }, .{ 500000, std.math.maxInt(u32) } };
+    const shapes = [_][2]u64{ .{ 16, std.math.maxInt(u32) }, .{ 18, 32 }, .{ 100, 920 }, .{ 1000, 24 }, .{ 1022, 2 }, .{ 2008, 2400 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 2008, std.math.maxInt(u32) }, .{ 500000, std.math.maxInt(u32) } };
     for ([_]u64{ 16, 8 }) |kv_bits| {
         const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
         for (shapes) |shape| {
