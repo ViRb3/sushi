@@ -181,6 +181,7 @@ fn readConfigFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// sidecar goes with which checkpoint, and a mismatched pair is unbuildable.
 pub const IN_DIR_SUBDIR = "drafter";
 pub const DFLASH2_IN_DIR_SUBDIR = "dflash2";
+pub const SHIPPED_GLM_SUBDIR = "GLM-5.3-Flash-DFlash2";
 
 /// Prefer `<model_dir>/dflash2`, then the legacy `<model_dir>/drafter`,
 /// when the folder declares the DFlash contract; otherwise return null.
@@ -189,9 +190,9 @@ pub const DFLASH2_IN_DIR_SUBDIR = "dflash2";
 /// sidecar can still be pointed at a merged checkpoint.
 pub fn resolveInDirDrafter(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
-    for ([_][]const u8{ DFLASH2_IN_DIR_SUBDIR, IN_DIR_SUBDIR }) |subdir| {
+    for ([_][]const u8{ DFLASH2_IN_DIR_SUBDIR, IN_DIR_SUBDIR, SHIPPED_GLM_SUBDIR }) |subdir| {
         const path = std.fs.path.join(allocator, &.{ model_dir, subdir }) catch return null;
-        if (probeIsDflash(io, allocator, path)) return path;
+        if (probeIsDflash(io, allocator, path) and (!std.mem.eql(u8, subdir, DFLASH2_IN_DIR_SUBDIR) or @import("glm5_dflash_cache.zig").cacheValid(io, allocator, model_dir, path))) return path;
         allocator.free(path);
     }
     return null;
@@ -977,7 +978,7 @@ fn loadLinear(
 
 /// Affine-quantize a dense `[out, in]` weight in place of a transpose — the
 /// packed layout is exactly what `mlx_quantized_matmul(transpose=true)` reads.
-fn quantizeDense(raw: mlx.mlx_array, bits: u32, group: u32, s: mlx.mlx_stream) !DflashLinear {
+pub fn quantizeDense(raw: mlx.mlx_array, bits: u32, group: u32, s: mlx.mlx_stream) !DflashLinear {
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
     try mlx.check(mlx.mlx_quantize(

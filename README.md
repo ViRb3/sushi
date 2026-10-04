@@ -49,7 +49,12 @@ they do not impose a thinking-token cap. Omitted effort uses Sushi's high defaul
 GLM serving currently runs one request at a time, with MTP and RAM/disk prefix reuse off.
 A valid `dflash2/` folder inside a GLM pack loads automatically (legacy `drafter/`
 is also recognized). `--drafter /path/to/GLM-5.3-Flash-DFlash2` overrides that folder;
-`--no-drafter` disables it. Native DFlash2 supports greedy and sampled requests;
+`--no-drafter` disables it. If only the shipped `GLM-5.3-Flash-DFlash2/` BF16
+assistant exists, `serve` and `run` prepare a local A6/group-128 copy in `dflash2/`
+on first load and print a preparation/wait message. The original stays unchanged.
+Later loads reuse the cache; no disk space or write permission falls back to the
+original BF16 assistant with its full memory bill. Generated caches are local-only.
+Native DFlash2 supports greedy and sampled requests;
 constrained, penalized or explicitly bounded thinking requests decode serially. Original BF16 and stored
 A4/A6/A8 assistants keep their precision. The assistant weights join the load bill;
 its BF16 sliding window, target reservation, captures and verification scratch join

@@ -3517,7 +3517,7 @@ fn loadRequirementForConfig(config: *const ModelConfig, weights: u64, ctx_bytes:
         config.qsaRingBytes() +| (config.kvBytesPerToken() +| config.qsaHistoryBytesPerToken()) *| 1024;
 }
 
-fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, directory: []const u8) !u64 {
+fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, directory: []const u8) !u64 {
     if (directory.len == 0) return 0;
     if (std.c.getenv("SUSHI_DFLASH")) |v| if (v[0] == '0') return 0;
     if (!dflash_mod.probeIsDflash(io, allocator, directory)) return error.GlmDflashAssistantRequired;
@@ -3531,14 +3531,19 @@ fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelCo
     config.glm_dflash_window_bytes = per_token * ((@as(u64, cfg.sliding_window) + cfg.block_size + 255) / 256 * 256);
     config.glm_dflash_capture_bytes_per_token = (@as(u64, cfg.target_layer_ids.len) * cfg.hidden_size + @as(u64, cfg.hidden_size) * 2) * 2 + per_token;
     const mini = if (transformer_mod.diagEnvOn("SUSHI_GLM_DFLASH_MINI_HEAD")) @import("glm5_dflash_mini.zig").residentBytes(@intCast(config.vocab_size), @intCast(config.hidden_size)) else 0;
-    return (try @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory)) +| mini;
+    const runtime_cache = @import("glm5_dflash_cache.zig");
+    const weights = if (runtime_cache.isShippedSource(directory, model_dir))
+        try runtime_cache.plannedResidentBytes(io, allocator, directory)
+    else
+        try @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
+    return weights +| mini;
 }
 
 fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, load_vision: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
     const drafter = LoadDrafterDir.resolve(io, allocator, no_drafter, drafter_dir, model_dir);
     defer drafter.deinit(allocator);
     const weights = try @import("glm5_diagnostic.zig").residentBytesWithVision(io, allocator, model_dir, config.num_hidden_layers, load_vision and config.glm5_vision);
-    return loadRequirementForConfig(config, weights +| try glmDflashLoadBytes(io, allocator, config, drafter.dir), null);
+    return loadRequirementForConfig(config, weights +| try glmDflashLoadBytes(io, allocator, config, model_dir, drafter.dir), null);
 }
 
 test "Sushi quant memory production pack CPU header audit" {
@@ -3769,12 +3774,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Resolve the sidecar before preflight so billing and loading see the same dependency.
     const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter, params.drafter_dir, params.model_dir);
     defer drafter.deinit(sch.allocator);
-    const drafter_dir = drafter.dir;
+    var drafter_dir = drafter.dir;
+    var prepared_drafter_path: ?[]u8 = null;
+    defer if (prepared_drafter_path) |path| sch.allocator.free(path);
     if (drafter.owned != null) log.info("[dflash] auto-detected assistant: {s}\n", .{drafter_dir});
     if (model_mod.usesSushiQuantMemoryBill(params.config) and drafter_dir.len > 0)
         streaming_resident_bytes = streaming_resident_bytes.? +| try sushiAssistantLoadBytes(sch.io, sch.allocator, drafter_dir);
     if (params.config.isGlm5()) {
-        const assistant_bytes = try glmDflashLoadBytes(sch.io, sch.allocator, params.config, drafter_dir);
+        const assistant_bytes = try glmDflashLoadBytes(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir);
         streaming_resident_bytes = streaming_resident_bytes.? +| assistant_bytes;
         if (assistant_bytes > 0) log.info("[glm-dflash] resident assistant {d:.3} GiB; window {d} MiB; BF16 context; verification scratch billed per request\n", .{ @as(f64, @floatFromInt(assistant_bytes)) / (1024 * 1024 * 1024), params.config.glm_dflash_window_bytes >> 20 });
     }
@@ -3827,6 +3834,24 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
+    if (params.config.isGlm5() and @import("glm5_dflash_cache.zig").isShippedSource(drafter_dir, params.model_dir)) {
+        const prepared = try @import("glm5_dflash_cache.zig").prepare(sch.io, sch.allocator, drafter_dir, mlx.gpuStream());
+        prepared_drafter_path = prepared.path;
+        if (prepared.fallback) {
+            const cached_bytes = try @import("glm5_dflash_cache.zig").plannedResidentBytes(sch.io, sch.allocator, drafter_dir);
+            const bf16_bytes = try @import("glm5_diagnostic.zig").assistantResidentBytes(sch.io, sch.allocator, prepared.path);
+            streaming_resident_bytes = streaming_resident_bytes.? -| cached_bytes +| bf16_bytes;
+            if (!skip_mem_preflight) {
+                const available = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+                const needed = loadRequirementForConfig(params.config, streaming_resident_bytes.?, null);
+                log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {d:.2} GiB\n", .{ @as(f64, @floatFromInt(streaming_resident_bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), @as(f64, @floatFromInt(available)) / (1 << 30) });
+                if (available > 0 and needed > available) return error.InsufficientMemory;
+            }
+        }
+        drafter_dir = prepared.path;
+        _ = mlx.mlx_clear_cache();
+    }
+
     // Allocate the drafter_path dupe up front so the post-publish step
     // (lower down) has no fallible operations — once we start assigning
     // pointers onto `params.entry`, an OOM during a dupe would leave the
@@ -3834,7 +3859,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var drafter_path_owned: []u8 = &[_]u8{};
     errdefer if (drafter_path_owned.len > 0) sch.allocator.free(drafter_path_owned);
     if (params.drafter_dir.len > 0) {
-        drafter_path_owned = try sch.allocator.dupe(u8, params.drafter_dir);
+        drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
     }
 
     // Weights — first mlx call. Binds the stream on this thread.

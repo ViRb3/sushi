@@ -33,6 +33,27 @@ unchanged weight/scale/bias handles, mixed-format rejection and mismatched or
 inconsistent grids. The focused ReleaseFast filter passed eight tests. Evidence
 key: `glm53-a4g64-consumer-storage-20261003`.
 
+## First-load local runtime cache
+
+`serve` and `run` can find an unchanged BF16 assistant under
+`GLM-5.3-Flash-DFlash2/`. With no existing assistant override, Sushi uses its own
+MLX affine quantizer to prepare A6/group128 matrices under `dflash2/`. Selector
+codebooks, the selector hidden projection and non-matrix tensors stay BF16.
+The generated directory keeps attribution and a local-only manifest. The original
+checkpoint is opened read-only and its files are never rewritten.
+
+Preparation prints `Preparing GLM 5.3 Flash DFlash2 for Sushi ... please wait for a few minutes.`,
+then names the quantization and reports completion time. A per-pack process lock
+serializes builders. Complete files are synced and staged before publication;
+source/config identity and output size/mtime invalidate a stale generated cache.
+User-supplied assistants are preserved, and `--no-drafter` skips preparation.
+
+Preflight estimates the generated payload before target allocation. A storage
+failure selects the original BF16 assistant and repeats preflight with its actual
+resident bytes. No-space and read-only fallbacks do not quantize in memory.
+The CC BY-NC-ND 4.0 license remains applicable; the runtime cache is not a
+redistribution artifact.
+
 ## Matched drafter comparison
 
 One loaded target and both assistants were resident in a single process. Two
@@ -133,3 +154,14 @@ The result records all arm/phase/preparation/cleanup timings, engagement,
 equal-resident measured peaks and the unchanged 14,264,893,440-byte conservative
 bill under 115,448,725,504-byte limits. Evidence key:
 `glm53-a4-current-native-8k-20261003`.
+
+
+Runtime preparation verification, 2026-10-04: the original 2.18 GiB assistant
+produced exactly 1,013,090,816 bytes (0.944 GiB) of stored tensor payload. A
+standalone preparation process took 1.08 seconds; first-load `serve` reported
+0.43 seconds for preparation on the warm SSD, then completed ordinary target
+loading. The generated assistant loaded as A6/group128 and drafted a correct
+64-token code reply. Tiny fixtures cover cache reuse, invalidation, source
+byte preservation, read-only storage and insufficient-space BF16 fallback.
+These times describe local preparation on the M5 Max, not total server startup.
+Evidence key: `glm53-dflash-runtime-cache-20261004`.
