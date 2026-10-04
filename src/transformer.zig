@@ -2956,6 +2956,15 @@ fn logAttnPdEngaged(arm: AttnPdArm, qk_dim: c_int, v_dim: c_int, q_len: c_int, k
     log.info("[attn-pd] engaged: {s} qk={d} v={d} qL={d} kL={d} dispatches={d} (SUSHI_FUSED_256=0 restores composed)\n", .{ attnPdKernelName(arm), qk_dim, v_dim, q_len, kv_len, dispatches });
 }
 
+/// True when a bf16 view's bound address is 16-byte aligned, which every `uint4` K/V staging load needs. A lazy
+/// array has no address yet and passes: the stride gates are all that can be checked for it.
+fn attn256Base16Aligned(a: mlx.mlx_array) bool {
+    var avail = false;
+    if (mlx._mlx_array_is_available(&avail, a) != 0 or !avail) return true;
+    const p = mlx.mlx_array_data_uint32(a) orelse return true;
+    return @intFromPtr(p) % 16 == 0;
+}
+
 var qsa_fused_env_cached: ?bool = null;
 pub var qsa_fused_override: ?bool = null;
 
@@ -3839,7 +3848,7 @@ fn gatherQsa256Impl(
         }
         if (mlx.mlx_array_dtype(k) != .uint32 or mlx.mlx_array_dtype(v) != .uint32) return null;
         if (mlx.mlx_array_strides(k)[3] != 1 or mlx.mlx_array_strides(v)[3] != 1) return null;
-    } else if (mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
+    } else if (mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16 or !attn256Base16Aligned(k) or !attn256Base16Aligned(v)) return null;
     if (qs[3] != 256 or ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
     if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
     const gqa: c_int = @divTrunc(qs[1], ks[1]);
@@ -7346,6 +7355,7 @@ fn fusedSdpaPrefillImpl(
     if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
+    if (packed_kv == null and (!attn256Base16Aligned(k) or !attn256Base16Aligned(v))) return null;
 
     const arm: AttnPdArm = if (attnPdNaxServes(qs[3], vs[3], mask != null)) .nax else .simd;
     var dispatches: u32 = 0;
@@ -59232,6 +59242,132 @@ test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ra
     try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, bad)) == null);
     qsa_fused_override = false;
     try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
+}
+
+/// A materialized `[B,H,T,264]` padded cache sliced on the last axis to `[lo, lo+256)`: a 256-wide view whose
+/// row stride passes the 16-byte stride gates while its base sits `lo*2` bytes into the buffer.
+fn attn256SliceLastDim(parent: mlx.mlx_array, lo: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const ps = mlx.getShape(parent);
+    const one = [_]c_int{ 1, 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const stop = [_]c_int{ ps[0], ps[1], ps[2], lo + 256 };
+    try mlx.check(mlx.mlx_slice(&out, parent, &[_]c_int{ 0, 0, 0, lo }, 4, &stop, 4, &one, 4, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+fn attn256Contiguous(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_contiguous(&out, a, false, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+test "fusedSdpa256Masked: an unaligned last-axis slice declines and the fallback reads exactly; aligned is bit-identical to a contiguous copy" {
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    qsa_fused_override = true;
+    defer qsa_fused_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5E7_5E7);
+    const rnd = prng.random();
+
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 6, 70, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 193, 264 }, s);
+    defer _ = mlx.mlx_array_free(k_pad);
+    const v_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 193, 264 }, s);
+    defer _ = mlx.mlx_array_free(v_pad);
+    try mlx.check(mlx.mlx_array_eval(k_pad));
+    try mlx.check(mlx.mlx_array_eval(v_pad));
+    const mask = try attn256QsaMask(rnd, 70, 193);
+    defer _ = mlx.mlx_array_free(mask);
+    const scale: f32 = 1.0 / 16.0;
+
+    const k = try attn256SliceLastDim(k_pad, 3, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256SliceLastDim(v_pad, 3, s);
+    defer _ = mlx.mlx_array_free(v);
+    try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
+    const ref = try attn256Reference(q, k, v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const kc = try attn256Contiguous(k, s);
+    defer _ = mlx.mlx_array_free(kc);
+    const vc = try attn256Contiguous(v, s);
+    defer _ = mlx.mlx_array_free(vc);
+    const on_copy = (try fusedSdpa256Masked(s, q, kc, vc, scale, mask)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(on_copy);
+    try std.testing.expect(try attn256MaxDiff(on_copy, ref, s) < 0.005);
+
+    const k_al = try attn256SliceLastDim(k_pad, 0, s);
+    defer _ = mlx.mlx_array_free(k_al);
+    const v_al = try attn256SliceLastDim(v_pad, 0, s);
+    defer _ = mlx.mlx_array_free(v_al);
+    const fast = (try fusedSdpa256Masked(s, q, k_al, v_al, scale, mask)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fast);
+    const kac = try attn256Contiguous(k_al, s);
+    defer _ = mlx.mlx_array_free(kac);
+    const vac = try attn256Contiguous(v_al, s);
+    defer _ = mlx.mlx_array_free(vac);
+    const twin = (try fusedSdpa256Masked(s, q, kac, vac, scale, mask)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(twin);
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(fast, twin, s));
+}
+
+test "gatherQsa256: an unaligned last-axis slice declines and the fallback reads exactly; aligned is bit-identical to a contiguous copy" {
+    const s = mlx.gpuStream();
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    qsa_nax_override = false;
+    defer qsa_nax_override = null;
+    defer qsa_gather_bk_override = null;
+    var prng = std.Random.DefaultPrng.init(0x0FF_5E7);
+    const rnd = prng.random();
+
+    const qL: c_int = 40;
+    const kL: c_int = 101;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, qL, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kL, 264 }, s);
+    defer _ = mlx.mlx_array_free(k_pad);
+    const v_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kL, 264 }, s);
+    defer _ = mlx.mlx_array_free(v_pad);
+    try mlx.check(mlx.mlx_array_eval(k_pad));
+    try mlx.check(mlx.mlx_array_eval(v_pad));
+    var fx = try QsaBlockFixture.build(rnd, qL, kL, 512, 4);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 16.0;
+
+    const k = try attn256SliceLastDim(k_pad, 3, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256SliceLastDim(v_pad, 3, s);
+    defer _ = mlx.mlx_array_free(v);
+    try std.testing.expect((try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) == null);
+    const ref = try attn256Reference(q, k, v, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const kc = try attn256Contiguous(k, s);
+    defer _ = mlx.mlx_array_free(kc);
+    const vc = try attn256Contiguous(v, s);
+    defer _ = mlx.mlx_array_free(vc);
+    const on_copy = (try gatherQsa256(s, q, kc, vc, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(on_copy);
+    try std.testing.expect(try attn256MaxDiff(on_copy, ref, s) < 0.005);
+
+    const k_al = try attn256SliceLastDim(k_pad, 0, s);
+    defer _ = mlx.mlx_array_free(k_al);
+    const v_al = try attn256SliceLastDim(v_pad, 0, s);
+    defer _ = mlx.mlx_array_free(v_al);
+    const fast = (try gatherQsa256(s, q, k_al, v_al, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(fast);
+    const kac = try attn256Contiguous(k_al, s);
+    defer _ = mlx.mlx_array_free(kac);
+    const vac = try attn256Contiguous(v_al, s);
+    defer _ = mlx.mlx_array_free(vac);
+    const twin = (try gatherQsa256(s, q, kac, vac, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(twin);
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(fast, twin, s));
 }
 
 /// A sorted qwen4 block selection [1,qL,kb] int32 for rows straddling the
