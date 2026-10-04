@@ -186,6 +186,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   model's transformer, and the inference thread drains 16 entries per pass.
 - **A slot's error is latched with a static name when the name cannot be copied** (`Slot.latchErrorLocked`):
   `error_code != null` is the terminal predicate for the consumers and the cull, so it must never be lost.
+- A `submit` that fails before a slot exists (`ModelNotReady`, `GlmKvQuantUnsupported`, `Slot.init`) parks the request's
+  `vision_embeddings` in `Scheduler.orphan_vision` (fixed size, no allocation); the inference thread frees it.
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.

@@ -206,7 +206,7 @@ pub const LoadParams = struct {
 /// Submit-time parameters. `prompt_ids` and `eos_token_ids` are duped into the
 /// slot so callers can free their copies immediately. `vision_embeddings`
 /// ownership transfers into the slot when non-null (the slot will free on
-/// deinit).
+/// deinit); a `submit` that fails hands it to the inference thread to free.
 pub const SubmitParams = struct {
     prompt_ids: []const u32,
     /// Full original prompt for PLD lookup. When null, defaults to
@@ -353,6 +353,17 @@ pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig,
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
+
+const orphan_vision_cap = 16;
+
+/// Inference thread only (the sole mlx caller), like every other free of a slot's arrays.
+fn freeVisionArray(ve: mlx.mlx_array) void {
+    if (@import("builtin").is_test and slot_vision_free_test_hook != null) {
+        slot_vision_free_test_hook.?(ve);
+    } else {
+        _ = mlx.mlx_array_free(ve);
+    }
+}
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
@@ -770,13 +781,7 @@ pub const Slot = struct {
             }
             self.allocator.free(entries);
         }
-        if (self.vision_embeddings) |ve| {
-            if (@import("builtin").is_test and slot_vision_free_test_hook != null) {
-                slot_vision_free_test_hook.?(ve);
-            } else {
-                _ = mlx.mlx_array_free(ve);
-            }
-        }
+        if (self.vision_embeddings) |ve| freeVisionArray(ve);
         if (self.mrope_pos) |mp| self.allocator.free(mp);
         self.allocator.free(self.prompt_ids);
         self.allocator.free(self.full_prompt);
@@ -1370,6 +1375,10 @@ pub const Scheduler = struct {
     /// Slots whose `submit` failed after they were built, linked through `Slot.abandoned_next`
     /// (queue_mu). An intrusive list, so handing one over cannot fail for want of memory.
     abandoned: ?*Slot,
+    /// Vision arrays of requests whose `submit` failed before a slot took them (queue_mu).
+    /// Fixed-size, so handing one over never allocates; the inference thread frees them.
+    orphan_vision: [orphan_vision_cap]mlx.mlx_array,
+    orphan_vision_n: usize,
     /// Slots out of `pending` whose prefill pass is running: neither pending nor decoding, so
     /// a shutdown reaches them only here (queue_mu).
     prefilling: std.ArrayList(*Slot),
@@ -1493,6 +1502,8 @@ pub const Scheduler = struct {
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
             .abandoned = null,
+            .orphan_vision = undefined,
+            .orphan_vision_n = 0,
             .prefilling = std.ArrayList(*Slot).empty,
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
@@ -1560,6 +1571,7 @@ pub const Scheduler = struct {
         for (self.cleanup_queue.items) |slot| slot.deinit();
         self.cleanup_queue.deinit(self.allocator);
         destroyAbandoned(self.abandoned);
+        for (self.orphan_vision[0..self.orphan_vision_n]) |ve| freeVisionArray(ve);
         self.prefilling.deinit(self.allocator);
         // Vision/embed queues should be empty (encodeVision/computeEmbedding
         // block until done) but guard against shutdown-mid-encode by signaling
@@ -1649,11 +1661,10 @@ pub const Scheduler = struct {
         // actually run the request. Critical when two models with
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
-        const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
-        const eff_kv_quant = params.kv_quant_config orelse
-            transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
-        if (slot_config.isGlm5() and eff_kv_quant.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
-        const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
+        const slot = self.initSlot(params) catch |err| {
+            if (params.vision_embeddings) |ve| self.orphanVision(ve);
+            return err;
+        };
         // The slot may own GPU arrays that only the inference thread frees.
         errdefer self.abandon(slot);
 
@@ -1683,6 +1694,28 @@ pub const Scheduler = struct {
         defer self.queue_mu.unlock(self.io);
         slot.abandoned_next = self.abandoned;
         self.abandoned = slot;
+        self.queue_cond.broadcast(self.io);
+    }
+
+    fn initSlot(self: *Scheduler, params: SubmitParams) !*Slot {
+        const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        const eff_kv_quant = params.kv_quant_config orelse
+            transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
+        if (slot_config.isGlm5() and eff_kv_quant.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
+        return Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
+    }
+
+    /// `submit` failed before any slot owned `ve`; only the inference thread may free it. Waits
+    /// for room rather than allocating; a shutting-down scheduler drops it with the process.
+    fn orphanVision(self: *Scheduler, ve: mlx.mlx_array) void {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        while (self.orphan_vision_n == orphan_vision_cap and !self.shutdown.load(.acquire)) {
+            self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
+        }
+        if (self.orphan_vision_n == orphan_vision_cap) return;
+        self.orphan_vision[self.orphan_vision_n] = ve;
+        self.orphan_vision_n += 1;
         self.queue_cond.broadcast(self.io);
     }
 
@@ -5112,6 +5145,16 @@ fn destroyAbandoned(head: ?*Slot) void {
     }
 }
 
+/// Caller holds `queue_mu`; wakes a submit waiting for room in `orphan_vision`.
+fn takeOrphanedVisionLocked(sch: *Scheduler, out: *[orphan_vision_cap]mlx.mlx_array) usize {
+    const n = sch.orphan_vision_n;
+    if (n == 0) return 0;
+    @memcpy(out[0..n], sch.orphan_vision[0..n]);
+    sch.orphan_vision_n = 0;
+    sch.submit_cond.broadcast(sch.io);
+    return n;
+}
+
 /// Caller holds `queue_mu`. Shared with the wait condition below.
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
@@ -5120,6 +5163,7 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.embed_queue.items.len > 0 or
         sch.cleanup_queue.items.len > 0 or
         sch.abandoned != null or
+        sch.orphan_vision_n > 0 or
         sch.load_queue.items.len > 0 or
         sch.unload_queue.items.len > 0;
 }
@@ -5225,6 +5269,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         var cleanup_batch: [16]*Slot = undefined;
         var cleanup_n: usize = 0;
         var abandoned: ?*Slot = null;
+        var orphan_vision: [orphan_vision_cap]mlx.mlx_array = undefined;
+        var orphan_vision_n: usize = 0;
         // 0b. Drain any pending vision/embed work. These run synchronously on
         //     behalf of conn threads waiting in `encodeVision` /
         //     `computeEmbedding`. Processed here (not concurrently with decode
@@ -5247,6 +5293,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             const teardown = takeTeardownLocked(sch, &cleanup_batch);
             cleanup_n = teardown.cleanup_n;
             abandoned = teardown.abandoned;
+            orphan_vision_n = takeOrphanedVisionLocked(sch, &orphan_vision);
             while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
                 vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
                 vision_n += 1;
@@ -5283,6 +5330,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
         destroyAbandoned(abandoned);
+        for (orphan_vision[0..orphan_vision_n]) |ve| freeVisionArray(ve);
         if (vision_n > 0 or embed_n > 0) {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
@@ -11233,6 +11281,7 @@ fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Scheduler {
     sch.load_queue = .empty;
     sch.unload_queue = .empty;
     sch.abandoned = null;
+    sch.orphan_vision_n = 0;
     return sch;
 }
 
@@ -11352,6 +11401,99 @@ test "the four-row planner gives spare rows to drafts only while they beat the g
     try testing.expectEqual(@as(usize, 1), glmTreeNodes(3, 0.95, cost));
     try testing.expectEqual(@as(usize, 0), glmTreeNodes(3, 0.7, cost));
     try testing.expectEqual(@as(usize, 0), glmTreeNodes(4, 1.0, cost));
+}
+
+test "a submit that fails before its slot exists hands the vision array to the inference thread" {
+    const Probe = struct {
+        var inference_id: std.Thread.Id = undefined;
+        var frees: usize = 0;
+        var off_thread_frees: usize = 0;
+        fn free(_: mlx.mlx_array) void {
+            frees += 1;
+            if (std.Thread.getCurrentId() != inference_id) off_thread_frees += 1;
+        }
+        fn submit(sch: *Scheduler, model: *LoadedModel, err: *?anyerror) void {
+            _ = sch.submit(.{
+                .model = model,
+                .prompt_ids = &.{1},
+                .sampling = .{},
+                .eos_token_ids = &.{},
+                .max_tokens = 1,
+                .vision_embeddings = .{ .ctx = @ptrFromInt(1) },
+            }) catch |e| {
+                err.* = e;
+            };
+        }
+        /// One connection-thread submit that must fail, then the inference thread's drain.
+        fn expectHandedOver(allocator: std.mem.Allocator, model: *LoadedModel, kv: transformer_mod.KVQuantConfig, want: ?anyerror) !void {
+            var sch: Scheduler = undefined;
+            sch.allocator = allocator;
+            sch.io = testing.io;
+            sch.kv_quant_config = kv;
+            sch.kv_quant_explicit = true;
+            sch.queue_mu = .init;
+            sch.queue_cond = .init;
+            sch.submit_cond = .init;
+            sch.shutdown = .init(false);
+            sch.queue_cap = 2;
+            sch.in_flight = 0;
+            sch.req_seq = 0;
+            sch.pending = .empty;
+            sch.cleanup_queue = .empty;
+            sch.prefilling = .empty;
+            sch.orphan_vision_n = 0;
+            defer sch.pending.deinit(allocator);
+            defer sch.cleanup_queue.deinit(allocator);
+            defer sch.prefilling.deinit(allocator);
+            frees = 0;
+            off_thread_frees = 0;
+            var err: ?anyerror = null;
+            const conn = try std.Thread.spawn(.{}, submit, .{ &sch, model, &err });
+            conn.join();
+            if (want) |w| try testing.expectEqual(w, err.?) else try testing.expect(err != null);
+            try testing.expectEqual(@as(usize, 0), off_thread_frees);
+            try testing.expectEqual(@as(usize, 0), frees);
+            var buf: [orphan_vision_cap]mlx.mlx_array = undefined;
+            const n = takeOrphanedVisionLocked(&sch, &buf);
+            for (buf[0..n]) |ve| freeVisionArray(ve);
+            try testing.expectEqual(@as(usize, 1), n);
+            try testing.expectEqual(@as(usize, 1), frees);
+            try testing.expectEqual(@as(usize, 0), off_thread_frees);
+            try testing.expectEqual(@as(usize, 0), takeOrphanedVisionLocked(&sch, &buf));
+        }
+    };
+    Probe.inference_id = std.Thread.getCurrentId();
+    slot_vision_free_test_hook = Probe.free;
+    defer slot_vision_free_test_hook = null;
+
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.transformer = null;
+
+    model.config = null;
+    try Probe.expectHandedOver(testing.allocator, &model, .dense, error.ModelNotReady);
+
+    var glm_cfg = ModelConfig{ .num_hidden_layers = 0, .model_type = "glm5_next" };
+    model.config = &glm_cfg;
+    try Probe.expectHandedOver(testing.allocator, &model, .affine(4), error.GlmKvQuantUnsupported);
+
+    // Every allocation Slot.init makes is a point where it can fail.
+    model.config = &cfg;
+    var counting = testing.FailingAllocator.init(testing.allocator, .{});
+    const probe_slot = try Slot.init(counting.allocator(), testing.io, &cfg, .{
+        .prompt_ids = &.{1},
+        .sampling = .{},
+        .eos_token_ids = &.{},
+        .max_tokens = 1,
+        .vision_embeddings = null,
+        .model = &model,
+    }, .dense);
+    probe_slot.deinit();
+    try testing.expect(counting.alloc_index > 0);
+    for (0..counting.alloc_index) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        try Probe.expectHandedOver(failing.allocator(), &model, .dense, error.OutOfMemory);
+    }
 }
 
 test "a drafting GLM slot rides plain rows only in company of its own model" {
