@@ -80,6 +80,7 @@ PREFIX_CACHE_MEM="${PREFIX_CACHE_MEM:-6GB}"
 PREFIX_CACHE_DISK="${PREFIX_CACHE_DISK:-20GB}"
 SSM_CHECKPOINT_STRIDE="${SSM_CHECKPOINT_STRIDE:-2048}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-4096}"
+MTP_DEPTH="${MTP_DEPTH:-3}"
 MTP_TYPICAL="${MTP_TYPICAL:-0.2}"
 PRESERVE_THINKING="${PRESERVE_THINKING:-off}"
 TOKENIZE_CACHE_ENTRIES="${TOKENIZE_CACHE_ENTRIES:-16}"
@@ -1086,6 +1087,7 @@ run_service() {
         --host "${HOST}" \
         --port "${PORT}" \
         --mtp \
+        --mtp-depth "${MTP_DEPTH}" \
         --kv-quant 4 \
         --mtp-head-kv-quant \
         --skip-mem-preflight \
@@ -1212,6 +1214,7 @@ start_server() {
         --host "${HOST}" \
         --port "${PORT}" \
         --mtp \
+        --mtp-depth "${MTP_DEPTH}" \
         --kv-quant 4 \
         --mtp-head-kv-quant \
         --skip-mem-preflight \
@@ -1459,7 +1462,7 @@ Configuration:
   Sampling: ${PROFILE_NAME} (temp=${TEMP}, top_p=${TOP_P}, top_k=${TOP_K}, min_p=${MIN_P}, presence_penalty=${PRESENCE_PENALTY}, repetition_penalty=${REPEAT_PENALTY})
   Reasoning effort: ${REASONING_EFFORT}
   Preserve thinking: ${PRESERVE_THINKING}
-  Performance: prefill_chunk=${PREFILL_CHUNK}, ssm_stride=${SSM_CHECKPOINT_STRIDE}, mtp_typical=${MTP_TYPICAL}
+  Performance: prefill_chunk=${PREFILL_CHUNK}, ssm_stride=${SSM_CHECKPOINT_STRIDE}, mtp_depth=${MTP_DEPTH}, mtp_typical=${MTP_TYPICAL}
   Prefix cache: RAM=${PREFIX_CACHE_MEM}, SSD=${PREFIX_CACHE_DISK}, entries=${PREFIX_CACHE_ENTRIES}
   Production: timeout=${TIMEOUT}s, metrics=${METRICS_ENABLED}, max_log=${LOG_MAX_MB}MB
   Log file: ${LOG_FILE}
