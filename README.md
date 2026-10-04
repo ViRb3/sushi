@@ -11,6 +11,7 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
+* GLM-5.3-Flash (`glm5_next`), text input with native affine/EXL3 weights.
 
 ## Install
 
@@ -39,6 +40,21 @@ mkdir -p ~/.local/bin && ln -s "$PWD/zig-out/bin/sushi" ~/.local/bin/sushi   # o
 ```
 
 The server listens on `127.0.0.1:12345`, the model's own MTP draft head and the 8-bit KV cache are on by default.
+
+GLM-5.3 uses a BF16 compressed MLA cache by default. Its 11 attention layers store
+11,264 latent bytes plus 704 pooled-index bytes per token: 11,968 bytes (11.69 KiB).
+KDA recurrent state adds about 141 MiB independently of context length. `--think low`,
+`--think high`, and `--think max` select the checkpoint's reasoning instruction;
+they do not impose a thinking-token cap. Omitted effort uses Sushi's high default (the HF template itself defaults to max).
+GLM serving currently runs one request at a time, with MTP and RAM/disk prefix reuse off.
+`--drafter /path/to/GLM-5.3-Flash-DFlash2` enables native DFlash2 for greedy requests;
+sampled, constrained or penalized requests decode serially. Original BF16 and stored
+A4/A6/A8 assistants keep their precision. The assistant weights join the load bill;
+its BF16 sliding window, target reservation, captures and verification scratch join
+the request bill.
+Startup bills only text weights and the small warmup; request admission checks context
+storage, capacity growth and native kernel scratch. Vision and extra prediction-layer
+tensors remain on disk.
 
 ## Memory
 

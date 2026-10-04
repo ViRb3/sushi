@@ -394,6 +394,20 @@ pub const Request = struct {
         self.layer_ns = @splat(0);
         self.component_ns = @splat(.{});
     }
+
+    pub fn residentBytes(self: *const Request) u64 {
+        var total: u64 = 0;
+        for (self.layers) |*layer| {
+            if (layer.recurrent.initialized) {
+                for ([_]Arr{ layer.recurrent.conv_state, layer.recurrent.ssm_state }) |value|
+                    total += mlx.mlx_array_size(value) * mlx.mlx_array_itemsize(value);
+            }
+            for (layer.attention.arrays()) |value| if (value.ctx != null) {
+                total += mlx.mlx_array_size(value) * mlx.mlx_array_itemsize(value);
+            };
+        }
+        return total;
+    }
 };
 
 var schedule_test_syncs: usize = 0;
@@ -423,6 +437,8 @@ fn appendCaptures(evals: mlx.mlx_vector_array, capture: ?*Capture, hc_capture: ?
 }
 
 pub const Model = struct {
+    /// Serving's reserved-token policy, borrowed from Transformer.
+    suppress_mask: ?Arr = null,
     allocator: std.mem.Allocator,
     cfg: model.ModelConfig,
     layers: []Layer,
@@ -525,7 +541,14 @@ pub const Model = struct {
         if (sh.len < 2 or sh[sh.len - 1] != self.cfg.hidden_size) return error.InvalidGlmInput;
         var ops = Ops{ .s = self.s };
         defer ops.deinit();
-        return ops.result(try self.head.apply(&ops, hidden));
+        return ops.result(try self.samplingLogits(&ops, try self.head.apply(&ops, hidden)));
+    }
+
+    pub fn samplingLogits(self: *const Model, ops: *Ops, logits: Arr) !Arr {
+        const mask = self.suppress_mask orelse return logits;
+        const out = try ops.slot();
+        try @import("generate.zig").applySuppressMask(out, logits, mask, self.s);
+        return out.*;
     }
 
     pub fn forward(self: *const Model, request: *Request, ids: Arr) !Arr {

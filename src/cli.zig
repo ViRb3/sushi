@@ -2258,7 +2258,7 @@ pub fn isPromptFlag(arg: []const u8) bool {
 }
 
 pub fn buildPromptBody(allocator: std.mem.Allocator, prompt: []const u8, think: Think, sampling: PromptSampling) ![]u8 {
-    return buildChatBody(allocator, &.{.{ .role = "user", .content = prompt }}, if (think == .model_default) .{ .effort = .off } else think, null, sampling);
+    return buildChatBody(allocator, &.{.{ .role = "user", .content = prompt }}, think, null, sampling);
 }
 
 test "cli: one-shot prompt aliases" {
@@ -2287,7 +2287,7 @@ test "cli: one-shot request preserves prompt and sampling with every thinking ar
         switch (think) {
             .model_default => {
                 try testing.expect(root.get("enable_thinking") == null);
-                try testing.expectEqualStrings("off", root.get("reasoning_effort").?.string);
+                try testing.expect(root.get("reasoning_effort") == null);
             },
             .on => try testing.expect(root.get("enable_thinking").?.bool),
             .effort => |e| try testing.expectEqualStrings(@tagName(e), root.get("reasoning_effort").?.string),
@@ -2390,19 +2390,27 @@ test "cli: one-shot generation error is a failure even with a done marker" {
     try testing.expectError(error.PromptGenerationFailed, readPromptStream(testing.allocator, &r, &w.writer));
 }
 
-test "cli: one-shot omission preserves thinking-off while REPL keeps the model default" {
+test "cli: one-shot and REPL omission keep the model default" {
     const a = testing.allocator;
     const prompt = try buildPromptBody(a, "hello", .model_default, .{});
     defer a.free(prompt);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, prompt, .{});
     defer parsed.deinit();
     const effort = parsed.value.object.get("reasoning_effort");
-    try testing.expect(effort != null);
-    try testing.expectEqualStrings("off", effort.?.string);
+    try testing.expect(effort == null);
     const repl = try buildReplChatBody(a, &.{.{ .role = "user", .content = "hello" }}, .model_default, null);
     defer a.free(repl);
     const parsed_repl = try std.json.parseFromSlice(std.json.Value, a, repl, .{});
     defer parsed_repl.deinit();
     try testing.expect(parsed_repl.value.object.get("reasoning_effort") == null);
     try testing.expect(parsed_repl.value.object.get("enable_thinking") == null);
+}
+
+
+test "thinking policy CLI consumes MiMo on and rejects levels outside each model vocabulary" {
+    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .on }, .consumed = true }, parseThinkFlag("on"));
+    try testing.expect(parseThinkCommand("/think low", &.{ .on, .off }).? == .refuse);
+    try testing.expect(parseThinkCommand("/think on", &.{ .on, .off }).? == .set);
+    try testing.expect(parseThinkCommand("/think off", &.{ .low, .high, .max }).? == .refuse);
+    try testing.expect(parseThinkCommand("/think high", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
 }

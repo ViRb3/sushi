@@ -1282,9 +1282,16 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // everything else (incl. absent) stays the reference default.
     const dsv4_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
     const inkling_style = std.mem.indexOf(u8, chat_config.chat_template, "Thinking effort level") != null;
+    const glm5_style = std.mem.indexOf(u8, chat_config.chat_template, "effective_reasoning_effort") != null and
+        std.mem.indexOf(u8, chat_config.chat_template, "[gMASK]<sop>") != null;
     if (templateRequiresReasoningField(chat_config.chat_template)) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, k2EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else if (glm5_style) {
+        // Sushi defaults to high; depth is a prompt instruction, never a token cap.
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, effort orelse "high");
         try buf.append(allocator, '"');
     } else if (dsv4_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
@@ -15046,4 +15053,22 @@ test "foldSystemMessages: a system turn past index 0 joins the leading system me
     try plain.append(al, .{ .role = "user", .content = "hi" });
     try std.testing.expect((try foldSystemMessages(al, &plain)) == null);
     try std.testing.expectEqual(@as(usize, 2), plain.items.len);
+}
+
+test "GLM serving template receives low high max without a derived reasoning budget" {
+    const tpl = "[gMASK]<sop>{% set effective_reasoning_effort = reasoning_effort if reasoning_effort in ['low', 'high'] else 'max' %}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}<|assistant|><think>";
+    var cfg = ChatConfig{ .allocator = testing.allocator, .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false };
+    try testing.expect(templateConsumesEffort(tpl));
+    for ([_]struct { effort: ?[]const u8, label: []const u8 }{
+        .{ .effort = null, .label = "High" },
+        .{ .effort = "low", .label = "Low" },
+        .{ .effort = "high", .label = "High" },
+        .{ .effort = "max", .label = "Max" },
+    }) |c| {
+        const rendered = try renderChatTemplate(testing.allocator, &.{}, &cfg, null, null, true, c.effort, false);
+        defer testing.allocator.free(rendered);
+        const want = try std.fmt.allocPrint(testing.allocator, "Reasoning Effort: {s}<|assistant|><think>", .{c.label});
+        defer testing.allocator.free(want);
+        try testing.expect(std.mem.endsWith(u8, rendered, want));
+    }
 }

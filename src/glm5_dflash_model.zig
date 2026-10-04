@@ -416,7 +416,7 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     defer ops.deinit();
     var head_profile = profiling.Timer.start(tokens.len);
     const normalized = try ops.rms(try ops.reduce(h, 2, true, false), target.norm, target.cfg.rms_norm_eps);
-    const logits = try kda.linearRows(&ops, target.head, normalized, mode);
+    const logits = try target.samplingLogits(&ops, try kda.linearRows(&ops, target.head, normalized, mode));
     const decisions = try ops.slot();
     try mlx.check(mlx.mlx_argmax_axis(decisions, logits, -1, false, target.s));
     const u = try ops.cast(decisions.*, .uint32);

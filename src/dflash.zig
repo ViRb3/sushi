@@ -671,6 +671,7 @@ pub const DflashLayer = struct {
 };
 
 pub const DflashModel = struct {
+    native_glm_serving: bool = false,
     config: DflashConfig,
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
@@ -1841,6 +1842,34 @@ pub fn appendContext(
         defer _ = mlx.mlx_array_free(v);
         _ = try ctx.cache.update(@intCast(li), k, v, s, 0);
     }
+    if (model.native_glm_serving) try trimGlmServingContext(model, ctx);
+}
+
+/// The GLM serving assistant is entirely sliding attention. Materialize the
+/// retained window after every prefill chunk, so an old view cannot pin the
+/// complete prompt allocation. Absolute RoPE positions live in base_pos.
+pub fn trimGlmServingContext(model: *const DflashModel, ctx: *DflashCtx) !void {
+    if (model.config.sliding_window < 2) return error.GlmDflashWindowUnsupported;
+    for (model.layers) |layer| if (layer.layer_type != .sliding_attention) return error.GlmDflashWindowUnsupported;
+    const keep = @as(usize, model.config.sliding_window) - 1;
+    if (ctx.cache.step <= keep) return;
+    const drop = ctx.cache.step - keep;
+    var ops = @import("glm5_model.zig").Ops{ .s = model.s };
+    defer ops.deinit();
+    const arrays = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(arrays);
+    for (ctx.cache.entries) |*entry| {
+        const keys = try ops.contiguous(try ops.slice(entry.keys, 2, @intCast(drop), @intCast(ctx.cache.step)));
+        const values = try ops.contiguous(try ops.slice(entry.values, 2, @intCast(drop), @intCast(ctx.cache.step)));
+        try mlx.check(mlx.mlx_array_set(&entry.keys, keys));
+        try mlx.check(mlx.mlx_array_set(&entry.values, values));
+        entry.offset = keep;
+        try mlx.check(mlx.mlx_vector_array_append_value(arrays, entry.keys));
+        try mlx.check(mlx.mlx_vector_array_append_value(arrays, entry.values));
+    }
+    try mlx.check(mlx.mlx_eval(arrays));
+    ctx.cache.step = keep;
+    ctx.base_pos += drop;
 }
 
 /// Encoder projection: concatenate the trunk captures on features →
@@ -3903,4 +3932,42 @@ test "GLM assistant bounded block tail A6 component" {
     try testing.expectEqual(@as(usize, 2), top1_matches);
     try testing.expect(trees_equal);
     // Shape rounding is reported; the full model quality gate remains separate.
+}
+
+
+test "GLM serving DFlash2 trims physical window and preserves absolute append positions" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var ops = @import("glm5_model.zig").Ops{ .s = s };
+    defer ops.deinit();
+    var layer: DflashLayer = undefined;
+    layer.layer_type = .sliding_attention;
+    var types = [_]LayerType{.sliding_attention};
+    var model: DflashModel = undefined;
+    model.s = s;
+    model.layers = @as(*[1]DflashLayer, @ptrCast(&layer));
+    model.config = .{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 2, .num_key_value_heads = 2, .head_dim = 4, .intermediate_size = 16, .rms_norm_eps = 1e-5, .rope_theta = 10000, .sliding_window = 8, .layer_types = &types, .block_size = 4, .mask_token_id = 3, .target_layer_ids = &.{} };
+    var ctx = try DflashCtx.init(a, &model, 0);
+    defer ctx.deinit();
+    var values: [80]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @floatFromInt(i);
+    const raw = try ops.own(mlx.mlx_array_new_data(&values, &[_]c_int{ 1, 2, 10, 4 }, 4, .float32));
+    const keys = try ops.cast(raw, .bfloat16);
+    _ = try ctx.cache.update(0, keys, keys, s, 0);
+    try trimGlmServingContext(&model, &ctx);
+    try std.testing.expectEqual(@as(usize, 10), ctx.absLen());
+    try std.testing.expectEqual(@as(usize, 3), ctx.base_pos);
+    try std.testing.expectEqual(@as(u64, 224), ctx.cache.residentBytes());
+    try std.testing.expectEqual(@as(usize, 28), mlx.mlx_array_strides(ctx.cache.entries[0].keys)[1]);
+    const view = try ops.cast(ctx.cache.entries[0].keys, .float32);
+    try mlx.check(mlx.mlx_array_eval(view));
+    try std.testing.expectEqual(@as(f32, 12), mlx.mlx_array_data_float32(view).?[0]);
+    try std.testing.expectEqual(@as(f32, 52), mlx.mlx_array_data_float32(view).?[28]);
+    const next = try ops.slice(keys, 2, 0, 1);
+    _ = try ctx.cache.update(0, next, next, s, 0);
+    try trimGlmServingContext(&model, &ctx);
+    try std.testing.expectEqual(@as(usize, 11), ctx.absLen());
+    try std.testing.expectEqual(@as(usize, 4), ctx.base_pos);
+    try std.testing.expectEqual(@as(u64, 224), ctx.cache.residentBytes());
 }

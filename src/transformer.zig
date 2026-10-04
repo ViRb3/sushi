@@ -1,5 +1,6 @@
 const std = @import("std");
 const dsv4_mod = @import("deepseek_v4.zig");
+const glm5_mod = @import("glm5_forward.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_bf16 = @import("expert_bf16_kernels.zig");
@@ -11760,6 +11761,7 @@ test "persistent group: forwardWith releases a bound member between batched tick
         try ssmTickBumpSlots(s, &o_ctxs, kinds);
     }
     p_xfm.dsv4 = null;
+    p_xfm.glm5 = null;
     p_xfm.bert_layers = null;
     p_xfm.hybrid_layers = null;
     p_xfm.qwen4 = null;
@@ -16986,6 +16988,8 @@ pub const Transformer = struct {
     // diffusion.zig precedent). Non-null ⇒ every standard field below is empty
     // and the forward dispatches to the module. v0 decode = full re-forward.
     dsv4: ?*dsv4_mod.Dsv4Model = null,
+    glm5: ?*glm5_mod.Model = null,
+    glm5_request: ?glm5_mod.Request = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -17129,6 +17133,7 @@ pub const Transformer = struct {
         // dispatch to forwardGemma3EncoderWith.
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
+        if (config.isGlm5()) return initGlm5(allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
         // trait — one lookup table, three call sites (weight/scales/biases)
@@ -17862,6 +17867,7 @@ pub const Transformer = struct {
 
     /// Reset all caches for a new request (KV cache + SSM state for MoE).
     pub fn resetCache(self: *Transformer) !void {
+        if (self.glm5_request) |*request| request.reset();
         const prev_config = self.cache.config;
         try self.cache.reinit(self.config.num_hidden_layers, prev_config);
         if (self.ssm_entries) |entries| {
@@ -18594,6 +18600,13 @@ pub const Transformer = struct {
             self.allocator.free(rests);
             self.ane_chan = null;
         }
+        if (self.glm5_request) |*request| request.deinit();
+        self.glm5_request = null;
+        if (self.glm5) |mdl| {
+            mdl.deinit();
+            self.allocator.destroy(mdl);
+            self.glm5 = null;
+        }
         if (self.dsv4) |mdl| {
             mdl.deinit();
             self.allocator.destroy(mdl);
@@ -18720,6 +18733,7 @@ pub const Transformer = struct {
     /// thread-local (a stream created on thread A is invisible to thread B).
     pub fn useCurrentThreadStream(self: *Transformer) void {
         self.s = mlx.gpuStream();
+        if (self.glm5) |mdl| mdl.s = self.s;
     }
 
     // ── Core ops ──
@@ -19496,6 +19510,7 @@ pub const Transformer = struct {
     }
 
     pub fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        if (self.glm5) |mdl| return mdl.rawEmbedding(token_ids);
         const raw = try self.rawEmbedding(token_ids);
 
         // MuseGlimmer: weight-less RMS norm on the looked-up embeddings (the
@@ -20197,7 +20212,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{"dsv4"};
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "glm5" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20270,6 +20285,7 @@ pub const Transformer = struct {
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
+        if (self.glm5) |mdl| return forwardGlm5WithImpl(self, ctx, token_ids, mdl);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma) load standard gemma3
         // weights but never run causal decode.
@@ -20283,7 +20299,7 @@ pub const Transformer = struct {
     /// Does `forwardWith` route this model through `forwardStandardWith`?
     /// Mirrors the dispatch chain above IN ORDER.
     pub fn usesStandardForward(self: *const Transformer) bool {
-        return self.dsv4 == null and
+        return self.dsv4 == null and self.glm5 == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention and
             self.hybrid_layers == null and
@@ -20306,6 +20322,7 @@ pub const Transformer = struct {
     /// THIS head — the reference applies the bare Linear (no softcap /
     /// output_multiplier; both are monotone, so draft argmax is unaffected).
     pub fn lmHeadForDraft(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        if (self.glm5) |mdl| return mdl.projectHead(x);
         return self.lmHeadProject(x, false);
     }
 
@@ -22475,7 +22492,7 @@ pub const Transformer = struct {
         // Built-state question: this path reads `moe_layers` and the GDN
         // ssm entries, so the trunk must actually be that shape.
         if (self.moe_layers == null) return false;
-        if (self.hybrid_layers != null or self.dsv4 != null) return false;
+        if (self.hybrid_layers != null or self.dsv4 != null or self.glm5 != null) return false;
         // Every layer must be one of the two shapes this path handles.
         for (self.moe_layers.?) |*lw| {
             switch (lw.mlp) {
@@ -44608,18 +44625,61 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
     return mlx.mlx_array_new_data(logits_host.ptr, &shape, 3, .float32);
 }
 
+fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
+    const mdl = try allocator.create(glm5_mod.Model);
+    errdefer allocator.destroy(mdl);
+    mdl.* = try glm5_mod.Model.load(allocator, config, weights, s);
+    errdefer mdl.deinit();
+    var request = try glm5_mod.Request.init(allocator, config.num_hidden_layers);
+    errdefer request.deinit();
+    request.dense_prefill = true;
+    request.prefill_async = true;
+    var shell = try initModuleShell(allocator, config, s);
+    shell.glm5 = mdl;
+    shell.glm5_request = request;
+    return shell;
+}
+
+fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
+    const request = &self.glm5_request.?;
+    if (ctx.cache.step == 0) request.reset();
+    if (request.offset != ctx.cache.step) return error.GlmCachePositionMismatch;
+    mdl.s = self.s;
+    mdl.suppress_mask = self.suppress_mask;
+    var capture: glm5_mod.Capture = undefined;
+    if (ctx.capture_layers) |cl| {
+        // Generic capture buffers start empty; native GLM requires live
+        // destination handles before replacing them with captured arrays.
+        for (cl.out) |*out| if (out.ctx == null) {
+            out.* = mlx.mlx_array_new_float(0);
+        };
+        capture = .{ .ids = cl.ids, .out = cl.out };
+        request.capture = &capture;
+    }
+    defer request.capture = null;
+    const logits = try mdl.forwardLast(request, ids, true);
+    ctx.cache.step = request.offset;
+    return logits;
+}
+
 fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
     const dw = try dsv4_mod.loadDsv4Weights(allocator, &config, weights);
     const mdl = try allocator.create(dsv4_mod.Dsv4Model);
     errdefer allocator.destroy(mdl);
     mdl.* = try dsv4_mod.initModel(allocator, &config, dw, s);
+    errdefer mdl.deinit();
+    var shell = try initModuleShell(allocator, config, s);
+    shell.dsv4 = mdl;
+    return shell;
+}
+
+fn initModuleShell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const cache = try KVCache.init(allocator, 0);
     return .{
         .config = config,
         .cache = cache,
         .s = s,
         .allocator = allocator,
-        .dsv4 = mdl,
         .emb_w = mlx.mlx_array_new(),
         .emb_s = mlx.mlx_array_new(),
         .emb_b = mlx.mlx_array_new(),
@@ -58962,7 +59022,7 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
             const ref_bits = (mlx.mlx_array_data_bfloat16(ref) orelse return error.Unreadable)[0..n];
             std.debug.print("[attn-pd-ub] band qL {d} identical:", .{@as(u32, @intCast(ql))});
             for (0..n_alt) |i| {
-                attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = kernels[n_abl + i];
+                    attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = kernels[n_abl + i];
                 const got = (try fusedSdpaPrefillKv(s, q, &bv, scale, 128, sinks)) orelse return error.FusedDeclined;
                 defer _ = mlx.mlx_array_free(got);
                 try mlx.check(mlx.mlx_array_eval(got));
@@ -58976,7 +59036,7 @@ test "sushi_attn_pd_nax µbench: MiMo prefill attention per chunk at long contex
             defer view.deinit();
             var same: [4]bool = @splat(true);
             {
-                attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
+            attn_pd_kernels[@intFromEnum(AttnPdArm.nax)] = served_kernel;
                 const ref = (try fusedSdpaPrefillKv(s, q, &view.view, scale, 0, .{ .ctx = null })) orelse return error.FusedDeclined;
                 defer _ = mlx.mlx_array_free(ref);
                 try mlx.check(mlx.mlx_array_eval(ref));
@@ -64911,6 +64971,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     // drift from itself; this test pins the list against the struct.
     var t: Transformer = undefined;
     t.dsv4 = null;
+    t.glm5 = null;
     t.qwen4 = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
@@ -75909,4 +75970,58 @@ test "GLM qualified opt-out keeps experiments and generic diagnostics default of
         _ = unsetenv(name);
         try testing.expect(!diagEnvOn(name));
     }
+}
+
+test "GLM serving dispatch matches native forward across prefill decode and reset" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glm5_mod.completeFixture(&weights);
+    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.ownsModuleDecodeState());
+    try testing.expect(!xfm.usesStandardForward());
+    try testing.expect(xfm.supportsLayerCapture());
+    var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
+    defer reference.deinit();
+    var request = try glm5_mod.Request.init(a, cfg.num_hidden_layers);
+    defer request.deinit();
+    request.dense_prefill = true;
+    request.prefill_async = true;
+    for ([_]usize{ 3, 1, 2, 1 }) |n| {
+        const ids = mlx.mlx_array_new_data(&[_]u32{ 0, 1, 2 }, &[_]c_int{ 1, @intCast(n) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const actual = try xfm.forward(ids);
+        defer _ = mlx.mlx_array_free(actual);
+        const expected = try reference.forwardLast(&request, ids, true);
+        defer _ = mlx.mlx_array_free(expected);
+        var equal = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(equal);
+        try mlx.check(mlx.mlx_array_equal(&equal, actual, expected, true, xfm.s));
+            var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, equal));
+            try testing.expect(same);
+        try testing.expectEqual(request.offset, xfm.cache.step);
+    }
+    try xfm.resetCache();
+    try testing.expectEqual(@as(usize, 0), xfm.glm5_request.?.offset);
+    request.reset();
+    const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const actual = try xfm.forward(ids);
+    defer _ = mlx.mlx_array_free(actual);
+    try testing.expectEqual(@as(usize, 1), xfm.glm5_request.?.offset);
+    var ctx = xfm.defaultCtx();
+    ctx.cache.step = 2;
+    try testing.expectError(error.GlmCachePositionMismatch, xfm.forwardWith(&ctx, ids));
+    try xfm.resetCache();
+    var out = [_]mlx.mlx_array{mlx.mlx_array_new()};
+    defer _ = mlx.mlx_array_free(out[0]);
+    var captures = CaptureLayers{ .ids = &.{0}, .out = &out };
+    ctx = xfm.defaultCtx();
+    ctx.capture_layers = &captures;
+    const captured = try xfm.forwardWith(&ctx, ids);
+    defer _ = mlx.mlx_array_free(captured);
+    try testing.expectEqualSlices(c_int, &.{ 1, 1, 128 }, mlx.getShape(out[0]));
 }

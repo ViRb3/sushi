@@ -87,7 +87,8 @@ fn printUsage(io: std.Io) void {
         \\Commands:
         \\  run <model>         Download if needed, serve it, and chat right here
         \\                      (a local model name or a HuggingFace "org/repo")
-        \\                      --think [off|low|medium|high|xhigh|max] sets thinking;
+        \\                      --think <value>: GLM low|high|max (default high);
+        \\                      Qwen off|low|medium|xhigh; MiMo on|off.
         \\                      /think <effort> changes it in the chat;
         \\                      --tool on (or /tool on) lets the model search the
         \\                      web, fetch pages and read files in the current
@@ -241,7 +242,8 @@ fn printUsage(io: std.Io) void {
         \\                        for the last <n> (default: 0 = full history;
         \\                        windowing costs acceptance on stock Qwen heads).
         \\  --kv-quant <mode>   KV-cache quantization scheme:
-        \\                        off, 4, 8 (default)     — affine group quant.
+        \\                        off, 4, 8 — affine group quant; default 8.
+        \\                          GLM defaults to off (BF16 compressed MLA).
         \\                          `off` keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`
@@ -610,6 +612,10 @@ pub fn main(init: std.process.Init) !void {
             serve_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--think")) {
             const f = cli_mod.parseThinkFlag(if (i + 1 < args.len) args[i + 1] else null);
+            if (!f.consumed) {
+                log.err("--think requires a model-supported value: GLM low|high|max, Qwen off|low|medium|xhigh, MiMo on|off\n", .{});
+                std.process.exit(1);
+            }
             run_opts.think = f.think;
             if (f.consumed) i += 1;
         } else if (std.mem.eql(u8, args[i], "--tool") and i + 1 < args.len) {
@@ -1033,6 +1039,7 @@ pub fn main(init: std.process.Init) !void {
         serve_mode = true;
         repl_after_serve = false;
     }
+    model_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
     const prompt_body = if (prompt) |text| try cli_mod.buildPromptBody(allocator, text, run_opts.think, .{ .max_tokens = max_tokens, .temperature = temperature, .top_p = top_p_flag orelse 1.0, .top_k = top_k_flag orelse 0 }) else null;
     defer if (prompt_body) |body| allocator.free(body);
     var prompt_state: PromptClient = .{ .allocator = allocator, .io = io, .body = prompt_body orelse "", .stream = stream_mode };
@@ -1211,7 +1218,9 @@ pub fn main(init: std.process.Init) !void {
             sleep_inhibit_mod.isEnabled(),
         });
     }
-    switch (kv_quant_config.scheme) {
+    if (!kv_quant_explicit) {
+        log.info("[args] kv-quant: model default (resolved at load)\n", .{});
+    } else switch (kv_quant_config.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
@@ -1277,6 +1286,17 @@ pub fn main(init: std.process.Init) !void {
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
     scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
+    if (model_mod.think_effort_flag) |e| if (model_mod.effortArms(config.model_type)) |arms| {
+        if (model_mod.findEffortArm(arms, e) == null) {
+            var choices: [7]model_mod.Effort = undefined;
+            for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
+            var w = std.Io.Writer.Allocating.init(allocator);
+            defer w.deinit();
+            try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, choices[0..arms.len]);
+            log.err("--think: {s}\n", .{w.written()});
+            std.process.exit(1);
+        }
+    };
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -1517,7 +1537,7 @@ pub fn main(init: std.process.Init) !void {
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
-        const kv_cache = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_quant_config, kv_quant_explicit);
+        const kv_cache = transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, kv_quant_config, kv_quant_explicit, config.model_type);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
         const mtp_choice = scheduler_mod.mtpChoiceFor(enable_mtp, mtp_explicit, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });

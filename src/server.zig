@@ -640,6 +640,7 @@ fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
 /// Will a request that omits `enable_mtp` run the head on this model? The load-time bills
 /// (`sessionBytesPerToken`) price its KV whenever it does, the request-time bill per request.
 fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
+    if (config.isGlm5()) return false;
     const choice = mtpChoiceFor(config);
     if (choice.forced()) return true;
     return choice.on and model_mod.isServedArch(config.model_type) and !config.expert_streaming;
@@ -767,9 +768,9 @@ var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
 
 /// THIS model's KV scheme and its source, the one answer the load log, `/props` and every bill read.
 pub fn kvCacheFor(config: *const model_mod.ModelConfig) transformer_mod.KvCacheChoice {
-    if (global_scheduler) |sch| return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, sch.kv_quant_config, sch.kv_quant_explicit);
+    if (global_scheduler) |sch| return transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, sch.kv_quant_config, sch.kv_quant_explicit, config.model_type);
     const launch = configured_kv_quant orelse transformer_mod.KVQuantConfig.engine_default;
-    return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, launch, configured_kv_quant != null);
+    return transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, launch, configured_kv_quant != null, config.model_type);
 }
 
 pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
@@ -2176,7 +2177,9 @@ pub fn serve(
     } else if (scheduler.drafter != null and scheduler.dflash == null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
-    if (config.expert_streaming) {
+    if (config.isGlm5()) {
+        log.info("MTP: off (GLM native serving has no integrated MTP head)\n", .{});
+    } else if (config.expert_streaming) {
         log.info("MTP: off under expert streaming (--mtp is refused there)\n", .{});
     } else if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
@@ -3316,6 +3319,7 @@ pub fn prefillTransientReserveAtKv(
     kv_len: u64,
 ) u64 {
     const seq: u64 = @max(kv_len, chunk);
+    if (config.isGlm5()) return glm5TransientBytes(config, seq, chunk);
     return prefillMemoryNeeded(
         seq,
         config.num_attention_heads,
@@ -5587,6 +5591,7 @@ fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_me
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
 /// the raw `--prefix-cache-mem`. Both load-time wrappers must pass the same value.
 fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    if (config.isGlm5()) return 0; // native state cannot restore generic prefix snapshots
     if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
     return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
@@ -5648,6 +5653,7 @@ pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
 /// Every sizer that used to add `qsaRingBytes` adds this instead — a second
 /// per-slot constant billed at only some of them is the under-bill class.
 pub fn slotRingBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    if (config.isGlm5()) return config.qsaRingBytes() + config.ssmCheckpointBytes();
     const swa = config.swaRingBytes() +| prefix_cache_mod.SLOT_RING_CHECKPOINTS *| config.swaRingCheckpointBytes();
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(swa, kv_bits) +| batchedDecodeRowsBytes(config);
 }
@@ -5948,6 +5954,7 @@ fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
 /// hide. One helper because the auto-context sizer and the admission guard must agree.
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     const one = config.qsaHistoryBytesPerToken();
+    if (config.isGlm5()) return one;
     if (one == 0) return 0;
     const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled() and transformer_mod.KVCache.kvReservationEnabled()) 1 else 2;
     return one * copies + config.qsaScoreBankBytesPerToken();
@@ -6014,8 +6021,43 @@ fn mtpHeadStateBytesPerToken(config: *const model_mod.ModelConfig) u64 {
 }
 
 fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    if (config.isGlm5()) return config.kvBytesPerToken() + config.qsaHistoryBytesPerToken();
     const head: u64 = if (mtpHeadDefaultOn(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
     return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
+}
+
+/// Native MLA fuses attention and bounds index scores internally. It stores no
+/// per-head K/V, affine rebuild, QSA score bank or generic SSM checkpoints.
+fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+    const rows = @min(chunk, @max(seq, 1));
+    const width = @as(u64, config.linear_num_value_heads) * config.linear_value_head_dim;
+    const per_row = @as(u64, config.hidden_size) * 64 + width * 64 +
+        @as(u64, config.num_experts_per_tok) * (@as(u64, config.moe_intermediate_size) * 8 + @as(u64, config.hidden_size) * 4);
+    // A growing latent/pool layer retains its old allocation through evaluation.
+    const grow = seq * (@as(u64, config.mla_kv_lora_rank) * 2 + @as(u64, config.indexer_head_dim) * 2 / @max(config.indexer_compress_ratio, 1));
+    const pending = 2; // glm5_forward.Request.prefill_sync_layers
+    const n = std.math.cast(usize, rows) orelse return std.math.maxInt(u64);
+    const native = (@import("glm5_a6_dense_once.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_mla_prefill_batch.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_attention_nax_packed.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_attention.zig").packedCadenceTransientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_indexpool_nax.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
+    const dflash = if (config.glm_dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
+    return rows *| per_row +| grow +| slotRingBytes(config, 16) +| native +| dflash +|
+        @import("glm5_attention.zig").score_scratch_bytes +| @import("glm5_attention.zig").attention_scratch_bytes +| PREFILL_RUNTIME_FLOOR_BYTES;
+}
+
+/// Dense sliding assistant window, capture/encoder/projection rows, target
+/// replay states and the native verifier's bounded MLA work. Model weights
+/// are already resident and are never charged again per request.
+pub fn glmDflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u64 {
+    if (!config.glm_dflash_loaded) return 0;
+    return config.glm_dflash_window_bytes *| 4 +|
+        config.glm_dflash_capture_bytes_per_token *| chunk +|
+        config.ssmCheckpointBytes() *| 3 +|
+        @import("glm5_dflash_memory.zig").limit_bytes +| 64 * 1024 * 1024;
 }
 
 /// The per-request terms of the admission bill, in one place.
@@ -6276,6 +6318,13 @@ pub fn prefillNeededAtChunk(
     chunk: u64,
     warm: WarmPrefix,
 ) u64 {
+    if (config.isGlm5()) {
+        const ctx = getEffectiveContextLength(config);
+        const reserved = @max(seq, @min(seq +| max_tokens, ctx));
+        // Native appendRows rounds latent and pooled capacities separately to 256 rows.
+        const rows = (reserved +| 1023) / 1024 * 1024;
+        return (sessionBytesPerToken(config, 16) *| rows +| glm5TransientBytes(config, seq, chunk)) *| 5 / 4;
+    }
     // deepseek_v4 gets its own estimator: it sub-chunks prefill internally and its state is module-owned f32.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
     const heads: u64 = config.num_attention_heads;
@@ -6730,6 +6779,15 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
+    if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).isQuant()) {
+        const msg = "GLM native MLA cache requires BF16; set kv_quant to off.";
+        if (is_anthropic) {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        } else {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
+        }
+        return false;
+    }
     const prompt_len: usize = prompt_ids.len;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
@@ -7689,9 +7747,9 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .pld = .{ .enable = pld.on, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
         .pld_source = pld.source,
         .max_concurrent = max_concurrent,
-        .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
-        .prefix_cache_ram_enabled = prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
-        .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
+        .prefix_cache_mem_bytes = if (config.isGlm5()) 0 else resolvedPrefixCacheMem(),
+        .prefix_cache_ram_enabled = !config.isGlm5() and prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
+        .prefix_cache_disk_bytes = if (config.isGlm5()) 0 else prefix_cache_disk_bytes,
     };
 }
 
@@ -8307,13 +8365,13 @@ fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_
 /// Anthropic's `output_config.effort` must not drift on what "low" means.
 /// `arms` is the model's `model.effortArms` table; a word outside it is refused.
 fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consumes_effort: bool, arms: ?[]const model_mod.EffortArm) error{EffortRefused}!ReasoningEffort {
-    if (arms) |table| if (!std.mem.eql(u8, word, "minimal")) {
+    if (arms) |table| {
         const e = model_mod.parseEffort(word) orelse return error.EffortRefused;
         const arm = model_mod.findEffortArm(table, e) orelse return error.EffortRefused;
         if (e == .off) return .{ .enable = false, .budget = default_budget, .effort = word };
         const budget = if (template_consumes_effort) default_budget else arm.budget orelse default_budget;
         return .{ .enable = true, .budget = budget, .effort = word };
-    };
+    }
     if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
     // Where the TEMPLATE reads the effort word, the word is the behavioral
     // lever and a budget derived from the same string is pure display
@@ -8408,6 +8466,13 @@ fn responsesEnableThinking(root: std.json.ObjectMap, from_reasoning: bool, arch_
 /// through to the arch default (`ModelConfig.defaultEnableThinking`).
 ///
 /// The two knobs stay OR'd when both are present, as they always were.
+fn checkThinkingSupport(allocator: std.mem.Allocator, stream: *Conn, config: *const model_mod.ModelConfig, enabled: bool, anthropic: bool) !bool {
+    if (!config.isGlm5() or enabled) return true;
+    const message = "GLM-5.3 supports thinking low, high, max; thinking off is not supported by its original template.";
+    if (anthropic) try sendAnthropicError(allocator, stream, "invalid_request_error", message, 400) else try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", message, 400);
+    return false;
+}
+
 fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
     const et = requestEnableThinking(root);
     if (et == null and effort_cfg == null) return arch_default;
@@ -8802,6 +8867,7 @@ fn handleChatCompletions(
         return;
     };
     var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -8937,7 +9003,7 @@ fn handleChatCompletions(
     const continue_final = continueFinalMessageRequested(root, messages.items);
     var tokenize_sw = Stopwatch.init(stream.io);
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -8955,7 +9021,7 @@ fn handleChatCompletions(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else model_mod.defaultEffortWord(config), continue_final);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -12749,7 +12815,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
     return switch (err) {
         error.NotEnoughMemory => .{ .type = "out_of_memory", .message = not_enough_memory_message },
         error.InsufficientMemory => .{ .type = "out_of_memory", .message = insufficient_free_memory_message },
-        error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads only qwen4_exp (Qwen3.8-Flash-Next) and mimo_v2 (MiMo-V2.6-Flash)." },
+        error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), and glm5_next (GLM-5.3-Flash)." },
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (qwen4_exp or mimo_v2)." },
         error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --expert-cache-gb or free memory." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
@@ -15554,7 +15620,7 @@ fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return;
     }
-    var effort_word: ?[]const u8 = null;
+    var effort_word: ?[]const u8 = model_mod.defaultEffortWord(config);
     if (output_cfg.effort) |word| {
         const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
             const msg = try effortRefusalFor(allocator, lm, word);
@@ -15566,6 +15632,7 @@ fn handleAnthropicMessages(
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
     }
+    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, true)) return;
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
 
@@ -17297,7 +17364,8 @@ fn handleResponsesInner(
     // ── reasoning ──
     // Budget precedence as on chat: reasoning_budget_tokens > the effort word's budget >
     // --reasoning-budget.
-    const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
+    var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
+    if (root.get("reasoning") == null) reasoning_cfg.effort = model_mod.defaultEffortWord(config);
     var enable_thinking = reasoning_cfg.enable;
     var effort_budget: i32 = server_config.default_reasoning_budget;
     if (reasoning_cfg.effort) |word| {
@@ -17350,6 +17418,7 @@ fn handleResponsesInner(
     const active_tools_json: ?[]const u8 = if (active_has_tools) tools_json else null;
     const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice_instruction else null;
     enable_thinking = responsesEnableThinking(root, enable_thinking, config.defaultEnableThinking(active_has_tools));
+    if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
@@ -21412,10 +21481,10 @@ test "reasoningEffortFromWord: a served arch's table refuses words outside it, n
     try std.testing.expectEqual(@as(i32, -1), (try reasoningEffortFromWord("low", -1, true, qwen)).budget);
     try std.testing.expectEqualStrings("xhigh", (try reasoningEffortFromWord("xhigh", -1, false, qwen)).effort.?);
     // An uncapped arm takes `--reasoning-budget`.
-    try std.testing.expectEqual(@as(i32, 4096), (try reasoningEffortFromWord("max", 4096, false, mimo)).budget);
-    try std.testing.expectEqual(@as(i32, 8192), (try reasoningEffortFromWord("medium", -1, false, mimo)).budget);
-    // `minimal` keeps its legacy budget; an inherited arch keeps enabling any word.
-    try std.testing.expectEqual(@as(i32, 1024), (try reasoningEffortFromWord("minimal", -1, false, mimo)).budget);
+    try std.testing.expectEqual(@as(i32, 4096), (try reasoningEffortFromWord("on", 4096, false, mimo)).budget);
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("medium", -1, false, mimo));
+    // Inherited arches keep the legacy ladder; served models accept only native words.
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, false, mimo));
     try std.testing.expect((try reasoningEffortFromWord("ultra", -1, false, null)).enable);
 }
 
@@ -25353,8 +25422,11 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
         .{ "mimo_v2", @embedFile("fixtures/mimo_v26_chat_template.jinja") },
     };
     inline for (families) |family| {
-        const arms = [_]cli.Think{ .model_default, .on, .{ .effort = .off }, .{ .effort = .low }, .{ .effort = .medium }, .{ .effort = .xhigh } };
-        for (arms) |think| {
+        var choices = std.ArrayList(cli.Think).empty;
+        defer choices.deinit(a);
+        try choices.appendSlice(a, &.{ .model_default, .on });
+        for (model_mod.effortArms(family[0]).?) |arm| try choices.append(a, .{ .effort = arm.effort });
+        for (choices.items) |think| {
             const body = try cli.buildPromptBody(a, "  literal prompt\n", think, .{});
             defer a.free(body);
             const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
@@ -25362,7 +25434,7 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
             const root = parsed.value.object;
             const effort = try parseReasoningEffort(root, 77, false, model_mod.effortArms(family[0]));
             const enable = resolveEnableThinking(root, effort, true);
-            try std.testing.expectEqual(think != .model_default and (think != .effort or think.effort != .off), enable);
+            try std.testing.expectEqual(think != .effort or think.effort != .off, enable);
             if (think == .effort) {
                 try std.testing.expectEqual(@as(i32, switch (think.effort) {
                     .low => 2048,
@@ -25596,4 +25668,51 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+}
+
+test "GLM serving memory bills one BF16 latent and pooled index per token" {
+    const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const saved = configured_kv_quant;
+    defer configured_kv_quant = saved;
+    configured_kv_quant = null;
+    try std.testing.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
+    try std.testing.expectEqual(@as(u64, 11968), sessionBytesPerToken(&cfg, 16));
+    try std.testing.expectEqual(@as(u64, 11968), sessionBytesPerToken(&cfg, 8));
+    try std.testing.expectEqual(cfg.ssmCheckpointBytes() + cfg.qsaRingBytes(), slotRingBytes(&cfg, 16));
+    try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
+    try std.testing.expectEqual(@as(u64, 704), statePerTokenBilled(&cfg));
+    try std.testing.expectEqual(@as(u64, 0), cfg.layerKvBytes(0));
+    try std.testing.expectEqual(@as(u64, 1024), cfg.layerKvBytes(3));
+    try std.testing.expect(prefillTransientReserveAtKv(&cfg, 16, 2048, 500000) < 6 * 1024 * 1024 * 1024);
+}
+
+
+test "thinking policy HTTP accepts only each original model vocabulary" {
+    for ([_]struct { arch: []const u8, accepted: []const model_mod.Effort }{
+        .{ .arch = "glm5_next", .accepted = &.{ .low, .high, .max } },
+        .{ .arch = "qwen4_exp", .accepted = &.{ .off, .low, .medium, .xhigh } },
+        .{ .arch = "mimo_v2", .accepted = &.{ .on, .off } },
+    }) |c| {
+        for (std.enums.values(model_mod.Effort)) |e| {
+            if (std.mem.indexOfScalar(model_mod.Effort, c.accepted, e) != null) {
+                const got = try reasoningEffortFromWord(@tagName(e), -1, true, model_mod.effortArms(c.arch));
+                try std.testing.expectEqual(e != .off, got.enable);
+            } else try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord(@tagName(e), -1, true, model_mod.effortArms(c.arch)));
+        }
+        try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, true, model_mod.effortArms(c.arch)));
+    }
+}
+
+
+test "GLM serving DFlash2 bill includes the bounded window captures replay and scratch" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    try std.testing.expectEqual(@as(u64, 0), glmDflashRequestBytes(&cfg, 2048));
+    cfg.glm_dflash_loaded = true;
+    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.glm_dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
+    const needed = glmDflashRequestBytes(&cfg, 2048);
+    try std.testing.expect(needed >= cfg.glm_dflash_window_bytes * 4 + 256 * 1024 * 1024);
+    try std.testing.expect(needed >= cfg.ssmCheckpointBytes() * 3);
+    try std.testing.expect(needed < 2 * 1024 * 1024 * 1024);
+    try std.testing.expect(glmDflashRequestBytes(&cfg, 1024) < needed);
 }

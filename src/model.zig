@@ -515,6 +515,12 @@ pub const ModelConfig = struct {
     // thinking preference; an explicit request value still outranks it.
     gen_enable_thinking: ?bool = null,
 
+    /// Native GLM DFlash2 request terms, stamped from the selected assistant's
+    /// config before load. Its stored weights are in the resident load bill.
+    glm_dflash_loaded: bool = false,
+    glm_dflash_window_bytes: u64 = 0,
+    glm_dflash_capture_bytes_per_token: u64 = 0,
+
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = @splat(false),
@@ -851,6 +857,7 @@ pub const ModelConfig = struct {
     /// global/sliding split); `kvBytesPerToken` keeps the uniform formula
     /// everywhere else so no arch's number moves without its bytes moving.
     pub fn layerKvBytes(self: *const ModelConfig, li: u32) u64 {
+        if (self.isGlm5()) return if (self.isKvPerTokenLayer(li)) @as(u64, self.mla_kv_lora_rank) * 2 else 0;
         return @as(u64, self.layerKVHeads(li)) *
             (@as(u64, self.layerHeadDim(li)) + @as(u64, self.layerVHeadDim(li))) * 2;
     }
@@ -927,7 +934,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
-        if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * self.mla_kv_lora_rank * 4;
+        if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * self.mla_kv_lora_rank * 2;
         // A ringed arch pays per token only on its global layers; the sliding
         // half is `swaRingBytes`, a constant. Both halves land in the same
         // commit — billing the ring before the storage rings is an under-bill,
@@ -978,6 +985,8 @@ pub const ModelConfig = struct {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
+        // Native GLM retains only the incomplete pool's key/gate pairs.
+        if (self.isGlm5()) return n * (@as(u64, self.indexer_compress_ratio) -| 1) * hd * 2 * 2;
         const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
         return n * rows * hd * 2 * @as(u64, if (self.isGlm5()) 2 else 1);
     }
@@ -1173,6 +1182,7 @@ pub const ModelConfig = struct {
     /// allocation — the two predicates MUST agree or slots crash on a null
     /// `ctx.ssm_entries` (the Qwen3.5-MoE class).
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
+        if (self.isGlm5()) return false; // state belongs to glm5_forward.Request
         return self.has_hybrid_layers or self.full_attention_interval > 0 or self.isInkling();
     }
 
@@ -1349,9 +1359,13 @@ pub const ModelConfig = struct {
     /// vendor documents thinking-on AND the shipped template agrees — never
     /// inferred from "the template mentions enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
+        if (think_effort_flag) |e| if (effortArms(self.model_type)) |arms| {
+            if (findEffortArm(arms, e) != null) return e != .off;
+        };
         // The checkpoint's own declared default outranks the arch allowlist:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
+        if (self.isGlm5()) return true;
         // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
         // header, so the recipient must stay free and the reasoning is
         // delivered rather than paid-and-dropped). A plain chat request
@@ -4330,11 +4344,21 @@ pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir:
 
 /// The architectures this build serves. Every other `model_type` is refused
 /// by name at the loader, so the inherited forwards behind it are unreachable.
-pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2" };
+pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" };
 
 /// The engine's thinking-effort vocabulary. Each served arch accepts a subset
 /// (`effortArms`); a word outside it is refused, never rounded.
-pub const Effort = enum { off, low, medium, high, xhigh, max };
+pub const Effort = enum { off, on, low, medium, high, xhigh, max };
+
+/// Explicit --think default for serving, CLI and later model loads.
+pub var think_effort_flag: ?Effort = null;
+
+pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
+    if (think_effort_flag) |e| if (effortArms(config.model_type)) |arms| {
+        if (findEffortArm(arms, e) != null) return @tagName(e);
+    };
+    return if (config.isGlm5()) "high" else null;
+}
 
 /// One accepted effort word on one arch. `budget` is the decode-time thinking
 /// cap in tokens; null = `--reasoning-budget` (unlimited by default). The word
@@ -4348,18 +4372,21 @@ const qwen4_exp_efforts = [_]EffortArm{
     .{ .effort = .xhigh },
 };
 
-// MiMo's template has only on/off; effort is our thinking budget alone.
+// MiMo's template has only on/off; do not advertise artificial effort levels.
 const mimo_v2_efforts = [_]EffortArm{
     .{ .effort = .off },
-    .{ .effort = .low, .budget = 2048 },
-    .{ .effort = .medium, .budget = 8192 },
+    .{ .effort = .on },
+};
+
+const glm5_efforts = [_]EffortArm{
+    .{ .effort = .low },
     .{ .effort = .high },
-    .{ .effort = .xhigh },
     .{ .effort = .max },
 };
 
 /// null = an inherited arch: its effort words keep `responses.effortBudget`.
 pub fn effortArms(model_type: []const u8) ?[]const EffortArm {
+    if (std.mem.eql(u8, model_type, "glm5_next")) return &glm5_efforts;
     if (std.mem.eql(u8, model_type, "qwen4_exp")) return &qwen4_exp_efforts;
     if (std.mem.eql(u8, model_type, "mimo_v2")) return &mimo_v2_efforts;
     return null;
@@ -4395,10 +4422,18 @@ pub fn loadWeightsForConfig(
     load_vision: bool,
 ) !Weights {
     if (!isServedArch(config.model_type)) {
-        log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2 only)\n", .{config.model_type});
+        log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2, glm5_next only)\n", .{config.model_type});
         return error.ArchitectureUnsupported;
     }
+    if (think_effort_flag) |e| if (findEffortArm(effortArms(config.model_type).?, e) == null) {
+        log.err("--think {s} is not supported by {s}\n", .{ @tagName(e), config.model_type });
+        return error.ThinkingUnsupported;
+    };
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
+    if (config.isGlm5()) {
+        if (config.expert_streaming) return error.ExpertStreamingUnsupportedLayout;
+        return @import("glm5_diagnostic.zig").loadWeights(io, allocator, model_dir, mlx.gpuStream());
+    }
     if (config.expert_streaming and config.usesMimoSourceTrunk()) {
         logMimoSourceLoad(config, false);
         return @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
@@ -5298,12 +5333,13 @@ test "effortArms: every engine word on each served arch" {
     const off: Budget = .{ .on = false, .cap = null };
     const cases = [_]Want{
         .{ .word = "off", .qwen = off, .mimo = off },
+        .{ .word = "on", .qwen = null, .mimo = .{ .on = true, .cap = null } },
         .{ .word = "none", .qwen = off, .mimo = off },
-        .{ .word = "low", .qwen = .{ .on = true, .cap = 2048 }, .mimo = .{ .on = true, .cap = 2048 } },
-        .{ .word = "medium", .qwen = .{ .on = true, .cap = 8192 }, .mimo = .{ .on = true, .cap = 8192 } },
-        .{ .word = "high", .qwen = null, .mimo = .{ .on = true, .cap = null } },
-        .{ .word = "xhigh", .qwen = .{ .on = true, .cap = null }, .mimo = .{ .on = true, .cap = null } },
-        .{ .word = "max", .qwen = null, .mimo = .{ .on = true, .cap = null } },
+        .{ .word = "low", .qwen = .{ .on = true, .cap = 2048 }, .mimo = null },
+        .{ .word = "medium", .qwen = .{ .on = true, .cap = 8192 }, .mimo = null },
+        .{ .word = "high", .qwen = null, .mimo = null },
+        .{ .word = "xhigh", .qwen = .{ .on = true, .cap = null }, .mimo = null },
+        .{ .word = "max", .qwen = null, .mimo = null },
     };
     for (cases) |c| {
         const e = parseEffort(c.word).?;
@@ -9259,11 +9295,11 @@ test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assum
     try testing.expectEqual(@as(u32, 512), c.mla_kv_lora_rank);
     try testing.expectEqual(@as(u32, 0), c.mla_qk_rope_head_dim);
     try testing.expectEqual(@as(u32, 20), c.glm_hc_sinkhorn_iters);
-    try testing.expectEqual(@as(u64, 11 * 512 * 4), c.kvBytesPerToken());
+    try testing.expectEqual(@as(u64, 11 * 512 * 2), c.kvBytesPerToken());
     try testing.expectEqual(@as(u64, 34 * (64 * 128 * 128 * 4 + 3 * 3 * 64 * 128 * 2)), c.ssmCheckpointBytes());
     try testing.expectEqual(@as(u64, 11 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
     try testing.expectEqual(@as(u64, 0), c.qsaScoreBankBytesPerToken());
-    try testing.expectEqual(@as(u64, 11 * 32 * 128 * 2 * 2), c.qsaRingBytes());
+    try testing.expectEqual(@as(u64, 11 * 3 * 128 * 2 * 2), c.qsaRingBytes());
     try testing.expectApproxEqAbs(@as(f32, -5), c.kda_gate_lower_bound, 1e-6);
     try testing.expect(c.moe_sigmoid_router and c.moe_route_norm and !c.norm_has_offset);
 }
@@ -9315,4 +9351,37 @@ test "GLM config preserves optional shared expert counts" {
         const config = try parseConfigFromJson(testing.allocator, raw);
         try testing.expectEqual(count * 2048, config.shared_expert_intermediate_size);
     }
+}
+
+test "GLM serving accepts native effort levels and thinks by default" {
+    const cfg = ModelConfig{ .model_type = "glm5_next" };
+    try testing.expect(isServedArch(cfg.model_type));
+    try testing.expect(cfg.defaultEnableThinking(false));
+    try testing.expect(!cfg.needsSsmEntries());
+    for ([_]Effort{ .low, .high, .max }) |effort| {
+        try testing.expectEqual(@as(?i32, null), findEffortArm(effortArms(cfg.model_type).?, effort).?.budget);
+    }
+    try testing.expect(findEffortArm(effortArms(cfg.model_type).?, .medium) == null);
+    try testing.expect(findEffortArm(effortArms(cfg.model_type).?, .xhigh) == null);
+    try testing.expect(findEffortArm(effortArms(cfg.model_type).?, .off) == null);
+    try testing.expectEqualStrings("high", defaultEffortWord(&cfg).?);
+}
+
+
+test "thinking policy launch defaults are model-specific and preserve GLM high" {
+    const saved = think_effort_flag;
+    defer think_effort_flag = saved;
+    const glm = ModelConfig{ .model_type = "glm5_next" };
+    const mimo = ModelConfig{ .model_type = "mimo_v2" };
+    const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    think_effort_flag = null;
+    try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
+    think_effort_flag = .low;
+    try testing.expectEqualStrings("low", defaultEffortWord(&glm).?);
+    try testing.expectEqualStrings("low", defaultEffortWord(&qwen).?);
+    try testing.expect(defaultEffortWord(&mimo) == null);
+    think_effort_flag = .off;
+    try testing.expect(!qwen.defaultEnableThinking(false));
+    try testing.expect(!mimo.defaultEnableThinking(false));
+    try testing.expect(glm.defaultEnableThinking(false));
 }

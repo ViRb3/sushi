@@ -1,4 +1,4 @@
-//! Opt-in GLM diagnostics; no public model registration or serving dispatch.
+//! Native GLM weight selection and diagnostic runners.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
@@ -23,12 +23,101 @@ pub fn storedBytes(weights: *const model.Weights) u64 {
     return total;
 }
 
+/// Complete assistant safetensors payload, following its index when present.
+/// DFlash2's native loader retains the stored tensor precision.
+pub fn assistantResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !u64 {
+    _ = allocator;
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var referenced = @import("model_discovery.zig").indexShardSet(io, dir);
+    defer if (referenced) |*r| @import("model_discovery.zig").freeShardSet(r);
+    var files = dir.iterate();
+    var bytes: u64 = 0;
+    while (try files.next(io)) |entry| {
+        if ((entry.kind != .file and entry.kind != .sym_link) or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        const file = try dir.openFile(io, entry.name, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        var buffer: [8]u8 = undefined;
+        var reader = file.reader(io, &buffer);
+        const header = try reader.interface.takeInt(u64, .little);
+        if (header == 0 or header > 128 * 1024 * 1024 or header > stat.size -| 8) return error.InvalidSafetensorsHeader;
+        bytes = try std.math.add(u64, bytes, stat.size - header - 8);
+    }
+    if (bytes == 0) return error.MissingIndexedGlmWeight;
+    return bytes;
+}
+
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream) !model.Weights {
     return loadWeightsBounded(io, allocator, model_dir, s, false, std.math.maxInt(u64));
 }
 
 fn keepLoadKey(name: []const u8, layers: usize, trunk_only: bool) bool {
     return keepTextKey(name, layers) and (!trunk_only or (std.mem.indexOf(u8, name, ".mlp.experts.") == null and std.mem.indexOf(u8, name, ".mlp.switch_mlp.") == null));
+}
+
+/// The same indexed text tensors the native loader retains, before allocating MLX arrays.
+/// Counts payloads, excluding vision, extra prediction layers and unindexed shard contents.
+pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize) !u64 {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+    defer dir.close(io);
+    const raw = try dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(raw);
+    const index = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer index.deinit();
+    if (index.value != .object) return error.InvalidGlmWeightIndex;
+    const wm = index.value.object.get("weight_map") orelse return error.InvalidGlmWeightIndex;
+    if (wm != .object) return error.InvalidGlmWeightIndex;
+    var files = std.StringHashMap(void).init(allocator);
+    defer files.deinit();
+    var it = wm.object.iterator();
+    var expected: usize = 0;
+    while (it.next()) |entry| {
+        if (!keepLoadKey(entry.key_ptr.*, layers, false)) continue;
+        const value = entry.value_ptr.*;
+        if (value != .string or value.string.len == 0 or std.mem.indexOfAny(u8, value.string, "/\\") != null or std.mem.eql(u8, value.string, "..")) return error.InvalidGlmShardName;
+        try files.put(value.string, {});
+        expected += 1;
+    }
+    if (expected == 0) return error.MissingIndexedGlmWeight;
+    var found: usize = 0;
+    var total: u64 = 0;
+    var file_it = files.keyIterator();
+    while (file_it.next()) |file| {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file.* }, 0);
+        defer allocator.free(path);
+        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.MissingIndexedGlmWeight;
+        defer _ = std.c.close(fd);
+        var size: [8]u8 = undefined;
+        try @import("expert_io.zig").readExact(fd, &size, 0);
+        const len = std.mem.readInt(u64, &size, .little);
+        if (len == 0 or len > 128 * 1024 * 1024) return error.InvalidSafetensorsHeader;
+        const raw_header = try allocator.alloc(u8, @intCast(len));
+        defer allocator.free(raw_header);
+        try @import("expert_io.zig").readExact(fd, raw_header, 8);
+        const header = try std.json.parseFromSlice(std.json.Value, allocator, raw_header, .{});
+        defer header.deinit();
+        if (header.value != .object) return error.InvalidSafetensorsHeader;
+        var tensors = header.value.object.iterator();
+        while (tensors.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (!keepLoadKey(name, layers, false)) continue;
+            const owner = wm.object.get(name) orelse continue;
+            if (owner != .string or !std.mem.eql(u8, owner.string, file.*)) continue;
+            if (entry.value_ptr.* != .object) return error.InvalidSafetensorsTensor;
+            const offsets = entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsTensor;
+            if (offsets != .array or offsets.array.items.len != 2) return error.InvalidSafetensorsTensor;
+            const lo = offsets.array.items[0];
+            const hi = offsets.array.items[1];
+            if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer) return error.InvalidSafetensorsTensor;
+            total = try std.math.add(u64, total, @intCast(hi.integer - lo.integer));
+            found += 1;
+        }
+    }
+    if (found != expected) return error.MissingIndexedGlmWeight;
+    return total;
 }
 
 /// The budget is checked on lazy metadata before any retained tensor is evaluated.
@@ -144,6 +233,7 @@ test "GLM diagnostic loader preserves stored dtypes and strict index ownership" 
     defer weights.deinit();
     try std.testing.expectEqual(@as(u32, 4), weights.count());
     try std.testing.expectEqual(@as(u64, 10), storedBytes(&weights));
+    try std.testing.expectEqual(storedBytes(&weights), try residentBytes(std.testing.io, a, path, 1));
     try std.testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(weights.get("lm_head.weight").?));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.language_model.norm.weight").?));
     const half = weights.get("model.language_model.layers.0.x.suh").?;

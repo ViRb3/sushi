@@ -84,6 +84,16 @@ pub const KvCacheChoice = struct {
     config: KVQuantConfig,
     source: model_settings.Source,
 
+    /// GLM's native MLA stores one BF16 latent; it has no affine-cache backend.
+    /// Keep flags/settings visible so the loader can refuse unsupported schemes.
+    pub fn resolveForModel(setting: ?KVQuantConfig, launch: KVQuantConfig, launch_explicit: bool, model_type: []const u8) KvCacheChoice {
+        if (std.mem.eql(u8, model_type, "glm5_next")) {
+            const p = model_settings.pick(KVQuantConfig, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, KVQuantConfig.dense);
+        return .{ .config = p.value, .source = p.source };
+        }
+        return resolve(setting, launch, launch_explicit);
+    }
+
     pub fn resolve(setting: ?KVQuantConfig, launch: KVQuantConfig, launch_explicit: bool) KvCacheChoice {
         const p = model_settings.pickLaunch(KVQuantConfig, .kv_quant, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, launch);
         return .{ .config = p.value, .source = p.source };
@@ -1195,4 +1205,18 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
         if (e > max_err) max_err = e;
     }
     try testing.expect(max_err < 0.05);
+}
+
+test "GLM serving cache defaults to BF16 even under fast, with explicit choices preserved" {
+    const saved = model_settings.fast;
+    defer model_settings.fast = saved;
+    for ([_]bool{ false, true }) |fast| {
+        model_settings.fast = fast;
+        const choice = KvCacheChoice.resolveForModel(null, KVQuantConfig.engine_default, false, "glm5_next");
+        try std.testing.expectEqual(KVQuantConfig.dense, choice.config);
+        try std.testing.expectEqualStrings("default", choice.sourceName());
+    }
+    try std.testing.expectEqual(KVQuantConfig.affine(4), KvCacheChoice.resolveForModel(null, KVQuantConfig.affine(4), true, "glm5_next").config);
+    try std.testing.expectEqual(KVQuantConfig.affine(8), KvCacheChoice.resolveForModel(KVQuantConfig.affine(8), KVQuantConfig.dense, false, "glm5_next").config);
+    try std.testing.expectEqual(KVQuantConfig.dense, KvCacheChoice.resolveForModel(KVQuantConfig.affine(8), KVQuantConfig.dense, true, "glm5_next").config);
 }

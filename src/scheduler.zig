@@ -1625,7 +1625,8 @@ pub const Scheduler = struct {
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
         const eff_kv_quant = params.kv_quant_config orelse
-            transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
+            transformer_mod.KvCacheChoice.resolveForModel(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit, slot_config.model_type).config;
+        if (slot_config.isGlm5() and eff_kv_quant.isQuant()) return error.GlmKvQuantUnsupported;
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
         errdefer slot.deinit();
 
@@ -1806,7 +1807,9 @@ pub const Scheduler = struct {
                 per_expert,
             );
             break :blk expertStreamingGateBytes(split.trunk +| split.mtp, plan.cache_bytes, plan.prefill_peak_bytes, plan.bounce_bytes);
-        } else if (owned.config.usesMimoSourceTrunk())
+        } else if (owned.config.isGlm5())
+            try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
+        else if (owned.config.usesMimoSourceTrunk())
             try mimoColdLoadBillBytes(
                 self.io,
                 self.allocator,
@@ -2626,7 +2629,7 @@ const LaunchPicks = struct {
             .mtp = mtpChoiceFor(mtp_flag orelse true, mtp_flag != null, config),
             .acceptance = generate_mod.mtpAcceptanceFor(config.mtp_acceptance_override),
             .greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
-            .kv = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_flag orelse transformer_mod.KVQuantConfig.engine_default, kv_flag != null),
+            .kv = transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, kv_flag orelse transformer_mod.KVQuantConfig.engine_default, kv_flag != null, config.model_type),
         };
     }
 };
@@ -3440,6 +3443,52 @@ pub fn loadRequirementBytes(weights_bytes: u64, ctx_bytes: ?u64) u64 {
 /// Resident Flash-Next and MiMo EXL3 load/warmup scratch; measured envelope in engine-memory-admission.md.
 const LOAD_WARMUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+fn loadRequirementForConfig(config: *const ModelConfig, weights: u64, ctx_bytes: ?u64) u64 {
+    if (!config.isGlm5()) return loadRequirementBytes(weights, ctx_bytes);
+    // Native serving warms T=1 and T=8, then resets. The requested context
+    // allocates later; billing a percentage of the expert banks at startup
+    // charged 7 GiB for scratch that does not grow with their resident size.
+    // Keep the 2 GiB runtime allowance plus the fixed FP32 KDA state and
+    // rounded latent/index buffers. Request admission bills the full context.
+    return weights +| LOAD_WARMUP_BYTES +| config.ssmCheckpointBytes() +|
+        config.qsaRingBytes() +| (config.kvBytesPerToken() +| config.qsaHistoryBytesPerToken()) *| 1024;
+}
+
+fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, directory: []const u8) !u64 {
+    if (directory.len == 0) return 0;
+    if (std.c.getenv("SUSHI_DFLASH")) |v| if (v[0] == '0') return 0;
+    if (!dflash_mod.probeIsDflash(io, allocator, directory)) return error.GlmDflashAssistantRequired;
+    var cfg = try dflash_mod.parseConfig(io, allocator, directory);
+    defer cfg.deinit(allocator);
+    if (!cfg.isDflash2() or cfg.hidden_size != config.hidden_size or cfg.sliding_window < 2) return error.GlmDraftTargetMismatch;
+    for (cfg.layer_types) |kind| if (kind != .sliding_attention) return error.GlmDflashWindowUnsupported;
+    config.glm_dflash_loaded = true;
+    const per_token = @as(u64, cfg.num_hidden_layers) * cfg.num_key_value_heads * cfg.head_dim * 4;
+    // A draft block grows a 2047-row window to the next 256-row allocation.
+    config.glm_dflash_window_bytes = per_token * ((@as(u64, cfg.sliding_window) + cfg.block_size + 255) / 256 * 256);
+    config.glm_dflash_capture_bytes_per_token = (@as(u64, cfg.target_layer_ids.len) * cfg.hidden_size + @as(u64, cfg.hidden_size) * 2) * 2 + per_token;
+    const mini = if (transformer_mod.diagEnvOn("SUSHI_GLM_DFLASH_MINI_HEAD")) @import("glm5_dflash_mini.zig").residentBytes(@intCast(config.vocab_size), @intCast(config.hidden_size)) else 0;
+    return (try @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory)) +| mini;
+}
+
+fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, no_drafter: bool, drafter_dir: []const u8) !u64 {
+    const drafter = LoadDrafterDir.resolve(io, allocator, no_drafter, drafter_dir, model_dir);
+    defer drafter.deinit(allocator);
+    const weights = try @import("glm5_diagnostic.zig").residentBytes(io, allocator, model_dir, config.num_hidden_layers);
+    return loadRequirementForConfig(config, weights +| try glmDflashLoadBytes(io, allocator, config, drafter.dir), null);
+}
+
+test "GLM serving load bills text weights and warmup instead of an unallocated context" {
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const weights: u64 = 93295638776;
+    const wanted = loadRequirementForConfig(&cfg, weights, null);
+    cfg.ctx_override = 500000;
+    try testing.expectEqual(wanted, loadRequirementForConfig(&cfg, weights, 500000 * 11968));
+    try testing.expect(wanted < 90 * 1024 * 1024 * 1024);
+    cfg.model_type = "mimo_v2";
+    try testing.expectEqual(loadRequirementBytes(weights, null), loadRequirementForConfig(&cfg, weights, null));
+}
+
 test "a refusal quotes the number it actually compared" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -3607,6 +3656,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         params.config.expert_fill_peak_bytes = plan.prefill_peak_bytes;
         streaming_resident_bytes = split.trunk +| split.mtp;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
+    } else if (params.config.isGlm5()) {
+        const kv = transformer_mod.KvCacheChoice.resolveForModel(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit, params.config.model_type);
+        if (kv.config.isQuant()) {
+            log.err("[glm] native MLA cache requires BF16; use --kv-quant off\n", .{});
+            return error.GlmKvQuantUnsupported;
+        }
+        streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytes(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers);
     } else if (params.config.usesMimoSourceTrunk()) {
         streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     }
@@ -3615,6 +3671,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter, params.drafter_dir, params.model_dir);
     defer drafter.deinit(sch.allocator);
     const drafter_dir = drafter.dir;
+    if (params.config.isGlm5()) {
+        const assistant_bytes = try glmDflashLoadBytes(sch.io, sch.allocator, params.config, drafter_dir);
+        streaming_resident_bytes = streaming_resident_bytes.? +| assistant_bytes;
+        if (assistant_bytes > 0) log.info("[glm-dflash] resident assistant {d:.3} GiB; window {d} MiB; BF16 context; verification scratch billed per request\n", .{ @as(f64, @floatFromInt(assistant_bytes)) / (1024 * 1024 * 1024), params.config.glm_dflash_window_bytes >> 20 });
+    }
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
@@ -3626,15 +3687,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
         const ctx_bytes = preflightCtxBytes(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.ane_prefill, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
+        const needed = loadRequirementForConfig(params.config, weights_bytes, ctx_bytes);
         log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes, ctx_bytes))) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
         });
-        if (memInsufficientForLoad(weights_bytes, avail_bytes, ctx_bytes)) {
+        if (weights_bytes > 0 and avail_bytes > 0 and avail_bytes < needed) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available (free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets). Close other models/apps (or wait for a prior sushi to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
-                @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes, ctx_bytes))) / gb,
+                @as(f64, @floatFromInt(needed)) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
             });
@@ -3676,7 +3738,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     // An explicit launch flag outranks the per-model settings stamped on the config at BOTH construction sites.
-    const kv_cache = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
+    const kv_cache = transformer_mod.KvCacheChoice.resolveForModel(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit, params.config.model_type);
     const load_ctx = model_settings.contextPick(sch.ctx_size_flag, params.config.ctx_override);
     var ctx_buf: [16]u8 = undefined;
     log.info("[kv-cache] {s} ({s}); ctx {s} ({s})\n", .{
@@ -3689,11 +3751,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const acceptance = generate_mod.mtpAcceptanceFor(params.config.mtp_acceptance_override);
     const greedy_tail = generate_mod.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
     log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
-        if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
+        if (mtp_streaming_off or params.config.isGlm5()) "off" else mtp.label(), if (params.config.isGlm5()) "GLM unavailable; " else if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
         mtp_acceptance_mod.name(acceptance.value),     model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
         if (greedy_tail.value) "on" else "off",        model_settings.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
-    const mtp_enabled = mtp.on and !mtp_streaming_off;
+    const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5();
+    if (params.config.isGlm5()) {
+        log.info("[glm] native BF16 MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ params.config.kvBytesPerToken(), params.config.qsaHistoryBytesPerToken() });
+        log.info("[glm] vision tower unavailable in native serving; text only\n", .{});
+        if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
+        if (params.prefix_cache_capacity > 0) log.warn("[glm] native recurrent state has no prefix-cache restore yet; RAM/disk prefix reuse off\n", .{});
+    }
     if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
         const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", model_settings.sourceLabel(keep.source, "--preserve-thinking") });
@@ -4031,12 +4099,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             log.info("[dflash] sidecar at {s} skipped (SUSHI_DFLASH=0)\n", .{drafter_dir});
         } else {
             const d = try sch.allocator.create(DflashModel);
-            d.* = dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
+            d.* = (if (params.config.isGlm5()) @import("glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
                 sch.allocator.destroy(d);
                 log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
                 return err;
             };
-            d.bind(xfm_ptr) catch |err| {
+            if (params.config.isGlm5()) {
+                d.native_glm_serving = true;
+                log.info("[glm-dflash] native DFlash2 loaded; greedy requests use layerwise tree verification; sampled requests decode serially\n", .{});
+            } else d.bind(xfm_ptr) catch |err| {
                 d.deinit();
                 sch.allocator.destroy(d);
                 log.err(
@@ -4153,7 +4224,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Same predicate as the resident bill that prices this copy.
     if (mimoCoarseHeadBytes(params.config) > 0 and xfm_ptr.lm_head_coarse == null)
         xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
-    if (mtp_enabled and !params.config.isMimo() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
+    if (mtp_enabled and !params.config.isMimo() and !params.config.isGlm5() and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
@@ -5003,6 +5074,12 @@ fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session
 /// to that entry (`shared_view`), not here.
 fn slotStateBytes(s: *const Slot) u64 {
     var bytes = s.cache.residentBytes();
+    if (s.model.transformer) |xfm| {
+        if (xfm.glm5_request) |*request| bytes += request.residentBytes();
+    }
+    if (s.legacy_gen) |*gen| {
+        if (gen.dflash_ctx) |*ctx| bytes += ctx.cache.residentBytes();
+    }
     if (s.ssm_entries) |ents| for (ents) |*e| {
         bytes += transformer_mod.ssmEntryBytes(e);
     };
@@ -5738,6 +5815,9 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
     if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
+    // Native GLM has no reusable prefix snapshot. Release its reserved target
+    // state on the inference owner before the next request's admission read.
+    if (slot.model.transformer) |xfm| if (xfm.glm5_request) |*request| request.reset();
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
@@ -6339,7 +6419,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     );
     const use_mtp = wiring.use_mtp;
     const use_drafter = wiring.use_drafter;
-    const use_dflash = wiring.use_dflash;
+    const use_dflash = wiring.use_dflash or (slot.model.config.?.isGlm5() and slot.enable_drafter and slot.dflash != null and generate_mod.glmDflashEligible(slot.sampling, slot.logprobs_n));
     const use_pld = wiring.use_pld;
     const dsv4_spec_intent = wiring.native_intent;
     log.debug("[spec-wiring] mtp={} dflash={} drafter={} pld={} (slot: drafter_flag={} dflash_handle={} drafter_handle={})\n", .{
@@ -9713,9 +9793,11 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
     const src = @embedFile("scheduler.zig");
     // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
     // this test's own arms would satisfy.
-    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_dflash = wiring" ++ ".use_dflash;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
+    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
     }
+    try testing.expect(std.mem.indexOf(u8, src, "const use_dflash = wiring.use_dflash or (") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "generate_mod.glmDflashEligible(slot.sampling, slot.logprobs_n)") != null);
     // The exclusion must come from the shared predicate, not a new arch list.
     const from_predicate = "transformer.?.moduleSpec" ++ "Wiring()";
     try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);

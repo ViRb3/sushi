@@ -1136,7 +1136,7 @@ pub fn installThinkMarkers(xfm: *Transformer, tok: *const Tokenizer) void {
 /// `out = where(mask, -inf, logits)` — the masked lanes get EXACTLY -inf
 /// (never an additive -inf, whose 0×-inf/NaN edge the parity rules exist
 /// for). `[V]` broadcasts over both `[1, V]` and `[1, 1, V]` logits.
-fn applySuppressMask(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_array, s: mlx.mlx_stream) !void {
+pub fn applySuppressMask(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_array, s: mlx.mlx_stream) !void {
     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(out, mask, neg_inf, logits, s));
@@ -1220,6 +1220,12 @@ fn specDecodeUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
 /// repeat or presence penalty reads ids no verify row has committed yet.
 pub fn draftsRefused(sampling: SamplingParams) bool {
     return sampling.constraint != null or sampling.call_force != null or penaltyActive(sampling);
+}
+
+pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
+    return (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
+        !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null and
+        !sampling.think_penalty.active();
 }
 
 /// Only the synchronous serial sampler (`sampleToken`) applies these penalties. A repeat
@@ -1709,6 +1715,8 @@ pub const Generator = struct {
     // the trunk's capture_layers hiddens, freed in `deinit`.
     dflash: ?*DflashModel = null,
     dflash_ctx: ?dflash_mod.DflashCtx = null,
+    glm_dflash_native: bool = false,
+    glm_dflash_reserved: bool = false,
     /// Effective block size (assistant config, clamped by --draft-block-size).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
@@ -2612,6 +2620,14 @@ pub const Generator = struct {
         // and per-site wiring is the class the spec-dispatch rule warns
         // about).
         var options = options_in;
+        const glm_dflash_native = xfm.glm5 != null and options.dflash_enabled and options.dflash != null and glmDflashEligible(sampling, options.logprobs_n);
+        if (xfm.glm5 != null) {
+            options.pld_enabled = false;
+            options.drafter_enabled = false;
+            options.drafter = null;
+            options.mtp_enabled = false;
+            options.dflash_enabled = glm_dflash_native;
+        }
         var dspark_active = false;
         var dspark_stochastic = false;
         if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
@@ -3515,8 +3531,9 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
+                .glm_dflash_native = glm_dflash_native,
                 .dflash_block_size = dflash_bs,
-                .dflash_chooser = if (dflash_active and dflashChooserEnabled())
+                .dflash_chooser = if (dflash_active and !glm_dflash_native and dflashChooserEnabled())
                     round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
                 else
                     null,
@@ -5328,7 +5345,51 @@ pub const Generator = struct {
     /// Drafts are greedy (argmax over the trunk lm_head on assistant
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
     /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
+    fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.done or try self.checkStop()) return null;
+        if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        const target = self.xfm.glm5.?;
+        const request = &self.xfm.glm5_request.?;
+        const assistant = self.dflash.?;
+        target.s = self.xfm.s;
+        assistant.s = self.xfm.s;
+        target.suppress_mask = self.xfm.suppress_mask;
+        if (!self.glm_dflash_reserved) {
+            const total = request.offset + @as(usize, self.max_tokens) + 3;
+            _ = try @import("glm5_dflash_reserve.zig").reserve(request, total, @intCast(@import("server.zig").prefillHeadroomNow(&self.xfm.config, 0)), self.xfm.s);
+            self.glm_dflash_reserved = true;
+        }
+        const schedule = try @import("glm5_dflash_model.zig").bindSchedule(4);
+        defer schedule.restore();
+        const budget = self.max_tokens - self.completion_tokens;
+        const round = try @import("glm5_dflash.zig").roundTreeLayerwiseConfigured(self.timer.io, assistant, &self.dflash_ctx.?, target, request, self.next_token_id, @min(@max(self.dflash_block_size, 2) - 1, 2), budget, self.eos_token_ids, .affine_rows_ffn, 4);
+        var emitted = round.count;
+        for (round.tokens[1..round.count], 1..) |token, i| {
+            if (tokenStops(token, self.eos_token_ids, &self.consecutive_pad)) {
+                if (!isEosId(token, self.eos_token_ids)) emitted = i;
+                self.done = true;
+                self.finish_reason = "stop";
+                break;
+            }
+        }
+        const tokens = try allocator.dupe(u32, round.tokens[0..emitted]);
+        errdefer allocator.free(tokens);
+        try self.generated_ids.appendSlice(allocator, tokens);
+        self.advanceStep(@intCast(tokens.len));
+        self.ctx.cache.step = request.offset;
+        self.next_token_id = round.pending orelse tokens[tokens.len - 1];
+        self.dflash_attempted += 1;
+        self.dflash_accepted_tokens += round.accepted_drafts;
+        self.dflash_round_width = @intCast(round.verified_rows - 1);
+        if (round.stopped) {
+            self.done = true;
+            self.finish_reason = "stop";
+        }
+        return .{ .tokens = tokens, .accepted_tokens = @intCast(round.accepted_drafts) };
+    }
+
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.glm_dflash_native) return self.nextGlmDflash(allocator);
         // The kv term is the same physics for either block decoder (one
         // forward, one KV read, shared across the block's rows), so a DFlash
         // round is an observation for it too — and on a DFlash-only server
@@ -21993,4 +22054,14 @@ test "logit bias CPU: rewards and penalties require the full head while zero sta
     const zero = [_]logit_bias.Bias{.{ .id = 1, .delta = 0 }};
     try t.expect(argmaxOnlyRequest(.{ .temperature = 0, .think_penalty = .{ .biases = &zero } }, 0, false));
     try t.expect(argmaxOnlyRequest(.{ .temperature = 0 }, 0, false));
+}
+
+
+test "GLM serving DFlash2 arms only requests the native verifier can reproduce" {
+    try testing.expect(glmDflashEligible(.{ .temperature = 0 }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 1, .top_k = 1 }, 0));
+    try testing.expect(!glmDflashEligible(.{ .temperature = 1 }, 0));
+    try testing.expect(!glmDflashEligible(.{ .temperature = 0 }, 1));
+    try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }, 0));
+    try testing.expect(!glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1 } }, 0));
 }
