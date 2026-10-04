@@ -11,6 +11,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Cancelling a GLM-5.3 request while it decodes no longer races the scheduler's list of running requests**, and its
   prefix is committed exactly once.
 - **A GLM-5.3 prefix-cache commit that runs out of memory no longer leaks the request's KDA checkpoints.**
+- **A crash during an SSD cache commit can no longer restore a newer assistant window under older positions**; the
+  draft-side snapshot is declined and the trunk still restores.
 - **Concurrent GLM-5.3 requests no longer leak a verifier result per tick** when one of them runs a DFlash2 draft tree
   beside the others.
 - **A streamed answer that ends in the middle of a character delivers it** like the non-streaming answer does, on chat,

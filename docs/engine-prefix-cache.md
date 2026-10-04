@@ -229,6 +229,8 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
   - Rows go in the usual chunk files as a dense pseudo-cache of two entries per layer (`glm5_prefix.diskEntries`).
     kv8 is keyed `{off, 8, 64}`, which the manifest keeps.
   - KDA checkpoints go in `s{pos}` files, at most 8 per entry, the window in the spec sidecar.
+  - `spec.safetensors` is replaced in place before the manifest commits and equal windows share a size, so it carries a
+    `d.pos`/`m.pos` = `base:step` stamp; a load that finds it absent or different declines the spec (trunk restores).
   - A restore reads only its own checkpoint file (`DiskTier.restoreIntoKda`); the QSA check that rereads the
     newest one is Qwen's.
   - GLM is never SSD-first while RAM retention is on. Under SSD-only storage it is: the commit captures the rows,

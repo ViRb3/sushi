@@ -1820,9 +1820,32 @@ pub const DiskTier = struct {
         var res: SpecSidecarResult = .{};
         if (dflash) |dc| res.dflash = try self.insertSpecTensors(tensor_map, "d", dc, s);
         if (mtp) |mc| res.mtp = try self.insertSpecTensors(tensor_map, "m", mc, s);
+        // The file is replaced before the manifest commits; equal-shaped windows share a byte
+        // size, so the load re-checks base/step from here.
+        if (res.dflash) |sm| try insertSpecStamp(meta_map, "d", sm);
+        if (res.mtp) |sm| try insertSpecStamp(meta_map, "m", sm);
         try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
         res.bytes = fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
         return res;
+    }
+
+    fn insertSpecStamp(meta_map: mlx.mlx_map_string_to_string, prefix: []const u8, sm: SpecMeta) !void {
+        var key: [8]u8 = undefined;
+        var val: [48]u8 = undefined;
+        const k = try std.fmt.bufPrint(&key, "{s}.pos\x00", .{prefix});
+        const v = try std.fmt.bufPrint(&val, "{d}:{d}\x00", .{ sm.base, sm.step });
+        try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(k.ptr), @ptrCast(v.ptr)));
+    }
+
+    /// False for a sidecar whose stamp is absent (written before stamps) or names other rows.
+    fn specStampMatches(meta_map: mlx.mlx_map_string_to_string, prefix: []const u8, sm: SpecMeta) bool {
+        var key: [8]u8 = undefined;
+        var want: [48]u8 = undefined;
+        const k = std.fmt.bufPrint(&key, "{s}.pos\x00", .{prefix}) catch return false;
+        const w = std.fmt.bufPrint(&want, "{d}:{d}", .{ sm.base, sm.step }) catch return false;
+        var got: [*:0]const u8 = undefined;
+        if (mlx.mlx_map_string_to_string_get(&got, meta_map, @ptrCast(k.ptr)) != 0) return false;
+        return std.mem.eql(u8, std.mem.span(got), w);
     }
 
     fn insertSpecTensors(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, sc: SpecCommit, s: mlx.mlx_stream) !SpecMeta {
@@ -1952,6 +1975,10 @@ pub const DiskTier = struct {
             .dflash => "d",
             .mtp => "m",
         };
+        if (!specStampMatches(meta_map, prefix, meta)) {
+            log.info("  [disk-cache] spec sidecar declined (stamp mismatch)\n", .{});
+            return null;
+        }
         const kinds: []const []const u8 = if (meta.quant.scheme == .off)
             &.{ "k", "v" }
         else
@@ -5660,6 +5687,57 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     defer cache3.deinit();
     const restored = try tier3.restoreInto(&cache3, m3.idx, s);
     try testing.expectEqual(@as(u32, 600), restored);
+}
+
+test "DiskTier: a spec sidecar replaced before its manifest commits is declined, never relabelled" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-crash", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var old_win = try KVCache.init(testing.allocator, 2);
+    defer old_win.deinit();
+    try fillCache(&old_win, s, 2, 300, 8, 3.5, .float32);
+    var new_win = try KVCache.init(testing.allocator, 2);
+    defer new_win.deinit();
+    try fillCache(&new_win, s, 2, 300, 8, 700.5, .float32);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        .{ .entries = old_win.entries, .step = old_win.step, .config = old_win.config, .base_pos = 100 },
+        null,
+        s,
+    );
+    const e = tier.entries.items[0];
+    const old_bytes = e.spec_bytes;
+
+    // The crash: the next commit's sidecar (same shape, later rows) landed, its manifest did not.
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, e.id });
+    defer testing.allocator.free(dir);
+    const res = try tier.writeSpecSidecar(dir, .{ .entries = new_win.entries, .step = new_win.step, .config = new_win.config, .base_pos = 200 }, null, s);
+    try testing.expectEqual(old_bytes, res.bytes);
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec-crash", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    try testing.expect(tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) == null);
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    try testing.expectEqual(@as(u32, 600), try tier2.restoreInto(&cache2, m.idx, s));
 }
 
 test "DiskTier: a dense MTP sidecar is rewritten at affine-8 on the next commit" {
