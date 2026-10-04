@@ -116,11 +116,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - **KDA**: parent-indexed prework over 1–16 nodes, then a tree recurrence holding FP32 parent states locally; the tape
   keeps projected prework and replays only the accepted path. The first-child leaf (chain row 2, fork row 1) is kept and
   aliased on a hit (4 MiB per layer; −25%; 59% hits at 8K, break-even 21%).
-- **MLA**: trees of at most three nodes read the committed buffer plus a ≤3-row ancestry tail instead of a replaced
-  latent buffer (1.97× at 32K); query and value projections broadcast the one-row geometry over three rows (exact,
-  −3.6%). Accepted rows append at commit. Live branch scratch is capped at 256 MiB; overlay trees bill only the branch
-  pooled copy, so three branches fit even at a full-context reservation, while wider trees still bill a latent copy
-  per branch. Branch groups that do not fit settle in turn and B3 falls back to per-node B1.
+- **MLA**: trees of at most four nodes read the committed buffer plus a ≤4-row ancestry tail instead of a replaced
+  latent buffer (1.97× at 32K); the native gather and the overlay both read four-row tails (`max_tail`), exact against
+  those rows committed. Query and value projections broadcast the one-row geometry over three rows (exact, −3.6%).
+  Accepted rows append at commit. Live branch scratch is capped at 256 MiB; overlay trees bill only the branch
+  pooled copy, so four branches fit even at a full-context reservation (three beside the off-NAX B1/B3 scratch, B3
+  intact), while wider trees still bill a latent copy per branch. Branch groups that do not fit settle in turn and B3 falls back to per-node B1.
 - **Commit**: the commit hands the request's latent (kv8: codes, scales, biases) and pooled buffers to the accepted
   state before evaluating, so MLX appends in place; a buffer the committed request still shares is copied whole,
   reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,

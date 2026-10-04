@@ -1,4 +1,4 @@
-//! Verification-only latent prefix plus at most three ancestry rows.
+//! Verification-only latent prefix plus at most four ancestry rows.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -6,8 +6,11 @@ const latent_store = @import("glm5_latent.zig");
 const Latent = latent_store.Latent;
 const Arr = mlx.mlx_array;
 
+/// Ancestry rows a branch overlays: the native gather's tail bound.
+pub const max_rows = @import("glm5_attention_decode_batch.zig").max_tail;
+
 pub fn tailBytes(width: usize, rows: usize, bytes: usize) !usize {
-    if (width == 0 or rows == 0 or rows > 3 or (bytes != 2 and bytes != 4)) return error.InvalidGlmOverlay;
+    if (width == 0 or rows == 0 or rows > max_rows or (bytes != 2 and bytes != 4)) return error.InvalidGlmOverlay;
     return std.math.mul(usize, try std.math.mul(usize, rows, width), bytes);
 }
 /// `tail` holds rows as attention reads them: under kv8, their quantize-dequantize round trip.
@@ -25,7 +28,7 @@ pub const View = struct {
         if (self.tail.ctx == null or q.ctx == null or self.prefix_rows > 1048576) return error.InvalidGlmOverlay;
         const qs = mlx.getShape(q);
         const ts = mlx.getShape(self.tail);
-        if (qs.len != 3 or qs[0] != 1 or qs[1] < 1 or qs[2] < 1 or ts.len != 2 or ts[0] < 1 or ts[0] > 3 or ts[1] != qs[2] or
+        if (qs.len != 3 or qs[0] != 1 or qs[1] < 1 or qs[2] < 1 or ts.len != 2 or ts[0] < 1 or ts[0] > max_rows or ts[1] != qs[2] or
             mlx.mlx_array_dtype(self.tail) != mlx.mlx_array_dtype(q)) return error.InvalidGlmOverlay;
         _ = try tailBytes(@intCast(qs[2]), @intCast(ts[0]), mlx.mlx_array_itemsize(q));
         const qt = mlx.mlx_array_strides(q);
@@ -125,7 +128,8 @@ pub fn partials(q: Arr, view: View, ids: Arr, offset: Arr, length: Arr, scale: A
 test "GLM latent overlay byte bill excludes immutable prefix" {
     try std.testing.expectEqual(@as(usize, 3072), try tailBytes(512, 3, 2));
     try std.testing.expectEqual(@as(usize, 6144), try tailBytes(512, 3, 4));
-    try std.testing.expectError(error.InvalidGlmOverlay, tailBytes(512, 4, 2));
+    try std.testing.expectEqual(@as(usize, 4096), try tailBytes(512, 4, 2));
+    try std.testing.expectError(error.InvalidGlmOverlay, tailBytes(512, 5, 2));
 }
 
 fn fork(source: *const @import("glm5_attention.zig").State) !@import("glm5_attention.zig").State {
@@ -164,13 +168,13 @@ test "GLM latent overlay branch outputs index state and commit match full append
         const ape = try ops.zeros(&.{ 4, 8 }, dtype);
         _ = try source.append(try normal(&ops, &.{ @intCast(prefix), 32 }, dtype, 11), try normal(&ops, &.{ @intCast(prefix), 8 }, dtype, 12), try ops.zeros(&.{ @intCast(prefix), 8 }, dtype), ape, s);
         try source.evaluate();
-        const latents = try normal(&ops, &.{ 3, 32 }, dtype, 31);
-        const keys = try normal(&ops, &.{ 3, 8 }, dtype, 32);
-        const gates = try ops.zeros(&.{ 3, 8 }, dtype);
-        const queries = try normal(&ops, &.{ 3, 2, 32 }, dtype, 41);
-        const iq = try normal(&ops, &.{ 3, 2, 8 }, dtype, 42);
-        const iw = try ops.ones(&.{ 3, 2 }, dtype);
-        for ([_][]const u32{ &.{0}, &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 2 } }) |path| {
+        const latents = try normal(&ops, &.{ 4, 32 }, dtype, 31);
+        const keys = try normal(&ops, &.{ 4, 8 }, dtype, 32);
+        const gates = try ops.zeros(&.{ 4, 8 }, dtype);
+        const queries = try normal(&ops, &.{ 4, 2, 32 }, dtype, 41);
+        const iq = try normal(&ops, &.{ 4, 2, 8 }, dtype, 42);
+        const iw = try ops.ones(&.{ 4, 2 }, dtype);
+        for ([_][]const u32{ &.{0}, &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 2 }, &.{ 0, 1, 2, 3 } }) |path| {
             var original = try fork(&source);
             defer original.deinit();
             var virtual = try fork(&source);

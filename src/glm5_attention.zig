@@ -787,7 +787,7 @@ fn attendNativeDecode(state: *const State, q: Arr, iq: ?Arr, weights: ?Arr, offs
             const prefix = if (view) |v| v.storage() else state.latentView();
             const prefix_rows = if (view) |v| v.prefix_rows else pos;
             const tail = if (view) |v| v.tail else try ops.own(try state.latentView().dense(@intCast(pos), @intCast(pos + 1), s));
-            const branch = native.Branch{ .offset = pos, .length = pos + 1, .path = .{ 0, 1, 2 } };
+            const branch = native.Branch{ .offset = pos, .length = pos + 1, .path = .{ 0, 1, 2, 3 } };
             const out = (try native.run(&ops, query, prefix, prefix_rows, tail, &.{branch}, indices, scale)) orelse return error.GlmDecodeNativeUnsupported;
             try mlx.check(mlx.mlx_vector_array_append_value(outputs, out));
             try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
@@ -1445,9 +1445,9 @@ test "GLM decode attention without NAX: the FP32 composite B3 is three B1, held 
     const prefix = Latent{ .data = try normal(&scope, &.{ prefix_rows, 512 }, 30, 1) };
     const tape = try normal(&scope, &.{ 3, 512 }, 31, 1);
     const branches = [_]native.Branch{
-        .{ .offset = prefix_rows, .length = prefix_rows + 1, .path = .{ 0, 0, 0 } },
-        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 1, 0 } },
-        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 2, 0 } },
+        .{ .offset = prefix_rows, .length = prefix_rows + 1, .path = .{ 0, 0, 0, 0 } },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 1, 0, 0 } },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 2, 0, 0 } },
     };
     var ids: [3 * 2051]i32 = undefined;
     for (branches, 0..) |branch, row| for (0..2051) |k| {

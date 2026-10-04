@@ -110,9 +110,10 @@ inside 1.46% drift) because verification per round grew 20.6%.
 - **N2 saturates on copies, breaks even on prose** (no runtime yield gate): a ~2K-token verbatim copy and a rename
   edit accepted 2.00 of 2 drafts every round (41.4/40.8 vs 25.2 tok/s serial), low-effort prose 0.88 (26.1 vs 25.6);
   greedy bytes equal serial (`144f63db`, BF16 latent, Sushi-2.3bpw + A4 g64, `taskpolicy -a`, busy box, 2026-10-04).
-- **No lookup drafting**: PLD never runs on GLM (`specInitWiring`'s module branch, cleared again in `Generator.init`),
-  so `--no-drafter` decodes plain serial; the request log's `pld=enabled` then `drafter takes priority` is cosmetic
-  and the 0.010 n-gram gate is inert (DFlash2 is exempt from it).
+- **Verbatim lookup chains instead of PLD**: PLD never runs on GLM (`specInitWiring`'s module branch), so `--no-drafter`
+  decodes plain serial and the 0.010 n-gram gate is inert. A request drafting alone whose output agrees with its context
+  for `mtp_lookup.STRONG_SUFFIX` tokens verifies the context's next three tokens as a four-row chain in place of the
+  assistant's tree (`glmLookupProposal`, `[spec-stats] … lookup=rounds/landed`).
 
 <a id="concurrency"></a>
 ## Concurrency

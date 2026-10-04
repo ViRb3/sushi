@@ -1227,6 +1227,22 @@ pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
         !sampling.think_penalty.active();
 }
 
+/// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
+/// agrees back `mtp_lookup.STRONG_SUFFIX` tokens and the budget holds the whole chain.
+pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@import("glm5_dflash.zig").Proposal {
+    const drafts = Generator.glm_lookup_drafts;
+    const m = got orelse return null;
+    if (m.suffix < mtp_lookup.STRONG_SUFFIX or m.draft.len < drafts or budget <= drafts) return null;
+    var chain = @import("glm5_dflash.zig").Proposal{ .count = drafts + 1 };
+    chain.tokens[0] = pending;
+    chain.parents[0] = -1;
+    for (m.draft[0..drafts], 1..) |token, row| {
+        chain.tokens[row] = token;
+        chain.parents[row] = @intCast(row - 1);
+    }
+    return chain;
+}
+
 /// Takes the verifier's MLA capacity right after prefill, inside the request's admission bill: no
 /// round grows a buffer, and a later admission already sees the capacity as live memory.
 fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assistant: *const dflash_mod.DflashCtx, max_tokens: u32, s: mlx.mlx_stream) !void {
@@ -1728,6 +1744,8 @@ pub const Generator = struct {
     glm_dflash_native: bool = false,
     /// Accepted share of a DFlash2 round's drafts, smoothed; the grouped tick prices draft rows with it.
     glm_draft_rate: f32 = 0.8,
+    /// Verbatim-copy rounds (`glmLookupChain`) and the drafts they landed, for `[spec-stats]`.
+    glm_lookup: struct { rounds: u64 = 0, landed: u64 = 0 } = .{},
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, clamped by --draft-block-size).
@@ -2275,11 +2293,13 @@ pub const Generator = struct {
             if (self.glm_dflash_native) {
                 const rounds: f64 = @floatFromInt(self.dflash_attempted);
                 const r = self.glm_round;
-                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2}\n", .{
+                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2} lookup={d}/{d}\n", .{
                     @as(f64, @floatFromInt(r.draft_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.verify_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.replay_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.commit_ns)) / rounds / 1e6,
+                    self.glm_lookup.rounds,
+                    self.glm_lookup.landed,
                 });
             }
             return;
@@ -5418,7 +5438,8 @@ pub const Generator = struct {
         const schedule = try @import("glm5_dflash_model.zig").bindSchedule(4);
         defer schedule.restore();
         var timer = io_util.Stopwatch.init(self.timer.io);
-        const proposal = try self.glmPropose(@min(@max(self.dflash_block_size, 2) - 1, 2));
+        const lookup = try self.glmLookupChain(allocator);
+        const proposal = lookup orelse try self.glmPropose(@min(@max(self.dflash_block_size, 2) - 1, 2));
         const draft_ns = timer.read();
         timer.reset();
         const request = self.ctx.glm5_request.?;
@@ -5426,7 +5447,27 @@ pub const Generator = struct {
         var layerwise = try @import("glm5_dflash_model.zig").verify(self.xfm.glm5.?, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], self.dflash.?.config.target_layer_ids, .affine_rows_ffn);
         defer layerwise.deinit();
         const verify_ns = timer.read();
-        return try self.glmRoundEnd(allocator, &proposal, &layerwise, draft_ns, verify_ns);
+        const result = try self.glmRoundEnd(allocator, &proposal, &layerwise, draft_ns, verify_ns, lookup != null);
+        if (lookup != null) {
+            self.glm_lookup.rounds += 1;
+            self.glm_lookup.landed += result.accepted_tokens;
+        }
+        return result;
+    }
+
+    /// Drafts a verbatim-copy round takes from the context instead of the assistant: four rows,
+    /// the widest the native verify overlay reads.
+    pub const glm_lookup_drafts = 3;
+
+    /// The context's continuation after the pending token when the output is copying a long
+    /// span (`mtp_lookup.STRONG_SUFFIX` tokens of agreement), as a chain in place of the
+    /// assistant's tree.
+    fn glmLookupChain(self: *Generator, allocator: std.mem.Allocator) !?@import("glm5_dflash.zig").Proposal {
+        if (!glmLookupEnabled() or isEosId(self.next_token_id, self.eos_token_ids)) return null;
+        const got = (try self.mtpLookupIndex(allocator)).match(self.next_token_id, glm_lookup_drafts);
+        const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
+        if (self.glm_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
+        return chain;
     }
 
     /// A DFlash2 GLM round may run: not done, no stop due.
@@ -5448,7 +5489,7 @@ pub const Generator = struct {
 
     /// Decides (sampled requests draw along the visited path), commits and books a verified
     /// round, alone or as one group of a grouped tick.
-    pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *const @import("glm5_dflash.zig").Proposal, layerwise: *@import("glm5_dflash_model.zig").Verified, draft_ns: u64, verify_ns: u64) !DrafterStepResult {
+    pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *const @import("glm5_dflash.zig").Proposal, layerwise: *@import("glm5_dflash_model.zig").Verified, draft_ns: u64, verify_ns: u64, lookup: bool) !DrafterStepResult {
         const budget = self.max_tokens - self.completion_tokens;
         const sampled = !isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
         if (sampled) try sampledGlmDecisions(self, layerwise, budget, self.eos_token_ids);
@@ -5463,7 +5504,7 @@ pub const Generator = struct {
             depth[row] = depth[@intCast(parent)] + 1;
             deepest = @max(deepest, depth[row]);
         }
-        if (deepest > 0) {
+        if (deepest > 0 and !lookup) {
             const rate: f32 = @as(f32, @floatFromInt(round.accepted_drafts)) / @as(f32, @floatFromInt(deepest));
             self.glm_draft_rate = 0.7 * self.glm_draft_rate + 0.3 * rate;
         }
@@ -6294,6 +6335,14 @@ pub const Generator = struct {
     pub fn mtpLookupEnabledFromEnv(raw: ?[]const u8) bool {
         const value = raw orelse return true;
         return value.len == 0 or value[0] != '0';
+    }
+
+    var glm_lookup_off_cache: ?bool = null;
+
+    /// Lookup chains are exact; the diagnostic only isolates them in an A/B.
+    fn glmLookupEnabled() bool {
+        if (glm_lookup_off_cache == null) glm_lookup_off_cache = transformer_mod.diagEnvOn("SUSHI_GLM_NO_LOOKUP");
+        return !glm_lookup_off_cache.?;
     }
 
     fn mtpLookupEnabled() bool {
@@ -22165,6 +22214,18 @@ test "logit bias CPU: rewards and penalties require the full head while zero sta
     try t.expect(argmaxOnlyRequest(.{ .temperature = 0 }, 0, false));
 }
 
+
+test "a GLM lookup chain needs a long verbatim match and the budget for all four rows" {
+    const draft = [_]u32{ 7, 8, 9, 10 };
+    const strong = mtp_lookup.Match{ .draft = &draft, .suffix = mtp_lookup.STRONG_SUFFIX };
+    const chain = glmLookupProposal(strong, 6, 64).?;
+    try testing.expectEqualSlices(u32, &.{ 6, 7, 8, 9 }, chain.tokens[0..chain.count]);
+    try testing.expectEqualSlices(i32, &.{ -1, 0, 1, 2 }, chain.parents[0..chain.count]);
+    try testing.expect(glmLookupProposal(null, 6, 64) == null);
+    try testing.expect(glmLookupProposal(.{ .draft = &draft, .suffix = mtp_lookup.STRONG_SUFFIX - 1 }, 6, 64) == null);
+    try testing.expect(glmLookupProposal(.{ .draft = draft[0..2], .suffix = mtp_lookup.STRONG_SUFFIX }, 6, 64) == null);
+    try testing.expect(glmLookupProposal(strong, 6, 3) == null);
+}
 
 test "GLM serving DFlash2 arms only requests the native verifier can reproduce" {
     try testing.expect(glmDflashEligible(.{ .temperature = 0 }, 0));

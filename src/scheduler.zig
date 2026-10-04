@@ -9105,7 +9105,7 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
     for (batch.*, out[0..batch.len], 0..) |slot, *v, i| {
         const gen = &slot.legacy_gen.?;
         if (tree_at == i) {
-            const result = gen.glmRoundEnd(slot.allocator, &proposal, v, draft_ns, verify_ns) catch |err| {
+            const result = gen.glmRoundEnd(slot.allocator, &proposal, v, draft_ns, verify_ns, false) catch |err| {
                 slot.markError(@errorName(err));
                 continue;
             };

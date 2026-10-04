@@ -2,7 +2,7 @@
 const std = @import("std");
 pub const limit_bytes: usize = 256 * 1024 * 1024;
 /// Trees up to this many rows read the committed latent plus an ancestry overlay.
-pub const overlay_rows: usize = 3;
+pub const overlay_rows: usize = @import("glm5_attention_overlay.zig").max_rows;
 pub const Plan = struct { branches: usize, common_bytes: usize, per_branch_bytes: usize, live_bytes: usize };
 fn add(a: usize, b: usize) !usize {
     return std.math.add(usize, a, b) catch error.GlmTreeScratchLimit;
@@ -39,11 +39,14 @@ pub fn plan(processed: usize, latent_capacity: usize, pool_capacity: usize, widt
     return .{ .branches = branches, .common_bytes = common, .per_branch_bytes = per_branch, .live_bytes = try add(common, try mul(branches, per_branch)) };
 }
 
-test "GLM DFlash overlay trees keep three branches at a full-context reservation" {
+test "GLM DFlash overlay trees keep every overlay branch at a full-context reservation" {
     // A request without max_tokens reserves its whole context window (946,179 rows here).
     const full = try plan(7585, 946432, 236608, 512, 128, 64, overlay_rows, 2);
     try std.testing.expectEqual(@as(usize, overlay_rows), full.branches);
-    try std.testing.expect(full.live_bytes + @import("glm5_attention_decode_batch.zig").scratchLimit() <= limit_bytes);
+    try std.testing.expect(full.live_bytes <= limit_bytes);
+    // The B3 batch keeps its three branches beside either arm's native scratch.
+    const three = try plan(7585, 946432, 236608, 512, 128, 64, 3, 2);
+    try std.testing.expect(three.live_bytes + @import("glm5_attention_decode_batch.zig").scratchLimit() <= limit_bytes);
     try std.testing.expectError(error.GlmTreeScratchLimit, plan(7585, 946432, 236608, 512, 128, 64, overlay_rows + 1, 2));
 }
 

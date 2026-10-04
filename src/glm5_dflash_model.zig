@@ -142,7 +142,7 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
     const native = @import("glm5_attention_decode_batch.zig");
     const dtype = mlx.mlx_array_dtype(rows.latent);
     const native_mode = native.enabled() and native.supportedConfig(cfg, dtype, ops.s);
-    if (native_mode and parents.len > 3) return error.GlmDecodeNativeTreeUnsupported;
+    if (native_mode and parents.len > @import("glm5_dflash_memory.zig").overlay_rows) return error.GlmDecodeNativeTreeUnsupported;
     const heads: c_int = @intCast(cfg.num_attention_heads);
     const kd: c_int = @intCast(cfg.mla_qk_nope_head_dim);
     const width: c_int = @intCast(cfg.mla_kv_lora_rank);
@@ -197,7 +197,7 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
         const offset = state.processed + kept.len - 1;
         if (batched_native) {
             native_ids[row] = try ops.own(try attention.decodeSelected(&branch, index_query, weights, offset, ops.s));
-            native_branches[row] = .{ .offset = offset, .length = branch.processed, .path = .{ 0, 0, 0 } };
+            native_branches[row] = .{ .offset = offset, .length = branch.processed, .path = .{ 0, 0, 0, 0 } };
             @memcpy(native_branches[row].path[0..kept.len], kept);
             continue;
         }

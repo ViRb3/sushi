@@ -22,6 +22,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Concurrent GLM-5.3 requests decode together instead of queueing**: each keeps its own native state, and up to
   four decode as rows of one forward; a request decoding alone keeps DFlash2 speculation, and in company the request
   whose drafts land best keeps drafting in the forward's spare rows.
+- **GLM-5.3 copies long verbatim spans four tokens per round**: when the output repeats its context, DFlash2 verifies
+  the context's continuation instead of the assistant's drafts.
 - **GLM-5.3 now stores its MLA latent at 8 bits by default**, like every model: 6,688 instead of 11,968 bytes per
   token. `--kv-quant 16` (or a request's `kv_quant: 16`) keeps it BF16; `16` is accepted for every model.
 - **GLM-5.3-Flash streams its experts from SSD** under `--ssd-budget-gb`/`--expert-cache-gb`, for Sushi packs and the
