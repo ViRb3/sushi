@@ -366,10 +366,23 @@ const Ledger = struct {
             defer self.a.free(logits);
             const logits_sha = shaHex(logits);
             if (!std.mem.eql(u8, r.ids_sha256, &ids_sha) or !std.mem.eql(u8, r.logits_sha256, &logits_sha)) return error.GlmLayerMajorWindowChanged;
+            if (!try self.idListIs(io, r.dir, "prompt_tokens.txt", inputs[i]) or !try self.idListIs(io, r.dir, "generated_tokens.txt", &.{r.chosen})) return error.GlmLayerMajorWindowChanged;
             offset += r.tokens;
         }
         self.committed_tokens = offset;
         if (self.run.hidden_out.len != 0 and self.records.len != 0) try self.verifyHidden(inputs);
+    }
+
+    /// A committed window's token file, byte for byte what the fixture writer emits for `ids`; a missing one differs.
+    fn idListIs(self: *Ledger, io: std.Io, dir: []const u8, leaf: []const u8, ids: []const u32) !bool {
+        const path = try std.fmt.allocPrint(self.a, "{s}/{s}/{s}", .{ self.staging, dir, leaf });
+        defer self.a.free(path);
+        const stored = std.Io.Dir.cwd().readFileAlloc(io, path, self.a, .limited(64 << 20)) catch return false;
+        defer self.a.free(stored);
+        var want: std.Io.Writer.Allocating = .init(self.a);
+        defer want.deinit();
+        try kld.writeIdList(&want.writer, ids);
+        return std.mem.eql(u8, stored, want.written());
     }
 
     fn verifyHidden(self: *Ledger, inputs: []const []u32) !void {
@@ -486,9 +499,11 @@ const Ledger = struct {
             var tokens: u64 = 0;
             for (sink.results, next..) |*res, i| {
                 const record = res.record orelse return error.NativeGlmTeacherRowCountMismatch;
-                const logits_path = try std.fmt.allocPrint(a, "{s}/{s}/logits.f32", .{ self.staging, record.dir });
-                defer a.free(logits_path);
-                try fsyncPath(logits_path);
+                for ([_][]const u8{ "logits.f32", "prompt_tokens.txt", "generated_tokens.txt" }) |leaf| {
+                    const path = try std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ self.staging, record.dir, leaf });
+                    defer a.free(path);
+                    try fsyncPath(path);
+                }
                 const ids_sha = shaHex(std.mem.sliceAsBytes(b.inputs[i]));
                 const hidden_sha = std.fmt.bytesToHex(sink.hashes[i - next].finalResult(), .lower);
                 const line = try std.json.Stringify.valueAlloc(a, WindowRecord{
@@ -1083,6 +1098,35 @@ test "GLM layer-major resume refuses a changed committed window or a different r
     bytes[17] ^= 1;
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
     try std.testing.expectError(error.GlmLayerMajorWindowChanged, tiny.capture(a, try tiny.opts("run", 2)));
+}
+
+test "GLM layer-major resume refuses a mutated, deleted or truncated committed token file" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    interrupt_boundaries_for_test = 2 * 6 + 3;
+    try std.testing.expectError(error.TestInterrupted, tiny.capture(a, try tiny.opts("run", 2)));
+    interrupt_boundaries_for_test = null;
+    const arena = tiny.arena.allocator();
+    for ([_][]const u8{ "prompt_tokens.txt", "generated_tokens.txt" }) |leaf| {
+        const sub = try std.fmt.allocPrint(arena, "run.partial/prompts/01_w00001/{s}", .{leaf});
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ tiny.root, sub });
+        const original = try tiny.read(sub);
+        try std.testing.expect(original.len > 0);
+        const altered = try arena.dupe(u8, original);
+        altered[0] = if (altered[0] == '9') '8' else altered[0] + 1;
+        for ([_][]const u8{ altered, original[0 .. original.len - 1], "" }) |body| {
+            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = body });
+            try std.testing.expectError(error.GlmLayerMajorWindowChanged, tiny.capture(a, try tiny.opts("run", 2)));
+        }
+        try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+        try std.testing.expectError(error.GlmLayerMajorWindowChanged, tiny.capture(a, try tiny.opts("run", 2)));
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = original });
+    }
+    try tiny.capture(a, try tiny.opts("run", 2));
+    try tiny.capture(a, try tiny.opts("window-major", 0));
+    try tiny.expectSame("window-major", "run");
 }
 
 test "GLM layer-major capture idles on its pause file and continues when it is removed" {

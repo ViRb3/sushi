@@ -699,11 +699,16 @@ fn writeIdListFile(io: std.Io, dir: std.Io.Dir, name: []const u8, ids: []const u
     defer f.close(io);
     var buf: [16 * 1024]u8 = undefined;
     var fw = f.writer(io, &buf);
-    for (ids, 0..) |id, i| {
-        if (i > 0) try fw.interface.writeAll(",");
-        try fw.interface.print("{d}", .{id});
-    }
+    try writeIdList(&fw.interface, ids);
     try fw.interface.flush();
+}
+
+/// The text of a fixture's `prompt_tokens.txt` / `generated_tokens.txt`: comma-separated decimal ids.
+pub fn writeIdList(w: *std.Io.Writer, ids: []const u32) !void {
+    for (ids, 0..) |id, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("{d}", .{id});
+    }
 }
 
 fn sanitizeDirName(allocator: std.mem.Allocator, id: []const u8) ![]u8 {

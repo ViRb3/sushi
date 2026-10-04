@@ -57,9 +57,10 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
   fits, at most 32.
 - Resumable: `<out>.partial/layer-major.json` binds the run (source hashes, prompt ids, chunk, label, hidden
   directory, engine binary hash); `windows.jsonl` gains a line per window only after its logits and boundary rows
-  are synced. Rerunning the command re-hashes every committed window (inputs, logits, boundary rows, `tokens.bin`),
-  truncates the hidden files to the committed tokens and continues; a changed window or another run is refused
-  (`GlmLayerMajorWindowChanged`, `GlmLayerMajorResumeMismatch`). While P exists the capture idles between batches
+  (and its `prompt_tokens.txt` / `generated_tokens.txt`) are synced. Rerunning the command re-hashes every
+  committed window (inputs, logits, boundary rows, `tokens.bin`) and compares both token files with the committed
+  record, truncates the hidden files to the committed tokens and continues; a changed, truncated or missing window
+  file or another run is refused (`GlmLayerMajorWindowChanged`, `GlmLayerMajorResumeMismatch`). While P exists the capture idles between batches
   and writes `P.ack`. A volume without room for every remaining boundary, id and logits row plus 16 GiB is refused
   before the first batch (`GlmLayerMajorDiskTooSmall`).
 
