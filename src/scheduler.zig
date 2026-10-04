@@ -4231,7 +4231,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             if (params.config.isGlm5()) {
                 d.native_glm_serving = true;
-                log.info("[glm-dflash] native DFlash2 loaded; greedy requests use layerwise tree verification; sampled requests decode serially\n", .{});
+                log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
             } else d.bind(xfm_ptr) catch |err| {
                 d.deinit();
                 sch.allocator.destroy(d);

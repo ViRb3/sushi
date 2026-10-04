@@ -47,8 +47,8 @@ KDA recurrent state adds about 141 MiB independently of context length. `--think
 `--think high`, and `--think max` select the checkpoint's reasoning instruction;
 they do not impose a thinking-token cap. Omitted effort uses Sushi's high default (the HF template itself defaults to max).
 GLM serving currently runs one request at a time, with MTP and RAM/disk prefix reuse off.
-`--drafter /path/to/GLM-5.3-Flash-DFlash2` enables native DFlash2 for greedy requests;
-sampled, constrained or penalized requests decode serially. Original BF16 and stored
+`--drafter /path/to/GLM-5.3-Flash-DFlash2` enables native DFlash2 for greedy and sampled requests;
+constrained, penalized or explicitly bounded thinking requests decode serially. Original BF16 and stored
 A4/A6/A8 assistants keep their precision. The assistant weights join the load bill;
 its BF16 sliding window, target reservation, captures and verification scratch join
 the request bill.

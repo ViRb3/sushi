@@ -428,6 +428,32 @@ pub fn accept(tokens: []const u32, parents: []const i32, targets: []const u32, b
     }
 }
 
+/// Draw from the target distribution only along the visited ancestry path.
+/// A matching proposal reuses its already-verified state; a missing child
+/// returns that same target draw as the pending correction. Unvisited nodes
+/// consume no RNG draws, so proposal breadth cannot change the sample stream.
+pub fn sampledTargets(tokens: []const u32, parents: []const i32, targets: []u32, budget: usize, eos: []const u32, ctx: *anyopaque, draw: *const fn (*anyopaque, usize) anyerror!u32) !usize {
+    try validate(tokens, parents);
+    if (targets.len != tokens.len or budget == 0) return error.InvalidGlmDraftBudget;
+    var row: usize = 0;
+    var draws: usize = 0;
+    while (draws < budget and std.mem.indexOfScalar(u32, eos, tokens[row]) == null) {
+        const token = try draw(ctx, row);
+        targets[row] = token;
+        draws += 1;
+        if (draws >= budget) break;
+        var child: ?usize = null;
+        for (1..tokens.len) |candidate| {
+            if (parents[candidate] == row and tokens[candidate] == token) {
+                child = candidate;
+                break;
+            }
+        }
+        row = child orelse break;
+    }
+    return draws;
+}
+
 test "GLM DFlash best-first tree visits likely ancestry before siblings" {
     const a = std.testing.allocator;
     var lat = Lattice{ .m = 2, .k = 2, .cands = try a.dupe(i32, &.{ 11, 12, 13, 14 }), .unary = try a.dupe(f32, &.{ 5, 0, 5, 0 }), .e0 = try a.dupe(f32, &.{ 0, 0 }), .e = try a.dupe(f32, &.{ 0, 0, 0, 0 }) };
@@ -438,4 +464,71 @@ test "GLM DFlash best-first tree visits likely ancestry before siblings" {
     try std.testing.expectEqualSlices(i32, &.{ -1, 0, -1 }, tree.parents);
     lat.unary[0] = std.math.nan(f32);
     try std.testing.expectError(error.InvalidGlmDraftLattice, bestFirstTree(a, &lat, .{ .max_nodes = 3 }));
+}
+
+
+test "GLM sampled tree visits only the target-selected path and preserves categorical probabilities" {
+    const Fixture = struct {
+        first: usize,
+        second: usize,
+        visited: [4]usize = undefined,
+        count: usize = 0,
+        fn draw(raw: *anyopaque, row: usize) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.visited[self.count] = row;
+            self.count += 1;
+            return switch (row) {
+                0 => ([_]u32{ 20, 30, 30, 50 })[self.first],
+                1 => ([_]u32{ 40, 40, 60 })[self.second],
+                2 => 70,
+                3 => 80,
+                else => error.UnexpectedRow,
+            };
+        }
+    };
+    const tokens = [_]u32{ 10, 20, 30, 40 };
+    const parents = [_]i32{ -1, 0, 0, 1 };
+    var mass: [4]usize = @splat(0);
+    for (0..4) |first| for (0..3) |second| {
+        var f = Fixture{ .first = first, .second = second };
+        var targets = [_]u32{ 999, 999, 999, 999 };
+        const draws = try sampledTargets(&tokens, &parents, &targets, 8, &.{}, &f, Fixture.draw);
+        const kept = try accept(&tokens, &parents, &targets, 8, &.{});
+        try std.testing.expectEqual(f.count, draws);
+        try std.testing.expectEqual(kept.count, draws);
+        switch (kept.pending.?) {
+            50 => { mass[0] += 1; try std.testing.expectEqualSlices(usize, &.{0}, f.visited[0..f.count]); },
+            60 => { mass[1] += 1; try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, f.visited[0..f.count]); },
+            80 => { mass[2] += 1; try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3 }, f.visited[0..f.count]); },
+            70 => { mass[3] += 1; try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, f.visited[0..f.count]); },
+            else => return error.UnexpectedPending,
+        }
+    };
+    // Same path probabilities as serial draws: 1/4, (1/4)(1/3), (1/4)(2/3), 1/2.
+    try std.testing.expectEqualSlices(usize, &.{ 3, 1, 2, 6 }, &mass);
+}
+
+test "GLM sampled tree stops RNG at output budget and EOS" {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn draw(raw: *anyopaque, row: usize) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return ([_]u32{ 20, 40, 80 })[row];
+        }
+    };
+    const tokens = [_]u32{ 10, 20, 40 };
+    const parents = [_]i32{ -1, 0, 1 };
+    var targets = [_]u32{ 999, 999, 999 };
+    var f = Fixture{};
+    try std.testing.expectEqual(@as(usize, 1), try sampledTargets(&tokens, &parents, &targets, 1, &.{}, &f, Fixture.draw));
+    try std.testing.expectEqual(@as(usize, 1), f.calls);
+    const limited = try accept(&tokens, &parents, &targets, 1, &.{});
+    try std.testing.expectEqual(@as(usize, 1), limited.count);
+    try std.testing.expectEqual(@as(?u32, 20), limited.pending);
+    f.calls = 0;
+    try std.testing.expectEqual(@as(usize, 2), try sampledTargets(&tokens, &parents, &targets, 8, &.{40}, &f, Fixture.draw));
+    const stopped = try accept(&tokens, &parents, &targets, 8, &.{40});
+    try std.testing.expect(stopped.stopped and stopped.pending == null);
+    try std.testing.expectEqual(@as(usize, 2), f.calls);
 }

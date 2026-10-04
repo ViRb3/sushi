@@ -646,7 +646,16 @@ pub fn roundTreeLayerwiseMode(io: std.Io, assistant: *draft.DflashModel, context
     return roundTreeLayerwiseConfigured(io, assistant, context, target, request, pending, max_nodes, budget, eos, mode, 4);
 }
 
+pub const DecisionHook = struct {
+    ctx: *anyopaque,
+    apply: *const fn (*anyopaque, *@import("glm5_dflash_model.zig").Verified, usize, []const u32) anyerror!void,
+};
+
 pub fn roundTreeLayerwiseConfigured(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode, children: usize) !RoundResult {
+    return roundTreeLayerwiseWithDecisions(io, assistant, context, target, request, pending, max_nodes, budget, eos, mode, children, null);
+}
+
+pub fn roundTreeLayerwiseWithDecisions(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode, children: usize, decisions: ?DecisionHook) !RoundResult {
     if (children == 0 or children > 16) return error.InvalidGlmDraftTree;
     if (mode == .batched) return error.GlmBatchedVerifyUnqualified;
     try validatePair(assistant, target);
@@ -663,6 +672,7 @@ pub fn roundTreeLayerwiseConfigured(io: std.Io, assistant: *draft.DflashModel, c
     timer.reset();
     var layerwise = try @import("glm5_dflash_model.zig").verify(target, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], assistant.config.target_layer_ids, mode);
     defer layerwise.deinit();
+    if (decisions) |hook| try hook.apply(hook.ctx, &layerwise, budget, eos);
     const verify_ns = timer.read();
     timer.reset();
     var verified = try layerwise.prepareCommit(request, budget, eos, target.s);

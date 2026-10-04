@@ -1223,8 +1223,7 @@ pub fn draftsRefused(sampling: SamplingParams) bool {
 }
 
 pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
-    return (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
-        !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null and
+    return !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null and
         !sampling.think_penalty.active();
 }
 
@@ -5345,6 +5344,29 @@ pub const Generator = struct {
     /// Drafts are greedy (argmax over the trunk lm_head on assistant
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
     /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
+    const GlmSampleContext = struct { generator: *Generator, logits: mlx.mlx_array };
+
+    fn sampleGlmNode(raw: *anyopaque, row: usize) !u32 {
+        const context: *GlmSampleContext = @ptrCast(@alignCast(raw));
+        const gen = context.generator;
+        var ops = @import("glm5_model.zig").Ops{ .s = gen.xfm.s };
+        defer ops.deinit();
+        const logits = try ops.slice(context.logits, 1, @intCast(row), @intCast(row + 1));
+        const sampled = sampleTokenLazy(logits, gen.sampling, gen.xfm.s);
+        defer _ = mlx.mlx_array_free(sampled);
+        try mlx.check(mlx.mlx_array_eval(sampled));
+        var token: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&token, sampled));
+        gen.sampling.draw +%= 1;
+        return @intCast(token);
+    }
+
+    fn sampledGlmDecisions(raw: *anyopaque, verified: *@import("glm5_dflash_model.zig").Verified, budget: usize, eos: []const u32) !void {
+        const gen: *Generator = @ptrCast(@alignCast(raw));
+        var context = GlmSampleContext{ .generator = gen, .logits = verified.logits };
+        _ = try @import("glm5_dflash_tree.zig").sampledTargets(verified.tokens[0..verified.count], verified.parents[0..verified.count], verified.targets[0..verified.count], budget, eos, &context, sampleGlmNode);
+    }
+
     fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done or try self.checkStop()) return null;
         if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
@@ -5362,7 +5384,11 @@ pub const Generator = struct {
         const schedule = try @import("glm5_dflash_model.zig").bindSchedule(4);
         defer schedule.restore();
         const budget = self.max_tokens - self.completion_tokens;
-        const round = try @import("glm5_dflash.zig").roundTreeLayerwiseConfigured(self.timer.io, assistant, &self.dflash_ctx.?, target, request, self.next_token_id, @min(@max(self.dflash_block_size, 2) - 1, 2), budget, self.eos_token_ids, .affine_rows_ffn, 4);
+        const sampled = !isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
+        const decisions: ?@import("glm5_dflash.zig").DecisionHook = if (sampled) .{ .ctx = self, .apply = sampledGlmDecisions } else null;
+        // Preserve serial projection arithmetic for sampled probabilities.
+        const mode: @import("glm5_dflash_kda.zig").ProjectionMode = if (sampled) .serial_rows else .affine_rows_ffn;
+        const round = try @import("glm5_dflash.zig").roundTreeLayerwiseWithDecisions(self.timer.io, assistant, &self.dflash_ctx.?, target, request, self.next_token_id, @min(@max(self.dflash_block_size, 2) - 1, 2), budget, self.eos_token_ids, mode, 4, decisions);
         var emitted = round.count;
         for (round.tokens[1..round.count], 1..) |token, i| {
             if (tokenStops(token, self.eos_token_ids, &self.consecutive_pad)) {
@@ -22060,7 +22086,7 @@ test "logit bias CPU: rewards and penalties require the full head while zero sta
 test "GLM serving DFlash2 arms only requests the native verifier can reproduce" {
     try testing.expect(glmDflashEligible(.{ .temperature = 0 }, 0));
     try testing.expect(glmDflashEligible(.{ .temperature = 1, .top_k = 1 }, 0));
-    try testing.expect(!glmDflashEligible(.{ .temperature = 1 }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 1 }, 0));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0 }, 1));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }, 0));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1 } }, 0));

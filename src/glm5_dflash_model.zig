@@ -258,7 +258,9 @@ pub const Verified = struct {
     targets: [16]u32 = undefined,
     count: usize,
     offset: usize,
+    logits: Arr = .{ .ctx = null },
     pub fn deinit(self: *Verified) void {
+        if (self.logits.ctx != null) _ = mlx.mlx_array_free(self.logits);
         for (self.layers) |*maybe| if (maybe.*) |*layer| layer.deinit();
         self.allocator.free(self.layers);
         self.captures.deinit();
@@ -432,6 +434,7 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     sync_dispatches += 1;
     head_profile.record("head");
     @memcpy(result.targets[0..tokens.len], (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..tokens.len]);
+    result.logits = try ops.result(logits);
     return result;
 }
 
