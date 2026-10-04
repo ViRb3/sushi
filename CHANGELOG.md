@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
   instead of failing to compile mlx-c after a plain `git pull`.
+- **GLM's first load prepares its DFlash2 assistant as A4/group-64** (was A6/group-128), 0.24 GB smaller with identical
+  output; an existing A6 cache is rebuilt once.
 - **`--wired-margin-gib` defaults to 4 GiB (was 8)**, so a raised `iogpu.wired_limit_mb` admits 4 GiB more weights
   and context.
 - **MiMo takes every thinking effort word** (`minimal` through `max`) as thinking on instead of answering 400, on

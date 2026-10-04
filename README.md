@@ -53,7 +53,7 @@ GLM serving currently runs one request at a time, with MTP and RAM/disk prefix r
 A valid `dflash2/` folder inside a GLM pack loads automatically (legacy `drafter/`
 is also recognized). `--drafter /path/to/GLM-5.3-Flash-DFlash2` overrides that folder;
 `--no-drafter` disables it. If only the shipped `GLM-5.3-Flash-DFlash2/` BF16
-assistant exists, `serve` and `run` prepare a local A6/group-128 copy in `dflash2/`
+assistant exists, `serve` and `run` prepare a local A4/group-64 copy in `dflash2/`
 on first load and print a preparation/wait message. The original stays unchanged.
 Later loads reuse the cache; no disk space or write permission falls back to the
 original BF16 assistant with its full memory bill. Generated caches are local-only.

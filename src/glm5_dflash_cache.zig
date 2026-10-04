@@ -1,10 +1,12 @@
-//! Local runtime A6/group128 cache. The shipped BF16 checkpoint is read-only.
+//! Local runtime A4/group64 cache. The shipped BF16 checkpoint is read-only.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const draft = @import("dflash.zig");
 const model = @import("model.zig");
 const log = @import("log.zig");
-const schema = "sushi-glm-dflash-runtime-a6g128-v1";
+const schema = "sushi-glm-dflash-runtime-a4g64-v1";
+const cache_bits = 4;
+const cache_group = 64;
 var space_for_test: ?u64 = null;
 extern "c" fn sushi_available_disk_bytes(path: [*:0]const u8, out: *u64) c_int;
 
@@ -14,7 +16,7 @@ pub fn isShippedSource(directory: []const u8, model_dir: []const u8) bool {
 }
 
 fn quantizeKey(name: []const u8, shape: []const c_int) bool {
-    if (shape.len != 2 or shape[1] <= 0 or @rem(shape[1], 128) != 0) return false;
+    if (shape.len != 2 or shape[1] <= 0 or @rem(shape[1], cache_group) != 0) return false;
     if (std.mem.eql(u8, name, "fc.weight") or std.mem.eql(u8, name, "encoder.fc.weight")) return true;
     if (!std.mem.startsWith(u8, name, "layers.")) return false;
     for ([_][]const u8{ ".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight", ".self_attn.o_proj.weight", ".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight", ".attention_conv.kernel_projection.weight", ".mlp_conv.kernel_projection.weight" }) |suffix| {
@@ -61,7 +63,7 @@ pub fn plannedResidentBytes(io: std.Io, a: std.mem.Allocator, source: []const u8
         const hi = offsets.array.items[1];
         const original_bytes = try std.math.mul(u64, count, 2);
         if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != original_bytes) return error.InvalidSafetensorsTensor;
-        const bytes = if (quantizeKey(entry.key_ptr.*, shape[0..dims.array.items.len])) count / 4 * 3 + count / 128 * 4 else count * 2;
+        const bytes = if (quantizeKey(entry.key_ptr.*, shape[0..dims.array.items.len])) count * cache_bits / 8 + count / cache_group * 4 else count * 2;
         total = try std.math.add(u64, total, bytes);
     }
     _ = io;
@@ -139,7 +141,7 @@ pub fn prepare(io: std.Io, a: std.mem.Allocator, source: []const u8, s: mlx.mlx_
         free = forced;
     };
     if (!space_ok or free < payload + 16 * 1024 * 1024) {
-        const result = try fallback(a, source, "not enough disk space for the local A6/group128 cache");
+        const result = try fallback(a, source, "not enough disk space for the local A4/group64 cache");
         a.free(destination);
         return result;
     }
@@ -155,7 +157,7 @@ pub fn prepare(io: std.Io, a: std.mem.Allocator, source: []const u8, s: mlx.mlx_
     };
     defer parent_dir.deleteTree(io, std.fs.path.basename(stage)) catch {};
     log.info("Preparing GLM 5.3 Flash DFlash2 for Sushi ... please wait for a few minutes.\n", .{});
-    log.info("[glm-dflash] quantizing the checkpoint to a local A6/group128 cache; shipped BF16 files stay unchanged\n", .{});
+    log.info("[glm-dflash] quantizing the checkpoint to a local A4/group64 cache; shipped BF16 files stay unchanged\n", .{});
     const timer = @import("io_util.zig").Stopwatch.init(io);
     build(io, a, source, stage, s, payload) catch |err| {
         if (err == error.DflashCacheStorageUnavailable or err == error.AccessDenied or err == error.ReadOnlyFileSystem or err == error.NoSpaceLeft or err == error.DiskQuota) {
@@ -183,7 +185,7 @@ pub fn prepare(io: std.Io, a: std.mem.Allocator, source: []const u8, s: mlx.mlx_
         if (err != error.FileNotFound) return err;
         try std.Io.Dir.renameAbsolute(stage, destination, io);
     }
-    log.info("[glm-dflash] A6/group128 cache ready in {d:.2} seconds ({d:.3} GiB); future loads reuse {s}\n", .{ @as(f64, @floatFromInt(timer.read())) / 1e9, @as(f64, @floatFromInt(payload)) / (1 << 30), destination });
+    log.info("[glm-dflash] A4/group64 cache ready in {d:.2} seconds ({d:.3} GiB); future loads reuse {s}\n", .{ @as(f64, @floatFromInt(timer.read())) / 1e9, @as(f64, @floatFromInt(payload)) / (1 << 30), destination });
     return .{ .path = destination, .generated = true };
 }
 
@@ -213,7 +215,7 @@ fn build(io: std.Io, a: std.mem.Allocator, source: []const u8, stage: []const u8
         const raw = entry.value_ptr.*;
         if (mlx.mlx_array_dtype(raw) != .bfloat16) return error.DflashSourceMustBeBf16;
         if (quantizeKey(name, mlx.getShape(raw))) {
-            var q = try draft.quantizeDense(raw, 6, 128, s);
+            var q = try draft.quantizeDense(raw, cache_bits, cache_group, s);
             defer q.deinit();
             for ([_]mlx.mlx_array{ q.w, q.scales, q.biases }) |v| try mlx.check(mlx.mlx_array_eval(v));
             try insert(a, map, name, q.w);
@@ -247,8 +249,8 @@ fn build(io: std.Io, a: std.mem.Allocator, source: []const u8, stage: []const u8
     defer parsed.deinit();
     const arena = parsed.arena.allocator();
     var quant: std.json.ObjectMap = .empty;
-    try quant.put(arena, "bits", .{ .integer = 6 });
-    try quant.put(arena, "group_size", .{ .integer = 128 });
+    try quant.put(arena, "bits", .{ .integer = cache_bits });
+    try quant.put(arena, "group_size", .{ .integer = cache_group });
     try quant.put(arena, "mode", .{ .string = "affine" });
     try quant.put(arena, "candidate_selector.hidden_projection", .{ .bool = false });
     var root = parsed.value;
@@ -300,7 +302,7 @@ fn tinySource(io: std.Io, a: std.mem.Allocator, parent: std.Io.Dir, path: []cons
     return source;
 }
 
-test "GLM runtime cache creates A6 group128 once and preserves the shipped BF16 source" {
+test "GLM runtime cache creates A4 group64 once and preserves the shipped BF16 source" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -316,7 +318,7 @@ test "GLM runtime cache creates A6 group128 once and preserves the shipped BF16 
     const original = try from.readFileAlloc(io, "model.safetensors", a, .limited(1 << 20));
     defer a.free(original);
     const planned = try plannedResidentBytes(io, a, source);
-    try std.testing.expectEqual(@as(u64, 128 * 256 / 4 * 3 + 128 * 256 / 128 * 4 + 16 * 128 * 2 + 32 * 16 * 2), planned);
+    try std.testing.expectEqual(@as(u64, 128 * 256 / 2 + 128 * 256 / 64 * 4 + 16 * 128 * 2 + 32 * 16 * 2), planned);
     const made = try prepare(io, a, source, s);
     defer a.free(made.path);
     try std.testing.expect(made.generated and !made.fallback);
@@ -325,7 +327,7 @@ test "GLM runtime cache creates A6 group128 once and preserves the shipped BF16 
     var weights = try model.loadWeights(io, a, made.path);
     defer weights.deinit();
     try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(weights.get("fc.weight").?));
-    try std.testing.expectEqualSlices(c_int, &.{ 128, 2 }, mlx.getShape(weights.get("fc.scales").?));
+    try std.testing.expectEqualSlices(c_int, &.{ 128, 4 }, mlx.getShape(weights.get("fc.scales").?));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("candidate_selector.hidden_projection.weight").?));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("candidate_selector.predecessor_codebook").?));
     const again = try prepare(io, a, source, s);
@@ -339,6 +341,32 @@ test "GLM runtime cache creates A6 group128 once and preserves the shipped BF16 
     const refreshed = try prepare(io, a, source, s);
     defer a.free(refreshed.path);
     try std.testing.expect(refreshed.generated);
+}
+
+test "GLM runtime cache regenerates a cache written under the earlier A6 policy" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const parent = path_buf[0..n];
+    const s = mlx.gpuStream();
+    const source = try tinySource(io, a, tmp.dir, parent, s);
+    defer a.free(source);
+    const made = try prepare(io, a, source, s);
+    defer a.free(made.path);
+    var cache = try std.Io.Dir.openDirAbsolute(io, made.path, .{});
+    defer cache.close(io);
+    const manifest = try cache.readFileAlloc(io, "sushi-runtime-cache.json", a, .limited(64 * 1024));
+    defer a.free(manifest);
+    const old = try std.mem.replaceOwned(u8, a, manifest, schema, "sushi-glm-dflash-runtime-a6g128-v1");
+    defer a.free(old);
+    try cache.writeFile(io, .{ .sub_path = "sushi-runtime-cache.json", .data = old });
+    try std.testing.expect(!cacheValid(io, a, parent, made.path));
+    const again = try prepare(io, a, source, s);
+    defer a.free(again.path);
+    try std.testing.expect(again.generated);
 }
 
 test "GLM runtime cache uses unchanged BF16 when the cache parent is read only" {

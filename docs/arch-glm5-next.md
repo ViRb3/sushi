@@ -74,13 +74,14 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **Discovery**: `--drafter <dir>` wins, `--no-drafter` disables; otherwise a valid `dflash2/` inside the pack, then
   legacy `drafter/`. One resolved path feeds both the bill and the loader.
 - **First-load cache**: when only the shipped BF16 `GLM-5.3-Flash-DFlash2/` exists, `serve` and `run` quantize its
-  matrices once to A6 group-128 with MLX's affine quantizer into `dflash2/` (selector codebooks, selector hidden
+  matrices once to A4 group-64 with MLX's affine quantizer into `dflash2/` (selector codebooks, selector hidden
   projection and non-matrix tensors stay BF16), under a per-pack lock, staged and synced before publication, and
-  invalidated by source/config identity. 2.18 GiB → 0.944 GiB, 0.43 s on a warm SSD. No space or no write permission
+  invalidated by source/config identity. 2.18 GiB → 0.721 GiB. No space or no write permission
   falls back to the BF16 assistant and reruns preflight with its full size. The cache is local only: the assistant's
   CC BY-NC-ND 4.0 license is unchanged and the cache is no redistribution artifact.
 - **Stored formats**: BF16, or one uniform affine format per assistant: A4 g64, A6 g128 or A8 g128 (anything else is
-  `UnsupportedGlmDraftStorage`). A6 g128 is the default; A4 g64 drafts ~11% faster but never beat A6's control drift.
+  `UnsupportedGlmDraftStorage`). A4 g64 is the first-load default (774.5 MB vs A6's 1013.1 MB; drafts ~11% faster, decode within drift, target
+  output exact); an A6 cache from the earlier policy is regenerated.
 - **Tree**: two draft nodes plus the root, up to four children per node; the verifier runs all rows layerwise.
   KDA replays only the accepted path from a prework tape; IndexPool builds branch-local pools from the committed prefix
   plus each node's ancestry (pooling flattened tree rows would pool siblings together); MLA reads the committed prefix
@@ -104,7 +105,8 @@ inside 1.46% drift) because verification per round grew 20.6%.
 - Measured: Sushi-2.3bpw plus the A6 assistant settles at 94.55 GB active (88.06 GiB) under a 115.45 GB limit on the
   128 GB box; a 16K prefill peaks at 96.43 GB without an assistant. Sushi-2.45bpw (raw FP8) is 101.75 GB resident,
   102.51 GB peak while scoring KLD. Sushi-2.5bpw with the A6 assistant and vision is 104.56 GB active, leaving
-  `max_safe_context` 746,036 tokens under `iogpu.wired_limit_mb=120000` (margin 4 GiB): 1M context does not fit there.
+  `max_safe_context` 746,036 tokens (A4 assistant: 104.32 GB, 758,793; BF16 cache with no assistant, no vision and
+  `--wired-margin-gib 2`: 955,781) under `iogpu.wired_limit_mb=120000` (margin 4 GiB): 1M context does not fit there.
 - An explicit `--ctx-size` is not checked against that bill at load (GLM is outside the load-time serving bill), so
   `n_ctx` can advertise more than a request may use; request admission refuses past the affordable context.
 
