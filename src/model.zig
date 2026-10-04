@@ -263,6 +263,7 @@ pub const ModelConfig = struct {
     glm_swiglu_limit: f32 = 10,
     glm_index_tail: bool = true,
     glm_mtp_layers: u32 = 0,
+    glm_fp8_trunk: bool = false,
 
     // Multi-head Latent Attention (bailing_hybrid's full-attention layers,
     // DeepSeek-V3 shape): low-rank Q (q_a_proj → q_a_layernorm → q_b_proj) and
@@ -2888,6 +2889,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         try parseQwenVisionFields(&config, root, cfg_obj);
     } else if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5_next_text")) {
         try parseGlm5Fields(&config, cfg_obj);
+        if (root.get("sushi_pack")) |pack| {
+            if (pack == .object) if (pack.object.get("trunk_storage")) |storage| {
+                if (storage == .string) config.glm_fp8_trunk = std.mem.eql(u8, storage.string, "source-fp8-e4m3fn-block128");
+            };
+        }
         try parseGlm5VisionFields(&config, root);
     } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
@@ -9481,7 +9487,6 @@ test "GLM serving accepts native effort levels and thinks by default" {
     try testing.expectEqualStrings("high", defaultEffortWord(&cfg).?);
 }
 
-
 test "thinking policy launch defaults are model-specific and preserve GLM high" {
     const saved = think_effort_flag;
     defer think_effort_flag = saved;
@@ -9525,4 +9530,15 @@ test "GLM vision config rejects unsupported tower geometry and accepts a text-on
     try testing.expectEqual(@as(?u32, 16), processor.min_image_tokens);
     try testing.expectEqual(@as(?u32, 8000), processor.max_image_tokens);
     try testing.expectEqual(@as(?u32, 240000), processor.max_video_tokens);
+}
+
+test "GLM raw FP8 config identifies source storage without changing native KV" {
+    const source = @embedFile("fixtures/glm5_config.json");
+    const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"sushi_pack\":{{\"trunk_storage\":\"source-fp8-e4m3fn-block128\"}},{s}", .{source[1..]});
+    defer std.testing.allocator.free(raw);
+    const cfg = try parseConfigFromJson(std.testing.allocator, raw);
+    try std.testing.expect(cfg.glm_fp8_trunk);
+    try std.testing.expectEqual(@as(u64, 11 * 512 * 2), cfg.kvBytesPerToken());
+    const affine = try parseConfigFromJson(std.testing.allocator, source);
+    try std.testing.expect(!affine.glm_fp8_trunk);
 }

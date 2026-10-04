@@ -52,8 +52,8 @@ sushi kld compare --model "$STUDENT_MODEL" --fixture teacher-standard4 \
 
 If the teacher needs expert streaming, add `--ssd-budget-gb <total RAM GiB>`;
 choose a budget that fits the machine. Native BF16 GLM capture requires streaming.
-GLM comparison currently uses the native diagnostic harness; public `sushi kld compare`
-supports its existing architectures, not GLM.
+Resident GLM packs use public `sushi kld compare` through the native forward bridge.
+The older gated diagnostic comparison remains available for engine studies.
 
 The saved fixture contains token IDs and all 512 full-vocabulary rows per prompt,
 including rows after EOS. Compare reports all positions and the first-EOS-inclusive
@@ -247,3 +247,28 @@ Against the 2026-09-30 MOPD teacher. Readings against an earlier teacher capture
 are not comparable.
 
 The FP8-native teacher against the bf16-rounded teacher: 0.0034 nats.
+
+
+## GLM-5.3 raw FP8 pack, 2026-10-04
+
+Public `sushi kld compare` scored GLM-5.3-Flash-Sushi-2.45bpw against the saved
+`glm53-sushi-bf16-4x512-raw` teacher: two code and two prose prompts, 512 positions
+each. The compare used every stored teacher token ID and full-vocabulary logit row,
+BF16 compressed MLA, FP32 KDA state, exact expert routing, MTP off, TF32 off and
+`taskpolicy -a`. GPU lock owner: `root-glm-fp8-kld`. The source was `3ab30727` plus
+the raw-FP8/serving changes in this landing; ReleaseFast binary SHA256:
+`0d48358da1ced68fe12a9135b0ce650359612c4543cab760705ff2d50662a781`.
+
+| Prompt | Mean KLD | Top1 matches | Mean NLL |
+| --- | ---: | ---: | ---: |
+| Python topological sort | 0.042175518 | 488/512 | 0.185114568 |
+| Zig byte reader | 0.045603492 | 487/512 | 0.187756538 |
+| Water cycle | 0.126661763 | 421/512 | 0.641875656 |
+| Navigation | 0.150624043 | 419/512 | 0.706800501 |
+| All positions | 0.091266204 | 1815/2048 (88.623%) | 0.430386816 |
+
+All 2,048 positions were also in the first-EOS-inclusive subset. Mean cosine
+similarity was 0.959473416. MLX reported 101,750,954,768 resident bytes before
+scoring and 102,511,216,292 peak active bytes. This is the four-prompt screen;
+the separate 2K–32K speed comparison was stopped by the user and has no completed
+comparison result. Evidence key: `glm53-raw-fp8-serving-20261004`.

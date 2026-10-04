@@ -194,6 +194,15 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   peaks reproduced to the MB), `taskpolicy -a`, GPU lock `video-bill`, 2026-09-25; pinned by `visionEncodeBill covers
   each measured video peak`.
 
+GLM source-FP8 packs retain one byte per E4M3FN weight and four bytes per 128×128 tile
+scale. The selected tensor payload bill includes those grids. They share MiMo's `fp8_block`
+GEMV/dequantize path. Beyond its 16-row GEMV limit, `glmFp8DequantScratchBytes` charges
+all FP8 projections in the largest pending layer, times the native evaluation window.
+For GLM-5.3's default two pending layers this is 576 MiB; decode adds no dense weight copy.
+Resident GLM also honors an explicitly raised `iogpu.wired_limit_mb` ceiling, retaining the
+same configurable 8 GiB reserve as Qwen and MiMo. An unchanged system limit retains the
+physical free-memory ceiling.
+
 ## Observing memory
 
 `/props` reports `active_bytes`, `memory.cache_bytes`, `batching`; RSS is blind to Metal.

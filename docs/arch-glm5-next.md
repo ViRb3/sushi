@@ -1,9 +1,17 @@
 # GLM-5.3-Flash: native engine foundation
 
-The `glm5_next` source adapter preserves official BF16 expert tensors for native streaming. The native
-text forward runs resident EXL3 and streamed BF16 checkpoints through an opt-in diagnostic harness. It is not
-registered in `model.served_model_types`: production serving, full reference parity and quality gates
-remain open. See [diagnostic usage](glm5-diagnostic.md) and [attention/cache details](engine-glm5-attention.md).
+The `glm5_next` native runtime serves resident EXL3 packs with affine or source FP8
+trunk weights. It supports text, images and videos through the public APIs. Its
+source adapter also preserves official BF16 experts for native streaming capture.
+GLM currently serves one request at a time. MTP and RAM/disk prefix reuse are off;
+DFlash2 supports greedy and sampled target decisions. Thinking accepts low, high
+and max, with high as the serving default.
+
+The MLA cache retains one BF16 latent per attention layer and pooled index keys:
+11,968 bytes per token for GLM-5.3, plus about 141 MiB of fixed recurrent state.
+Vision is enabled by default when present; `--no-vision` drops its payload and
+buffers. Load and request bills include the selected assistant and enabled tower.
+See [diagnostic usage](glm5-diagnostic.md) and [attention/cache details](engine-glm5-attention.md).
 
 Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-glm5-dflash2.md),
 [correctness audit](glm5-correctness-audit.md), [efficiency audit](glm5-efficiency-audit.md),

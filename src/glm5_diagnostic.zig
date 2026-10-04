@@ -126,6 +126,90 @@ pub fn residentBytesWithVision(io: std.Io, allocator: std.mem.Allocator, model_d
     return total;
 }
 
+/// MLX safetensors does not represent source E4M3 storage. For a mixed FP8
+/// shard, upload selected payloads directly, preserving FP8 codes as U8 just
+/// as mimo_source does. No tensor is converted or requantized.
+fn loadFp8Shard(allocator: std.mem.Allocator, path: [:0]const u8, file: []const u8, owners: std.json.ObjectMap, layers: usize, trunk_only: bool, vision: bool, result: *model.Weights, max_bytes: u64) !bool {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.MissingIndexedGlmWeight;
+    defer _ = std.c.close(fd);
+    var size: [8]u8 = undefined;
+    const readExact = @import("expert_io.zig").readExact;
+    try readExact(fd, &size, 0);
+    const len = std.mem.readInt(u64, &size, .little);
+    if (len == 0 or len > 128 * 1024 * 1024) return error.InvalidSafetensorsHeader;
+    const raw_header = try allocator.alloc(u8, @intCast(len));
+    defer allocator.free(raw_header);
+    try readExact(fd, raw_header, 8);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_header, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSafetensorsHeader;
+    var tensors = parsed.value.object.iterator();
+    var has_fp8 = false;
+    while (tensors.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const dtype = entry.value_ptr.object.get("dtype") orelse continue;
+        if (dtype == .string and isFp8Dtype(dtype.string)) has_fp8 = true;
+    }
+    if (!has_fp8) return false;
+    tensors = parsed.value.object.iterator();
+    var bytes = storedBytes(result);
+    while (tensors.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const owner = owners.get(name) orelse continue;
+        if (!keepLoadKey(name, layers, trunk_only, vision) or owner != .string or !std.mem.eql(u8, owner.string, file)) continue;
+        if (entry.value_ptr.* != .object) return error.InvalidSafetensorsTensor;
+        const meta = entry.value_ptr.object;
+        const dtype = meta.get("dtype") orelse return error.InvalidSafetensorsTensor;
+        const dims = meta.get("shape") orelse return error.InvalidSafetensorsTensor;
+        const offsets = meta.get("data_offsets") orelse return error.InvalidSafetensorsTensor;
+        if (dtype != .string or dims != .array or dims.array.items.len > 8 or offsets != .array or offsets.array.items.len != 2) return error.InvalidSafetensorsTensor;
+        const dt: mlx.mlx_dtype = if (isFp8Dtype(dtype.string)) .uint8 else if (std.mem.eql(u8, dtype.string, "BF16")) .bfloat16 else if (std.mem.eql(u8, dtype.string, "F32")) .float32 else if (std.mem.eql(u8, dtype.string, "F16")) .float16 else if (std.mem.eql(u8, dtype.string, "U16")) .uint16 else if (std.mem.eql(u8, dtype.string, "U32")) .uint32 else return error.UnsupportedGlmStorage;
+        const itemsize: u64 = switch (dt) {
+            .uint8 => 1,
+            .uint16, .bfloat16, .float16 => 2,
+            else => 4,
+        };
+        var shape: [8]c_int = undefined;
+        var expected: u64 = itemsize;
+        for (dims.array.items, 0..) |dim, i| {
+            if (dim != .integer or dim.integer <= 0 or dim.integer > std.math.maxInt(c_int)) return error.InvalidSafetensorsTensor;
+            shape[i] = @intCast(dim.integer);
+            expected = try std.math.mul(u64, expected, @intCast(dim.integer));
+        }
+        const lo = offsets.array.items[0];
+        const hi = offsets.array.items[1];
+        if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != expected) return error.InvalidSafetensorsTensor;
+        bytes = try std.math.add(u64, bytes, expected);
+        if (bytes > max_bytes) return error.GlmResidentBudgetExceeded;
+        const raw = try allocator.alignedAlloc(u8, .@"16", @intCast(expected));
+        defer allocator.free(raw);
+        try readExact(fd, raw, try std.math.add(u64, len + 8, @intCast(lo.integer)));
+        if (isFp8Dtype(dtype.string)) {
+            for (raw) |code| if (code & 0x7f == 0x7f) return error.InvalidFp8Value;
+        } else if (std.mem.endsWith(u8, name, ".weight_scale_inv")) {
+            if (dt != .float32) return error.InvalidFp8Scale;
+            const bf16_max: f32 = @bitCast(@as(u32, 0x7f7f0000));
+            for (0..raw.len / 4) |i| {
+                const scale: f32 = @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
+                if (!std.math.isFinite(scale) or @abs(scale) * 448.0 > bf16_max) return error.InvalidFp8Scale;
+            }
+        }
+        if (result.get(name) != null) return error.DuplicateGlmWeight;
+        const value = mlx.mlx_array_new_data(raw.ptr, &shape, @intCast(dims.array.items.len), dt);
+        if (value.ctx == null) return error.OutOfMemory;
+        errdefer _ = mlx.mlx_array_free(value);
+        const key = try allocator.dupe(u8, name);
+        errdefer allocator.free(key);
+        try result.map.put(key, value);
+    }
+    return true;
+}
+
+fn isFp8Dtype(dtype: []const u8) bool {
+    return std.mem.eql(u8, dtype, "F8_E4M3") or std.mem.eql(u8, dtype, "F8_E4M3FN");
+}
+
 /// The budget is checked on lazy metadata before any retained tensor is evaluated.
 /// Expert-only shards are never opened; mixed shards materialize only trunk tensors.
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream, vision: bool) !model.Weights {
@@ -177,6 +261,7 @@ pub fn loadWeightsBoundedWithVision(io: std.Io, allocator: std.mem.Allocator, mo
     while (file_it.next()) |file| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file.* }, 0);
         defer allocator.free(path);
+        if (try loadFp8Shard(allocator, path, file.*, wm.object, layers, trunk_only, vision, &result, max_bytes)) continue;
         const present = try std.Io.Dir.openFileAbsolute(io, path, .{});
         present.close(io);
         var arrays = mlx.mlx_map_string_to_array_new();
@@ -638,4 +723,42 @@ test "GLM vision local packed checkpoint header bill adds only enabled tower byt
     const vision = try residentBytesWithVision(std.testing.io, a, std.mem.span(model_dir), cfg.num_hidden_layers, true);
     try std.testing.expectEqual(@as(u64, 493389824), vision - text);
     try std.testing.expectEqual(@as(u64, 93295638776), text);
+}
+
+test "GLM raw FP8 CPU loader preserves codes scales owners and exact resident bill" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const base = "model.language_model.layers.0.p";
+    const header = "{\"" ++ base ++ ".weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[129,128],\"data_offsets\":[0,16512]},\"" ++ base ++ ".weight_scale_inv\":{\"dtype\":\"F32\",\"shape\":[2,1],\"data_offsets\":[16512,16520]},\"model.language_model.norm.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[16520,16522]},\"unindexed\":{\"dtype\":\"F8_E4M3\",\"shape\":[1],\"data_offsets\":[16522,16523]}}";
+    const raw = try a.alloc(u8, 16523);
+    defer a.free(raw);
+    @memset(raw[0..16512], 0x38);
+    @memcpy(raw[16512..], &[_]u8{ 0, 0, 128, 63, 0, 0, 0, 64, 128, 63, 0x7f });
+    try fixture(tmp.dir, "raw.safetensors", header, raw);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"num_hidden_layers\":1}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ base ++ ".weight\":\"raw.safetensors\",\"" ++ base ++ ".weight_scale_inv\":\"raw.safetensors\",\"model.language_model.norm.weight\":\"raw.safetensors\"}}" });
+    const path = try tmpPath(tmp);
+    defer a.free(path);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var weights = try loadWeights(std.testing.io, a, path, cpu);
+    defer weights.deinit();
+    try std.testing.expectEqual(@as(u64, 16522), storedBytes(&weights));
+    try std.testing.expectEqual(storedBytes(&weights), try residentBytes(std.testing.io, a, path, 1));
+    try std.testing.expectEqual(@as(usize, 3), weights.count());
+    const linear = try @import("glm5_model.zig").Linear.load(&weights, base, 128);
+    try std.testing.expect(linear.isFp8());
+    try std.testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(linear.w));
+    try std.testing.expectEqualSlices(u8, raw[0..16512], mlx.mlx_array_data_uint8(linear.w).?[0..16512]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, mlx.mlx_array_data_float32(linear.scales).?[0..2]);
+    try std.testing.expectError(error.GlmResidentBudgetExceeded, loadWeightsBounded(std.testing.io, a, path, cpu, false, 16521));
+    try std.testing.expectError(error.InvalidGlmLinear, @import("glm5_model.zig").Linear.load(&weights, base, 256));
+    raw[0] = 0x7f;
+    try fixture(tmp.dir, "raw.safetensors", header, raw);
+    try std.testing.expectError(error.InvalidFp8Value, loadWeights(std.testing.io, a, path, cpu));
+    raw[0] = 0x38;
+    @memcpy(raw[16512..16516], &[_]u8{ 0, 0, 128, 127 });
+    try fixture(tmp.dir, "raw.safetensors", header, raw);
+    try std.testing.expectError(error.InvalidFp8Scale, loadWeights(std.testing.io, a, path, cpu));
 }

@@ -5,6 +5,7 @@ const model = @import("model.zig");
 const primitive = @import("glm5_next.zig");
 const exl3 = @import("sushi_exl3");
 const Arr = mlx.mlx_array;
+const fp8_block = @import("fp8_block.zig");
 
 pub const Ops = struct {
     s: mlx.mlx_stream,
@@ -228,6 +229,12 @@ pub const Linear = struct {
         const w = weights.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{base})) orelse return error.MissingGlmWeight;
         const shape = mlx.getShape(w);
         if (shape.len != 2 or input == 0 or input > std.math.maxInt(c_int) or shape[0] <= 0) return error.InvalidGlmLinear;
+        if (mlx.mlx_array_dtype(w) == .uint8) {
+            const sc = weights.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale_inv", .{base})) orelse return error.MissingGlmWeight;
+            if (input % fp8_block.BLOCK != 0 or shape[1] != input or mlx.mlx_array_dtype(sc) != .float32 or
+                !std.mem.eql(c_int, &.{ @divTrunc(shape[0] + 127, 128), @intCast(input / 128) }, mlx.getShape(sc))) return error.InvalidGlmLinear;
+            return .{ .w = w, .scales = sc, .input = @intCast(input), .output = shape[0] };
+        }
         if (mlx.mlx_array_dtype(w) == .uint32) {
             const sc = weights.get(try std.fmt.bufPrint(&buf, "{s}.scales", .{base})) orelse return error.MissingGlmWeight;
             const bias = weights.get(try std.fmt.bufPrint(&buf, "{s}.biases", .{base})) orelse return error.MissingGlmWeight;
@@ -242,7 +249,12 @@ pub const Linear = struct {
         return .{ .w = w, .input = @intCast(input), .output = shape[0] };
     }
 
+    pub fn isFp8(self: Linear) bool {
+        return mlx.mlx_array_dtype(self.w) == .uint8;
+    }
+
     pub fn apply(self: Linear, ops: *Ops, x: Arr) !Arr {
+        if (self.isFp8()) return ops.own(try fp8_block.linear(ops.s, x, self.w, self.scales));
         if (self.scales.ctx != null) {
             if (try @import("glm5_a6_dense_once.zig").tryPrefill(ops, x, self.w, self.scales, self.biases)) |result| return result;
             return ops.qmm(x, self.w, self.scales, self.biases, true);
@@ -1039,4 +1051,41 @@ test "GLM model A6 stored projection transpose and embedding rows preserve geome
     try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(try ops.zeros(&.{ 4, 25 }, .uint32), linear.scales, linear.biases));
     try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(try ops.zeros(&.{ 4, 16 }, .uint32), linear.scales, linear.biases));
     try std.testing.expectError(error.InvalidGlmAffine, storedAffineBits(linear.w, linear.scales, try ops.zeros(&.{ 4, 2 }, .bfloat16)));
+}
+
+test "GLM FP8 projection follows MiMo source arithmetic at decode and prefill widths" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const n = 129;
+    const k = 256;
+    var codes: [n * k]u8 = undefined;
+    var decoded: [n * k]u16 = undefined;
+    const scales = [_]f32{ 0.125, 0.25, 0.5, 1.0 };
+    for (&codes, &decoded, 0..) |*code, *weight, i| {
+        code.* = if (i % 3 == 0) 0xb8 else 0x38; // exactly +/-1 in E4M3FN
+        const value = (if (code.* == 0x38) @as(f32, 1) else -1) * scales[(i / k / 128) * 2 + i % k / 128];
+        weight.* = @truncate(@as(u32, @bitCast(value)) >> 16);
+    }
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    try weights.map.put(try a.dupe(u8, "p.weight"), mlx.mlx_array_new_data(&codes, &.{ n, k }, 2, .uint8));
+    try weights.map.put(try a.dupe(u8, "p.weight_scale_inv"), mlx.mlx_array_new_data(&scales, &.{ 2, 2 }, 2, .float32));
+    const linear = try Linear.load(&weights, "p", k);
+    for ([_]c_int{ 1, 3, 8, 16, 17, 128 }) |rows| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const x = try ops.ones(&.{ 1, rows, k }, .bfloat16);
+        const y = try linear.apply(&ops, x);
+        try mlx.check(mlx.mlx_array_eval(y));
+        const values = mlx.mlx_array_data_bfloat16(y).?;
+        for (0..@intCast(rows)) |r| for (0..n) |o| {
+            var expected: f32 = 0;
+            for (decoded[o * k ..][0..k]) |w| expected += @as(f32, @bitCast(@as(u32, w) << 16));
+            const actual: f32 = @bitCast(@as(u32, values[r * n + o]) << 16);
+            try std.testing.expectEqual(expected, actual);
+        };
+        try std.testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(linear.w));
+        try std.testing.expectEqual(@as(u64, n * k + scales.len * 4), @import("glm5_diagnostic.zig").storedBytes(&weights));
+    }
 }

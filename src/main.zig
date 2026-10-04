@@ -1010,7 +1010,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const effective_decode_share = scheduler_mod.prefillDecodeShare();
     log.info("[prefill] decode share: configured={d}, effective={d} ({s})\n", .{
-        scheduler_mod.prefill_decode_share, effective_decode_share,
+        scheduler_mod.prefill_decode_share,                                                                                                     effective_decode_share,
         if (decode_share_flag != null) "--prefill-decode-share" else if (decode_share_env != null) "SUSHI_PREFILL_DECODE_SHARE" else "default",
     });
 
@@ -1297,16 +1297,20 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     };
-    log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
-        config.model_type,
-        config.num_hidden_layers,
-        config.hidden_size,
-        config.head_dim,
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.quant_bits,
-        @tagName(config.quant_mode),
-    });
+    if (config.glm_fp8_trunk) {
+        log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk + EXL3 experts)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });
+    } else {
+        log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
+            config.model_type,
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.head_dim,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.quant_bits,
+            @tagName(config.quant_mode),
+        });
+    }
 
     // Load tokenizer — heap-allocated, ownership transfers to registry on serve_mode.
     log.info("Loading tokenizer...\n", .{});

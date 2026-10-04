@@ -11,7 +11,7 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
-* GLM-5.3-Flash (`glm5_next`), text, image, and video input with native affine/EXL3 weights. Vision loads by default when present; `--no-vision` excludes its weights and buffers.
+* GLM-5.3-Flash (`glm5_next`), text, image, and video input with native affine or raw FP8 trunk weights and EXL3 experts. Vision loads by default when present; `--no-vision` excludes its weights and buffers.
 
 ## Install
 
@@ -52,6 +52,9 @@ constrained, penalized or explicitly bounded thinking requests decode serially. 
 A4/A6/A8 assistants keep their precision. The assistant weights join the load bill;
 its BF16 sliding window, target reservation, captures and verification scratch join
 the request bill.
+Raw FP8 packs use MiMo's block-128 kernels: E4M3FN bytes and FP32 scales stay resident,
+decode uses direct FP32 accumulation, and wider prefill expands projections into temporary BF16
+scratch. The default two-layer evaluation window bills up to 576 MiB of that scratch.
 Startup bills text weights, enabled vision and the selected assistant plus warmup.
 Native GLM vision is enabled unless `--no-vision` is given; its preprocessing and tower
 scratch are checked before image/video encoding. Request admission checks context

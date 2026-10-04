@@ -1291,7 +1291,6 @@ pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) 
 // and `global_model_id` singletons were removed. The `discovered_models`
 // slice was also removed — `/v1/models` iterates `registry.entries` directly.
 
-
 /// Assistant-history reasoning field on an incoming chat message:
 /// `reasoning_content` (our own SSE/vLLM field, what pi rounds-trips) with
 /// `reasoning` (the vLLM request spelling laguna's template reads first) as
@@ -3035,7 +3034,7 @@ test "MiMo honors the declared wired limit streamed or resident, without enablin
 fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
     const c = config orelse return 0;
     // Resident MiMo fills a 128 GB Mac, so its ceiling is the declared limit, not what other apps leave free.
-    if (!c.longCtxGated() and !c.expert_streaming and !c.isMimo()) return 0;
+    if (!c.longCtxGated() and !c.expert_streaming and !c.isMimo() and !c.isGlm5()) return 0;
     const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, wired_limit_margin_bytes);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
         log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
@@ -6218,8 +6217,20 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
         (@import("glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
     const dflash = if (config.glm_dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
-    return rows *| per_row +| grow +| slotRingBytes(config, 16) +| native +| dflash +|
+    return rows *| per_row +| grow +| slotRingBytes(config, 16) +| native +| dflash +| glmFp8DequantScratchBytes(config, rows, pending) +|
         @import("glm5_attention.zig").score_scratch_bytes +| @import("glm5_attention.zig").attention_scratch_bytes +| PREFILL_RUNTIME_FLOOR_BYTES;
+}
+
+/// MiMo's raw-FP8 prefill route retains BF16 scratch for each projection until
+/// the pending layer graph is evaluated. Decode uses its direct GEMV, with none.
+pub fn glmFp8DequantScratchBytes(config: *const model_mod.ModelConfig, rows: u64, pending_layers: u64) u64 {
+    if (!config.glm_fp8_trunk or rows <= @as(u64, @intCast(fp8_block.gemv_max_rows))) return 0;
+    const hidden: u64 = config.hidden_size;
+    const dense = 3 *| hidden *| config.intermediate_size;
+    const shared = 3 *| hidden *| config.moe_intermediate_size;
+    const mla = @as(u64, config.mla_q_lora_rank) *| (hidden +| @as(u64, config.num_attention_heads) *| config.mla_qk_nope_head_dim) +|
+        @as(u64, config.mla_kv_lora_rank) *| hidden +| hidden *| config.num_attention_heads *| config.mla_v_head_dim +| shared;
+    return @max(dense, mla) *| 2 *| pending_layers;
 }
 
 /// Dense sliding assistant window, capture/encoder/projection rows, target
@@ -6956,8 +6967,10 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         pinnedResidentBytes(bill) / mb,
     });
     const context = requestContextRefusal(config, prompt_len, max_tokens, kv_cfg, bill, .{
-        .matched_tokens = warm_matched, .capacity_tokens = warm_capacity,
-        .will_donate = warm_will_donate, .mtp_on = enable_mtp,
+        .matched_tokens = warm_matched,
+        .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate,
+        .mtp_on = enable_mtp,
     });
     if (context) |r| log.warn("  maximum context at KV{d}, prefill chunk {d}: {d} tokens\n", .{ r.kv_bits, r.chunk, r.maximum });
     return context;
@@ -7219,6 +7232,7 @@ fn modelEngineName(path: []const u8, arch_hint: []const u8) []const u8 {
 fn modelQuantizationLabel(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
     if (config.expert_layout == .exl3_k4) {
         var rate_buf: [8]u8 = undefined;
+        if (config.glm_fp8_trunk) return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, raw FP8 E4M3FN block128 trunk", .{config.expert_quant_rate.kText(&rate_buf)});
         return std.fmt.allocPrint(allocator, "EXL3 {s}bpw experts, {d}-bit dense", .{ config.expert_quant_rate.kText(&rate_buf), config.quant_bits });
     }
     return std.fmt.allocPrint(allocator, "{d}-bit", .{config.quant_bits});
@@ -7963,10 +7977,9 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.max_mtp_ctx,                             st.drafter,
         st.pld.enable,                              st.pld_source,
         st.pld.draft_len,                           st.pld.key_len,
-        st.max_concurrent,
-        st.prefill_decode_share,
-        st.prefix_cache_ram_enabled,
-        st.prefix_cache_mem_bytes,                  st.prefix_cache_disk_bytes,
+        st.max_concurrent,                          st.prefill_decode_share,
+        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
+        st.prefix_cache_disk_bytes,
     });
 }
 
@@ -12848,7 +12861,6 @@ test "every streaming chat emitter carries logprobs (silently-ignored-field guar
         return error.ChunkTemplateNotFound;
     try std.testing.expect(std.mem.indexOfPos(u8, src, chunk_at, interpolates) != null);
 }
-
 
 test "ipIsLoopback exempts local addresses only" {
     // IPv4 loopback (whole 127.0.0.0/8) is exempt; a LAN address is not.
@@ -25932,7 +25944,6 @@ test "GLM serving memory bills one BF16 latent and pooled index per token" {
     try std.testing.expect(prefillTransientReserveAtKv(&cfg, 16, 2048, 500000) < 6 * 1024 * 1024 * 1024);
 }
 
-
 test "thinking policy HTTP accepts only each original model vocabulary" {
     for ([_]struct { arch: []const u8, accepted: []const model_mod.Effort }{
         .{ .arch = "glm5_next", .accepted = &.{ .low, .high, .max } },
@@ -25948,7 +25959,6 @@ test "thinking policy HTTP accepts only each original model vocabulary" {
         try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, true, model_mod.effortArms(c.arch)));
     }
 }
-
 
 test "GLM serving DFlash2 bill includes the bounded window captures replay and scratch" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
@@ -25973,8 +25983,8 @@ test "GLM vision serving processor carries image and video token budgets without
     try std.testing.expectEqual(@as(u32, 8000), processor.max_tokens);
     try std.testing.expectEqual(@as(u32, 240000), processor.max_video_tokens);
     try std.testing.expect(!cfg.qwen_vision);
-    const images = [_]chat_mod.ImageData{ .{ .pixels = &.{}, .width = 56, .height = 56, .grid_h = 4, .grid_w = 4 } };
-    const videos = [_]chat_mod.VideoData{ .{ .pixels = &.{}, .grid_t = 2, .grid_h = 4, .grid_w = 4, .fps = 2 } };
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 56, .height = 56, .grid_h = 4, .grid_w = 4 }};
+    const videos = [_]chat_mod.VideoData{.{ .pixels = &.{}, .grid_t = 2, .grid_h = 4, .grid_w = 4, .fps = 2 }};
     const ids = [_]u32{ 154830, 154854, 154831, 154832, 154855, 154833 };
     const counts = countMediaPlaceholders(&ids, &cfg);
     try std.testing.expectEqual(@as(usize, 1), counts.images);
@@ -25986,12 +25996,29 @@ test "GLM vision serving processor carries image and video token budgets without
     var placed = try placeMedia(std.testing.allocator, &ids, &cfg, &images, &videos, &tok);
     defer placed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 12), placed.rows);
-    try std.testing.expectEqualSlices(u32, &.{ 154830, 154854, 154854, 154854, 154854, 154831,
-        154832, 154830, 154854, 154854, 154854, 154854, 154831, 1000,
-        154830, 154854, 154854, 154854, 154854, 154831, 1001, 154833 }, placed.ids);
+    try std.testing.expectEqualSlices(u32, &.{ 154830, 154854, 154854, 154854, 154854, 154831, 154832, 154830, 154854, 154854, 154854, 154854, 154831, 1000, 154830, 154854, 154854, 154854, 154854, 154831, 1001, 154833 }, placed.ids);
     const bill = visionEncodeBill(&cfg, &images, &videos, placed.rows);
     try std.testing.expectEqual(@as(u64, 16), bill.largest_group_patches);
     const input_bytes: u64 = 3 * 16 * 3 * 2 * 14 * 14 * 4;
     const output_bytes: u64 = 12 * 4096 * 2;
     try std.testing.expectEqual(glm5_vision.encodeScratchBytes(&cfg, 16) + input_bytes + 3 * output_bytes, bill.bytes);
+}
+
+test "GLM raw FP8 scratch bills all pending projections only beyond direct decode" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    try std.testing.expectEqual(@as(u64, 0), glmFp8DequantScratchBytes(&cfg, 2048, 2));
+    cfg.glm_fp8_trunk = true;
+    try std.testing.expectEqual(@as(u64, 0), glmFp8DequantScratchBytes(&cfg, @intCast(fp8_block.gemv_max_rows), 2));
+    try std.testing.expectEqual(@as(u64, 576 * 1024 * 1024), glmFp8DequantScratchBytes(&cfg, 2048, 2));
+    try std.testing.expectEqual(glmFp8DequantScratchBytes(&cfg, 17, 1) * 2, glmFp8DequantScratchBytes(&cfg, 2048, 2));
+}
+
+test "GLM raw FP8 honors the declared wired limit with the same reserve as MiMo" {
+    const prior = wired_limit_mb_override;
+    wired_limit_mb_override = 120000;
+    defer wired_limit_mb_override = prior;
+    const cfg = model_mod.ModelConfig{ .model_type = "glm5_next", .glm_fp8_trunk = true };
+    try std.testing.expectEqual(wiredLimitFloor(120000 * 1024 * 1024, 128 << 30, wired_limit_margin_bytes), wiredCeilingFloorForRam(&cfg, 128 << 30));
+    wired_limit_mb_override = 98304;
+    try std.testing.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(&cfg, 128 << 30));
 }
