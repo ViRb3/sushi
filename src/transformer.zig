@@ -75994,6 +75994,54 @@ test "GLM forward contexts carry their own request: interleaved streams equal ea
     try testing.expectError(error.GlmRequestMissing, xfm.forwardWith(&orphan, ids));
 }
 
+test "a GLM prefill interleaved with another stream's decode builds the solo prefill's cache bits" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glm5_mod.completeFixture(&weights);
+    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer xfm.deinit();
+    var caches: [3]KVCache = undefined;
+    var offsets: [3]usize = .{ 0, 0, 0 };
+    var requests: [3]glm5_mod.Request = undefined;
+    var ctxs: [3]ForwardCtx = undefined;
+    for (0..3) |i| {
+        caches[i] = try KVCache.init(a, cfg.num_hidden_layers);
+        requests[i] = try glm5_mod.Request.initServing(a, cfg.num_hidden_layers);
+        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .glm5_request = &requests[i] };
+    }
+    defer for (0..3) |i| {
+        caches[i].deinit();
+        requests[i].deinit();
+    };
+    // ctxs[0] prefills alone; ctxs[1] prefills the same chunks around ctxs[2]'s decode steps.
+    const chunks = [_][]const u32{ &.{ 0, 1, 2 }, &.{ 3, 1 }, &.{2} };
+    const other = [_][]const u32{ &.{ 1, 3 }, &.{0}, &.{2} };
+    for (chunks, other) |chunk, step| {
+        for ([_]usize{ 0, 2, 1 }, [_][]const u32{ chunk, step, chunk }) |slot, ids_slice| {
+            const ids = mlx.mlx_array_new_data(ids_slice.ptr, &[_]c_int{ 1, @intCast(ids_slice.len) }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(ids);
+            const out = try xfm.forwardWith(&ctxs[slot], ids);
+            _ = mlx.mlx_array_free(out);
+        }
+    }
+    for (requests[0].layers, requests[1].layers) |solo, mixed| {
+        for ([_]mlx.mlx_array{ solo.recurrent.conv_state, solo.recurrent.ssm_state } ++ solo.attention.arrays(), [_]mlx.mlx_array{ mixed.recurrent.conv_state, mixed.recurrent.ssm_state } ++ mixed.attention.arrays()) |x, y| {
+            if (x.ctx == null or y.ctx == null) {
+                try testing.expect(x.ctx == null and y.ctx == null);
+                continue;
+            }
+            var equal = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(equal);
+            try mlx.check(mlx.mlx_array_equal(&equal, x, y, true, xfm.s));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, equal));
+            try testing.expect(same);
+        }
+    }
+}
+
 test "a streamed GLM load keeps its one teacher stream exclusive" {
     var t: Transformer = undefined;
     t.dsv4 = null;

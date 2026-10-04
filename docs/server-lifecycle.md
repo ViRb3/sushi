@@ -153,6 +153,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   normal tail merging still applies. Admission bills the original width, and adaptive widening retains its memory
   confirmation. An adaptive slot can lift the cap after the other decoders finish; a pinned slot keeps its cap.
   Hosted decode time is excluded from prefill compute time but remains part of request latency.
+- **GLM prefill chunks never narrow for company** (`prefillShareCapFor`): its numerics depend on chunk boundaries, so a
+  request's output must not depend on what else decodes; it yields only between whole chunks.
 - **Serial ≠ exclusive**: only a slot driving a module-owned decode state is exclusive (`slotExclusiveDecode`);
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:

@@ -6987,7 +6987,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = req_prefill_chunk,
-            .decode_share_width_cap = decodeShareAdmissionCap(liveDecodingCount(sch), prefillDecodeShare()),
+            .decode_share_width_cap = prefillShareCapFor(&xfm_ptr.config, liveDecodingCount(sch), prefillDecodeShare()),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -10905,6 +10905,11 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
 pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
     return parseDecodeShare(flag orelse env orelse return 0);
 }
+/// The decode share's prefill width cap for this model. GLM prefill numerics depend on the chunk
+/// boundaries, so its chunks stay whole whatever else decodes: it yields only between chunks.
+pub fn prefillShareCapFor(cfg: *const ModelConfig, decoding: usize, share: f32) u32 {
+    return if (cfg.isGlm5()) 0 else decodeShareAdmissionCap(decoding, share);
+}
 pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
     return if (decoding == 0 or share <= 0) 0 else DECODE_SHARE_PREFILL_CHUNK;
 }
@@ -10931,6 +10936,14 @@ pub fn runOwedDecodeTicks(share: f32, chunk_ns: u64, first_ns: u64, ctx: *anyopa
         result.spent_ns +|= ns;
     }
     return result;
+}
+
+test "decode share never narrows a GLM prefill: its chunk boundaries are numerics" {
+    const glm = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
+    try testing.expectEqual(@as(u32, 0), prefillShareCapFor(&glm, 3, 0.5));
+    try testing.expectEqual(DECODE_SHARE_PREFILL_CHUNK, prefillShareCapFor(&qwen4, 3, 0.5));
+    try testing.expectEqual(@as(u32, 0), prefillShareCapFor(&qwen4, 0, 0.5));
 }
 
 test "decode share: a live share caps the width only while someone decodes" {
