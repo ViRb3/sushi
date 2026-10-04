@@ -10765,6 +10765,7 @@ test "outcome: a real Slot's fields satisfy the recorder, and a cancelled GLM sl
     slot.metrics_recorded = false;
     slot.finished = false;
     slot.error_code = null;
+    slot.stop_hit = .init(false);
     slot.first_token_ns = 1;
     slot.prefill_ns = 1;
     slot.decode_ns = 1;
