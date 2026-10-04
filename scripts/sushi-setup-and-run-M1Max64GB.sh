@@ -328,6 +328,16 @@ switch_to_main_binary() {
 
     # Check if there are unbuilt commits in local repo or upstream
     if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ]; then
+        local current_flavor_commit=""
+        if [ -f "${BIN_DIR}/.sushi_flavor" ]; then
+            current_flavor_commit=$(grep "^FLAVOR_COMMIT=" "${BIN_DIR}/.sushi_flavor" | cut -d= -f2 || echo "")
+        fi
+        local head_commit
+        head_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "")
+        if [ -n "${current_flavor_commit}" ] && [ -n "${head_commit}" ] && [ "${current_flavor_commit}" != "${head_commit}" ]; then
+            needs_build=true
+        fi
+
         (cd "${REPO_DIR}" && git fetch origin 2>/dev/null || true)
         local behind_count
         behind_count=$(cd "${REPO_DIR}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
@@ -521,12 +531,52 @@ ensure_latest_sushi_binary() {
     else
         # Default or flavor_type == 'main'
         if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ]; then
-            local local_commit ahead_release_count behind_count
-            local_commit="${flavor_commit:-$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "")}"
+            local repo_head_commit current_binary_commit
+            repo_head_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "")
+            current_binary_commit="${flavor_commit:-}"
+
+            # If the deployed binary was built from an older commit than current git HEAD, prompt or rebuild
+            if [ -n "${repo_head_commit}" ] && [ -n "${current_binary_commit}" ] && [ "${repo_head_commit}" != "${current_binary_commit}" ]; then
+                local unbuilt_count
+                unbuilt_count=$(cd "${REPO_DIR}" && git rev-list --count "${current_binary_commit}..HEAD" 2>/dev/null || echo 0)
+                if [ "${unbuilt_count}" -gt 0 ]; then
+                    echo ""
+                    echo -e "${YELLOW}================================================================${NC}"
+                    echo -e "${YELLOW}[!] New commits detected in git repository since last build:${NC}"
+                    echo -e "${YELLOW}    ${unbuilt_count} unbuilt commit(s) (${current_binary_commit} -> ${repo_head_commit})${NC}"
+                    echo -e "${YELLOW}================================================================${NC}"
+                    (cd "${REPO_DIR}" && git log --format="  • %s" -n 5 "${current_binary_commit}..HEAD")
+                    echo -e "${YELLOW}================================================================${NC}"
+                    echo ""
+
+                    local do_rebuild="y"
+                    if [ -t 0 ]; then
+                        read -r -p "Do you want to recompile and deploy the latest binary now? [Y/n] " do_rebuild
+                        do_rebuild="${do_rebuild:-y}"
+                    else
+                        print_info "Non-interactive session: automatically compiling latest binary..."
+                        do_rebuild="y"
+                    fi
+
+                    case "${do_rebuild}" in
+                        [yY][eE][sS]|[yY])
+                            print_info "Rebuilding and deploying latest binary from source..."
+                            build_and_deploy_from_source || return 1
+                            current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.1.1")
+                            current_binary_commit="${repo_head_commit}"
+                            ;;
+                        *)
+                            print_info "Skipping build; continuing with current binary (${current_binary_commit})."
+                            ;;
+                    esac
+                fi
+            fi
+
+            local ahead_release_count behind_count
             ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${current_ver}..HEAD" 2>/dev/null || echo 0)
             
             if [ "${ahead_release_count}" -gt 0 ]; then
-                print_success "Sushi Engine: Running 'main' branch build (${local_commit:-main}, ${ahead_release_count} commits ahead of v${current_ver} release)"
+                print_success "Sushi Engine: Running 'main' branch build (${current_binary_commit:-${repo_head_commit}}, ${ahead_release_count} commits ahead of v${current_ver} release)"
                 echo -e "${CYAN}Active Delta Features & Fixes over v${current_ver}:${NC}"
                 (cd "${REPO_DIR}" && git log --format="  • %s" -n 6 HEAD)
                 print_info "Note: You can rollback to the official release binary anytime via '$0 use-release'"
