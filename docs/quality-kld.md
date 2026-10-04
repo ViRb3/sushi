@@ -46,6 +46,9 @@ chunk with the same chunk width, state and kernels, so the order of work is the 
 (logits, tokens, baseline) and `SUSHI_HIDDEN_OUT` boundaries are byte-identical to the window-major capture. A tiny
 seeded GLM checks this at several W, across chunks and across a resume (`glm5_layer_major.zig`,
 `glm5_kld_capture.zig`).
+- Measured (binary `65a5904b`, 16 real 500-token tune windows, W=8, `--ssd-budget-gb 100`, `taskpolicy -a`, GPU lock):
+  33.1 tok/s against 4.2 window-major (608.8 GB read per batch in ~48 s, ~9 s compute per window); byte-identical
+  to window-major on 14 windows (131 files).
 - A window carries only its HC residual between layers (32 KiB per token at 4096 hidden): a layer's KDA state,
   MLA latent and pooled index are dropped once the window has run that layer. Decode would need every layer's state per
   window, so `--tokens` above 1 is refused (`GlmLayerMajorNeedsOneRow`).
