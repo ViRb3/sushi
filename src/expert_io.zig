@@ -1226,7 +1226,7 @@ test "expert io file cache reopens a replaced shard and reuses a stable one" {
     try t.expectEqualSlices(u8, replacement, &got);
 }
 
-pub const Dtype = enum { bf16, f16, u8, u16, u32, other };
+pub const Dtype = enum { bf16, f16, u8, u16, u32, f32, f8e4m3, other };
 
 pub const TensorRegion = struct {
     data_offset: u64,
@@ -1276,6 +1276,10 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
         .u8
     else if (std.mem.eql(u8, dtype.string, "U32") or std.mem.eql(u8, dtype.string, "UINT32"))
         .u32
+    else if (std.mem.eql(u8, dtype.string, "F32"))
+        .f32
+    else if (std.mem.eql(u8, dtype.string, "F8_E4M3") or std.mem.eql(u8, dtype.string, "F8_E4M3FN"))
+        .f8e4m3
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;

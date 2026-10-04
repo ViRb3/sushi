@@ -76183,6 +76183,48 @@ test "GLM serving streams BF16 source experts through the engine the native capt
     try testing.expect(streamed.expert_stream.?.fill_bytes_total > 0);
 }
 
+test "GLM serving streams FP8 source experts through eviction and the union, the bits of an all-resident cache" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var trunk = Weights.init(a);
+    defer trunk.deinit();
+    const cfg = try glm5_mod.routedFixture(&trunk, 4);
+    try trunk.dropPrefix(glm5_mod.ROUTED_BANK_PREFIX);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try @import("glm_stream_fixture.zig").writeStorage(a, tmp.dir, .none, 128, 128, .fp8);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    const per_expert = try expert_stream_mod.expertBytesFor(a, path, cfg.expertGeometry(), .fp8_individual);
+    var streamed: [2]Transformer = undefined;
+    for (&streamed, [_]u64{ 2, 4 }) |*xfm, slots| {
+        var c = cfg;
+        c.expert_streaming = true;
+        c.expert_layout = .fp8_individual;
+        c.expert_source_dir = path;
+        c.expert_cache_bytes = slots * per_expert;
+        xfm.* = try Transformer.init(testing.io, a, c, &trunk);
+    }
+    defer for (&streamed) |*xfm| xfm.deinit();
+    var union_seen = false;
+    var first_bytes: ?[8]u8 = null;
+    var logits_moved = false;
+    for ([_][]const u32{ &.{ 0, 1, 2, 3, 1 }, &.{2}, &.{3}, &.{0}, &.{1}, &.{ 2, 0 }, &.{3} }) |chunk| {
+        const ids = mlx.mlx_array_new_data(chunk.ptr, &[_]c_int{ 1, @intCast(chunk.len) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const expected = try streamed[1].forward(ids);
+        defer _ = mlx.mlx_array_free(expected);
+        const actual = try streamed[0].forward(ids);
+        defer _ = mlx.mlx_array_free(actual);
+        const want = try expectSameBits(expected, actual);
+        if (first_bytes) |first| logits_moved = logits_moved or !std.mem.eql(u8, &first, want[0..8]) else first_bytes = want[0..8].*;
+        union_seen = union_seen or streamed[0].expert_stream.?.breakdown().union_members > 0;
+    }
+    try testing.expect(logits_moved);
+    try testing.expect(union_seen);
+    try testing.expect(streamed[0].expert_stream.?.fill_experts_total > streamed[1].expert_stream.?.fill_experts_total);
+}
+
 test "GLM vision native serving splices media before HC expansion and preserves layer capture" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;

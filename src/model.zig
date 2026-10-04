@@ -2899,6 +2899,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 if (storage == .string) config.glm_fp8_trunk = std.mem.eql(u8, storage.string, "source-fp8-e4m3fn-block128");
             };
         }
+        if (root.get("quantization_config")) |q| if (q == .object) if (q.object.get("quant_method")) |method| {
+            if (method == .string and std.mem.eql(u8, method.string, "fp8")) {
+                const block = q.object.get("weight_block_size") orelse return error.UnsupportedGlmConfig;
+                if (block != .array or block.array.items.len != 2) return error.UnsupportedGlmConfig;
+                for (block.array.items) |side| if (side != .integer or side.integer != 128) return error.UnsupportedGlmConfig;
+                config.glm_fp8_trunk = true;
+            }
+        };
         try parseGlm5VisionFields(&config, root);
     } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
@@ -9624,4 +9632,10 @@ test "GLM raw FP8 config identifies source storage without changing native KV" {
     try std.testing.expectEqual(@as(u64, 11 * 512 * 2), cfg.kvBytesPerToken());
     const affine = try parseConfigFromJson(std.testing.allocator, source);
     try std.testing.expect(!affine.glm_fp8_trunk);
+    const release = try std.fmt.allocPrint(std.testing.allocator, "{{\"quantization_config\":{{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"activation_scheme\":\"dynamic\",\"weight_block_size\":[128,128]}},{s}", .{source[1..]});
+    defer std.testing.allocator.free(release);
+    try std.testing.expect((try parseConfigFromJson(std.testing.allocator, release)).glm_fp8_trunk);
+    const other_block = try std.fmt.allocPrint(std.testing.allocator, "{{\"quantization_config\":{{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"weight_block_size\":[64,64]}},{s}", .{source[1..]});
+    defer std.testing.allocator.free(other_block);
+    try std.testing.expectError(error.UnsupportedGlmConfig, parseConfigFromJson(std.testing.allocator, other_block));
 }

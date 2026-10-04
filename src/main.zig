@@ -1288,7 +1288,7 @@ pub fn main(init: std.process.Init) !void {
         }
     };
     if (config.glm_fp8_trunk) {
-        log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk + EXL3 experts)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });
+        log.info("Model: {s} ({d} layers, {d}-dim, raw FP8 E4M3FN block128 trunk)\n", .{ config.model_type, config.num_hidden_layers, config.hidden_size });
     } else {
         log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
             config.model_type,

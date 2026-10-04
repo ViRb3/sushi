@@ -2816,11 +2816,19 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
-    split.trunk +|= mimoCoarseHeadBytes(&streamed);
+    split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry);
     const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
     const resolved = try resolveExpertCache(explicit_cache_bytes, budget_bytes, config, split, false, per_expert);
     const cache = try expert_stream_mod.cachePlanBytesForGeometry(resolved.cache_bytes, geometry, per_expert);
     return .{ .layout = streamed.expert_layout, .split = split, .resolved = resolved, .cache = cache };
+}
+
+/// FP8 experts compute from bf16 copies of a layer's routed slots (`glm5_stream.fp8Routed`): at most
+/// every expert, plus the gathered codes when the routed slots of a cache slab are not contiguous.
+pub fn fp8ExpertScratchBytes(layout: expert_stream_mod.quant.Layout, geometry: expert_stream_mod.Geometry) u64 {
+    if (layout != .fp8_individual) return 0;
+    const codes = 3 *| @as(u64, geometry.hidden) *| geometry.intermediate;
+    return @as(u64, geometry.experts) *| codes *| (2 + 1);
 }
 
 /// Marks the config streamed: the fields every streamed forward and bill reads.
@@ -10614,6 +10622,7 @@ test "every real streamed pack and source on this box plans a streamed load" {
         .{ .name = "GLM-5.3-Flash-Sushi-2.3bpw", .layout = .exl3_k4 },
         .{ .name = "GLM-5.3-Flash-Sushi-2.5bpw", .layout = .exl3_k4 },
         .{ .name = "GLM-5.3-Flash-BF16", .layout = .bf16_individual },
+        .{ .name = "GLM-5.3-Flash-FP8", .layout = .fp8_individual },
     }) |case| {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try @import("test_models.zig").packPath(&path_buf, case.name);

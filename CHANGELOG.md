@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3-Flash's FP8 release streams its experts from SSD** as stored FP8 codes and block scales, in `serve`, `run`
+  and `kld compare`; `kld capture` refuses it, since the BF16 source stays the teacher. Verified by hermetic tests only.
 - **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
   instead of failing to compile mlx-c after a plain `git pull`.
 - **Concurrent GLM-5.3 requests interleave instead of queueing**: each request keeps its own native state, so a

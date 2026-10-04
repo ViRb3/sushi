@@ -9,6 +9,8 @@ const streaming = @import("glm5_stream.zig");
 const Arr = mlx.mlx_array;
 pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (!cfg.isGlm5() or opts.command != .capture) return false;
+    // The FP8 release is a block quantization of the BF16 one, never a teacher.
+    if (cfg.expert_layout == .fp8_individual) return error.NativeGlmTeacherRequiresLosslessStreaming;
     // A pack captures its own served path (a student reference, not the teacher) at a BF16 latent.
     if (cfg.expert_layout != .bf16_individual) {
         if (opts.kv_quant_config.isQuant()) return error.GlmStudentReferenceNeedsBf16Latent;
@@ -477,6 +479,11 @@ test "GLM KLD capture sends a pack to the generic student reference, at a BF16 l
     }
     opts.command = .compare;
     try std.testing.expect(!(try accepts(&cfg, opts)));
+    cfg.expert_layout = .fp8_individual;
+    try std.testing.expect(!(try accepts(&cfg, opts)));
+    opts.command = .capture;
+    opts.kv_quant_config = .dense;
+    try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     cfg.expert_layout = .bf16_individual;
     opts = .{ .command = .capture, .no_template = true, .tokens = 256 };
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));

@@ -84,8 +84,9 @@ pub fn kFromPackedDim(last: u64) ?expert_exl3.Rate {
 }
 
 /// Routed experts are leading-index banks or individual source tensors.
-/// Both MXFP4 layouts use nine component ids with three absent bias slots.
-pub const Layout = enum { bf16_individual, bf16_fused, quantized_split, exl3_k4, mxfp4_split, mxfp4_individual };
+/// Both MXFP4 layouts use nine component ids with three absent bias slots; GLM's
+/// FP8 source keeps e4m3 weights and their f32 block-128 `weight_scale_inv` grids.
+pub const Layout = enum { bf16_individual, bf16_fused, quantized_split, exl3_k4, mxfp4_split, mxfp4_individual, fp8_individual };
 
 pub const Component = enum(u4) {
     gate_w,
@@ -300,6 +301,7 @@ pub fn bf16IndividualTensorKey(buf: []u8, layer: u16, expert: u16, projection: P
     return std.fmt.bufPrint(buf, "model.language_model.layers.{d}.mlp.experts.{d}.{s}_proj.weight", .{ layer, expert, @tagName(projection) });
 }
 
+/// GLM's individual experts: `.weight` alone (BF16 source) or with `.weight_scale_inv` (FP8 source).
 fn parseBf16IndividualKey(key: []const u8) Mxfp4IndividualKeyParse {
     const prefix = "model.language_model.layers.";
     if (!std.mem.startsWith(u8, key, prefix) or std.mem.indexOf(u8, key, ".mlp.experts.") == null) return .not_family;
@@ -310,11 +312,25 @@ fn parseBf16IndividualKey(key: []const u8) Mxfp4IndividualKeyParse {
     const expert = decimalU16(parts.next() orelse return .malformed) orelse return .malformed;
     const name = parts.next() orelse return .malformed;
     const projection: Projection = if (std.mem.eql(u8, name, "gate_proj")) .gate else if (std.mem.eql(u8, name, "up_proj")) .up else if (std.mem.eql(u8, name, "down_proj")) .down else return .malformed;
-    if (!std.mem.eql(u8, parts.next() orelse return .malformed, "weight") or parts.next() != null) return .malformed;
-    return .{ .valid = .{ .layer = layer, .expert = expert, .projection = projection, .part = .weight } };
+    const leaf = parts.next() orelse return .malformed;
+    if (parts.next() != null) return .malformed;
+    const part: Part = if (std.mem.eql(u8, leaf, "weight")) .weight else if (std.mem.eql(u8, leaf, "weight_scale_inv")) .scales else return .malformed;
+    return .{ .valid = .{ .layer = layer, .expert = expert, .projection = projection, .part = part } };
 }
 
-fn validateBf16IndividualMap(map: std.json.ObjectMap, layers: u16, first: u16, experts: ?u16) !void {
+fn fp8ScaleKey(buf: []u8, layer: u16, expert: u16, projection: Projection) ![]const u8 {
+    return std.fmt.bufPrint(buf, "model.language_model.layers.{d}.mlp.experts.{d}.{s}_proj.weight_scale_inv", .{ layer, expert, @tagName(projection) });
+}
+
+fn hasFp8ScaleKey(map: std.json.ObjectMap) bool {
+    for (map.keys()) |key| switch (parseBf16IndividualKey(key)) {
+        .valid => |k| if (k.part == .scales) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn validateBf16IndividualMap(map: std.json.ObjectMap, layers: u16, first: u16, experts: ?u16, fp8: bool) !void {
     if (first >= layers) return error.InvalidExpertGeometry;
     var count: u32 = 0;
     var it = map.iterator();
@@ -325,6 +341,7 @@ fn validateBf16IndividualMap(map: std.json.ObjectMap, layers: u16, first: u16, e
             },
             .malformed => return error.InvalidExpertTensor,
             .valid => |key| {
+                if (key.part == .scales and !fp8) return error.InvalidExpertTensor;
                 if (key.layer < first or key.layer > layers) return error.ExpertLayerOutOfRange;
                 if (experts) |n| if (key.expert >= n) return error.ExpertOutOfRange;
                 if (entry.value_ptr.* != .string) return error.InvalidSafetensorsIndex;
@@ -341,6 +358,7 @@ fn validateBf16IndividualMap(map: std.json.ObjectMap, layers: u16, first: u16, e
             for ([_]Projection{ .gate, .up, .down }) |projection| {
                 const key = try bf16IndividualTensorKey(&buf, @intCast(layer), @intCast(expert), projection);
                 if (!stringAt(map, key)) return error.MissingExpertTensor;
+                if (fp8 and !stringAt(map, try fp8ScaleKey(&buf, @intCast(layer), @intCast(expert), projection))) return error.MissingExpertTensor;
             }
         }
     }
@@ -348,33 +366,44 @@ fn validateBf16IndividualMap(map: std.json.ObjectMap, layers: u16, first: u16, e
 
 fn populateBf16IndividualStore(allocator: std.mem.Allocator, model_dir: []const u8, map: std.json.ObjectMap, files: *std.ArrayList(SourceFile), store: *QuantStore) !void {
     const g = store.geometry;
-    try validateBf16IndividualMap(map, g.layers, g.first_moe_layer, g.experts);
+    const fp8 = store.layout == .fp8_individual;
+    try validateBf16IndividualMap(map, g.layers, g.first_moe_layer, g.experts, fp8);
+    if (fp8 and (g.hidden % 128 != 0 or g.intermediate % 128 != 0)) return error.InvalidExpertGeometry;
     var buf: [192]u8 = undefined;
     for (g.first_moe_layer..g.layers) |layer| {
         for (0..g.experts) |expert| {
             for ([_]Projection{ .gate, .up, .down }) |projection| {
-                const key = try bf16IndividualTensorKey(&buf, @intCast(layer), @intCast(expert), projection);
-                const file = try openSource(allocator, files, model_dir, map.get(key).?.string);
-                const region = sourceTensorRegion(allocator, &files.items[file], key) catch |err| return switch (err) {
-                    error.MissingSafetensorsTensor => error.MissingExpertTensor,
-                    error.SafetensorsTensorOutOfBounds => error.ExpertTensorOutOfBounds,
-                    else => error.InvalidExpertTensor,
-                };
                 const rows = if (projection == .down) g.hidden else g.intermediate;
                 const cols = if (projection == .down) g.intermediate else g.hidden;
-                const bytes = try std.math.mul(u64, try std.math.mul(u64, rows, cols), 2);
-                if (region.dtype != .bf16 or region.rank != 2 or region.shape[0] != rows or region.shape[1] != cols or region.tensor_bytes != bytes) return error.InvalidExpertTensor;
-                const c = weightOf(projection);
-                const ci = @backingInt(c);
-                store.rows[ci] = rows;
-                store.cols[ci] = cols;
-                store.dtypes[ci] = .bf16;
-                store.slot_bytes[ci] = bytes;
-                store.spans[store.sourceIndex(@intCast(layer), @intCast(expert), c)] = .{
-                    .file = file,
-                    .offset = try std.math.add(u64, region.data_offset, region.tensor_offset),
-                    .len = bytes,
-                };
+                const parts: []const Part = if (fp8) &.{ .weight, .scales } else &.{.weight};
+                for (parts) |part| {
+                    const key = if (part == .weight)
+                        try bf16IndividualTensorKey(&buf, @intCast(layer), @intCast(expert), projection)
+                    else
+                        try fp8ScaleKey(&buf, @intCast(layer), @intCast(expert), projection);
+                    const file = try openSource(allocator, files, model_dir, map.get(key).?.string);
+                    const region = sourceTensorRegion(allocator, &files.items[file], key) catch |err| return switch (err) {
+                        error.MissingSafetensorsTensor => error.MissingExpertTensor,
+                        error.SafetensorsTensorOutOfBounds => error.ExpertTensorOutOfBounds,
+                        else => error.InvalidExpertTensor,
+                    };
+                    const shape: [2]u32 = if (part == .weight) .{ rows, cols } else .{ rows / 128, cols / 128 };
+                    const dtype: io_mod.Dtype = if (part == .scales) .f32 else if (fp8) .f8e4m3 else .bf16;
+                    const elem: u64 = if (part == .scales) 4 else if (fp8) 1 else 2;
+                    const bytes = try std.math.mul(u64, try std.math.mul(u64, shape[0], shape[1]), elem);
+                    if (region.dtype != dtype or region.rank != 2 or region.shape[0] != shape[0] or region.shape[1] != shape[1] or region.tensor_bytes != bytes) return error.InvalidExpertTensor;
+                    const c = if (part == .weight) weightOf(projection) else scalesOf(projection);
+                    const ci = @backingInt(c);
+                    store.rows[ci] = shape[0];
+                    store.cols[ci] = shape[1];
+                    store.dtypes[ci] = dtype;
+                    store.slot_bytes[ci] = bytes;
+                    store.spans[store.sourceIndex(@intCast(layer), @intCast(expert), c)] = .{
+                        .file = file,
+                        .offset = try std.math.add(u64, region.data_offset, region.tensor_offset),
+                        .len = bytes,
+                    };
+                }
             }
         }
     }
@@ -384,7 +413,7 @@ fn populateBf16IndividualStore(allocator: std.mem.Allocator, model_dir: []const 
 /// streamed loader must NOT fault into RAM.
 pub fn isRoutedExpertKey(layout: Layout, key: []const u8) bool {
     return switch (layout) {
-        .bf16_individual => parseBf16IndividualKey(key) == .valid,
+        .bf16_individual, .fp8_individual => parseBf16IndividualKey(key) == .valid,
         .bf16_fused => std.mem.startsWith(u8, key, "model.language_model.layers.") and
             (std.mem.endsWith(u8, key, ".mlp.experts.gate_up_proj") or
                 std.mem.endsWith(u8, key, ".mlp.experts.down_proj")),
@@ -688,8 +717,9 @@ pub fn layoutFromIndexJsonWithFirstMoe(
             }
             return .exl3_k4;
         }
-        validateBf16IndividualMap(map.object, layers, first_moe_layer, null) catch return null;
-        return .bf16_individual;
+        const fp8 = hasFp8ScaleKey(map.object);
+        validateBf16IndividualMap(map.object, layers, first_moe_layer, null, fp8) catch return null;
+        return if (fp8) .fp8_individual else .bf16_individual;
     }
     const mimo = std.mem.eql(u8, model_type, "mimo_v2");
     const layout = layoutFromWeightMapWithFirstMoe(map.object, layers, first_moe_layer, mimo) orelse return null;
@@ -790,6 +820,7 @@ pub const QuantStore = struct {
 
     pub fn componentPresent(self: *const QuantStore, c: Component) bool {
         if (self.layout == .bf16_individual) return partOf(c) == .weight;
+        if (self.layout == .fp8_individual) return partOf(c) != .biases;
         return !isMxfp4Layout(self.layout) or partOf(c) != .biases;
     }
 
@@ -904,7 +935,7 @@ pub const QuantStore = struct {
             }
         }
 
-        if (chosen == .bf16_individual) {
+        if (chosen == .bf16_individual or chosen == .fp8_individual) {
             try populateBf16IndividualStore(allocator, model_dir, weight_map, &files_list, &store);
         } else if (chosen == .mxfp4_individual) {
             try populateMxfp4IndividualStore(
@@ -969,8 +1000,8 @@ pub const QuantStore = struct {
                     if (region.shape[2] == 0 or region.shape[2] > std.math.maxInt(u32)) return error.InvalidExpertTensor;
                     const elem: u64 = switch (region.dtype) {
                         .bf16, .f16, .u16 => 2,
-                        .u8 => 1,
-                        .u32 => 4,
+                        .u8, .f8e4m3 => 1,
+                        .u32, .f32 => 4,
                         .other => return error.InvalidExpertTensor,
                     };
                     const expected_rows = std.math.mul(u64, region.shape[0], region.shape[1]) catch return error.InvalidExpertTensor;
@@ -1009,7 +1040,7 @@ pub const QuantStore = struct {
             if (!metadata_ready) return error.MissingExpertTensor;
         }
         for ([_]Projection{ .gate, .up, .down }) |p| {
-            if (chosen == .exl3_k4 or chosen == .bf16_individual) continue;
+            if (chosen == .exl3_k4 or chosen == .bf16_individual or chosen == .fp8_individual) continue;
             const in_dim: u64 = if (p == .down) geometry.intermediate else geometry.hidden;
             const out_rows: u64 = if (p == .down) geometry.hidden else geometry.intermediate;
             const w = weightOf(p);
@@ -1146,6 +1177,10 @@ fn cachedTensorRegion(file: *const SourceFile, key: []const u8) !io_mod.TensorRe
         .u8
     else if (std.mem.eql(u8, dtype.string, "U32") or std.mem.eql(u8, dtype.string, "UINT32"))
         .u32
+    else if (std.mem.eql(u8, dtype.string, "F32"))
+        .f32
+    else if (std.mem.eql(u8, dtype.string, "F8_E4M3") or std.mem.eql(u8, dtype.string, "F8_E4M3FN"))
+        .f8e4m3
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;
@@ -1867,6 +1902,41 @@ test "GLM BF16 individual source preserves shard bytes and leaves dense prefix a
     }
     try t.expectError(error.ExpertLayerAbsent, store.readExpert(0, 0, &got));
     try t.expectError(error.ExpertOutOfRange, store.readExpert(3, 4, &got));
+}
+
+test "GLM FP8 individual source resolves its layout and keeps e4m3 codes and block scales as stored" {
+    const t = std.testing;
+    const fixture = @import("glm_stream_fixture.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture.writeStorage(t.allocator, tmp.dir, .none, 128, 128, .fp8);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(t.io, &path_buf)];
+    try t.expectEqual(Layout.fp8_individual, layoutOfDirWithFirstMoe(t.allocator, t.io, "glm5_next", path, 4, 3).?);
+    const geometry = Geometry{ .layers = 4, .experts = 4, .hidden = 128, .intermediate = 128, .first_moe_layer = 3 };
+    var store = try QuantStore.openForLayout(t.allocator, path, geometry, .fp8_individual);
+    defer store.deinit();
+    try t.expectEqual(@as(u64, 3 * (128 * 128 + 4)), store.expertBytes());
+    var got: [3 * (128 * 128 + 4)]u8 = undefined;
+    for (0..4) |expert| {
+        try store.readExpert(3, @intCast(expert), &got);
+        var at: usize = 0;
+        for ([_]Projection{ .gate, .up, .down }, 0..) |projection, pi| {
+            try t.expectEqual(io_mod.Dtype.f8e4m3, store.dtypeOf(weightOf(projection)));
+            try t.expectEqual(io_mod.Dtype.f32, store.dtypeOf(scalesOf(projection)));
+            try t.expect(!store.componentPresent(biasesOf(projection)));
+            for (0..128 * 128) |i| try t.expectEqual(fixture.fp8Code(expert, pi, i), got[at + i]);
+            at += 128 * 128;
+            try t.expectEqual(fixture.fp8Scale(expert, pi, 0), @as(f32, @bitCast(std.mem.readInt(u32, got[at..][0..4], .little))));
+            at += 4;
+        }
+    }
+    var missing = t.tmpDir(.{});
+    defer missing.cleanup();
+    try fixture.writeStorage(t.allocator, missing.dir, .fp8_scale, 128, 128, .fp8);
+    const missing_path = path_buf[0..try missing.dir.realPath(t.io, &path_buf)];
+    try t.expect(layoutOfDirWithFirstMoe(t.allocator, t.io, "glm5_next", missing_path, 4, 3) == null);
+    try t.expectError(error.MissingExpertTensor, QuantStore.openForLayout(t.allocator, missing_path, geometry, .fp8_individual));
 }
 
 test "GLM BF16 individual source rejects incomplete quantized or malformed banks" {

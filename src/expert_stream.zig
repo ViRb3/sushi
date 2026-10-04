@@ -79,7 +79,7 @@ pub fn mxfp4ExpertBytes(hidden: u32, intermediate: u32) !u64 {
 pub fn expertBytesFor(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: quant.Layout) !u64 {
     switch (layout) {
         .bf16_fused => return expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate),
-        .bf16_individual, .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
+        .bf16_individual, .fp8_individual, .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
             var store = try quant.QuantStore.openForLayout(allocator, model_dir, geometry, layout);
             defer store.deinit();
             return store.expertBytes();
@@ -623,13 +623,14 @@ pub const ExpertStore = struct {
                 .bf16 => .bfloat16,
                 .f16 => .float16,
                 .u16 => .uint16,
-                .u8 => .uint8,
+                .u8, .f8e4m3 => .uint8,
                 .u32 => .uint32,
+                .f32 => .float32,
                 .other => .bfloat16,
             };
             const elem: u8 = switch (q.dtypeOf(c)) {
-                .u8 => 1,
-                .u32 => 4,
+                .u8, .f8e4m3 => 1,
+                .u32, .f32 => 4,
                 .bf16, .f16, .u16 => 2,
                 .other => 0,
             };

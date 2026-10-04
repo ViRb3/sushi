@@ -56,6 +56,8 @@ kept raw (Sushi-2.45bpw). Small BF16/FP32 tensors keep their source precision. T
   ([engine-expert-streaming](engine-expert-streaming.md)).
 - `--ssd-budget-gb`/`--expert-cache-gb` stream any pack's EXL3 experts, or the BF16 source's, through the same engine
   for `serve`, `run` and `kld compare`: text only, DFlash2 off, output identical to the resident load.
+- The FP8 release (E4M3FN block-128 trunk and experts) streams its experts as stored and runs its trunk on `fp8_block`
+  like Sushi-2.45bpw; it is never a teacher. Hermetic proof only: the checkpoint is no longer on the box.
 
 ## Serving loop
 

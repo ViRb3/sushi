@@ -15,7 +15,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 | `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
 | `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab |
-| `src/glm5_stream.zig` | GLM's routed experts over the engine (BF16 or EXL3 slabs), the native teacher's capture budget |
+| `src/glm5_stream.zig` | GLM's routed experts over the engine (BF16, FP8 or EXL3 slabs), the native teacher's capture budget |
 | `src/imatrix.zig` | imatrix capture on the streamed forward |
 | `src/hidden_capture.zig` | block-boundary residual capture under `kld capture` |
 
@@ -35,6 +35,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 | MiMo-V2.6-Flash | original checkpoint | `mxfp4_individual` | streams; required | streams (the teacher) |
 | GLM-5.3-Flash | Sushi EXL3 pack | `exl3_k4` | streams | streams (a BF16-latent student reference) |
 | GLM-5.3-Flash | BF16 source (643 GB) | `bf16_individual` | streams; required | native streamed teacher |
+| GLM-5.3-Flash | FP8 release | `fp8_individual` beside its FP8 trunk | streams (hermetic proof only) | refused |
 
 - Rate-group (`.gN`) and pruned EXL3 packs are refused by name (`Exl3RateGroupsStreamingUnsupported`,
   `Exl3RaggedStreamingUnsupported`) and serve resident: an open gap, not the design.
@@ -42,6 +43,12 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - GLM's routed experts go through `glm5_stream.Stream`: BF16 source experts through the clamped `gather_mm`
   composite, EXL3 banks through the resident `routedExl3` dispatch; router ids become slot ids, scores, clamps and
   the FP32 reduction are untouched, and each layer completes before its slabs are reused.
+- The FP8 release's experts stream as stored: e4m3 codes plus f32 block-128 scales. A layer's routed slots
+  dequantize to bf16(code x scale) through `fp8_block` and run the BF16 composite; the copies and gathered codes (at
+  most every expert of one layer, about 21.7 GB) are billed beside the trunk (`scheduler.fp8ExpertScratchBytes`).
+  Its capture is refused: the release is a block quantization of the BF16 source, which stays the only teacher.
+- The FP8 release is verified by hermetic tests only, with no live boot, KLD or speed number: the checkpoint is no
+  longer on the box.
 - A streamed GLM keeps no speculative state: its DFlash2 assistant stays unloaded and an explicit `--drafter` is
   refused (`GlmStreamingSpecUnsupported`).
 - A streamed GLM serves the kv8 or the BF16 latent; its request bill adds the fill peak, and its planned KV counts the
@@ -141,7 +148,8 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - Store-level same-expert byte identity (`real qwen expert store spans and source bytes are exact`); teacher replay
   via `kld compare` (the affine pack is the control); greedy determinism.
 - Streamed logits equal resident logits bit for bit through eviction and the union (`GLM serving streams EXL3
-  experts ...`); `every real streamed pack and source on this box plans a streamed load` plans each pack on the box.
+  experts ...`, `GLM serving streams FP8 source experts ...`); `every real streamed pack and source on this box
+  plans a streamed load` plans each pack on the box.
 - Live (main `1e484c10` plus this change): GLM-5.3-Flash-Sushi-2.3bpw `kld compare --limit 1` on the 4x512 BF16
   teacher scores the same every field streamed at `--ssd-budget-gb 32` (81 slots/layer) and resident, with the BF16
   latent (KLD 0.044647, top-1 489/512) and with `--kv-quant 8` (KLD 0.042316, top-1 492/512).
