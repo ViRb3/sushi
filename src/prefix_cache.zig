@@ -2523,7 +2523,16 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk try self.mergeCheckpointLists(old, new, eff_media_start);
+                break :blk self.mergeCheckpointLists(old, new, eff_media_start) catch |err| {
+                    // The merge consumed both lists, so the entry has no checkpoints to restore from: evict it.
+                    self.allocator.free(tokens_owned);
+                    var snap = new_snap;
+                    snap.deinit();
+                    if (new_dflash) |*d| d.deinit();
+                    if (new_mtp) |*m3| m3.deinit();
+                    self.evictAt(idx, "checkpoint merge failed");
+                    return err;
+                };
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
@@ -11831,4 +11840,41 @@ test "a GLM commit whose retention snapshot fails still destroys every transferr
     const tokens: [24]u32 = @splat(1);
     try testing.expectError(error.OutOfMemory, hc.commitGlm(&source, &tokens, false, 0, 0, null, cps, rows, null, tokens.len));
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
+}
+
+test "a GLM replace commit that fails at any allocation leaks nothing and leaves the cache consistent" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const Stub = struct {
+        fn cps(pos: usize) ![]SSMCheckpoint {
+            const out = try testing.allocator.alloc(SSMCheckpoint, 1);
+            const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 1);
+            layers[0] = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+            out[0] = .{ .pos = pos, .layers = layers };
+            return out;
+        }
+        fn rows() !glm5_prefix.MlaRows {
+            const layers = try testing.allocator.alloc(glm5_prefix.MlaRows.Layer, 1);
+            @memset(layers, .{});
+            return .{ .allocator = testing.allocator, .layers = layers, .len = 8, .latent_bits = 8 };
+        }
+    };
+    const tokens: [24]u32 = @splat(1);
+    var k: usize = 0;
+    while (k < 64) : (k += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+        var hc = HotPrefixCache.init(failing.allocator(), 2);
+        defer hc.deinit();
+        var source = try KVCache.initWithConfig(testing.allocator, 1, glmKvConfig(8));
+        defer source.deinit();
+        _ = try hc.commitGlm(&source, tokens[0..16], false, 0, 0, null, try Stub.cps(8), try Stub.rows(), null, 16);
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+
+        failing.fail_index = failing.alloc_index + k;
+        const res = hc.commitGlm(&source, &tokens, false, 0, 0, null, try Stub.cps(16), try Stub.rows(), null, 24);
+        var sum: u64 = 0;
+        for (hc.entries.items) |e| sum += e.kv_bytes;
+        try testing.expectEqual(sum, hc.current_kv_bytes);
+        if (res) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(k < 64);
 }
