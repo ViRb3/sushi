@@ -406,6 +406,9 @@ pub fn formatChat(
     return ids.toOwnedSlice(allocator);
 }
 
+/// Renders whose shipped template raised and fell to the generic format; `/props` reports it.
+pub var template_fallbacks = std.atomic.Value(u64).init(0);
+
 /// Render the Jinja chat template with the given messages.
 pub fn renderChatTemplate(
     allocator: std.mem.Allocator,
@@ -587,6 +590,7 @@ pub fn renderChatTemplate(
     // tokens differ (Gemma 4's <|turn> vs the fallback's <start_of_turn>)
     // that means degenerate generation, so the downgrade must be visible
     // at the default log level.
+    _ = template_fallbacks.fetchAdd(1, .monotonic);
     if (jinja_c.jinja_last_error()) |e| {
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
     }
@@ -15074,4 +15078,141 @@ test "GLM serving template receives low high max without a derived reasoning bud
         defer testing.allocator.free(want);
         try testing.expect(std.mem.endsWith(u8, rendered, want));
     }
+}
+
+const glm53_template = @embedFile("fixtures/glm53_chat_template.jinja");
+
+fn glm53Config(allocator: std.mem.Allocator) ChatConfig {
+    return .{ .chat_template = glm53_template, .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = allocator };
+}
+
+test "jinja: a number after a dot subscripts, as in Jinja2" {
+    const tpl = "{{ x.0.y }}|{{ x.1.0 }}|{{ x.1.1 }}|{{ s.0 }}|{{ x[1].0 }}|{{ x.1.0 + 0.5 }}|{{ 'no' if x.5 is not defined else 'yes' }}|{{ 1.5 }}";
+    const extra = "{\"x\":[{\"y\":\"a\"},[7,8]],\"s\":\"hey\"}";
+    var len: usize = 0;
+    const ptr = jinja_c.jinja_render_chat(tpl, "[]", null, extra, 0, &len) orelse {
+        std.debug.print("\njinja error: {s}\n", .{std.mem.span(jinja_c.jinja_last_error().?)});
+        return error.RenderFailed;
+    };
+    defer jinja_c.jinja_str_free(ptr);
+    try testing.expectEqualStrings("a|7|8|h|7|7.5|no|1.5", ptr[0..len]);
+}
+
+test "GLM-5.3 template renders a tool round-trip itself, never the generic fallback" {
+    const a = testing.allocator;
+    var config = glm53Config(a);
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
+    ;
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What is the weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "Need the weather." },
+        .{ .role = "tool", .content = "Sunny, 21C", .tool_call_id = "call_1" },
+    };
+    const want = "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\n" ++
+        "You may call one or more functions to assist with the user query.\n\n" ++
+        "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n" ++
+        "{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n" ++
+        "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n" ++
+        "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>" ++
+        "<|system|>You are helpful.<|user|>What is the weather in Paris?" ++
+        "<|assistant|><think>Need the weather.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>" ++
+        "<|observation|><tool_response>Sunny, 21C</tool_response><|assistant|><think>";
+    const before = template_fallbacks.load(.monotonic);
+    const rendered = try renderChatTemplate(a, &messages, &config, tools, null, true, null, false);
+    defer a.free(rendered);
+    try testing.expectEqual(before, template_fallbacks.load(.monotonic));
+    try testing.expectEqualStrings(want, rendered);
+}
+
+/// Renders `messages_json` through GLM-5.3's own template; the text from the first user turn on.
+fn glm53RenderRaw(messages_json: [:0]const u8, tools_json: ?[:0]const u8, out: *std.ArrayList(u8)) !void {
+    const extra = "{\"enable_thinking\":true,\"reasoning_effort\":\"high\"}";
+    var len: usize = 0;
+    const ptr = jinja_c.jinja_render_chat(glm53_template, messages_json, if (tools_json) |t| t.ptr else null, extra, 1, &len) orelse {
+        std.debug.print("\njinja error: {s}\n", .{std.mem.span(jinja_c.jinja_last_error().?)});
+        return error.RenderFailed;
+    };
+    defer jinja_c.jinja_str_free(ptr);
+    const text = ptr[0..len];
+    try out.appendSlice(testing.allocator, text[std.mem.indexOf(u8, text, "<|user|>").?..]);
+}
+
+test "GLM-5.3 template: a tool result given as a list of outputs, text parts or tool references renders in place" {
+    const user = "{\"role\":\"user\",\"content\":\"Q\"}";
+    const call = "{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"R\",\"tool_calls\":[" ++
+        "{\"type\":\"function\",\"id\":\"call_1\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}}," ++
+        "{\"type\":\"function\",\"id\":\"call_2\",\"function\":{\"name\":\"get_time\",\"arguments\":{}}}]}";
+    const head = "<|user|>Q<|assistant|><think>R</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>" ++
+        "<tool_call>get_time</tool_call><|observation|>";
+    const tail = "<|assistant|><think>";
+    const tools =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const cases = [_]struct { tool: [:0]const u8, tools: ?[:0]const u8, want: []const u8 }{
+        .{
+            .tool = "{\"role\":\"tool\",\"content\":[{\"tool_call_id\":\"call_2\",\"output\":\"12:00\"},{\"tool_call_id\":\"call_1\",\"output\":\"Sunny\"}]}",
+            .tools = null,
+            .want = head ++ "<tool_response>Sunny</tool_response><tool_response>12:00</tool_response>" ++ tail,
+        },
+        .{
+            .tool = "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"Sunny\"},{\"type\":\"image\"}]}",
+            .tools = null,
+            .want = head ++ "<tool_response>Sunny<|begin_of_image|><|image|><|end_of_image|></tool_response>" ++ tail,
+        },
+        .{
+            .tool = "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":[{\"type\":\"tool_reference\",\"name\":\"get_time\"}]}",
+            .tools = tools,
+            .want = head ++ "<tool_response><tools>\n{\"name\": \"get_time\", \"description\": \"Get time\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools></tool_response>" ++ tail,
+        },
+    };
+    for (cases) |c| {
+        const json = try std.fmt.allocPrintSentinel(testing.allocator, "[{s},{s},{s}]", .{ user, call, c.tool }, 0);
+        defer testing.allocator.free(json);
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(testing.allocator);
+        try glm53RenderRaw(json, c.tools, &out);
+        try testing.expectEqualStrings(c.want, out.items);
+    }
+}
+
+test "GLM-5.3 template: parallel results come back in the order of the calls" {
+    const a = testing.allocator;
+    var config = glm53Config(a);
+    const calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" },
+        .{ .id = "call_2", .name = "get_time", .arguments = "{}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Q" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "R" },
+        .{ .role = "tool", .content = "12:00", .tool_call_id = "call_2" },
+        .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
+    };
+    const before = template_fallbacks.load(.monotonic);
+    const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(rendered);
+    try testing.expectEqual(before, template_fallbacks.load(.monotonic));
+    const from = std.mem.indexOf(u8, rendered, "<|user|>").?;
+    try testing.expectEqualStrings(
+        "<|user|>Q<|assistant|><think>R</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>" ++
+            "<tool_call>get_time</tool_call><|observation|><tool_response>Sunny</tool_response><tool_response>12:00</tool_response><|assistant|><think>",
+        rendered[from..],
+    );
+}
+
+test "a template that raises counts one generic fallback" {
+    var config = ChatConfig{
+        .chat_template = "{{ raise_exception('refused') }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = testing.allocator,
+    };
+    const before = template_fallbacks.load(.monotonic);
+    const rendered = try renderChatTemplate(testing.allocator, &.{.{ .role = "user", .content = "hi" }}, &config, null, null, true, null, false);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqual(before + 1, template_fallbacks.load(.monotonic));
 }

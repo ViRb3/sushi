@@ -3221,3 +3221,78 @@ test "format corpus: a stream cut off inside a character delivers the non-stream
 test "format corpus: tokenizer rules are model-local across Unicode scripts" {
     try @import("tokenizer.zig").checkTokenizerRuleFixtures();
 }
+
+test "format corpus: tool traffic renders through every served template, never the generic fallback" {
+    // GLM-5.3's `m.content.0.output` (numeric member access) raised in the parser on every tool
+    // message and the whole class rendered in an untrained generic format. A raise is a SILENT
+    // downgrade, so each family's own template must render the shapes a tool loop produces.
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}},
+        \\ {"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const Case = struct { name: []const u8, tpl: []const u8, media: bool = true };
+    const cases = [_]Case{
+        .{ .name = "glm5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
+        // The 2.4T checkpoint is text-only: its template raises on a media part by design.
+        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .media = false },
+        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+    };
+    const one = [_]chat.ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\",\"nested\":{\"a\":[1,{\"b\":true}]}}" }};
+    const two = [_]chat.ToolCall{
+        .{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" },
+        .{ .id = "call_2", .name = "get_time", .arguments = "{}" },
+    };
+    const shapes = [_]struct { label: []const u8, messages: []const chat.Message, media: bool = false }{
+        .{ .label = "round trip", .messages = &.{
+            .{ .role = "system", .content = "Be brief." },
+            .{ .role = "user", .content = "Weather?" },
+            .{ .role = "assistant", .content = "", .tool_calls = &one, .reasoning_content = "r" },
+            .{ .role = "tool", .content = "Sunny, 21C", .tool_call_id = "call_1" },
+        } },
+        .{ .label = "result then a new user turn", .messages = &.{
+            .{ .role = "user", .content = "Weather?" },
+            .{ .role = "assistant", .content = "", .tool_calls = &one, .reasoning_content = "r" },
+            .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
+            .{ .role = "assistant", .content = "It is sunny.", .reasoning_content = "done" },
+            .{ .role = "user", .content = "And tomorrow?" },
+        } },
+        .{ .label = "parallel results, reversed", .messages = &.{
+            .{ .role = "user", .content = "Both?" },
+            .{ .role = "assistant", .content = "", .tool_calls = &two, .reasoning_content = "r" },
+            .{ .role = "tool", .content = "12:00", .tool_call_id = "call_2" },
+            .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
+        } },
+        .{ .label = "result without an id, special characters", .messages = &.{
+            .{ .role = "user", .content = "Weather?" },
+            .{ .role = "assistant", .content = "Checking.", .tool_calls = &one },
+            .{ .role = "tool", .content = "Soleil \"\xe2\x98\x80\" <b>&</b>\nline2\t\xe4\xb8\xad" },
+        } },
+        .{ .label = "empty result", .messages = &.{
+            .{ .role = "user", .content = "Weather?" },
+            .{ .role = "assistant", .content = "", .tool_calls = &one, .reasoning_content = "r" },
+            .{ .role = "tool", .content = "", .tool_call_id = "call_1" },
+        } },
+        .{ .label = "image turn then a tool round", .media = true, .messages = &.{
+            .{ .role = "user", .content = "Look: ", .media_parts = &.{.{ .at = 6, .kind = .image }} },
+            .{ .role = "assistant", .content = "", .tool_calls = &one, .reasoning_content = "r" },
+            .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
+        } },
+        .{ .label = "video turn", .media = true, .messages = &.{
+            .{ .role = "user", .content = "Watch: ", .media_parts = &.{.{ .at = 7, .kind = .video }} },
+        } },
+    };
+    const efforts = [_]?[]const u8{ null, "low" };
+    const before = chat.template_fallbacks.load(.monotonic);
+    for (cases) |c| {
+        var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        for (shapes) |shape| for ([_]?[]const u8{ null, tools }) |tj| for ([_]bool{ true, false }) |thinking| for (efforts) |effort| {
+            if (shape.media and !c.media) continue;
+            const rendered = try chat.renderChatTemplate(allocator, shape.messages, &config, tj, null, thinking, effort, false);
+            defer allocator.free(rendered);
+            errdefer std.debug.print("\n[{s}] {s} tools={} thinking={}\n{s}\n", .{ c.name, shape.label, tj != null, thinking, rendered });
+            try testing.expectEqual(before, chat.template_fallbacks.load(.monotonic));
+        };
+    }
+}

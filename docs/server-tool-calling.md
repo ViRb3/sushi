@@ -33,6 +33,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   its stop token). Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A
   NUL byte truncated the rendered prompt (`jinja_render_chat` returns its LENGTH; tell: the same `prompt=` count on
   consecutive turns).
+- **A parse or runtime gap in jinja.cpp is the same silent downgrade**: GLM-5.3's `m.content.0.output` (a number after
+  a dot) failed to parse on EVERY tool message, so each agent turn after a tool result ran in the untrained generic
+  format and broke prefix reuse. Fixed in `lib/jinja_cpp` (`x.0` is `x[0]`; `x.1.0` is two subscripts, never a float);
+  the pack template is a committed fixture. A fallback logs `jinja render failed (…)` at warn on every render and
+  counts into `/props.template_fallbacks`: nonzero on a model that ships a template means a broken prompt, so grep
+  that line first. A new template ships its fixture and a no-fallback case in the `format corpus` tool-traffic test.
+  Cross-check suspect templates against Python Jinja2 on the same JSON before blaming the model.
 - **A `chat_template` value can be a POINTER** (`{% include 'chat_template.jinja' %}`): `chat.isIncludeStub` reads it
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
 - A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`

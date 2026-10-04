@@ -317,7 +317,9 @@ lexer_result lexer::tokenize(const std::string & source) {
         // Numbers
         if (is_integer(ch)) {
             start_pos = pos;
-            std::string num = consume_numeric();
+            // after a dot the digits are an index (`x.1.0`), never a float
+            bool member_index = !tokens.empty() && tokens.back().t == token::dot;
+            std::string num = member_index ? consume_while(is_integer) : consume_numeric();
             // JJ_DEBUG("consumed numeric literal: '%s'", num.c_str());
             tokens.push_back({token::numeric_literal, num, start_pos});
             continue;

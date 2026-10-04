@@ -8079,6 +8079,12 @@ fn batchingPropsJson(allocator: std.mem.Allocator, why: scheduler_mod.BatchVerdi
     });
 }
 
+/// The /props "template_fallbacks" count: renders where the model's own chat template raised and the
+/// generic format answered instead. Above zero the prompts are degraded, never a normal state.
+fn templateFallbacksPropsJson(allocator: std.mem.Allocator, count: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"template_fallbacks\":{d}", .{count});
+}
+
 /// The /props "ngram_warm" object; absent when no table is warming.
 fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u8 {
     if (total == 0) return allocator.dupe(u8, "");
@@ -8265,7 +8271,9 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(settings_json);
     const update_json = try update_mod.propsJson(allocator);
     defer allocator.free(update_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, update_json });
+    const fallbacks_json = try templateFallbacksPropsJson(allocator, chat_mod.template_fallbacks.load(.monotonic));
+    defer allocator.free(fallbacks_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, update_json, fallbacks_json });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -21166,6 +21174,17 @@ test "settingsPropsJson: /props names the greedy tail and where it came from" {
         try testing.expectEqual(tail.value, mtp.get("greedy_tail").?.bool);
         try testing.expectEqualStrings(source, mtp.get("greedy_tail_source").?.string);
     }
+}
+
+test "templateFallbacksPropsJson: /props counts renders that fell back to the generic format" {
+    const frag = try templateFallbacksPropsJson(testing.allocator, 3);
+    defer testing.allocator.free(frag);
+    var config = model_mod.ModelConfig{};
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 3), parsed.value.object.get("template_fallbacks").?.integer);
 }
 
 test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {

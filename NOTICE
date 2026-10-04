@@ -243,6 +243,8 @@ directories.
 
 Modifications by mlx-serve: `value.cpp` and `value.h` were changed to add
 `tojson(sort_keys=..., separators=...)`, which some chat templates require.
+Modification by sushi: `lexer.cpp` and `parser.cpp` read a number after a dot
+(`x.0`, `x.1.0`) as a subscript, as Jinja2 does.
 `jinja_wrapper.*`, `caps.*`, `jinja_string.*` and `log.h` are sushi
 additions providing the C interface the Zig side calls.
 
