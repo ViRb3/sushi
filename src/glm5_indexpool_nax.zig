@@ -1,4 +1,4 @@
-//! Bounded IndexPool NAX scoring; top-512 retrieval policy is unchanged.
+//! IndexPool NAX scoring in 2048-pool tiles; top-512 retrieval policy is unchanged.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -6,7 +6,9 @@ const Arr = mlx.mlx_array;
 pub const dot_limit: usize = 2 * 1024 * 1024;
 pub const tile_pools: usize = 2048;
 pub const max_rows: usize = 16;
-pub const transient_bytes: usize = 8 * 1024 * 1024;
+/// Tiles stay lazy until the packed tile pair settles: four 16-row selections at 8192 pools, each
+/// holding every dot plane (8 MiB), the tile outputs and the joined scores (512 KiB each).
+pub const transient_bytes: usize = 4 * (8 * 1024 * 1024 + 2 * 512 * 1024);
 var calls: usize = 0;
 pub fn enabled() bool {
     return !@import("glm5_model.zig").reference_numerics and @import("glm5_model.zig").naxArms();
@@ -108,7 +110,6 @@ pub fn scores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: m
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", .bfloat16));
         if (epi_kernel == null) epi_kernel = try kernel("sushi_glm_index_nax_epilogue", &.{ "dots", "weights", "offset", "first" }, EPILOGUE);
         const tile = try apply(&ops, epi_kernel.?, cfg, &.{ dots, weights, try scalar(&ops, offset), try scalar(&ops, first) });
-        try mlx.check(mlx.mlx_array_eval(tile));
         try mlx.check(mlx.mlx_vector_array_append_value(parts, tile));
         first = end;
     }
@@ -125,6 +126,10 @@ test "GLM IndexPool NAX dot plane remains within original bound" {
 }
 test "GLM IndexPool NAX reserves transient copies per pending layer" {
     if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    // Two packed tiles in flight hold four 16-row selections, each with every tile's dot plane,
+    // its epilogue output and the joined scores.
+    const selection = try dotBytes(max_rows, 8192) + 2 * try outputBytes(max_rows, 8192);
+    try std.testing.expectEqual(4 * selection, transient_bytes);
     try std.testing.expectEqual(transient_bytes * 2, try transientBudget(2048, 2));
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
     try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));

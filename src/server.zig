@@ -6250,8 +6250,11 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
         (@import("glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
     const dflash = if (config.glm_dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
+    const attention = @import("glm5_attention.zig");
+    const history = std.math.cast(usize, seq) orelse return std.math.maxInt(u64);
+    const selection = @max(attention.score_scratch_bytes, attention.selectionScratchBytes(history) catch return std.math.maxInt(u64));
     return rows *| per_row +| grow +| kv8 +| slotRingBytes(config, 16) +| native +| dflash +| glmFp8DequantScratchBytes(config, rows, pending) +|
-        @import("glm5_attention.zig").score_scratch_bytes +| @import("glm5_attention.zig").attention_scratch_bytes +| PREFILL_RUNTIME_FLOOR_BYTES;
+        selection +| attention.attention_scratch_bytes +| PREFILL_RUNTIME_FLOOR_BYTES;
 }
 
 /// MiMo's raw-FP8 prefill route retains BF16 scratch for each projection until
@@ -26100,6 +26103,17 @@ test "a Qwen or MiMo request owes no growth after admission, its reserved capaci
         const cfg = model_mod.ModelConfig{ .model_type = model_type };
         try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&cfg, 40_000, 4096, 8));
     }
+}
+
+test "GLM prefill bills the packed selection planes of its history" {
+    const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const attention = @import("glm5_attention.zig");
+    const short: u64 = 1 << 19;
+    const long: u64 = 1 << 20;
+    // Beyond selection planes, only the growing kv8 latent (544) and pooled index (64) scale with history.
+    const growth = (long - short) * (544 + 64);
+    const planes = try attention.selectionScratchBytes(long) - try attention.selectionScratchBytes(short);
+    try std.testing.expectEqual(growth + planes, prefillTransientReserveAtKv(&cfg, 8, 2048, long) - prefillTransientReserveAtKv(&cfg, 8, 2048, short));
 }
 
 test "a streamed GLM bills its fill peak per request and its latent at the KV width plus the pooled index per planned token" {

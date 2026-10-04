@@ -17,6 +17,11 @@ pub const score_scratch_bytes: usize = 2 * 1024 * 1024;
 pub const attention_scratch_bytes: usize = 8 * 1024 * 1024;
 /// Scalar latent-attention dispatches, [dense, sparse].
 pub var scalar_calls: [2]usize = .{ 0, 0 };
+/// Packed prefill selection planes at `history` rows: two 32-row tiles in flight, each two
+/// 16-row selections holding their FP32 scores (ranked selection keeps no other plane).
+pub fn selectionScratchBytes(history: usize) !usize {
+    return std.math.mul(usize, 2 * 2 * packed_nax.max_rows * 4, history / pool_size);
+}
 /// Paired packed tiles keep a second tile live beside the first.
 pub fn packedCadenceTransientBudget(chunk: usize, pending_layers: usize) !usize {
     if (!packed_nax.enabled() or chunk <= packed_nax.wide_rows) return 0;
@@ -271,22 +276,64 @@ fn template(cfg: mlx.mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name, value));
 }
 
+// The SIMD-sum scorer's arithmetic without its shuffles: each lane owns one head, forms that
+// scorer's 32 lane partials in lane order (each sequential over d = l, l+32, ...) and joins them in
+// `simd_sum`'s order, an xor butterfly over 1, 2, 4, 8, 16 lanes: balanced pairs in lane order.
+const SCORE_HEADER: [:0]const u8 =
+    \\#define SUSHI_TREE_PUSH(v) { float c = (v); \
+    \\  if ((l & 1u) == 0u) s0 = c; else { c = s0 + c; \
+    \\  if ((l & 2u) == 0u) s1 = c; else { c = s1 + c; \
+    \\  if ((l & 4u) == 0u) s2 = c; else { c = s2 + c; \
+    \\  if ((l & 8u) == 0u) s3 = c; else { c = s3 + c; \
+    \\  if ((l & 16u) == 0u) s4 = c; else dot = s4 + c; } } } } }
+    \\
+;
 const SCORE: [:0]const u8 =
     \\#pragma clang fp contract(off)
-    \\const uint lane=thread_position_in_threadgroup.x;
-    \\const uint p=threadgroup_position_in_grid.y;
-    \\const uint row=threadgroup_position_in_grid.z;
-    \\const uint pools=uint(count);
-    \\if ((p+1u)*4u > uint(offset)+row+1u) { if(lane==0) out[row*pools+p]=-INFINITY; return; }
-    \\float total=0.0f;
-    \\for(uint h=0;h<uint(J);++h) {
-    \\  float dot=0.0f;
-    \\  for(uint d=lane;d<uint(I);d+=32u) dot+=float(q[(row*uint(J)+h)*uint(I)+d])*float(keys[p*uint(I)+d]);
-    \\  dot=simd_sum(dot);
-    \\  const float rounded=float(InT(dot));
-    \\  total+=float(InT(max(rounded,0.0f)*float(weights[row*uint(J)+h])));
+    \\const uint lane = thread_position_in_threadgroup.x;
+    \\const uint ty = thread_position_in_threadgroup.y;
+    \\const uint row = threadgroup_position_in_grid.y * uint(RT) + ty;
+    \\const uint pools = uint(count);
+    \\const uint first = threadgroup_position_in_grid.x * 32u;
+    \\const uint last = min(pools, first + 32u);
+    \\const uint limit = uint(offset) + row + 1u;
+    \\// Lanes past the last head repeat it; only heads below J are summed.
+    \\const uint head = min(lane, uint(J) - 1u);
+    \\threadgroup float terms[RT][8][33];
+    \\InT qv[I];
+    \\for (uint d = 0; d < uint(I); ++d) qv[d] = q[(row * uint(J) + head) * uint(I) + d];
+    \\const float weight = float(weights[row * uint(J) + head]);
+    \\for (uint base = first; base < last; base += 8u) {
+    \\  const uint block = min(8u, last - base);
+    \\  for (uint j = 0; j < block; ++j) {
+    \\    const uint p = base + j;
+    \\    if ((p + 1u) * 4u > limit) continue;
+    \\    const device InT* kp = keys + size_t(p) * uint(I);
+    \\    float s0, s1, s2, s3, s4, dot;
+    \\    #pragma unroll
+    \\    for (uint l = 0; l < 32u; ++l) {
+    \\      float part = 0.0f;
+    \\      if (l < uint(I)) part += float(qv[l]) * float(kp[l]);
+    \\      if (l + 32u < uint(I)) part += float(qv[l + 32u]) * float(kp[l + 32u]);
+    \\      if (l + 64u < uint(I)) part += float(qv[l + 64u]) * float(kp[l + 64u]);
+    \\      if (l + 96u < uint(I)) part += float(qv[l + 96u]) * float(kp[l + 96u]);
+    \\      SUSHI_TREE_PUSH(part)
+    \\    }
+    \\    terms[ty][j][lane] = float(InT(max(float(InT(dot)), 0.0f) * weight));
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (lane < block) {
+    \\    const uint p = base + lane;
+    \\    float total = -INFINITY;
+    \\    if ((p + 1u) * 4u <= limit) {
+    \\      total = 0.0f;
+    \\      for (uint h = 0; h < uint(J); ++h) total += terms[ty][lane][h];
+    \\      total = float(InT(total));
+    \\    }
+    \\    out[row * pools + p] = total;
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
-    \\if(lane==0) out[row*pools+p]=float(InT(total));
 ;
 const EXPAND: [:0]const u8 =
     \\const uint i=thread_position_in_grid.x;
@@ -322,25 +369,156 @@ const MERGE: [:0]const u8 =
     \\out[i]=OutT(denom>0.0f?sum/denom:0.0f);
 ;
 
+var tree_score_calls: usize = 0;
+
 fn indexScores(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
-    const sh = mlx.getShape(index_q);
-    const rows = sh[0];
     const pools: c_int = @intCast(state.processed / 4);
     if (try @import("glm5_indexpool_nax.zig").tryScores(index_q, state.pooled, weights, offset, @intCast(pools), scope.s)) |out|
         return scope.own(out);
+    return treeScores(scope, state.pooled, index_q, weights, offset, pools);
+}
+
+fn treeScores(scope: *Scope, pooled: Arr, index_q: Arr, weights: Arr, offset: usize, pools: c_int) !Arr {
+    const sh = mlx.getShape(index_q);
+    const rows = sh[0];
+    if (sh[1] > 32 or sh[2] > 128) return error.InvalidGlmAttentionShape;
+    const row_group = @min(rows, 16);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, pools }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, pools, rows));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(pools + 31, 32) * 32, rows, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, row_group, 1));
     try template(cfg, "J", sh[1]);
     try template(cfg, "I", sh[2]);
+    try template(cfg, "RT", row_group);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", mlx.mlx_array_dtype(index_q)));
     const off = try scope.own(mlx.mlx_array_new_int(@intCast(offset)));
     const count = try scope.own(mlx.mlx_array_new_int(pools));
-    const k = try kernel(&score_kernel, "sushi_glm_index_scores", &.{ "q", "keys", "weights", "offset", "count" }, &.{"out"}, SCORE);
-    const ov = try apply(k, &.{ index_q, state.pooled, weights, off, count }, cfg, scope.s);
+    const k = try kernelWithHeader(&score_kernel, "sushi_glm_index_scores_tree", &.{ "q", "keys", "weights", "offset", "count" }, &.{"out"}, SCORE, SCORE_HEADER);
+    const ov = try apply(k, &.{ index_q, pooled, weights, off, count }, cfg, scope.s);
     defer _ = mlx.mlx_vector_array_free(ov);
+    tree_score_calls += 1;
+    if (tree_score_calls == 1) @import("log.zig").info("[glm-index] tree scorer engaged\n", .{});
+    return kernelOutput(scope, ov, 0);
+}
+
+/// The first `min(pools, 512)` of a stable ascending sort of the negated scores.
+fn partitionTop(scope: *Scope, scores: Arr, rows: c_int) !Arr {
+    const k = @min(mlx.getShape(scores)[1], pool_budget);
+    const neg = try scope.slot();
+    try mlx.check(mlx.mlx_negative(neg, scores, scope.s));
+    const partition = try scope.slot();
+    try mlx.check(mlx.mlx_argpartition_axis(partition, neg.*, k - 1, -1, scope.s));
+    const selected = try scope.slot();
+    try mlx.check(mlx.mlx_slice(selected, partition.*, &.{ 0, 0 }, 2, &.{ rows, k }, 2, &.{ 1, 1 }, 2, scope.s));
+    return selected.*;
+}
+
+// `partitionTop` in one dispatch per row: radix-16 search for the 512th key, every larger key plus
+// the lowest-pool ties at it, then each candidate's rank. Keys order like the stable sort: higher
+// score first, NaN last, -0 equal to +0. BF16-valued scores need only the top 16 key bits.
+const RANK_HEADER: [:0]const u8 =
+    \\template <int KB>
+    \\inline uint sushi_rank_key(float v) {
+    \\  if (isnan(v)) return 0u;
+    \\  const uint b = as_type<uint>(v == 0.0f ? 0.0f : v);
+    \\  const uint u = (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+    \\  return KB == 16 ? (u >> 16) : u;
+    \\}
+    \\
+;
+const RANK: [:0]const u8 =
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint row = threadgroup_position_in_grid.x;
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const uint sg = simdgroup_index_in_threadgroup;
+    \\const uint n = uint(count);
+    \\const device float* s = scores + size_t(row) * n;
+    \\threadgroup uint partial[32][16];
+    \\threadgroup uint bins[16];
+    \\threadgroup uint pick[2];
+    \\threadgroup ulong cand[512];
+    \\uint prefix = 0u, mask = 0u, want = 512u;
+    \\for (int shift = KB - 4; shift >= 0; shift -= 4) {
+    \\  uint4 c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u;
+    \\  for (uint i = tid; i < n; i += 1024u) {
+    \\    const uint k = sushi_rank_key<KB>(s[i]);
+    \\    if ((k & mask) != prefix) continue;
+    \\    const uint4 d = uint4((k >> uint(shift)) & 15u);
+    \\    c0 += uint4(d == uint4(0u, 1u, 2u, 3u));
+    \\    c1 += uint4(d == uint4(4u, 5u, 6u, 7u));
+    \\    c2 += uint4(d == uint4(8u, 9u, 10u, 11u));
+    \\    c3 += uint4(d == uint4(12u, 13u, 14u, 15u));
+    \\  }
+    \\  c0 = simd_sum(c0); c1 = simd_sum(c1); c2 = simd_sum(c2); c3 = simd_sum(c3);
+    \\  if (lane == 0u) for (uint j = 0; j < 4u; ++j) {
+    \\    partial[sg][j] = c0[j]; partial[sg][4u + j] = c1[j]; partial[sg][8u + j] = c2[j]; partial[sg][12u + j] = c3[j];
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (tid < 16u) { uint t = 0u; for (uint g = 0; g < 32u; ++g) t += partial[g][tid]; bins[tid] = t; }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (tid == 0u) {
+    \\    uint above = 0u, chosen = 0u;
+    \\    for (int d = 15; d >= 0; --d) {
+    \\      if (above + bins[d] >= want) { chosen = uint(d); break; }
+    \\      above += bins[d];
+    \\    }
+    \\    pick[0] = chosen;
+    \\    pick[1] = want - above;
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  prefix |= pick[0] << uint(shift);
+    \\  mask |= 15u << uint(shift);
+    \\  want = pick[1];
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\const uint per = (n + 1023u) / 1024u;
+    \\const uint lo = min(n, tid * per), hi = min(n, lo + per);
+    \\uint gt = 0u, eq = 0u;
+    \\for (uint i = lo; i < hi; ++i) {
+    \\  const uint k = sushi_rank_key<KB>(s[i]);
+    \\  gt += k > prefix ? 1u : 0u;
+    \\  eq += k == prefix ? 1u : 0u;
+    \\}
+    \\const uint gt_lane = simd_prefix_exclusive_sum(gt), eq_lane = simd_prefix_exclusive_sum(eq);
+    \\if (lane == 31u) { partial[sg][0] = gt_lane + gt; partial[sg][1] = eq_lane + eq; }
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\uint gt_at = gt_lane, eq_at = eq_lane;
+    \\for (uint g = 0; g < sg; ++g) { gt_at += partial[g][0]; eq_at += partial[g][1]; }
+    \\const uint above = 512u - want;
+    \\for (uint i = lo; i < hi; ++i) {
+    \\  const uint k = sushi_rank_key<KB>(s[i]);
+    \\  const ulong entry = (ulong(k) << 32) | ulong(0xFFFFFFFFu - i);
+    \\  if (k > prefix) cand[gt_at++] = entry;
+    \\  else if (k == prefix) { if (eq_at < want) cand[above + eq_at] = entry; ++eq_at; }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (tid < 512u) {
+    \\  const ulong mine = cand[tid];
+    \\  uint rank = 0u;
+    \\  for (uint j = 0; j < 512u; ++j) rank += cand[j] > mine ? 1u : 0u;
+    \\  out[row * 512u + rank] = 0xFFFFFFFFu - uint(mine & 0xFFFFFFFFul);
+    \\}
+;
+var rank_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var rank_top_calls: usize = 0;
+
+/// Needs at least 512 pools; `key_bits` 16 only for BF16-valued scores.
+fn rankTop(scope: *Scope, scores: Arr, key_bits: u8) !Arr {
+    const sh = mlx.getShape(scores);
+    if (sh.len != 2 or sh[1] < pool_budget or mlx.mlx_array_dtype(scores) != .float32 or (key_bits != 16 and key_bits != 32)) return error.InvalidGlmAttentionShape;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ sh[0], pool_budget }, 2, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, sh[0] * 1024, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
+    try template(cfg, "KB", key_bits);
+    const count = try scope.own(mlx.mlx_array_new_int(sh[1]));
+    const k = try kernelWithHeader(&rank_kernel, "sushi_glm_rank_top512", &.{ "scores", "count" }, &.{"out"}, RANK, RANK_HEADER);
+    const ov = try apply(k, &.{ scores, count }, cfg, scope.s);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    rank_top_calls += 1;
+    if (rank_top_calls == 1) @import("log.zig").info("[glm-index] ranked top-512 engaged\n", .{});
     return kernelOutput(scope, ov, 0);
 }
 
@@ -349,12 +527,10 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     const pools: c_int = @intCast(state.processed / 4);
     const off = try scope.own(mlx.mlx_array_new_int(@intCast(offset)));
     const scores = try indexScores(scope, state, index_q, weights, offset);
-    const neg = try scope.slot();
-    try mlx.check(mlx.mlx_negative(neg, scores, scope.s));
-    const partition = try scope.slot();
-    try mlx.check(mlx.mlx_argpartition_axis(partition, neg.*, @min(pools, pool_budget) - 1, -1, scope.s));
-    const selected = try scope.slot();
-    try mlx.check(mlx.mlx_slice(selected, partition.*, &.{ 0, 0 }, 2, &.{ rows, @min(pools, pool_budget) }, 2, &.{ 1, 1 }, 2, scope.s));
+    const selected = if (rows > 1 and pools >= pool_budget)
+        try rankTop(scope, scores, if (mlx.mlx_array_dtype(index_q) == .bfloat16) 16 else 32)
+    else
+        try partitionTop(scope, scores, rows);
     const ec = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(ec);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(ec, &.{ rows, selected_width }, 2, .int32));
@@ -363,7 +539,7 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     try template(ec, "ROWS", rows);
     try template(ec, "K", @min(pools, pool_budget));
     const ek = try kernel(&expand_kernel, "sushi_glm_expand_pools", &.{ "selected", "offset" }, &.{"out"}, EXPAND);
-    const ev = try apply(ek, &.{ selected.*, off }, ec, scope.s);
+    const ev = try apply(ek, &.{ selected, off }, ec, scope.s);
     defer _ = mlx.mlx_vector_array_free(ev);
     return kernelOutput(scope, ev, 0);
 }
@@ -566,7 +742,9 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
     if (per_row > attention_scratch_bytes or (sparse and pool_bytes > score_scratch_bytes)) return error.GlmAttentionScratchBudget;
     const wide_chunk = headpack and sh[0] >= 32 and @import("glm5_model.zig").naxArms();
     const packed_rows = if (wide_chunk) packed_nax.wide_rows else packed_nax.tileRows();
-    const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), if (headpack) packed_rows else 128));
+    // Packed tiles select 16 rows at a time; their planes are billed by `selectionScratchBytes`.
+    const score_rows = if (sparse and !headpack) score_scratch_bytes / pool_bytes else std.math.maxInt(usize);
+    const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, score_rows), if (headpack) packed_rows else 128));
     if (headpack and (@as(usize, @intCast(sh[0])) > max_rows or (wide_chunk and max_rows == 32)))
         return attendPackedPairs(state, q, index_q.?, weights.?, offset, scale, max_rows, s);
     const parts = mlx.mlx_vector_array_new();
@@ -871,6 +1049,93 @@ test "GLM index score matches rounded per-head scalar math with negative weights
     }
 }
 
+/// The scorer the tree scorer replaced: one 32-lane group per (row, pool) and a `simd_sum` per head.
+const SCORE_SIMD_SUM: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint lane=thread_position_in_threadgroup.x;
+    \\const uint p=threadgroup_position_in_grid.y;
+    \\const uint row=threadgroup_position_in_grid.z;
+    \\const uint pools=uint(count);
+    \\if ((p+1u)*4u > uint(offset)+row+1u) { if(lane==0) out[row*pools+p]=-INFINITY; return; }
+    \\float total=0.0f;
+    \\for(uint h=0;h<uint(J);++h) {
+    \\  float dot=0.0f;
+    \\  for(uint d=lane;d<uint(I);d+=32u) dot+=float(q[(row*uint(J)+h)*uint(I)+d])*float(keys[p*uint(I)+d]);
+    \\  dot=simd_sum(dot);
+    \\  const float rounded=float(InT(dot));
+    \\  total+=float(InT(max(rounded,0.0f)*float(weights[row*uint(J)+h])));
+    \\}
+    \\if(lane==0) out[row*pools+p]=float(InT(total));
+;
+var simd_sum_score_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn simdSumScores(scope: *Scope, pooled: Arr, index_q: Arr, weights: Arr, offset: usize, pools: c_int) !Arr {
+    const sh = mlx.getShape(index_q);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ sh[0], pools }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, pools, sh[0]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    try template(cfg, "J", sh[1]);
+    try template(cfg, "I", sh[2]);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", mlx.mlx_array_dtype(index_q)));
+    const off = try scope.own(mlx.mlx_array_new_int(@intCast(offset)));
+    const count = try scope.own(mlx.mlx_array_new_int(pools));
+    const k = try kernel(&simd_sum_score_kernel, "sushi_glm_index_scores_simd_sum", &.{ "q", "keys", "weights", "offset", "count" }, &.{"out"}, SCORE_SIMD_SUM);
+    const ov = try apply(k, &.{ index_q, pooled, weights, off, count }, cfg, scope.s);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    return kernelOutput(scope, ov, 0);
+}
+
+test "GLM tree index scorer equals the SIMD-sum scorer bit for bit at real magnitudes and long key counts" {
+    const s = mlx.gpuStream();
+    const Case = struct { rows: c_int, pools: c_int, back: c_int, heads: c_int = 32, dim: c_int = 128, dtype: mlx.mlx_dtype = .bfloat16 };
+    // Causal edges land inside and at the end of eight-pool blocks; 17 rows leave a partial row group.
+    for ([_]Case{
+        .{ .rows = 1, .pools = 513, .back = 1 },
+        .{ .rows = 1, .pools = 32771, .back = 2 },
+        .{ .rows = 3, .pools = 1027, .back = 9 },
+        .{ .rows = 16, .pools = 4099, .back = 16 },
+        .{ .rows = 17, .pools = 2053, .back = 40 },
+        .{ .rows = 16, .pools = 32768, .back = 70 },
+        .{ .rows = 5, .pools = 37, .back = 5, .heads = 2, .dim = 8, .dtype = .float32 },
+        .{ .rows = 2, .pools = 300, .back = 3, .dtype = .float32 },
+    }, 0..) |case, i| {
+        var scope = Scope{ .s = s };
+        defer scope.deinit();
+        const seed: u64 = 100 + 4 * i;
+        // Index queries reach a few units, pooled keys are layer-normed with a few large pools,
+        // and head weights carry the 1/sqrt(4096) scale; signed zeros come from zero weights.
+        const outliers = try scope.own(mlx.mlx_array_new_float(16));
+        const spikes = try scope.slot();
+        try mlx.check(mlx.mlx_multiply(spikes, try normal(&scope, &.{ case.pools, case.dim }, seed, 1), outliers, s));
+        const pick = try scope.slot();
+        try mlx.check(mlx.mlx_greater(pick, try normal(&scope, &.{ case.pools, 1 }, seed + 1, 1), try scope.own(mlx.mlx_array_new_float(2)), s));
+        const keys = try scope.slot();
+        try mlx.check(mlx.mlx_where(keys, pick.*, spikes.*, try normal(&scope, &.{ case.pools, case.dim }, seed + 2, 1), s));
+        const raw_w = try normal(&scope, &.{ case.rows, case.heads }, seed + 3, 0.1);
+        const zero_w = try scope.slot();
+        try mlx.check(mlx.mlx_greater(zero_w, raw_w, try scope.own(mlx.mlx_array_new_float(0.15)), s));
+        const w = try scope.slot();
+        try mlx.check(mlx.mlx_where(w, zero_w.*, try scope.zeros(&.{}, .bfloat16), raw_w, s));
+        const q = try scope.cast(try normal(&scope, &.{ case.rows, case.heads, case.dim }, seed + 4, 3), case.dtype);
+        const k = try scope.cast(keys.*, case.dtype);
+        const weights = try scope.cast(w.*, case.dtype);
+        const offset: usize = @intCast(case.pools * 4 - case.rows - case.back);
+        const want = try simdSumScores(&scope, k, q, weights, offset, case.pools);
+        const got = try treeScores(&scope, k, q, weights, offset, case.pools);
+        try expectSameBits(want, got);
+    }
+    // Decode and verify rows route to the tree scorer.
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const calls = tree_score_calls;
+    const pooled = try normal(&scope, &.{ 600, 128 }, 7, 1);
+    const state = State{ .pooled = pooled, .processed = 2400 };
+    _ = try indexScores(&scope, &state, try normal(&scope, &.{ 1, 32, 128 }, 8, 3), try normal(&scope, &.{ 1, 32 }, 9, 0.1), 2399);
+    try std.testing.expectEqual(calls + 1, tree_score_calls);
+}
+
 test "GLM attention rejects invalid append without advancing request state" {
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
@@ -924,6 +1189,80 @@ test "GLM native decode falls back for unsupported tiny attention bits" {
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(reference).?[0..count]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(actual).?[0..count]));
     try std.testing.expectEqual(@as(usize, 0), native.b1Calls());
     try std.testing.expectEqual(@as(usize, 0), native.b3Calls());
+}
+
+test "GLM ranked top-512 equals argpartition's stable order on ties, -inf and causal edges" {
+    const s = mlx.gpuStream();
+    // `future` pools at the end are -inf: 600/200 cuts inside the -inf ties, 1000 inside the zeros.
+    const Case = struct { rows: c_int, pools: c_int, bits: u8, future: usize = 1 };
+    for ([_]Case{
+        .{ .rows = 2, .pools = 513, .bits = 16 },
+        .{ .rows = 2, .pools = 600, .bits = 16, .future = 200 },
+        .{ .rows = 3, .pools = 1000, .bits = 16 },
+        .{ .rows = 3, .pools = 2049, .bits = 16 },
+        .{ .rows = 16, .pools = 8192, .bits = 16 },
+        .{ .rows = 16, .pools = 32771, .bits = 16 },
+        .{ .rows = 4, .pools = 131072, .bits = 16 },
+        .{ .rows = 5, .pools = 3001, .bits = 32 },
+    }, 0..) |case, i| {
+        var scope = Scope{ .s = s };
+        defer scope.deinit();
+        const seed: u64 = 200 + 3 * i;
+        // BF16-valued scores with a block of exact zeros (ties), a NaN pool and future pools at -inf.
+        const raw = try scope.cast(try normal(&scope, &.{ case.rows, case.pools }, seed, 0.5), .float32);
+        var values = raw;
+        if (case.bits == 32) {
+            const fine = try scope.slot();
+            try mlx.check(mlx.mlx_add(fine, raw, try scope.cast(try normal(&scope, &.{ case.rows, case.pools }, seed + 1, 0.001), .float32), s));
+            values = fine.*;
+        }
+        const low = try scope.slot();
+        try mlx.check(mlx.mlx_less(low, values, try scope.own(mlx.mlx_array_new_float(-0.2)), s));
+        const tied = try scope.slot();
+        try mlx.check(mlx.mlx_where(tied, low.*, try scope.zeros(&.{}, .float32), values, s));
+        var column: [131072]f32 = undefined;
+        const n: usize = @intCast(case.pools);
+        for (column[0..n], 0..) |*v, p| v.* = if (p + case.future + i * 3 >= n) -std.math.inf(f32) else if (p == n / 2) std.math.nan(f32) else 0;
+        const mask = try scope.own(mlx.mlx_array_new_data(&column, &.{ 1, case.pools }, 2, .float32));
+        const scores = try scope.slot();
+        try mlx.check(mlx.mlx_add(scores, tied.*, mask, s));
+        const want = try partitionTop(&scope, scores.*, case.rows);
+        const got = try rankTop(&scope, scores.*, case.bits);
+        try expectSameBits(want, got);
+    }
+    // Prefill tiles rank; a decode row keeps the partition.
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const state = State{ .pooled = try normal(&scope, &.{ 600, 128 }, 230, 1), .processed = 2400 };
+    const calls = rank_top_calls;
+    _ = try selectChunk(&scope, &state, try normal(&scope, &.{ 16, 32, 128 }, 231, 3), try normal(&scope, &.{ 16, 32 }, 232, 0.1), 2384);
+    var node = state;
+    node.processed = 2400;
+    _ = try selectChunk(&scope, &node, try normal(&scope, &.{ 1, 32, 128 }, 233, 3), try normal(&scope, &.{ 1, 32 }, 234, 0.1), 2399);
+    try std.testing.expectEqual(calls + 1, rank_top_calls);
+}
+
+test "GLM packed prefill keeps 32-row tiles at long history and equals 16-row tiles bit for bit" {
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    // Past 65536 rows the 2 MiB score plane used to cap a tile below 32 rows.
+    const n = 70000;
+    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 40, 1), try normal(&scope, &.{ n, 128 }, 41, 1), &.{ 32768, 32768, n - 65536 });
+    defer for (&twins) |*st| st.deinit();
+    const rows = 64;
+    const offset: usize = n - rows;
+    const q = try normal(&scope, &.{ rows, 64, 512 }, 42, 0.05);
+    const iq = try normal(&scope, &.{ rows, 32, 128 }, 43, 1);
+    const w = try normal(&scope, &.{ rows, 32 }, 44, 0.1);
+    const narrow = try scope.own(try attendPackedPairs(&twins[0], q, iq, w, offset, 1.0 / 16.0, packed_nax.max_rows, s));
+    packed_nax.resetDispatchCount();
+    const wide = try scope.own(try attend(&twins[0], q, iq, w, offset, 1.0 / 16.0, s));
+    try mlx.check(mlx.mlx_array_eval(wide));
+    try std.testing.expectEqual(@as(usize, rows / packed_nax.wide_rows), packed_nax.dispatchCount());
+    try expectSameBits(narrow, wide);
+    try std.testing.expectEqual(@as(usize, 64 * 131072), try selectionScratchBytes(131072));
 }
 
 test "GLM packed cadence bills a second tile only beyond one wide tile" {
@@ -1275,5 +1614,130 @@ test "GLM sparse attention arms per chunk (SUSHI_GLM_ATTN_UBENCH)" {
             std.mem.sort(f64, &times[arm], {}, std.sort.asc(f64));
             std.debug.print("[glm-attn-ubench] rows={d} arm={s} median {d:.3} ms min {d:.3} ms | row0 vs f64: max abs {e:.3} rms {e:.3} peak {d:.3}\n", .{ rows, ([_][]const u8{ "scalar", "composite", "nax" })[arm], times[arm][6], times[arm][0], worst, @sqrt(sq / @as(f64, @floatFromInt(n))), peak });
         }
+    }
+}
+
+const UbenchStage = enum { scores, select, attend };
+
+fn ubenchRun(stage: UbenchStage, state: *const State, q: Arr, iq: Arr, w: Arr, offset: usize, s: mlx.mlx_stream) !void {
+    const rows: usize = @intCast(mlx.getShape(q)[0]);
+    if (stage == .attend) {
+        const out = try attend(state, q, iq, w, offset, 1.0 / 16.0, s);
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_array_eval(out));
+        return;
+    }
+    var start: usize = 0;
+    while (start < rows) {
+        var scope = Scope{ .s = s };
+        defer scope.deinit();
+        const outputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs);
+        for (0..2) |_| {
+            if (start == rows) break;
+            const end = @min(rows, start + packed_nax.max_rows);
+            var node = state.*;
+            if (rows == 1) node.processed = offset + 1;
+            const iqc = try scope.cut(iq, @intCast(start), @intCast(end));
+            const wc = try scope.cut(w, @intCast(start), @intCast(end));
+            const out = if (stage == .scores) try indexScores(&scope, &node, iqc, wc, offset + start) else try selectChunk(&scope, &node, iqc, wc, offset + start);
+            try mlx.check(mlx.mlx_vector_array_append_value(outputs, out));
+            start = end;
+        }
+        try mlx.check(mlx.mlx_eval(outputs));
+    }
+}
+
+fn ubenchMedianMs(io: std.Io, reps: usize, stage: UbenchStage, state: *const State, q: Arr, iq: Arr, w: Arr, offset: usize, s: mlx.mlx_stream) !f64 {
+    var samples: [16]f64 = undefined;
+    const n = @min(reps, samples.len);
+    try ubenchRun(stage, state, q, iq, w, offset, s);
+    for (samples[0..n]) |*sample| {
+        const sw = @import("io_util.zig").Stopwatch.init(io);
+        try ubenchRun(stage, state, q, iq, w, offset, s);
+        sample.* = @as(f64, @floatFromInt(sw.read())) / 1e6;
+    }
+    std.mem.sort(f64, samples[0..n], {}, std.sort.asc(f64));
+    return samples[n / 2];
+}
+
+// DIAGNOSTIC (SUSHI_GLM_LONGCTX_UBENCH=1): one MLA layer's long-context attention on a synthetic kv8
+// state of `_CTX` rows (default 2048,8192,32768,131072): decode (one row) and a 2048-row prefill
+// chunk, split into index scores, top-512 selection and the whole attention. Synchronizing stages
+// rank costs; multiply by 11 MLA layers for a token or a chunk.
+test "GLM long-context attention components (SUSHI_GLM_LONGCTX_UBENCH=1)" {
+    if (!@import("transformer.zig").diagEnvOn("SUSHI_GLM_LONGCTX_UBENCH")) return error.SkipZigTest;
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const raw = if (std.c.getenv("SUSHI_GLM_LONGCTX_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "2048,8192,32768,131072";
+    const reps: usize = if (std.c.getenv("SUSHI_GLM_LONGCTX_UBENCH_REPS")) |r| try std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) else 5;
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |token| {
+        const n = try std.fmt.parseInt(c_int, token, 10);
+        var scope = Scope{ .s = s };
+        defer scope.deinit();
+        var state = State{ .latent_bits = latent_store.kv8_bits };
+        defer state.deinit();
+        const ape = try scope.zeros(&.{ 4, 128 }, .bfloat16);
+        var filled: c_int = 0;
+        while (filled < n) {
+            const rows = @min(n - filled, 16384);
+            var part = Scope{ .s = s };
+            defer part.deinit();
+            const seed: u64 = @intCast(filled);
+            _ = try state.append(try normal(&part, &.{ rows, 512 }, seed + 1, 1), try normal(&part, &.{ rows, 128 }, seed + 2, 1), try normal(&part, &.{ rows, 128 }, seed + 3, 1), ape, s);
+            try state.evaluate();
+            filled += rows;
+        }
+        const total: usize = @intCast(n);
+        const decode_q = try normal(&scope, &.{ 1, 64, 512 }, 21, 0.05);
+        const decode_iq = try normal(&scope, &.{ 1, 32, 128 }, 22, 1);
+        const decode_w = try normal(&scope, &.{ 1, 32 }, 23, 0.2);
+        var ms: [3]f64 = undefined;
+        for (std.enums.values(UbenchStage), &ms) |stage, *m| m.* = try ubenchMedianMs(io, reps, stage, &state, decode_q, decode_iq, decode_w, total - 1, s);
+        std.debug.print("[glm-attn-ubench] ctx={d} decode: scores {d:.3} ms, select {d:.3} ms, attend {d:.3} ms\n", .{ n, ms[0], ms[1], ms[2] });
+        {
+            // One decode row appended to the state it owns, then to a shared copy (no donation).
+            const row_latent = try normal(&scope, &.{ 1, 512 }, 24, 1);
+            const row_key = try normal(&scope, &.{ 1, 128 }, 25, 1);
+            for (0..2) |shared| {
+                var line: [8]f64 = undefined;
+                for (&line) |*m| {
+                    var other = if (shared == 1) try state.share() else State{};
+                    defer other.deinit();
+                    const sw = @import("io_util.zig").Stopwatch.init(io);
+                    _ = try state.append(row_latent, row_key, row_key, ape, s);
+                    try state.evaluate();
+                    m.* = @as(f64, @floatFromInt(sw.read())) / 1e6;
+                }
+                std.debug.print("[glm-attn-ubench] ctx={d} decode append {s} ms:", .{ n, if (shared == 1) "shared" else "owned" });
+                for (line) |m| std.debug.print(" {d:.3}", .{m});
+                std.debug.print("\n", .{});
+            }
+        }
+        if (n < 2051 + 2048) continue;
+        {
+            // A prefill chunk appended to the owned state: each one regrows capacity.
+            var part = Scope{ .s = s };
+            defer part.deinit();
+            const chunk_latent = try normal(&part, &.{ 2048, 512 }, 26, 1);
+            const chunk_key = try normal(&part, &.{ 2048, 128 }, 27, 1);
+            try mlx.check(mlx.mlx_array_eval(chunk_latent));
+            try mlx.check(mlx.mlx_array_eval(chunk_key));
+            std.debug.print("[glm-attn-ubench] ctx={d} chunk append ms:", .{n});
+            for (0..4) |_| {
+                const sw = @import("io_util.zig").Stopwatch.init(io);
+                _ = try state.append(chunk_latent, chunk_key, chunk_key, ape, s);
+                try state.evaluate();
+                std.debug.print(" {d:.3}", .{@as(f64, @floatFromInt(sw.read())) / 1e6});
+            }
+            std.debug.print("\n", .{});
+        }
+        const prefill_q = try normal(&scope, &.{ 2048, 64, 512 }, 31, 0.05);
+        const prefill_iq = try normal(&scope, &.{ 2048, 32, 128 }, 32, 1);
+        const prefill_w = try normal(&scope, &.{ 2048, 32 }, 33, 0.2);
+        for (std.enums.values(UbenchStage), &ms) |stage, *m| m.* = try ubenchMedianMs(io, @min(reps, 3), stage, &state, prefill_q, prefill_iq, prefill_w, total - 2048, s);
+        std.debug.print("[glm-attn-ubench] ctx={d} prefill chunk 2048: scores {d:.1} ms, select {d:.1} ms, attend {d:.1} ms\n", .{ n, ms[0], ms[1], ms[2] });
     }
 }

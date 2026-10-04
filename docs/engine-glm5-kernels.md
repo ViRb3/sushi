@@ -54,23 +54,36 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 
 ## Prefill (chunk 2048, two layers pending)
 
-- **Chunk**: GLM output depends on the prefill chunk width, so the auto chunk is capped at 2048
-  (`glm5_forward.prefill_chunk`, shared with KLD) and arms compared for identity must prefill at the same chunk.
+- **Chunk**: GLM output depends on the prefill chunk width: the auto chunk is the widest rung up to 2048
+  (`glm5_forward.prefill_chunk`, shared with KLD) that costs no admissible context, and arms compared for identity
+  must prefill at the same chunk.
 
 - **Cold MLA** (BF16, more than 8 rows, ending at or before token 2051): latent expanded through the per-head K/V banks
   (64 MiB each at T2048) into native causal SDPA D256, `force_fused`.
 - **Absorbed MLA projections**: query absorption (256→512) and value unembed (512→256) run head-batched (`[64,T,D]`)
   as native affine NAX QMM on A6 g128 banks, T128–2048. T2048 query 13.69 → 1.69 ms, value 19.45 → 1.64 ms; rel L2
   0.26%/0.32%; 4K/64 drift mean KL 0.0116. 768 MiB of copies at async2.
-- **Index scores** (9–16 query rows, 3584–8192 completed pools): Q `[T·32,128]` × pooled-key tiles of at most 2048
-  pools, each tile settled before the next (dot plane ≤ 2 MiB), scalar epilogue kept (BF16 dot, BF16 ReLU·weight,
-  sequential FP32 32-head sum, BF16 total, −inf for future pools). 0/7/6 of 16K/65K/131K scores differ, every
-  512-pool set kept; selector −32% at 16K/32K. Below 3584 pools full tiles waste the gain; above 8192 scalar runs.
+- **Index scores, tree scorer** (decode, verify, and prefill outside the NAX window): one lane per head forms the
+  32 lane partials of the old 32-lane scorer (each sequential over d = l, l+32, l+64, l+96) and joins them in
+  `simd_sum`'s order, an xor butterfly over 1, 2, 4, 8, 16 lanes, i.e. balanced pairs in lane order (200000/200000
+  probe sums). Exact against that scorer at real magnitudes, every NAX and non-NAX GPU; 16 rows × 32768 pools 4.4 →
+  0.93 ms, a decode row at 32768 pools 0.42 → 0.20 ms.
+- **Index scores, NAX window** (9–16 query rows, 3584–8192 completed pools): Q `[T·32,128]` × pooled-key tiles of at
+  most 2048 pools, scalar epilogue kept (BF16 dot, BF16 ReLU·weight, sequential FP32 32-head sum, BF16 total, −inf
+  for future pools). 0/7/6 of 16K/65K/131K scores differ, every 512-pool set kept. The tiles stay lazy until the packed
+  tile pair settles (36 MiB per pending layer): a host settle per tile cost 95 vs 21 ms per MLA layer at 32K.
+- **Selection**: a prefill tile ranks its top 512 pools in one dispatch per row (radix-16 search for the 512th key,
+  every larger key plus the lowest-pool ties at it, each candidate's rank), equal to ArgPartition's stable order
+  (higher score first, ties by pool, NaN last). Decode and verify rows keep ArgPartition.
+- **Meter**: `SUSHI_GLM_LONGCTX_UBENCH=1` (`_CTX`, `_REPS`) runs one MLA layer on a synthetic kv8 state: a decode row
+  and a 2048-row chunk split into scores, selection and whole attention, plus decode and chunk append costs.
 - **Sparse attention**: per real query, gather its 512 pools plus raw tail (2051 latent rows) into one BF16 bank used
   as K and V, native SDPA at scale 1/16 for at most 16 queries per graph (16K: 0.69 vs 5.22 ms scalar). Two such graphs
   stay in flight (−18.6% at 8K, −6.9% at 16K), and exactly 32 rows join two unchanged T16 selections into one B32 call
-  (whole attention −15.4%, 16K model prefill −4.9% vs 1.95% drift, exact against B16). Invalid and future slots are
-  zeroed before load, all-invalid outputs after; MLX's automatic input copy is off for gathers.
+  (whole attention −15.4%, 16K model prefill −4.9% vs 1.95% drift, exact against B16) at any history: the 2 MiB
+  score plane no longer narrows tiles past 64K, and the selection planes are billed per history token (64 B).
+  Invalid and future slots are zeroed before load, all-invalid outputs after; MLX's automatic input copy is off for
+  gathers.
 - **KDA**: FA/GA/beta read the same normalized input, so at exactly 2048 rows they run as one prepared BF16
   `[320,4096]` NAX GEMM with compact outputs (exact, −6.9%; 85 MiB resident, built at load on a NAX GPU). A6 QKV and
   output banks are dequantized to temporary BF16 and multiplied by dense NAX at exactly 2048 rows (exact, −7.4%/−5.3%;
@@ -144,7 +157,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   libmlx is looser than on an M1–M4; its tests widen the bar only when a probe GEMM shows TF32.
 - The scalar latent attention stays the teacher's arm and serves every shape the native arms decline
   (`[glm-attn] scalar dense|sparse latent attention engaged`).
-- Also off: NAX index scores (scalar scorer), the KDA cluster (three GEMMs), A6 dense-once and MLA head/verify batches
+- Also off: NAX index scores (the tree scorer serves them), the KDA cluster (three GEMMs), A6 dense-once and MLA head/verify batches
   (affine QMM). Their transient bills drop with the gate.
 - The KDA body, prework, post and FP32 router are plain SIMD kernels whose unary variants are probed against MLX on the
   device; they run on every GPU. The 1024-thread KDA body compiles to 24 GPRs for G13/G14 (`metal-tt`), inside M1/M2's
@@ -162,8 +175,13 @@ Prefill attention and index:
 - Masked full-history NAX D512 attention: 2.2× scalar at 32K but visits every history tile; exact-membership variant
   37% slower at T2048/16K (7.9× the K tiles).
 - Indexed K/V fragment loads instead of the gather: exact, 85% slower (130.4 → 241.4 ms).
-- Exact radix top-512 pool selector: +1.6%, 2/11 (the pinned ArgPartition sorts the whole axis anyway).
-- Two-tile cadence inside the NAX index scorer: −16.3% component, −0.45% at model level inside monotonic drift.
+- Ranked top-512 for decode rows: one threadgroup per row is equal to ArgPartition at 32768 pools and slower at
+  262144. At short context the first radix selector measured +1.6%, 2/11.
+- Two-tile cadence inside the NAX index scorer (−16.3% component, −0.45% model at 16K): superseded by keeping every
+  tile lazy until the tile pair settles.
+- Tree scorer variants: FMA partials (matched on random data, no faster), keys or queries held as FP32 register
+  arrays (spills, 5–7× slower), the partial terms as a loop over the head width with per-lane head ternaries (6×
+  slower than four statements and a clamped head).
 - Index-score NAX cap 8192 → 8448 pools for the 32K tail: −9.7% component, code max KL 0.345 on the 32K screen.
 - Four-query shared-bank retrieval: −53% attention, code mean KL 0.513 (70% recall still fails).
 - Cold absorbed D512 packed MLA instead of expanded K/V: +523%.
