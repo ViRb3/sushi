@@ -247,7 +247,7 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 ## Agent launcher (`sushi launch <agent>`)
 
-- `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider): reads `/v1/models`, writes agent configs into
+- `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long
   prefill plus a long think tripped them, and each fallback re-sent the whole prompt, then timed out and retried.
@@ -261,6 +261,17 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 - omp (a pi fork) has no off entry in its maps: off rides the qwen dialect (`enable_thinking: false`), `whenThinking`
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.
+- opencode 2.x talks to a background service that never sees `OPENCODE_CONFIG_CONTENT` and refuses `--model` on its
+  default command: the launcher passes `--standalone` (after a subcommand, flags bind to it), carries the model as
+  `model`, and marks a row with efforts `reasoning` + `interleaved: reasoning_content` + one `variants` entry per graded
+  word (GLM: low/high/max; on/off make none, and a default effort option would send words GLM refuses).
+- opencode sends no `max_tokens`, and GLM reserves a request's whole window without one (1M rows): serve GLM with
+  `--max-tokens N` for opencode (live: a 12k-token agent prompt hit `GlmReserveMemoryLimit` with 16 GB free). grok
+  sends its configured `max_completion_tokens`.
+- `sushi launch grok` writes `~/.sushi/grok/config.toml` and sets `GROK_HOME` there (the owner's `~/.grok` stays
+  untouched): one `[model."<id>"]` per chat row on `api_backend = "chat_completions"`, dummy `api_key`, advertised
+  `context_window`, `max_completion_tokens` from `budgetForContext`, the row's efforts as `reasoning_efforts`, and
+  `[session] auto_compact_threshold_percent` = share of the window that leaves `compactionReserve` free (min 50).
 - `sushi launch zcode [--url U] --model ID [--print] [-- zcode args]` writes schema-1
   `~/.sushi/zcode/provider_config.json` and points `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR` and
   `ZCODE_STORAGE_DIR` into `~/.sushi/zcode`; ZCode's own source and project config stay untouched. `--model` must be

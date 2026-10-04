@@ -11,6 +11,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **GLM-5.3-Flash tool results render in GLM's own chat format**: the chat-template engine now reads `x.0` as `x[0]`,
   so every request with a tool message no longer falls back to the generic format; `/props.template_fallbacks`
   counts any render that still does.
+- **`sushi launch grok` runs the Grok CLI against the local server, and `sushi launch opencode` works again with opencode 2.x** (it
+  now runs standalone with the model in its config, tool calls on, and the model's own reasoning efforts as variants), both ready for GLM-5.3.
+
 - **Non-streaming requests with `stop` sequences now stop generating when the stop completes**, instead of running to
   `max_tokens` or end of text and trimming afterwards; the returned text and finish reason are unchanged.
 - **GLM-5.3 prefix-cache commits no longer overrun memory on long generations**: a finished request copies only the
