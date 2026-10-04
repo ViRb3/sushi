@@ -6362,7 +6362,10 @@ pub fn glmDflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u
 /// What a GLM DFlash2 request may still allocate when it reserves its verifier capacity right after
 /// prefill: its admission bill at the narrowest width (no width bills less) less what it holds.
 pub fn glmDflashReserveBudget(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, held: u64) u64 {
-    return prefillNeededAtChunk(config, seq, max_tokens, kv_bits, 1, .{}) -| held;
+    // `max_tokens` is already clamped to admission's context; the caller's config copy is not pinned to it.
+    var sized = config.*;
+    sized.pinned_context = @intCast(@min(seq +| max_tokens, std.math.maxInt(u32)));
+    return prefillNeededAtChunk(&sized, seq, max_tokens, kv_bits, 1, .{}) -| held;
 }
 
 /// A native GLM request's latent and pooled-index capacity at its eventual length.
@@ -26448,6 +26451,31 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
             const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
             const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
             try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= glmDflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
+        }
+    }
+}
+
+test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context" {
+    const reserve = @import("glm5_dflash_reserve.zig");
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.glm_dflash_loaded = true;
+    var mla_layers: usize = 0;
+    for (0..cfg.num_hidden_layers) |l| mla_layers += @intFromBool(!cfg.isLinearLayer(@intCast(l)));
+    const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
+    for ([_]struct { bits: u64, ctx: u32 }{ .{ .bits = 8, .ctx = 1048576 }, .{ .bits = 16, .ctx = 524288 } }) |arm| {
+        cfg.pinned_context = arm.ctx;
+        const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
+        for ([_]usize{ 16, 2008, 100000 }) |seq| {
+            const max_tokens: u32 = @intCast(arm.ctx - seq);
+            const lc = try reserve.capacity(seq);
+            const pc = try reserve.capacity(seq / 4);
+            const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+            const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
+            const peak = try reserve.statesPeak(mla_layers, p);
+            // The generator's config copy is never pinned: it resolves its own, smaller context.
+            var unpinned = cfg;
+            unpinned.pinned_context = arm.ctx / 4;
+            try std.testing.expect(peak <= glmDflashReserveBudget(&unpinned, seq, max_tokens, arm.bits, held));
         }
     }
 }

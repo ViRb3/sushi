@@ -18,6 +18,7 @@ earlier history is mlx-serve's, in that project's changelog.
   `max_tokens` or end of text and trimming afterwards; the returned text and finish reason are unchanged.
 - **A non-streaming request cut by a `stop` sequence reports the tokens it returned and settled timings**, never a
   zero or partial count read while the last decode step was still being accounted.
+- **GLM-5.3 requests that omit `max_tokens` are served again with DFlash2 at the full auto context** instead of failing at prefill with HTTP 500.
 - **GLM-5.3 prefix-cache commits no longer overrun memory on long generations**: a finished request copies only the
   MLA rows its checkpoints can restore and its cache tier will keep, and admission bills that copy and the checkpoints a prefill really takes.
 - **Cancelling a GLM-5.3 request while it decodes no longer races the scheduler's list of running requests**, and its
