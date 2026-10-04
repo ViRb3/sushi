@@ -40,6 +40,7 @@ const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
+const stop_sequences = @import("stop_sequences.zig");
 
 test "format corpus: generic ChatML role headers preserve tool messages" {
     const templates = [_][]const u8{
@@ -3155,6 +3156,35 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
     }
 }
 
+
+test "format corpus: a streamed stop cut is the non-stream cut, whatever the token boundaries and stop order" {
+    // Every recorded output is a generation a client stop can land in: inside the thought, in a
+    // tool call, or in prose. The stop's own bytes arrive split at every width a tokenizer produces.
+    const allocator = testing.allocator;
+    for (corpus) |e| {
+        if (e.raw.len < 16) continue;
+        const mid = e.raw.len / 2;
+        const base = [_][]const u8{ "</think>", "<tool_call>", "\n\n", e.raw[mid .. mid + 5] };
+        for (0..base.len) |rot| {
+            var stops: [base.len][]const u8 = undefined;
+            for (&stops, 0..) |*slot, i| slot.* = base[(i + rot) % base.len];
+            var want_stop: ?[]const u8 = null;
+            const want = stop_sequences.nonStreamDelivered(e.raw, &stops, &want_stop);
+            for ([_]usize{ 1, 2, 3, 5, 8 }) |width| {
+                var fragments = std.ArrayList([]const u8).empty;
+                defer fragments.deinit(allocator);
+                var at: usize = 0;
+                while (at < e.raw.len) : (at += width) try fragments.append(allocator, e.raw[at..@min(at + width, e.raw.len)]);
+                var got_stop: ?[]const u8 = null;
+                const got = try stop_sequences.streamDelivered(allocator, fragments.items, &stops, &got_stop);
+                defer allocator.free(got);
+                errdefer std.debug.print("\nentry: {s}\nrot: {d} width: {d}\n", .{ e.name, rot, width });
+                try testing.expectEqualStrings(want, got);
+                try testing.expectEqualStrings(want_stop orelse "", got_stop orelse "");
+            }
+        }
+    }
+}
 
 test "format corpus: tokenizer rules are model-local across Unicode scripts" {
     try @import("tokenizer.zig").checkTokenizerRuleFixtures();

@@ -9,6 +9,7 @@ const mimo_mtp = @import("mimo_mtp.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
+const stop_seq_mod = @import("stop_sequences.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const expert_stream_mod = @import("expert_stream.zig");
@@ -9701,12 +9702,9 @@ fn handleNonStreamingCompletion(
 
     var final_text: []const u8 = raw_text;
     var finish_reason = result.finish_reason;
-    for (stop_sequences) |stop_seq| {
-        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
-            final_text = final_text[0..idx];
-            finish_reason = "stop";
-            break;
-        }
+    if (stop_seq_mod.earliest(final_text, stop_sequences)) |hit| {
+        final_text = final_text[0..hit.index];
+        finish_reason = "stop";
     }
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
@@ -9825,8 +9823,9 @@ fn handleStreamingCompletion(
     // SSE headers
     try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
-    var text_buf = std.ArrayList(u8).empty;
-    defer text_buf.deinit(allocator);
+    var stop_gate = stop_seq_mod.Gate{ .stops = stop_sequences };
+    defer stop_gate.deinit(allocator);
+    var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
     var stopped = false;
     var utf8_carry_c: [3]u8 = undefined;
     var utf8_carry_c_len: u8 = 0;
@@ -9837,7 +9836,10 @@ fn handleStreamingCompletion(
         if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_gate.hasHeld()) flush: {
+                tail_flush = true;
+                break :flush 0;
+            } else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -9863,13 +9865,12 @@ fn handleStreamingCompletion(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        if (!completionShowsToken(tok, token_id, skip_special)) continue;
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
-
         // Handle incomplete UTF-8 sequences across token boundaries
-        var token_text = blk: {
+        var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+            try lps.note(token_id);
+            if (!completionShowsToken(tok, token_id, skip_special)) continue;
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
             const with_carry = if (utf8_carry_c_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
                 @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
@@ -9898,12 +9899,15 @@ fn handleStreamingCompletion(
         defer allocator.free(token_text);
 
         if (stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) break;
-                token_text = try allocator.realloc(token_text, cut.token_keep);
+            if (!tail_flush) {
+                const released = try stop_gate.push(allocator, token_text);
+                allocator.free(token_text);
+                token_text = released;
+            }
+            stopped = stop_gate.matched != null;
+            if (token_text.len == 0) {
+                if (stopped) break;
+                continue;
             }
         }
 
@@ -9964,22 +9968,6 @@ fn handleStreamingCompletion(
     log.info("  <- {d}+{d} tokens streamed ({d}ms) [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, elapsed_ms, perf, finish_reason,
     });
-}
-
-/// Where a stop sequence cuts the accumulated text and how many bytes of the arriving token
-/// survive: streaming delivers the same `text[0..index]` non-streaming keeps.
-const StopCut = struct { index: usize, token_keep: usize, matched: []const u8 };
-
-fn stopSequenceCut(text: []const u8, token_len: usize, stops: []const []const u8) ?StopCut {
-    const emitted = text.len - @min(token_len, text.len);
-    var best: ?StopCut = null;
-    for (stops) |stop_seq| {
-        if (stop_seq.len == 0) continue;
-        const idx = std.mem.indexOf(u8, text, stop_seq) orelse continue;
-        if (best) |b| if (b.index <= idx) continue;
-        best = .{ .index = idx, .token_keep = if (idx > emitted) idx - emitted else 0, .matched = stop_seq };
-    }
-    return best;
 }
 
 /// A client that vanished mid-generation did not hit a token cap.
@@ -10339,15 +10327,12 @@ fn handleNonStreamingGeneration(
         allocator.free(lps);
     };
 
-    // Apply stop sequences: truncate text at first match
+    // Apply stop sequences: truncate at the earliest occurrence (`stop_sequences.zig`)
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
-    for (stop_sequences) |stop_seq| {
-        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
-            final_text = final_text[0..idx];
-            finish_reason = "stop";
-            break;
-        }
+    if (stop_seq_mod.earliest(final_text, stop_sequences)) |hit| {
+        final_text = final_text[0..hit.index];
+        finish_reason = "stop";
     }
 
     // Merge re-opened mid-text thought channels into the leading block so the
@@ -11139,6 +11124,9 @@ fn handleStreamingGeneration(
     var reasoning_tokens_sent: usize = 0; // reasoning deltas actually emitted (the budget is counted in these)
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
+    var stop_gate = stop_seq_mod.Gate{ .stops = stop_sequences };
+    defer stop_gate.deinit(allocator);
+    var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
 
     // Generate tokens via the adapter — yields one decoded token id per call
     // regardless of whether the underlying decode is regular, PLD, or drafter.
@@ -11147,7 +11135,10 @@ fn handleStreamingGeneration(
         if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_gate.hasHeld()) flush: {
+                tail_flush = true;
+                break :flush 0;
+            } else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -11173,14 +11164,14 @@ fn handleStreamingGeneration(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
         // then strip any new trailing incomplete bytes into the carry buffer.
-        var token_text = blk: {
+        var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+            try lps.note(token_id);
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
@@ -11214,23 +11205,24 @@ fn handleStreamingGeneration(
             break :blk with_carry;
         };
 
-        // Accumulate for stop sequence and tool call detection
-
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
+        // The gate delivers the bytes before a match and holds back any tail that could still become one.
+        if (stop_sequences.len > 0) {
+            if (!tail_flush) {
+                const released = try stop_gate.push(allocator, token_text);
+                allocator.free(token_text);
+                token_text = released;
+            }
+            stopped = stop_gate.matched != null;
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                if (stopped) break;
+                continue;
+            }
         }
 
-        // The stop cut is an INDEX, not a token boundary: bytes before the match still go out.
-        if (stop_sequences.len > 0) {
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
-            }
+        // Accumulate for tool call detection
+        if (gated_stream) {
+            try text_buf.appendSlice(allocator, token_text);
         }
 
         if (delivery) |*d| {
@@ -16269,13 +16261,10 @@ fn handleAnthropicNonStreaming(
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
     var matched_stop_seq: ?[]const u8 = null;
-    for (stop_sequences) |stop_seq| {
-        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
-            final_text = final_text[0..idx];
-            finish_reason = "stop";
-            matched_stop_seq = stop_seq;
-            break;
-        }
+    if (stop_seq_mod.earliest(final_text, stop_sequences)) |hit| {
+        final_text = final_text[0..hit.index];
+        finish_reason = "stop";
+        matched_stop_seq = hit.stop;
     }
 
     // Merge re-opened mid-text thought channels into the leading block so the
@@ -16627,7 +16616,9 @@ fn handleAnthropicStreaming(
         token_texts.deinit(allocator);
     }
     var stopped = false;
-    var matched_stop_seq: ?[]const u8 = null;
+    var stop_gate = stop_seq_mod.Gate{ .stops = stop_sequences };
+    defer stop_gate.deinit(allocator);
+    var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
     var client_gone = false;
     var utf8_carry: [3]u8 = undefined;
     var utf8_carry_len: u8 = 0;
@@ -16637,7 +16628,10 @@ fn handleAnthropicStreaming(
         if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_gate.hasHeld()) flush: {
+                tail_flush = true;
+                break :flush 0;
+            } else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -16663,12 +16657,12 @@ fn handleAnthropicStreaming(
             client_gone = true;
             break;
         }
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // UTF-8 carry handling
-        var token_text = blk: {
+        var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                 @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -16694,23 +16688,24 @@ fn handleAnthropicStreaming(
             break :blk with_carry;
         };
 
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
+        // The gate remembers WHICH stop matched (reported as stop_reason "stop_sequence" + the
+        // echoed `stop_sequence` field in message_delta).
+        if (stop_sequences.len > 0) {
+            if (!tail_flush) {
+                const released = try stop_gate.push(allocator, token_text);
+                allocator.free(token_text);
+                token_text = released;
+            }
+            stopped = stop_gate.matched != null;
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                if (stopped) break;
+                continue;
+            }
         }
 
-        // Stop sequences; remember WHICH one matched (reported as stop_reason
-        // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
-        if (stop_sequences.len > 0) {
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
-                stopped = true;
-                matched_stop_seq = cut.matched;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
-            }
+        if (gated_stream) {
+            try text_buf.appendSlice(allocator, token_text);
         }
 
         if (delivery) |*d| {
@@ -17218,9 +17213,9 @@ fn handleAnthropicStreaming(
     }
 
     const total_prompt = ts.prompt_tokens;
-    const stop_reason = anthropicStopReason(finish_reason, matched_stop_seq);
+    const stop_reason = anthropicStopReason(finish_reason, stop_gate.matched);
     const echo_stop_seq = std.mem.eql(u8, stop_reason, "stop_sequence");
-    const stop_seq_json: []const u8 = if (echo_stop_seq) try jsonEscape(allocator, matched_stop_seq.?) else "null";
+    const stop_seq_json: []const u8 = if (echo_stop_seq) try jsonEscape(allocator, stop_gate.matched.?) else "null";
     defer if (echo_stop_seq) allocator.free(stop_seq_json);
 
     if (!client_gone) {
@@ -18114,6 +18109,9 @@ fn handleResponsesInner(
         var utf8_carry: [3]u8 = undefined;
         var utf8_carry_len: u8 = 0;
         var stopped = false;
+        var stop_gate = stop_seq_mod.Gate{ .stops = stop_sequences.items };
+        defer stop_gate.deinit(allocator);
+        var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
         var client_gone = false;
         // Prompt-opened thinking streams as reasoning even when the request
         // asked for thinking off — generated reasoning is delivered, never
@@ -18137,7 +18135,10 @@ fn handleResponsesInner(
             if (stopped) break;
             const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
-                .done => break,
+                .done => if (stop_gate.hasHeld()) flush: {
+                    tail_flush = true;
+                    break :flush 0;
+                } else break,
                 .idle => {
                     // No tokens yet (long prefill). Probe the peer: an abandoned
                     // request must cancel instead of grinding a ghost prefill
@@ -18163,12 +18164,12 @@ fn handleResponsesInner(
                 client_gone = true;
                 break;
             }
-            try token_ids_buf.append(allocator, token_id);
-            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, false);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
             // UTF-8 carry across BPE-token boundaries (matches chat-completion).
-            var token_text = blk: {
+            var token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+                try token_ids_buf.append(allocator, token_id);
+                const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, false);
+                if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+
                 const with_carry = if (utf8_carry_len > 0) cc: {
                     const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                     @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -18195,16 +18196,20 @@ fn handleResponsesInner(
             };
             defer allocator.free(token_text);
 
-            try raw_buf.appendSlice(allocator, token_text);
-
             if (stop_sequences.items.len > 0) {
-                if (stopSequenceCut(raw_buf.items, token_text.len, stop_sequences.items)) |cut| {
-                    stopped = true;
-                    raw_buf.shrinkRetainingCapacity(cut.index);
-                    if (cut.token_keep == 0) break;
-                    token_text = try allocator.realloc(token_text, cut.token_keep);
+                if (!tail_flush) {
+                    const released = try stop_gate.push(allocator, token_text);
+                    allocator.free(token_text);
+                    token_text = released;
+                }
+                stopped = stop_gate.matched != null;
+                if (token_text.len == 0) {
+                    if (stopped) break;
+                    continue;
                 }
             }
+
+            try raw_buf.appendSlice(allocator, token_text);
 
             // Beat BEFORE the tool early-continue below: a tool-active request
             // emits nothing for its whole generation, and the thinking branch
@@ -18427,12 +18432,9 @@ fn handleResponsesInner(
     // ── apply stop sequences ──
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
-    for (stop_sequences.items) |stop_seq| {
-        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
-            final_text = final_text[0..idx];
-            finish_reason = "stop";
-            break;
-        }
+    if (stop_seq_mod.earliest(final_text, stop_sequences.items)) |hit| {
+        final_text = final_text[0..hit.index];
+        finish_reason = "stop";
     }
 
     if (!responsesStoresFinish(finish_reason, true)) {
@@ -24796,27 +24798,6 @@ test "a tool-call answer keeps the model's visible preamble" {
     const bare = chat_mod.splitThinkBlock("<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>", true, false);
     try t.expectEqualStrings("", visibleToolPreamble(bare.content));
     try t.expectEqualStrings("", visibleToolPreamble("  \n "));
-}
-
-test "a streaming stop sequence cuts at the match, not at the token boundary" {
-    // Bar: the streamed bytes are the bytes non-streaming keeps (`text[0..idx]`).
-    const t = std.testing;
-    const stops = [_][]const u8{"\n\nHuman:"};
-    // The stop opens inside the token that completes it: the leading bytes of
-    // that token are answer text and must still be delivered.
-    const buf = "Paris.\n\nHuman:";
-    const cut = stopSequenceCut(buf, "s.\n\nHuman:".len, &stops).?;
-    try t.expectEqual(@as(usize, 6), cut.index);
-    try t.expectEqual(@as(usize, 2), cut.token_keep);
-    try t.expectEqualStrings("\n\nHuman:", cut.matched);
-    // Match entirely inside already-delivered bytes: nothing of this token survives.
-    const late = stopSequenceCut(buf, 1, &stops).?;
-    try t.expectEqual(@as(usize, 6), late.index);
-    try t.expectEqual(@as(usize, 0), late.token_keep);
-    // Earliest match wins, and a clean buffer cuts nothing.
-    const many = [_][]const u8{ "END", "N" };
-    try t.expectEqual(@as(usize, 1), stopSequenceCut("aNbEND", 6, &many).?.index);
-    try t.expectEqual(@as(?StopCut, null), stopSequenceCut("all clear", 3, &stops));
 }
 
 fn mimoV2BillConfig() model_mod.ModelConfig {

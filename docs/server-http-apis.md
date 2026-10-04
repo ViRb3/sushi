@@ -61,8 +61,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (`streamContentLead`). A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
   carries the pre-markup text (`visibleToolPreamble`); a non-stream disconnect reports `client_disconnect`, never
   `length`, and is noticed after every decoded token as well as during prefill, so a client's timed-out retry never
-  leaves a ghost decoding to `max_tokens`; a stop sequence cuts at its INDEX (`stopSequenceCut`); request ints clamp (`parseRequestSeed`,
+  leaves a ghost decoding to `max_tokens`; request ints clamp (`parseRequestSeed`,
   `clampJsonI32`).
+- **A stop sequence cuts at the EARLIEST occurrence in the text** (shortest stop at the same start, never the first one
+  listed): `stop_sequences.earliest` on every non-stream surface, `stop_sequences.Gate` on every stream, ahead of the
+  reasoning/content/tool paths. The gate HOLDS back a tail that could still complete a stop (or an earlier match) and
+  flushes it at the end; the `format corpus` stop test pins stream == non-stream for any token split and stop order.
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
