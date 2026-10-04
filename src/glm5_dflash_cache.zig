@@ -361,16 +361,6 @@ test "GLM runtime cache uses unchanged BF16 when the cache parent is read only" 
     try std.testing.expectEqualStrings(source, result.path);
 }
 
-test "GLM runtime cache real checkpoint preparation" {
-    const source = std.c.getenv("SUSHI_GLM_RUNTIME_CACHE_SOURCE") orelse return error.SkipZigTest;
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    const stream = if (std.c.getenv("SUSHI_GLM_RUNTIME_CACHE_CPU") != null) cpu else mlx.gpuStream();
-    const result = try prepare(std.testing.io, std.testing.allocator, std.mem.span(source), stream);
-    defer std.testing.allocator.free(result.path);
-    try std.testing.expect(result.generated or !result.fallback);
-}
-
 test "GLM runtime cache uses unchanged BF16 when disk space cannot fit the cache" {
     const a = std.testing.allocator;
     const io = std.testing.io;

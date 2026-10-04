@@ -1927,17 +1927,11 @@ pub fn forwardBlock(
     noise_embeds: mlx.mlx_array,
     anchor_pos: usize,
 ) !mlx.mlx_array {
-    const eligible = blockTailEligible(model, ctx, noise_embeds);
-    return forwardBlockMode(model, ctx, noise_embeds, anchor_pos, eligible and transformer_mod.diagEnvOn("SUSHI_GLM_DFLASH_BLOCK_TAIL"));
-}
-
-var block_tail_calls: usize = 0;
-pub fn blockTailCalls() usize {
-    return block_tail_calls;
+    return forwardBlockMode(model, ctx, noise_embeds, anchor_pos, blockTailEligible(model, ctx, noise_embeds));
 }
 
 fn blockTailEligible(model: *const DflashModel, ctx: *const DflashCtx, noise: mlx.mlx_array) bool {
-    if (model.layers.len != 5 or model.config.block_size != 8 or model.config.sliding_window != 2048 or ctx.cache.config.scheme != .off or ctx.cache.step < 2048 or mlx.getShape(noise)[1] != 8) return false;
+    if (!model.native_glm_serving or model.layers.len != 5 or model.config.block_size != 8 or model.config.sliding_window != 2048 or ctx.cache.config.scheme != .off or ctx.cache.step < 2048 or mlx.getShape(noise)[1] != 8) return false;
     for (model.layers, ctx.cache.entries) |layer, entry| {
         if (layer.layer_type != .sliding_attention or !entry.initialized or entry.base != 0 or entry.offset != ctx.cache.step or mlx.mlx_array_dtype(entry.keys) != .bfloat16 or mlx.mlx_array_dtype(entry.values) != .bfloat16) return false;
     }
@@ -2073,7 +2067,6 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
 
     const out = try rmsNormFn(x, model.final_norm, cfg.rms_norm_eps, s);
     _ = mlx.mlx_array_free(x);
-    if (block_tail) block_tail_calls += 1;
     return out;
 }
 
@@ -3810,159 +3803,6 @@ test "GLM assistant bounded block tail preserves visible keys and masks" {
     }
 }
 
-test "GLM assistant bounded block tail A6 component" {
-    const dir = std.c.getenv("SUSHI_GLM_BLOCK_TAIL_ASSISTANT") orelse return error.SkipZigTest;
-    const output = std.c.getenv("SUSHI_GLM_BLOCK_TAIL_OUT") orelse return error.MissingGlmDiagnosticOutput;
-    const allocator = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const s = mlx.gpuStream();
-    var model = try loadDflashQuant(io, allocator, s, std.mem.span(dir), 0);
-    defer model.deinit();
-    var ctx = try DflashCtx.init(allocator, &model, 37);
-    defer ctx.deinit();
-    ctx.cache.reserve_tokens = 33024;
-    var ops = @import("glm5_model.zig").Ops{ .s = s };
-    defer ops.deinit();
-    const key = try ops.slot();
-    try mlx.check(mlx.mlx_random_key(key, 0x53132));
-    const shape = [_]c_int{ 1, 8, 32768, 128 };
-    for (0..model.layers.len) |li| {
-        const k = try ops.slot();
-        const v = try ops.slot();
-        try mlx.check(mlx.mlx_random_normal(k, &shape, 4, .bfloat16, 0, 1, key.*, s));
-        try mlx.check(mlx.mlx_random_normal(v, &shape, 4, .bfloat16, 0, 1, key.*, s));
-        _ = try ctx.cache.update(@intCast(li), k.*, v.*, s, 0);
-    }
-    const evals = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(evals);
-    ctx.appendEvalArrays(evals);
-    try mlx.check(mlx.mlx_eval(evals));
-    const noise = try ops.slot();
-    try mlx.check(mlx.mlx_random_normal(noise, &[_]c_int{ 1, 8, 4096 }, 3, .bfloat16, 0, 1, key.*, s));
-    try mlx.check(mlx.mlx_array_eval(noise.*));
-    try testing.expect(blockTailEligible(&model, &ctx, noise.*));
-    var source_handles: [5][2]mlx.mlx_array = undefined;
-    for (ctx.cache.entries, 0..) |entry, li| source_handles[li] = .{ entry.keys, entry.values };
-    var snapshot = try ctx.cache.snapshot();
-    defer snapshot.deinit();
-    var old = try DflashCtx.init(allocator, &model, ctx.base_pos);
-    defer old.deinit();
-    try old.cache.restore(&snapshot);
-    const full = try ops.own(try forwardBlockMode(&model, &old, noise.*, ctx.absLen(), false));
-    try mlx.check(mlx.mlx_array_eval(full));
-    const tail = try ops.own(try forwardBlockMode(&model, &ctx, noise.*, ctx.absLen(), true));
-    try mlx.check(mlx.mlx_array_eval(tail));
-    const a = mlx.mlx_array_data_bfloat16(full) orelse return error.MlxArrayDataNull;
-    const b = mlx.mlx_array_data_bfloat16(tail) orelse return error.MlxArrayDataNull;
-    var bits: usize = 0;
-    var squared: f64 = 0;
-    var norm: f64 = 0;
-    var max_abs: f64 = 0;
-    for (0..8 * 4096) |i| {
-        bits += @intFromBool(a[i] != b[i]);
-        const av: f32 = @bitCast(@as(u32, a[i]) << 16);
-        const bv: f32 = @bitCast(@as(u32, b[i]) << 16);
-        try testing.expect(std.math.isFinite(av) and std.math.isFinite(bv));
-        const delta: f64 = @as(f64, av) - bv;
-        squared += delta * delta;
-        norm += @as(f64, av) * av;
-        max_abs = @max(max_abs, @abs(delta));
-    }
-    var source_unchanged = ctx.cache.step == snapshot.step;
-    for (ctx.cache.entries, snapshot.entries, source_handles) |entry, before, handles| {
-        source_unchanged = source_unchanged and entry.keys.ctx == handles[0].ctx and entry.values.ctx == handles[1].ctx and entry.offset == before.offset and entry.base == before.base;
-    }
-    const head_path = std.c.getenv("SUSHI_GLM_BLOCK_TAIL_HEAD_SHARD") orelse return error.MissingGlmDiagnosticInput;
-    var arrays = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(arrays);
-    var metadata = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(metadata);
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, head_path, cpu));
-    var head_arrays: [3]mlx.mlx_array = undefined;
-    for ([_][*:0]const u8{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }, 0..) |name, index| {
-        const slot = try ops.slot();
-        try mlx.check(mlx.mlx_map_string_to_array_get(slot, arrays, name));
-        head_arrays[index] = slot.*;
-    }
-    const head = @import("glm5_model.zig").Linear{ .w = head_arrays[0], .scales = head_arrays[1], .biases = head_arrays[2], .input = 4096, .output = mlx.getShape(head_arrays[0])[0] };
-    const tree = @import("glm5_dflash_tree.zig");
-    var lattices: [2]tree.Lattice = undefined;
-    var logits: [2]mlx.mlx_array = undefined;
-    for ([_]mlx.mlx_array{ full, tail }, 0..) |hidden, arm| {
-        const projected = try head.apply(&ops, try ops.slice(hidden, 1, 1, 3));
-        logits[arm] = try ops.own(try applyLogitTransforms(projected, model.config.output_multiplier, model.config.logit_softcap, s));
-        lattices[arm] = try tree.lattice(allocator, &model.selector.?, 16, try ops.slice(hidden, 1, 0, 3), logits[arm], 1, s);
-    }
-    defer for (&lattices) |*lat| lat.deinit(allocator);
-    const la = mlx.mlx_array_data_bfloat16(logits[0]) orelse return error.MlxArrayDataNull;
-    const lb = mlx.mlx_array_data_bfloat16(logits[1]) orelse return error.MlxArrayDataNull;
-    var logit_bits: usize = 0;
-    var logit_squared: f64 = 0;
-    var logit_norm: f64 = 0;
-    var top1_matches: usize = 0;
-    const vocab: usize = @intCast(head.output);
-    for (0..2) |row| {
-        var ai: usize = 0;
-        var bi: usize = 0;
-        var av_max: f32 = -std.math.inf(f32);
-        var bv_max: f32 = -std.math.inf(f32);
-        for (0..vocab) |id| {
-            const index = row * vocab + id;
-            logit_bits += @intFromBool(la[index] != lb[index]);
-            const av: f32 = @bitCast(@as(u32, la[index]) << 16);
-            const bv: f32 = @bitCast(@as(u32, lb[index]) << 16);
-            try testing.expect(std.math.isFinite(av) and std.math.isFinite(bv));
-            const delta: f64 = @as(f64, av) - bv;
-            logit_squared += delta * delta;
-            logit_norm += @as(f64, av) * av;
-            if (av > av_max) {
-                av_max = av;
-                ai = id;
-            }
-            if (bv > bv_max) {
-                bv_max = bv;
-                bi = id;
-            }
-        }
-        top1_matches += @intFromBool(ai == bi);
-    }
-    var trees_equal = true;
-    for ([_]usize{ 1, 2, 4 }) |children| {
-        var before = try tree.bestFirstTree(allocator, &lattices[0], .{ .max_nodes = 2, .children = children });
-        defer before.deinit(allocator);
-        var after = try tree.bestFirstTree(allocator, &lattices[1], .{ .max_nodes = 2, .children = children });
-        defer after.deinit(allocator);
-        trees_equal = trees_equal and std.mem.eql(u32, before.tokens, after.tokens) and std.mem.eql(i32, before.parents, after.parents) and std.mem.eql(u32, before.depth, after.depth);
-    }
-    var original_ns: [4]u64 = undefined;
-    var tail_ns: [4]u64 = undefined;
-    for (0..6) |iteration| {
-        for (0..2) |arm| {
-            const bounded = (iteration + arm) % 2 == 1;
-            var work = try DflashCtx.init(allocator, &model, ctx.base_pos);
-            defer work.deinit();
-            try work.cache.restore(&snapshot);
-            const watch = @import("io_util.zig").Stopwatch.init(testing.io);
-            const hidden = try forwardBlockMode(&model, &work, noise.*, ctx.absLen(), bounded);
-            defer _ = mlx.mlx_array_free(hidden);
-            try mlx.check(mlx.mlx_array_eval(hidden));
-            const ns = watch.read();
-            if (iteration >= 2) {
-                if (bounded) tail_ns[iteration - 2] = ns else original_ns[iteration - 2] = ns;
-            }
-        }
-    }
-    const json = try std.json.Stringify.valueAlloc(allocator, .{ .input = "fixed BF16 seed 0x53132 KV32768 and full8 embeddings, actual A6 assistant and target head; no target trunk loaded", .hidden_bit_mismatches = bits, .hidden_rel_l2 = @sqrt(squared / norm), .hidden_max_abs = max_abs, .source_handles_counters_unchanged = source_unchanged, .first_two_readout_bit_mismatches = logit_bits, .readout_rel_l2 = @sqrt(logit_squared / logit_norm), .readout_top1_matches = top1_matches, .n2_trees_equal = trees_equal, .full_ns = original_ns, .tail_ns = tail_ns }, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(output), .data = json });
-    try testing.expect(source_unchanged);
-    try testing.expectEqual(@as(usize, 2), top1_matches);
-    try testing.expect(trees_equal);
-    // Shape rounding is reported; the full model quality gate remains separate.
-}
-
 test "GLM serving DFlash2 trims physical window and preserves absolute append positions" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -3998,4 +3838,39 @@ test "GLM serving DFlash2 trims physical window and preserves absolute append po
     try std.testing.expectEqual(@as(usize, 11), ctx.absLen());
     try std.testing.expectEqual(@as(usize, 4), ctx.base_pos);
     try std.testing.expectEqual(@as(u64, 224), ctx.cache.residentBytes());
+}
+
+test "DFlash block tail engages only for the native GLM drafter" {
+    const nil = mlx.mlx_array{ .ctx = null };
+    const lin = DflashLinear{ .w = nil, .scales = nil, .biases = nil };
+    var layers: [5]DflashLayer = @splat(.{ .layer_type = .sliding_attention, .input_norm = nil, .post_attn_norm = nil, .q = lin, .q_norm = nil, .k = lin, .k_norm = nil, .v = lin, .o = lin, .gate = lin, .up = lin, .down = lin });
+    var types: [5]LayerType = @splat(.sliding_attention);
+    var taps = [_]u32{0};
+    var model = DflashModel{
+        .allocator = testing.allocator,
+        .s = mlx.gpuStream(),
+        .config = .{ .hidden_size = 128, .num_hidden_layers = 5, .num_attention_heads = 1, .num_key_value_heads = 1, .head_dim = 128, .intermediate_size = 128, .rms_norm_eps = 1e-5, .rope_theta = 10000, .sliding_window = 2048, .layer_types = &types, .block_size = 8, .mask_token_id = 3, .target_layer_ids = &taps },
+        .fc = lin,
+        .enc_norm = nil,
+        .final_norm = nil,
+        .layers = &layers,
+    };
+    var ctx = try DflashCtx.init(testing.allocator, &model, 0);
+    defer ctx.deinit();
+    const bits = [_]u16{0};
+    const kv = mlx.mlx_array_new_data(&bits, &.{ 1, 1, 1, 1 }, 4, .bfloat16);
+    defer _ = mlx.mlx_array_free(kv);
+    for (ctx.cache.entries) |*entry| {
+        try mlx.check(mlx.mlx_array_set(&entry.keys, kv));
+        try mlx.check(mlx.mlx_array_set(&entry.values, kv));
+        entry.initialized = true;
+        entry.offset = 2048;
+    }
+    ctx.cache.step = 2048;
+    var noise = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(noise);
+    try mlx.check(mlx.mlx_zeros(&noise, &.{ 1, 8, 128 }, 3, .bfloat16, mlx.gpuStream()));
+    try testing.expect(!blockTailEligible(&model, &ctx, noise));
+    model.native_glm_serving = true;
+    try testing.expect(blockTailEligible(&model, &ctx, noise));
 }

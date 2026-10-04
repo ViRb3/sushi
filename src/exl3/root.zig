@@ -542,5 +542,5 @@ test "GLM clamped EXL3 rejects malformed banks before kernel dispatch" {
 test { _ = glm_group2; }
 
 test {
-    _ = @import("glm_prefill_grid_probe.zig");
+    _ = glm_prefill_grid;
 }

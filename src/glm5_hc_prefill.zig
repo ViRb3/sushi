@@ -1,4 +1,4 @@
-//! Experimental exact multi-output HC prefill dot, with optional exact RMS fusion.
+//! Exact multi-output HC mix for prefill rows, plus its fused RMS variant.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
@@ -20,7 +20,7 @@ const SOURCE: [:0]const u8 =
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if(tid==0)for(uint o=0;o<uint(COLS);++o)out[row*24u+first+o]=(partial[o*4u]+partial[o*4u+1u])+(partial[o*4u+2u]+partial[o*4u+3u]);
 ;
-// RMS mapping reused from glm5_hc_fused; MLX MIT and oMLX Apache-2.0 attribution in NOTICE.
+// RMS reduction mapping follows MLX rms_looped (MIT) and oMLX hc_mix1 (Apache-2.0).
 const RMS_SOURCE: [:0]const u8 =
     \\const uint row=threadgroup_position_in_grid.y;
     \\const uint first=threadgroup_position_in_grid.x*uint(COLS);
@@ -65,17 +65,8 @@ const REFERENCE: [:0]const u8 =
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if(tid==0)out[row*24u+output]=(partial[0]+partial[1])+(partial[2]+partial[3]);
 ;
-var enabled_cache: ?bool = null;
 pub fn enabled() bool {
-    if (enabled_cache) |v| return v;
-    const raw = std.c.getenv("SUSHI_GLM_HC_PREFILL");
-    const value = if (raw) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
-    enabled_cache = value;
-    return value;
-}
-pub fn testSetEnabled(value: ?bool) void {
-    std.debug.assert(@import("builtin").is_test);
-    enabled_cache = value;
+    return !@import("glm5_model.zig").reference_numerics;
 }
 var calls: usize = 0;
 pub fn dispatchCount() usize {
@@ -224,27 +215,6 @@ test "GLM HC multi-output keeps cancellation and magnitude behavior unchanged" {
     try std.testing.expect((try experimentalMix(s, one, w, 4)) == null);
 }
 
-fn fixtureValue(map: mlx.mlx_map_string_to_array, key: [:0]const u8) !Arr {
-    var a = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(a);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&a, map, key));
-    return a;
-}
-fn timed(s: mlx.mlx_stream, x: Arr, w: Arr, cols: c_int) !u64 {
-    var timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
-    const out = try run(s, x, w, cols);
-    defer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_array_eval(out));
-    return timer.read();
-}
-fn timedMode(s: mlx.mlx_stream, x: Arr, w: Arr, cols: c_int, epsilon: ?f32) !u64 {
-    if (epsilon == null) return timed(s, x, w, cols);
-    var timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
-    const out = if (cols == 1) try staged(s, x, w, epsilon.?) else (try experimentalRmsMix(s, x, w, epsilon.?, cols)).?;
-    defer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_array_eval(out));
-    return timer.read();
-}
 fn staged(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32) !Arr {
     var wide = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wide);
@@ -256,116 +226,6 @@ fn staged(s: mlx.mlx_stream, x: Arr, w: Arr, epsilon: f32) !Arr {
     try mlx.check(mlx.mlx_reshape(&flat, wide, &.{ 1, mlx.getShape(x)[1], 16384 }, 3, s));
     try mlx.check(mlx.mlx_fast_rms_norm(&norm, flat, .{ .ctx = null }, epsilon, s));
     return run(s, norm, w, 1);
-}
-test "GLM HC multi-output actual fixture parity and paired timing" {
-    const file = std.c.getenv("SUSHI_GLM_HC_PREFILL_FIXTURE") orelse return error.SkipZigTest;
-    const out = std.c.getenv("SUSHI_GLM_HC_PREFILL_REPORT") orelse return error.MissingHcReport;
-    const rms_mode = std.c.getenv("SUSHI_GLM_HC_PREFILL_RMS") != null;
-    const alloc = std.testing.allocator;
-    const s = mlx.gpuStream();
-    var tensors = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensors);
-    var metadata = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(metadata);
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    try mlx.check(mlx.mlx_load_safetensors(&tensors, &metadata, file, cpu));
-    const params = try fixtureValue(tensors, "rms_eps_hc_eps_sinkhorn_iters");
-    defer _ = mlx.mlx_array_free(params);
-    try mlx.check(mlx.mlx_array_eval(params));
-    const eps = mlx.mlx_array_data_float32(params).?[0];
-    const Record = struct { layer: u32, ffn: bool, rows: c_int, cols: c_int, reference_ns: [24]u64, candidate_ns: [24]u64 };
-    var records: [32]Record = undefined;
-    var count: usize = 0;
-    for ([_]u32{ 0, 3, 23, 44 }) |layer| for ([_]bool{ false, true }) |ffn| {
-        var xb: [80]u8 = undefined;
-        var wb: [80]u8 = undefined;
-        var mb: [80]u8 = undefined;
-        const kind = if (ffn) "ffn" else "attn";
-        var x = try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&xb, "layer{d:0>2}.{s}.x", .{ layer, kind }, 0));
-        defer _ = mlx.mlx_array_free(x);
-        const w = try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&wb, "layer{d:0>2}.{s}.w", .{ layer, kind }, 0));
-        defer _ = mlx.mlx_array_free(w);
-        var expected = try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&mb, "layer{d:0>2}.{s}.mix", .{ layer, kind }, 0));
-        defer _ = mlx.mlx_array_free(expected);
-        if (std.c.getenv("SUSHI_GLM_HC_PREFILL_ROWS128") != null and mlx.getShape(x)[1] >= 128) {
-            var slice = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&slice, x, &.{ 0, 0, 0, 0 }, 4, &.{ 1, 128, 4, 4096 }, 4, &.{ 1, 1, 1, 1 }, 4, s));
-            _ = mlx.mlx_array_free(x);
-            x = slice;
-            slice = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&slice, expected, &.{ 0, 0, 0 }, 3, &.{ 1, 128, 24 }, 3, &.{ 1, 1, 1 }, 3, s));
-            _ = mlx.mlx_array_free(expected);
-            expected = slice;
-        }
-        const sh = mlx.getShape(x);
-        if (sh.len != 4 or sh[0] != 1 or sh[2] != 4 or sh[3] != 4096 or mlx.mlx_array_dtype(x) != .bfloat16 or
-            !std.mem.eql(c_int, &.{ 24, 16384 }, mlx.getShape(w)) or !std.mem.eql(c_int, &.{ 1, sh[1], 24 }, mlx.getShape(expected))) return error.InvalidHcFixture;
-        const rows = sh[1];
-        var wide = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wide);
-        var flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(flat);
-        var normalized = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(normalized);
-        try mlx.check(mlx.mlx_astype(&wide, x, .float32, s));
-        try mlx.check(mlx.mlx_reshape(&flat, wide, &.{ 1, rows, sh[2] * sh[3] }, 3, s));
-        try mlx.check(mlx.mlx_fast_rms_norm(&normalized, flat, .{ .ctx = null }, eps, s));
-        const old = try run(s, normalized, w, 1);
-        defer _ = mlx.mlx_array_free(old);
-        try expectBits(expected, old);
-        for ([_]c_int{ 2, 4, 8, 24 }) |cols| {
-            if (rms_mode and cols < 8) continue;
-            if (rows < 16) {
-                try std.testing.expect((try experimentalMix(s, normalized, w, cols)) == null);
-                continue;
-            }
-            const check = if (rms_mode) (try experimentalRmsMix(s, x, w, eps, cols)).? else (try experimentalMix(s, normalized, w, cols)).?;
-            defer _ = mlx.mlx_array_free(check);
-            try expectBits(expected, check);
-            if (rms_mode and cols == 24) {
-                var ops = @import("glm5_model.zig").Ops{ .s = s };
-                defer ops.deinit();
-                var key: [80]u8 = undefined;
-                const scale = try ops.own(try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&key, "layer{d:0>2}.{s}.scale", .{ layer, kind }, 0)));
-                const base = try ops.own(try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&key, "layer{d:0>2}.{s}.base", .{ layer, kind }, 0)));
-                const hc = @import("glm5_model.zig").Hc{ .w = w, .scale = scale, .base = base };
-                const params_data = mlx.mlx_array_data_float32(params).?;
-                const cfg = @import("model.zig").ModelConfig{ .rms_norm_eps = eps, .glm_hc_eps = params_data[1], .glm_hc_sinkhorn_iters = @intFromFloat(params_data[2]) };
-                const previous = enabled_cache;
-                testSetEnabled(true);
-                defer testSetEnabled(previous);
-                const before = dispatchCount();
-                const collapsed = try hc.collapse(&ops, x, &cfg);
-                defer collapsed.deinit();
-                try std.testing.expectEqual(before + 1, dispatchCount());
-                for ([_][]const u8{ "mixed", "post", "comb" }, [_]Arr{ collapsed.mixed, collapsed.post, collapsed.comb }) |field, actual| {
-                    var saved = try ops.own(try fixtureValue(tensors, try std.fmt.bufPrintSentinel(&key, "layer{d:0>2}.{s}.{s}", .{ layer, kind, field }, 0)));
-                    if (mlx.getShape(saved)[1] != rows) saved = try ops.slice(saved, 1, 0, rows);
-                    try expectBits(saved, actual);
-                }
-            }
-            for (0..4) |_| {
-                _ = try timedMode(s, if (rms_mode) x else normalized, w, 1, if (rms_mode) eps else null);
-                _ = try timedMode(s, if (rms_mode) x else normalized, w, cols, if (rms_mode) eps else null);
-            }
-            var record = Record{ .layer = layer, .ffn = ffn, .rows = rows, .cols = cols, .reference_ns = undefined, .candidate_ns = undefined };
-            for (0..24) |i| {
-                if (i % 2 == 0) {
-                    record.reference_ns[i] = try timedMode(s, if (rms_mode) x else normalized, w, 1, if (rms_mode) eps else null);
-                    record.candidate_ns[i] = try timedMode(s, if (rms_mode) x else normalized, w, cols, if (rms_mode) eps else null);
-                } else {
-                    record.candidate_ns[i] = try timedMode(s, if (rms_mode) x else normalized, w, cols, if (rms_mode) eps else null);
-                    record.reference_ns[i] = try timedMode(s, if (rms_mode) x else normalized, w, 1, if (rms_mode) eps else null);
-                }
-            }
-            records[count] = record;
-            count += 1;
-        }
-    };
-    const json = try std.json.Stringify.valueAlloc(alloc, .{ .method = if (rms_mode) "captured raw BF16 inputs, RMS+dot, 4warm/24ABBApairs, all outputs bit-exact" else "captured normalized FP32 inputs, dot only, 4warm/24ABBApairs, all outputs bit-exact", .records = records[0..count] }, .{ .whitespace = .indent_2 });
-    defer alloc.free(json);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(out), .data = json });
 }
 
 test "GLM HC multi-output RMS preserves staged bits and rejects small rows" {
@@ -408,8 +268,6 @@ test "GLM HC multi-output RMS preserves staged bits and rejects small rows" {
 }
 
 test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
-    testSetEnabled(true);
-    defer testSetEnabled(null);
     const a = std.testing.allocator;
     var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
@@ -439,30 +297,4 @@ test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
         try expectBits(expected.post, actual.post);
         try expectBits(expected.comb, actual.comb);
     }
-}
-
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-test "GLM fast opt-out HC prefill defaults on and preserves explicit controls" {
-    const a = std.testing.allocator;
-    const name = "SUSHI_GLM_HC_PREFILL";
-    const previous_cache = enabled_cache;
-    defer enabled_cache = previous_cache;
-    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    defer {
-        if (previous) |value| {
-            _ = setenv(name, value, 1);
-            a.free(value);
-        } else _ = unsetenv(name);
-    }
-    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
-    enabled_cache = null;
-    try std.testing.expect(enabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
-    enabled_cache = null;
-    try std.testing.expect(!enabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
-    enabled_cache = null;
-    try std.testing.expect(enabled());
 }

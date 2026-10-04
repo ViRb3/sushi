@@ -13,12 +13,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   opt-ins = `reasoning_effort` OR `enable_thinking` (top-level, else vLLM's `chat_template_kwargs.enable_thinking`;
   `reasoning_budget_tokens` outranks); a request naming neither takes the arch default (`defaultEnableThinking`);
   on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
-- **Effort vocabulary** `off low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024 budget):
-  each served arch accepts a subset (`model.effortArms`), listed as `reasoning_efforts` on its `/v1/models` row; any
-  other word 400s on chat, Responses and Anthropic with the accepted list, never rounded. qwen4_exp: off, low (2048),
-  medium (8192), xhigh (uncapped); the template reads the word. mimo_v2: off, low (2048), medium (8192), high, xhigh,
-  max (uncapped); the template has only on/off, the budget is the whole effect. Uncapped = `--reasoning-budget`.
-  A thinking request that names NO effort gets no server budget (decided): Qwen3.8 renders it as low
+- **Effort vocabulary** `off on minimal low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024
+  budget on inherited arches): each served arch accepts a subset (`model.effortArms`), read through
+  `model.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike; a word outside it is
+  refused with the accepted list, never rounded. Uncapped = `--reasoning-budget`.
+- qwen4_exp: off, low (2048), medium (8192), xhigh (uncapped); the template reads the word; `minimal`, high, max 400.
+- glm5_next: low, high, max (uncapped, a prompt instruction); off and every other word 400.
+- mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
+  uncapped, and off/none is off.
+- `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
+  none runs at (`model.defaultReasoningEffort`: `--think`, else GLM high, else off/on per `defaultEnableThinking`,
+  where a thinking Qwen silence renders low).
+- `--think X` is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
+  any X but off is on) or, lacking it, keeps its own default. It never fails a load.
+- A thinking request that names NO effort gets no server budget (decided): Qwen3.8 renders it as low
   (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
   `sequence_number` on every event, stateful via
   `ResponseStore`, WS via Upgrade. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
@@ -194,10 +202,12 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those two paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. Guards: `tests/test_webui.sh`, the `chat page:` tests.
-- It speaks only the public API: `/v1/models` for the picker (`reasoning_efforts` fills the effort select, `vision` or
-  an `image` input modality shows the attach button), `/v1/chat/completions` streamed with `include_usage` (the
+- It speaks only the public API: `/v1/models` for the picker (`vision` or an `image` input modality shows the attach
+  button), `/v1/chat/completions` streamed with `include_usage` (the
   readout is the final chunk's `usage` + `timings`), `reasoning_content` shown collapsed. Stop aborts the fetch; the
   server cancels on disconnect.
+- The effort menu lists exactly the row's `reasoning_efforts`, with no default entry; it shows the stored choice where
+  the model takes it, else the row's `default_reasoning_effort`, and every request sends the shown word.
 - Under `--api-key` the page is served without the key (it holds no data), asks for it on the first 401 and sends it as
   a Bearer token. Its fetches use `credentials: "omit"`: the 401's Basic challenge would otherwise open the browser's
   own login dialog.
@@ -233,11 +243,20 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   capped at 20000, carried into pi's `settings.json` and opencode's `compaction` + `limit.output`. A launch below the
   agent's context floor WARNS (claude 64k, opencode 32k, others 16k).
 - pi sends its thinking level as `reasoning_effort` through a per-model `thinkingLevelMap` built from the row's
-  `reasoning_efforts` (`launch.piEffortFor`: exact, else the next accepted word up, else down; Qwen3.8 high → xhigh).
-  pi's `thinkingFormat: qwen` sent only `enable_thinking`, so low/medium never reached the server.
+  `reasoning_efforts` (`launch.piEffortFor`: exact, else the next accepted word up, else down, `on` being the lowest;
+  Qwen3.8 high → xhigh, MiMo every level → on). pi's `thinkingFormat: qwen` sent only `enable_thinking`, so low/medium
+  never reached the server. The launch tests build their vocabularies from `model.effortArms`.
 - omp (a pi fork) has no off entry in its maps: off rides the qwen dialect (`enable_thinking: false`), `whenThinking`
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.
+- `sushi launch zcode [--url U] --model ID [--print] [-- zcode args]` writes schema-1
+  `~/.sushi/zcode/provider_config.json` and points `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR` and
+  `ZCODE_STORAGE_DIR` into `~/.sushi/zcode`; ZCode's own source and project config stay untouched. `--model` must be
+  an advertised `/v1/models` chat ID (default: first loaded chat row; media/embedding rows excluded).
+- ZCode speaks `/v1/chat/completions` (SSE reasoning, function calls, tool-result replay); each model gets
+  `clamp(context / 2, 1024, 65536)` output (older rows: 32768 context, 8192 output) and exactly its advertised
+  `reasoning_efforts` (prefers medium). CPU test: `python3 tests/test_zcode_launch.py --bin zig-out/bin/sushi`
+  (`--zcode <zcode.cjs>` adds the real-client fixture).
 
 ## Web UI research tools
 
@@ -274,7 +293,8 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
   copyable. The upstream minified bundle is inline to keep the page self-contained; its license is in
   `src/webui/DOMPurify.LICENSE`. Updates should use a reviewed upstream release and rerun the renderer checks.
-- Checks: `node tests/test_webui_tools.cjs`, `tests/test_webui.sh`, and the `web tools:` unit test. Generate the
+- Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `tests/test_webui.sh`, and the
+  `web tools:` unit test. Generate the
   browser renderer suite with `node tests/test_webui_render.cjs /tmp/sushi-render-tests/index.html`, serve that
   directory locally (or open the HTML), and require **All renderer checks passed**.
 
@@ -307,5 +327,3 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   judged by their IPv4); each redirect hop re-checked; no cookies, auth headers or POST.
 - Every failure is a short tool-result string; results are data, never executed. A DuckDuckGo bot check (HTTP 202,
   `anomaly-modal`) reads as "search unavailable", never as zero results.
-
-ZCode launcher command and configuration contract: [server-zcode.md](server-zcode.md).

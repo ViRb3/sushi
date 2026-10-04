@@ -90,12 +90,9 @@ fn rowMajorReady(a: Arr) !bool {
 }
 
 pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
-    const hoisted = @import("glm5_dflash_a6_hoist.zig");
-    if (hoisted.enabled()) {
-        if (try hoisted.project(stream, x, linear)) |output| {
-            dispatch_count += 1;
-            return output;
-        }
+    if (try @import("glm5_dflash_a6_hoist.zig").project(stream, x, linear)) |output| {
+        dispatch_count += 1;
+        return output;
     }
     if (!mlx.streamIsGpu(stream) or x.ctx == null or linear.w.ctx == null or linear.scales.ctx == null or linear.biases.ctx == null) return null;
     const sh = mlx.getShape(x);
@@ -162,8 +159,7 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
 test "GLM DFlash affine row tiles preserve serial qmv bits" {
     const s = mlx.gpuStream();
     const Shape = struct { n: c_int, k: c_int };
-    for ([_]c_int{ 8, 6 }) |bits| for ([_]Shape{ .{ .n = 32, .k = 256 }, .{ .n = 1536, .k = 4096 }, .{ .n = 8192, .k = 4096 }, .{ .n = 4096, .k = 8192 }, .{ .n = 154880, .k = 4096 } }) |shape| {
-        if (shape.n == 154880 and std.c.getenv("SUSHI_GLM_DFLASH_HEAD_FIXTURE") == null) continue;
+    for ([_]c_int{ 8, 6 }) |bits| for ([_]Shape{ .{ .n = 32, .k = 256 }, .{ .n = 1536, .k = 4096 }, .{ .n = 8192, .k = 4096 }, .{ .n = 4096, .k = 8192 } }) |shape| {
         var ops = Ops{ .s = s };
         defer ops.deinit();
         const key = try ops.slot();

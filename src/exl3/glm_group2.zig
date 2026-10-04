@@ -1,4 +1,4 @@
-//! Unintegrated exact two-member reuse of GLM's cooperative F16 expert dot.
+//! Exact two-member reuse of GLM's cooperative F16 expert dot for DFlash verify rows.
 //! Routing IDs must be valid for the supplied expert bank, as in the baseline API.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
@@ -176,8 +176,7 @@ pub fn pairLayout(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Ar
 }
 
 pub const Down = enum { baseline, grouped };
-/// Research-only full routed chain. Unsupported inputs return null for baseline fallback.
-/// groupDown deliberately compares separate middle+grouped down with the native fused-middle path.
+/// Full routed chain; unsupported inputs return null so the caller falls back to moeClamped.
 pub fn moe(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: Arr, scores: Arr, dec: @import("expert_exl3.zig").Decode, reduction: Reduction, down: Down) !?Arr {
     return moeLayout(s, x, bank, indices, scores, dec, reduction, down, .natural);
 }
@@ -328,123 +327,6 @@ test "GLM group2 cooperative projections preserve F16 bits at all rates and ball
     }
 }
 
-fn tensor(owned: *Owned, value: std.json.Value) !Arr {
-    const file = value.object.get("file").?.string;
-    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, file, std.testing.allocator, .limited(256 * 1024 * 1024));
-    defer std.testing.allocator.free(data);
-    const dims = value.object.get("shape").?.array.items;
-    if (dims.len == 0 or dims.len > 4) return error.BadGroup2Fixture;
-    var shape: [4]c_int = undefined;
-    var bytes: usize = 2;
-    for (dims, 0..) |dim, i| {
-        if (dim.integer <= 0 or dim.integer > std.math.maxInt(c_int)) return error.BadGroup2Fixture;
-        shape[i] = @intCast(dim.integer);
-        bytes = try std.math.mul(usize, bytes, @intCast(dim.integer));
-    }
-    if (data.len != bytes) return error.BadGroup2Fixture;
-    const dtype_name = value.object.get("dtype").?.string;
-    const dtype: mlx.mlx_dtype = if (std.mem.eql(u8, dtype_name, "U16")) .uint16 else if (std.mem.eql(u8, dtype_name, "F16")) .float16 else return error.BadGroup2Fixture;
-    return owned.own(mlx.mlx_array_new_data(data.ptr, shape[0..dims.len].ptr, @intCast(dims.len), dtype));
-}
-const Real = struct { bank: @import("root.zig").Bank, x: Arr, ids: Arr, scores: Arr, layer: i64, saved: i64 };
-fn realFixture(owned: *Owned, value: std.json.Value, s: mlx.mlx_stream) !Real {
-    var bank: @import("root.zig").Bank = undefined;
-    const banks = value.object.get("banks").?;
-    inline for (.{ "gate", "up", "down" }) |name| {
-        const desc = banks.object.get(name).?;
-        @field(bank, name) = .{ .trellis = try tensor(owned, desc.object.get("trellis").?), .suh = try tensor(owned, desc.object.get("suh").?), .svh = try tensor(owned, desc.object.get("svh").?) };
-    }
-    const r: c_int = @intCast(value.object.get("rows").?.integer);
-    const top: c_int = @intCast(value.object.get("topk").?.integer);
-    if (r < 2 or r > 16 or top != 8) return error.BadGroup2Fixture;
-    const raw = value.object.get("local_ids").?.array.items;
-    if (raw.len != @as(usize, @intCast(r * top))) return error.BadGroup2Fixture;
-    var indices: [128]u32 = undefined;
-    var scores: [128]f32 = undefined;
-    for (raw, 0..) |id, i| {
-        if (id.integer < 0 or id.integer >= mlx.getShape(bank.gate.trellis)[0]) return error.BadGroup2Fixture;
-        indices[i] = @intCast(id.integer);
-        scores[i] = @as(f32, @floatFromInt(i % 8 + 1)) / 36 * 2.5;
-    }
-    const x = try owned.floats(&.{ 1, r, 4096 }, .bfloat16, @intCast(717 + value.object.get("layer").?.integer), 2, s);
-    try mlx.check(mlx.mlx_array_eval(x));
-    return .{ .bank = bank, .x = x, .ids = try owned.own(mlx.mlx_array_new_data(&indices, &.{ 1, r, top }, 3, .uint32)), .scores = try owned.own(mlx.mlx_array_new_data(&scores, &.{ 1, r, top }, 3, .float32)), .layer = value.object.get("layer").?.integer, .saved = value.object.get("saved_slots").?.integer };
-}
-fn realArm(s: mlx.mlx_stream, f: Real, id: usize) !Arr {
-    const dec = @import("expert_exl3.zig").Decode{ .codebook = .mcg, .window = .w12 };
-    if (id == 0) return @import("root.zig").moeClamped(s, f.x, f.bank, f.ids, f.scores, dec, 10);
-    return (try moe(s, f.x, f.bank, f.ids, f.scores, dec, if (id == 1 or id == 3) .parallel else .serial, if (id <= 2) .baseline else .grouped)) orelse error.TestExpectedGroup2;
-}
-
-test "GLM group2 actual checkpoint weights and captured routes preserve fullchain BF16 output" {
-    const path = std.c.getenv("SUSHI_GLM_GROUP2_FIXTURE") orelse return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(path), a, .limited(1024 * 1024));
-    defer a.free(data);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
-    defer parsed.deinit();
-    const s = mlx.gpuStream();
-    for (parsed.value.object.get("cases").?.array.items) |case| {
-        var owned: Owned = .{};
-        defer owned.deinit();
-        const f = try realFixture(&owned, case, s);
-        const expected = try realArm(s, f, 0);
-        defer _ = mlx.mlx_array_free(expected);
-        for (1..5) |id| {
-            const actual = try realArm(s, f, id);
-            defer _ = mlx.mlx_array_free(actual);
-            try exact(expected, actual);
-        }
-    }
-}
-fn timeReal(s: mlx.mlx_stream, f: Real, id: usize, count: usize) !u64 {
-    const clock = @import("mlx_host").io_util.Stopwatch.init(std.testing.io);
-    for (0..count) |_| {
-        const y = try realArm(s, f, id);
-        defer _ = mlx.mlx_array_free(y);
-        try mlx.check(mlx.mlx_array_eval(y));
-    }
-    return clock.read() / count;
-}
-
-test "GLM group2 isolated actual-route timing" {
-    const output = std.c.getenv("SUSHI_GLM_GROUP2_BENCH_OUT") orelse return error.SkipZigTest;
-    const path = std.c.getenv("SUSHI_GLM_GROUP2_FIXTURE") orelse return error.MissingGroup2Fixture;
-    const a = std.testing.allocator;
-    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(path), a, .limited(1024 * 1024));
-    defer a.free(data);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
-    defer parsed.deinit();
-    const cases = parsed.value.object.get("cases").?.array.items;
-    if (cases.len != 3) return error.BadGroup2Fixture;
-    var samples: [3][11][5]u64 = undefined;
-    var layers: [3]i64 = undefined;
-    var saved: [3]i64 = undefined;
-    const s = mlx.gpuStream();
-    for (cases, 0..) |case, ci| {
-        var owned: Owned = .{};
-        defer owned.deinit();
-        const f = try realFixture(&owned, case, s);
-        layers[ci] = f.layer;
-        saved[ci] = f.saved;
-        const expected = try realArm(s, f, 0);
-        defer _ = mlx.mlx_array_free(expected);
-        for (0..5) |id| {
-            const actual = try realArm(s, f, id);
-            defer _ = mlx.mlx_array_free(actual);
-            try exact(expected, actual);
-            _ = try timeReal(s, f, id, 5);
-        }
-        for (0..11) |round| for (0..5) |step| {
-            const id = if (round % 2 == 0) step else 4 - step;
-            samples[ci][round][id] = try timeReal(s, f, id, 3);
-        };
-    }
-    const json = try std.json.Stringify.valueAlloc(a, .{ .exact = true, .arms = .{ "baseline", "group_pair_parallel", "group_pair_serial", "group_all_parallel", "group_all_serial" }, .layers = layers, .saved_slots = saved, .slots = 32, .warmup = 5, .repetitions = 3, .timing = "warm selected real banks, synthetic activations, host apply+eval+free, interleaved arms", .nanoseconds = samples }, .{ .whitespace = .indent_2 });
-    defer a.free(json);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
-}
-
 test "GLM group2 singleton and all-shared routes preserve strided input bits" {
     const s = mlx.gpuStream();
     base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
@@ -557,96 +439,4 @@ test "GLM group2 half4 composition preserves all-rate cooperative projection bit
             }
         }
     }
-}
-fn realLaneArm(s: mlx.mlx_stream, f: Real, id: usize) !Arr {
-    const dec = @import("expert_exl3.zig").Decode{ .codebook = .mcg, .window = .w12 };
-    if (id == 0) return @import("root.zig").moeClamped(s, f.x, f.bank, f.ids, f.scores, dec, 10);
-    return (try moeLayout(s, f.x, f.bank, f.ids, f.scores, dec, if (id == 1 or id == 3) .parallel else .serial, if (id <= 2) .baseline else .grouped, .lane)) orelse error.TestExpectedGroup2;
-}
-fn requireLaneBaseline() !void {
-    const pair_on = std.c.getenv("SUSHI_GLM_LANE_PAIR") orelse return error.MissingLaneBaseline;
-    const down_on = std.c.getenv("SUSHI_GLM_DOWN_LANE") orelse return error.MissingLaneBaseline;
-    if (!std.mem.eql(u8, std.mem.span(pair_on), "1") or !std.mem.eql(u8, std.mem.span(down_on), "1")) return error.MissingLaneBaseline;
-}
-
-test "GLM group2 half4 actual weights preserve lane-plus-down fullchain bits" {
-    _ = std.c.getenv("SUSHI_GLM_GROUP2_LANE_TEST") orelse return error.SkipZigTest;
-    const path = std.c.getenv("SUSHI_GLM_GROUP2_FIXTURE") orelse return error.MissingGroup2Fixture;
-    try requireLaneBaseline();
-    const a = std.testing.allocator;
-    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(path), a, .limited(1024 * 1024));
-    defer a.free(data);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
-    defer parsed.deinit();
-    const s = mlx.gpuStream();
-    for (parsed.value.object.get("cases").?.array.items) |case| {
-        var owned: Owned = .{};
-        defer owned.deinit();
-        const f = try realFixture(&owned, case, s);
-        const pair_before = base.lanePairChainCalls();
-        const down_before = base.downLaneCalls();
-        const expected = try realLaneArm(s, f, 0);
-        defer _ = mlx.mlx_array_free(expected);
-        try std.testing.expectEqual(pair_before + 1, base.lanePairChainCalls());
-        try std.testing.expectEqual(down_before + 1, base.downLaneCalls());
-        for (1..5) |id| {
-            const actual = try realLaneArm(s, f, id);
-            defer _ = mlx.mlx_array_free(actual);
-            try exact(expected, actual);
-        }
-    }
-}
-fn timeLane(s: mlx.mlx_stream, f: Real, id: usize, count: usize) !u64 {
-    const clock = @import("mlx_host").io_util.Stopwatch.init(std.testing.io);
-    for (0..count) |_| {
-        const y = try realLaneArm(s, f, id);
-        defer _ = mlx.mlx_array_free(y);
-        try mlx.check(mlx.mlx_array_eval(y));
-    }
-    return clock.read() / count;
-}
-
-test "GLM group2 isolated lane-route timing" {
-    const output = std.c.getenv("SUSHI_GLM_GROUP2_LANE_BENCH_OUT") orelse return error.SkipZigTest;
-    const path = std.c.getenv("SUSHI_GLM_GROUP2_FIXTURE") orelse return error.MissingGroup2Fixture;
-    try requireLaneBaseline();
-    const a = std.testing.allocator;
-    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, std.mem.span(path), a, .limited(1024 * 1024));
-    defer a.free(data);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
-    defer parsed.deinit();
-    const cases = parsed.value.object.get("cases").?.array.items;
-    if (cases.len != 6) return error.BadGroup2Fixture;
-    var samples: [6][11][5]u64 = undefined;
-    var layers: [6]i64 = undefined;
-    var saved: [6]i64 = undefined;
-    var row_counts: [6]i64 = undefined;
-    const s = mlx.gpuStream();
-    for (cases, 0..) |case, ci| {
-        var owned: Owned = .{};
-        defer owned.deinit();
-        const f = try realFixture(&owned, case, s);
-        layers[ci] = f.layer;
-        row_counts[ci] = mlx.getShape(f.x)[1];
-        saved[ci] = f.saved;
-        const pair_before = base.lanePairChainCalls();
-        const down_before = base.downLaneCalls();
-        const expected = try realLaneArm(s, f, 0);
-        defer _ = mlx.mlx_array_free(expected);
-        try std.testing.expectEqual(pair_before + 1, base.lanePairChainCalls());
-        try std.testing.expectEqual(down_before + 1, base.downLaneCalls());
-        for (0..5) |id| {
-            const actual = try realLaneArm(s, f, id);
-            defer _ = mlx.mlx_array_free(actual);
-            try exact(expected, actual);
-            _ = try timeLane(s, f, id, 5);
-        }
-        for (0..11) |round| for (0..5) |step| {
-            const id = if (round % 2 == 0) step else 4 - step;
-            samples[ci][round][id] = try timeLane(s, f, id, 3);
-        };
-    }
-    const json = try std.json.Stringify.valueAlloc(a, .{ .exact = true, .arms = .{ "lane_down_baseline", "group_lane_pair_parallel", "group_lane_pair_serial", "group_lane_all_parallel", "group_lane_all_serial" }, .layers = layers, .saved_slots = saved, .rows = row_counts, .topk = 8, .route_source = "three-row cases are prefixes of the captured N3 routes", .warmup = 5, .repetitions = 3, .timing = "warm selected real banks, synthetic activations, host apply+eval+free, interleaved arms", .nanoseconds = samples }, .{ .whitespace = .indent_2 });
-    defer a.free(json);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
 }

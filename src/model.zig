@@ -1369,9 +1369,7 @@ pub const ModelConfig = struct {
     /// vendor documents thinking-on AND the shipped template agrees — never
     /// inferred from "the template mentions enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
-        if (think_effort_flag) |e| if (effortArms(self.model_type)) |arms| {
-            if (findEffortArm(arms, e) != null) return e != .off;
-        };
+        if (thinkFlagArm(self.model_type)) |arm| return arm.effort != .off;
         // The checkpoint's own declared default outranks the arch allowlist:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
@@ -4459,17 +4457,32 @@ pub fn mimoMtpResidentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir:
 pub const served_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next" };
 
 /// The engine's thinking-effort vocabulary. Each served arch accepts a subset
-/// (`effortArms`); a word outside it is refused, never rounded.
-pub const Effort = enum { off, on, low, medium, high, xhigh, max };
+/// (`effortArms`); a word outside it is refused, never rounded (`selectEffort`
+/// has the one exception).
+pub const Effort = enum { off, on, minimal, low, medium, high, xhigh, max };
 
 /// Explicit --think default for serving, CLI and later model loads.
 pub var think_effort_flag: ?Effort = null;
 
+/// The arm `--think` selects on this arch; null leaves the model on its own default.
+fn thinkFlagArm(model_type: []const u8) ?EffortArm {
+    const e = think_effort_flag orelse return null;
+    return armForWord(effortArms(model_type) orelse return null, @tagName(e));
+}
+
 pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
-    if (think_effort_flag) |e| if (effortArms(config.model_type)) |arms| {
-        if (findEffortArm(arms, e) != null) return @tagName(e);
-    };
+    if (thinkFlagArm(config.model_type)) |arm| return @tagName(arm.effort);
     return if (config.isGlm5()) "high" else null;
+}
+
+/// The word a request naming no effort runs at (`/v1/models` `default_reasoning_effort`).
+pub fn defaultReasoningEffort(config: *const ModelConfig) ?[]const u8 {
+    const arms = effortArms(config.model_type) orelse return null;
+    if (defaultEffortWord(config)) |w| return w;
+    if (!config.defaultEnableThinking(false)) return "off";
+    // Silence renders the cheapest thinking level (`chat.qwen38EffortFor`).
+    for (arms) |a| if (a.effort != .off) return @tagName(a.effort);
+    return null;
 }
 
 /// One accepted effort word on one arch. `budget` is the decode-time thinking
@@ -4504,8 +4517,8 @@ pub fn effortArms(model_type: []const u8) ?[]const EffortArm {
     return null;
 }
 
-/// `none` is an alias of off. `minimal` is not an engine word: it keeps the
-/// legacy ladder on every arch.
+/// `none` is an alias of off. No served table lists `minimal`; inherited arches
+/// keep its legacy budget (`responses.effortBudget`).
 pub fn parseEffort(word: []const u8) ?Effort {
     if (std.mem.eql(u8, word, "none")) return .off;
     return std.meta.stringToEnum(Effort, word);
@@ -4514,6 +4527,21 @@ pub fn parseEffort(word: []const u8) ?Effort {
 pub fn findEffortArm(arms: []const EffortArm, effort: Effort) ?EffortArm {
     for (arms) |a| if (a.effort == effort) return a;
     return null;
+}
+
+/// The effort `e` selects on a model offering `offered`; null = refused. On an
+/// on/off model (mimo_v2) every thinking word selects `on`.
+pub fn selectEffort(offered: []const Effort, e: Effort) ?Effort {
+    if (std.mem.indexOfScalar(Effort, offered, e) != null) return e;
+    return if (e != .off and std.mem.indexOfScalar(Effort, offered, .on) != null) .on else null;
+}
+
+/// The arm a client's effort word selects (`selectEffort`); null = refused.
+pub fn armForWord(arms: []const EffortArm, word: []const u8) ?EffortArm {
+    var offered: [std.enums.values(Effort).len]Effort = undefined;
+    for (arms, 0..) |a, i| offered[i] = a.effort;
+    const e = selectEffort(offered[0..arms.len], parseEffort(word) orelse return null) orelse return null;
+    return findEffortArm(arms, e);
 }
 
 pub fn isServedArch(model_type: []const u8) bool {
@@ -4537,10 +4565,6 @@ pub fn loadWeightsForConfig(
         log.err("model_type \"{s}\" is not served by this build (qwen4_exp, mimo_v2, glm5_next only)\n", .{config.model_type});
         return error.ArchitectureUnsupported;
     }
-    if (think_effort_flag) |e| if (findEffortArm(effortArms(config.model_type).?, e) == null) {
-        log.err("--think {s} is not supported by {s}\n", .{ @tagName(e), config.model_type });
-        return error.ThinkingUnsupported;
-    };
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
         if (config.expert_streaming) return error.ExpertStreamingUnsupportedLayout;
@@ -5469,7 +5493,8 @@ test "effortArms: every engine word on each served arch" {
             } else try testing.expect(got == null);
         }
     }
-    try testing.expect(parseEffort("minimal") == null);
+    // `minimal` parses but no served table lists it.
+    for (served_model_types) |t| try testing.expect(findEffortArm(effortArms(t).?, parseEffort("minimal").?) == null);
     try testing.expect(parseEffort("ultra") == null);
     // Inherited arches keep the legacy ladder.
     try testing.expect(effortArms("qwen3_5_moe") == null);
@@ -9498,11 +9523,66 @@ test "thinking policy launch defaults are model-specific and preserve GLM high" 
     think_effort_flag = .low;
     try testing.expectEqualStrings("low", defaultEffortWord(&glm).?);
     try testing.expectEqualStrings("low", defaultEffortWord(&qwen).?);
-    try testing.expect(defaultEffortWord(&mimo) == null);
+    try testing.expectEqualStrings("on", defaultEffortWord(&mimo).?);
     think_effort_flag = .off;
     try testing.expect(!qwen.defaultEnableThinking(false));
     try testing.expect(!mimo.defaultEnableThinking(false));
     try testing.expect(glm.defaultEnableThinking(false));
+}
+
+test "thinking policy: --think binds the models that take it, the rest keep their own default" {
+    const saved = think_effort_flag;
+    defer think_effort_flag = saved;
+    const glm = ModelConfig{ .model_type = "glm5_next" };
+    const mimo = ModelConfig{ .model_type = "mimo_v2" };
+    const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    think_effort_flag = .on;
+    try testing.expect(!qwen.defaultEnableThinking(false));
+    try testing.expect(defaultEffortWord(&qwen) == null);
+    try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
+    for ([_]Effort{ .low, .medium, .high, .xhigh, .max }) |e| {
+        think_effort_flag = e;
+        try testing.expectEqualStrings("on", defaultEffortWord(&mimo).?);
+        try testing.expect(mimo.defaultEnableThinking(false));
+    }
+    think_effort_flag = .minimal;
+    try testing.expectEqualStrings("on", defaultEffortWord(&mimo).?);
+    try testing.expect(defaultEffortWord(&qwen) == null);
+    think_effort_flag = .off;
+    try testing.expectEqualStrings("off", defaultEffortWord(&mimo).?);
+    try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
+    try testing.expectEqual(@as(?Effort, .on), selectEffort(&.{ .off, .on }, .max));
+    try testing.expectEqual(@as(?Effort, .off), selectEffort(&.{ .off, .on }, .off));
+    try testing.expectEqual(@as(?Effort, null), selectEffort(&.{ .low, .high, .max }, .off));
+    try testing.expectEqual(@as(?Effort, null), selectEffort(&.{ .off, .low, .medium, .xhigh }, .minimal));
+    // A model loaded on demand never fails its load over the flag.
+    think_effort_flag = .on;
+    if (loadWeightsForConfig(testing.io, testing.allocator, "/nonexistent/sushi-think-gate", &qwen, false)) |w| {
+        var owned = w;
+        owned.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expect(err != error.ThinkingUnsupported);
+}
+
+test "thinking policy: default_reasoning_effort is the word a request naming none runs at" {
+    const saved = think_effort_flag;
+    defer think_effort_flag = saved;
+    const glm = ModelConfig{ .model_type = "glm5_next" };
+    const mimo = ModelConfig{ .model_type = "mimo_v2" };
+    const mimo_off = ModelConfig{ .model_type = "mimo_v2", .gen_enable_thinking = false };
+    const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    const qwen_on = ModelConfig{ .model_type = "qwen4_exp", .gen_enable_thinking = true };
+    think_effort_flag = null;
+    try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
+    try testing.expectEqualStrings("on", defaultReasoningEffort(&mimo).?);
+    try testing.expectEqualStrings("off", defaultReasoningEffort(&mimo_off).?);
+    try testing.expectEqualStrings("off", defaultReasoningEffort(&qwen).?);
+    try testing.expectEqualStrings("low", defaultReasoningEffort(&qwen_on).?);
+    try testing.expect(defaultReasoningEffort(&ModelConfig{ .model_type = "llama" }) == null);
+    think_effort_flag = .xhigh;
+    try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
+    try testing.expectEqualStrings("on", defaultReasoningEffort(&mimo_off).?);
+    try testing.expectEqualStrings("xhigh", defaultReasoningEffort(&qwen).?);
 }
 
 test "GLM vision config rejects unsupported tower geometry and accepts a text-only checkpoint" {

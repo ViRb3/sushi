@@ -17,7 +17,7 @@ fn defaultEffort(entries: anytype, model: []const u8) []const u8 {
     for (entries) |e| {
         if (!std.mem.eql(u8, e.id, model)) continue;
         const values = effortsFor(e);
-        for ([_][]const u8{ "medium", "high", "xhigh", "low", "max" }) |want| {
+        for ([_][]const u8{ "medium", "high", "xhigh", "low", "max", "on" }) |want| {
             for (values) |value| if (std.mem.eql(u8, want, value)) return value;
         }
         return values[0];

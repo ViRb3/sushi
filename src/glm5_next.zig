@@ -1,4 +1,4 @@
-//! GLM-5.3-Flash forward primitives. The architecture is not yet served.
+//! GLM-5.3-Flash forward primitives: mHC collapse/expand and the KDA recurrence.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 

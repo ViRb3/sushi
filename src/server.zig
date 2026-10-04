@@ -2922,7 +2922,7 @@ fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system
 
 /// How far under the enforced wired limit a plan may reach: past the limit Metal returns
 /// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
-pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 8 << 30;
+pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 4 << 30;
 
 /// PURE: the floor an explicitly raised `iogpu.wired_limit_mb` puts under the ceiling; 0 when
 /// the sysctl is absent or at the macOS default (75% of RAM), which leaves the ceiling as is.
@@ -7281,7 +7281,7 @@ fn renderModelEntry(
         try mods.append(allocator, ']');
 
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
-        const efforts_part = try reasoningEffortsJson(allocator, model_mod.effortArms(config.model_type));
+        const efforts_part = try reasoningEffortsJson(allocator, config);
         defer allocator.free(efforts_part);
         const drafter_loaded = entry.drafter != null or entry.dflash != null;
         const mtp_loaded = entry.mtp != null;
@@ -7456,6 +7456,8 @@ fn renderModelEntry(
         break :blk try b.toOwnedSlice(allocator);
     };
     defer allocator.free(caps_part);
+    const efforts_part = try reasoningEffortsJson(allocator, &.{ .model_type = entry.arch_hint, .gen_enable_thinking = sm.enable_thinking });
+    defer allocator.free(efforts_part);
 
     const mods_part: []const u8 = if (streaming_required)
         ",\"input_modalities\":[\"text\"]"
@@ -7514,8 +7516,8 @@ fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, streaming_part, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":"{s}","object":"model","created":0,"owned_by":"sushi","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, state_str, bytes_on_disk_str, streaming_part, err_part, top_ctx_part, caps_part, efforts_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 fn handleModels(allocator: std.mem.Allocator, stream: *Conn) !void {
@@ -8538,7 +8540,8 @@ fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) EscapedText
 }
 
 /// `effort` is the client's raw string, borrowed from the parsed request JSON
-/// (which outlives the handler) — dsv4-family templates map it into the
+/// (which outlives the handler), or on a served arch the selected arm's static
+/// word — dsv4-family templates map it into the
 /// render via `chat.dsv4EffortFor`; every other consumer only reads
 /// enable/budget.
 const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null };
@@ -8565,14 +8568,13 @@ fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_
 /// One effort word → one thinking config, whatever field carried the word —
 /// OpenAI's flat `reasoning_effort`, Responses' `reasoning.effort` and
 /// Anthropic's `output_config.effort` must not drift on what "low" means.
-/// `arms` is the model's `model.effortArms` table; a word outside it is refused.
+/// `arms` is the model's `model.effortArms` table, read through `model.armForWord`.
 fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consumes_effort: bool, arms: ?[]const model_mod.EffortArm) error{EffortRefused}!ReasoningEffort {
     if (arms) |table| {
-        const e = model_mod.parseEffort(word) orelse return error.EffortRefused;
-        const arm = model_mod.findEffortArm(table, e) orelse return error.EffortRefused;
-        if (e == .off) return .{ .enable = false, .budget = default_budget, .effort = word };
+        const arm = model_mod.armForWord(table, word) orelse return error.EffortRefused;
+        if (arm.effort == .off) return .{ .enable = false, .budget = default_budget, .effort = word };
         const budget = if (template_consumes_effort) default_budget else arm.budget orelse default_budget;
-        return .{ .enable = true, .budget = budget, .effort = word };
+        return .{ .enable = true, .budget = budget, .effort = @tagName(arm.effort) };
     }
     if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
     // Where the TEMPLATE reads the effort word, the word is the behavioral
@@ -8595,14 +8597,16 @@ fn effortRefusal(allocator: std.mem.Allocator, word: []const u8, model_name: []c
     return out.toOwnedSlice(allocator);
 }
 
-/// The `/v1/models` row field listing the accepted effort words; "" for an arch without a table.
-fn reasoningEffortsJson(allocator: std.mem.Allocator, arms: ?[]const model_mod.EffortArm) ![]u8 {
-    const table = arms orelse return allocator.dupe(u8, "");
+/// The `/v1/models` row fields listing the accepted effort words and the one a request
+/// naming none runs at; "" for an arch without a table.
+fn reasoningEffortsJson(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig) ![]u8 {
+    const table = model_mod.effortArms(config.model_type) orelse return allocator.dupe(u8, "");
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, ",\"reasoning_efforts\":[");
     for (table, 0..) |a, i| try out.print(allocator, "{s}\"{s}\"", .{ if (i > 0) "," else "", @tagName(a.effort) });
     try out.append(allocator, ']');
+    if (model_mod.defaultReasoningEffort(config)) |w| try out.print(allocator, ",\"default_reasoning_effort\":\"{s}\"", .{w});
     return out.toOwnedSlice(allocator);
 }
 
@@ -20123,7 +20127,8 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     defer wired_limit_mb_override = saved;
     wired_limit_mb_override = 120_000;
 
-    try t.expectEqual(@as(u64, 111_808), wiredLimitFloor(120_000 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES) / mb);
+    try t.expectEqual(@as(u64, 4 << 30), WIRED_LIMIT_MARGIN_BYTES);
+    try t.expectEqual(@as(u64, 115_904), wiredLimitFloor(120_000 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES) / mb);
     // The macOS default (75% of RAM) and anything under it declares nothing; and however
     // absurd the sysctl, never plan within the margin of physical RAM.
     try t.expectEqual(@as(u64, 0), wiredLimitFloor(98_304 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES));
@@ -20164,7 +20169,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     try t.expectEqual(@as(u64, 11_388), needed / mb);
     try t.expect(needed > gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
     const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
-    try t.expectEqual(@as(u64, 24_086), (lifted -| footprint) / mb);
+    try t.expectEqual(@as(u64, 28_182), (lifted -| footprint) / mb);
     try t.expect(needed <= lifted -| footprint);
 }
 
@@ -21740,9 +21745,8 @@ test "reasoningEffortFromWord: a served arch's table refuses words outside it, n
     try std.testing.expectEqualStrings("xhigh", (try reasoningEffortFromWord("xhigh", -1, false, qwen)).effort.?);
     // An uncapped arm takes `--reasoning-budget`.
     try std.testing.expectEqual(@as(i32, 4096), (try reasoningEffortFromWord("on", 4096, false, mimo)).budget);
-    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("medium", -1, false, mimo));
-    // Inherited arches keep the legacy ladder; served models accept only native words.
-    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, false, mimo));
+    try std.testing.expectEqual(@as(i32, 4096), (try reasoningEffortFromWord("medium", 4096, false, mimo)).budget);
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, false, qwen));
     try std.testing.expect((try reasoningEffortFromWord("ultra", -1, false, null)).enable);
 }
 
@@ -21752,12 +21756,70 @@ test "effort refusal and /v1/models list name the model's accepted words" {
     const msg = try effortRefusal(allocator, "high", "Qwen3.8-Flash-Next-EXL3-K4", qwen);
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("reasoning effort 'high' is not supported by Qwen3.8-Flash-Next-EXL3-K4; use one of: off, low, medium, xhigh", msg);
-    const row = try reasoningEffortsJson(allocator, qwen);
+    const row = try reasoningEffortsJson(allocator, &.{ .model_type = "qwen4_exp" });
     defer allocator.free(row);
-    try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"]", row);
-    const legacy = try reasoningEffortsJson(allocator, null);
+    try std.testing.expectEqualStrings(",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"default_reasoning_effort\":\"off\"", row);
+    const legacy = try reasoningEffortsJson(allocator, &.{ .model_type = "llama" });
     defer allocator.free(legacy);
     try std.testing.expectEqualStrings("", legacy);
+}
+
+test "/v1/models rows, loaded or not, name each model's effort words and the one a silent request runs at" {
+    const t = std.testing;
+    const io = t.io;
+    const saved = model_mod.think_effort_flag;
+    defer model_mod.think_effort_flag = saved;
+    model_mod.think_effort_flag = null;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat_template.jinja", .data = "{{ messages }}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var chat_cfg = chat_mod.ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = t.allocator };
+    const Case = struct { arch: []const u8, gen: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .arch = "qwen4_exp", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"default_reasoning_effort\":\"off\"" },
+        .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":true}}", .want = ",\"default_reasoning_effort\":\"low\"" },
+        .{ .arch = "mimo_v2", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"on\"],\"default_reasoning_effort\":\"on\"" },
+        .{ .arch = "glm5_next", .gen = "{}", .want = ",\"reasoning_efforts\":[\"low\",\"high\",\"max\"],\"default_reasoning_effort\":\"high\"" },
+    }) |c| {
+        const config_json = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"{s}\"}}", .{c.arch});
+        defer t.allocator.free(config_json);
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
+        try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = c.gen });
+        var cfg = model_mod.ModelConfig{ .model_type = c.arch, .gen_enable_thinking = model_mod.parseGenerationDefaultsFromJson(c.gen).enable_thinking };
+        var entry = model_registry_mod.LoadedModel{
+            .allocator = t.allocator,
+            .id = "m",
+            .path = path,
+            .bytes_on_disk = 0,
+            .arch_hint = c.arch,
+            .config = &cfg,
+            .weights = null,
+            .transformer = null,
+            .tokenizer = null,
+            .chat_config = &chat_cfg,
+            .vision_encoder = null,
+            .drafter = null,
+            .drafter_path = "",
+            .drafter_block_size = 0,
+            .prefix_cache = null,
+            .refcount = std.atomic.Value(u32).init(0),
+            .last_used_ns = 0,
+            .bytes_resident = 0,
+            .state = .ready,
+            .error_name = null,
+        };
+        const loaded = try renderModelEntry(t.allocator, io, &entry);
+        defer t.allocator.free(loaded);
+        try t.expect(std.mem.indexOf(u8, loaded, c.want) != null);
+        entry.state = .unloaded;
+        entry.config = null;
+        entry.chat_config = null;
+        const stub = try renderModelEntry(t.allocator, io, &entry);
+        defer t.allocator.free(stub);
+        try t.expect(std.mem.indexOf(u8, stub, c.want) != null);
+    }
 }
 
 test "resolveEnableThinking: an explicit request value outranks the arch default, silence takes it" {
@@ -25944,11 +26006,10 @@ test "GLM serving memory bills one BF16 latent and pooled index per token" {
     try std.testing.expect(prefillTransientReserveAtKv(&cfg, 16, 2048, 500000) < 6 * 1024 * 1024 * 1024);
 }
 
-test "thinking policy HTTP accepts only each original model vocabulary" {
+test "thinking policy HTTP: Qwen and GLM accept their own words, MiMo takes every thinking word as on" {
     for ([_]struct { arch: []const u8, accepted: []const model_mod.Effort }{
         .{ .arch = "glm5_next", .accepted = &.{ .low, .high, .max } },
         .{ .arch = "qwen4_exp", .accepted = &.{ .off, .low, .medium, .xhigh } },
-        .{ .arch = "mimo_v2", .accepted = &.{ .on, .off } },
     }) |c| {
         for (std.enums.values(model_mod.Effort)) |e| {
             if (std.mem.indexOfScalar(model_mod.Effort, c.accepted, e) != null) {
@@ -25958,6 +26019,14 @@ test "thinking policy HTTP accepts only each original model vocabulary" {
         }
         try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", -1, true, model_mod.effortArms(c.arch)));
     }
+    const mimo = model_mod.effortArms("mimo_v2");
+    for ([_][]const u8{ "on", "minimal", "low", "medium", "high", "xhigh", "max" }) |w| {
+        const got = try reasoningEffortFromWord(w, -1, true, mimo);
+        try std.testing.expect(got.enable);
+        try std.testing.expectEqualStrings("on", got.effort.?);
+    }
+    for ([_][]const u8{ "off", "none" }) |w| try std.testing.expect(!(try reasoningEffortFromWord(w, -1, true, mimo)).enable);
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, true, mimo));
 }
 
 test "GLM serving DFlash2 bill includes the bounded window captures replay and scratch" {

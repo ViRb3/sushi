@@ -1,13 +1,9 @@
-//! Isolated exact A6 masked-coefficient hoist; original row arithmetic retained.
+//! Exact A6 masked-coefficient hoist; original row arithmetic retained.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
 const Ops = @import("glm5_model.zig").Ops;
 const Linear = @import("glm5_model.zig").Linear;
-pub fn enabled() bool {
-    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_A6_HOIST");
-}
-
 // The per-row dot/update order is inherited from glm5_decode's MLX-derived qmv_fast.
 const SOURCE =
     \\const int lane = int(thread_index_in_simdgroup);

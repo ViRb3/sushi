@@ -30,11 +30,8 @@ doc for the area before changing it, and update it in the same landing.
 | doc | what it holds |
 |---|---|
 | [docs/arch-qwen4exp.md](docs/arch-qwen4exp.md) | Flash-Next trunk, hyper-connections, n-gram PLE table, oracle and ties, packs on this box |
-| [docs/glm5-benchmark-http.md](docs/glm5-benchmark-http.md) | Loopback native GLM diagnostic HTTP bridge, llmprobe protocol and bounded DFlash context |
-| [docs/glm5-dflash-affine-storage.md](docs/glm5-dflash-affine-storage.md) | Stored A4/A6/A8 assistant validation and matched drafting evidence |
-| [docs/glm5-decode-attention-batch.md](docs/glm5-decode-attention-batch.md) | Optional native B1/B3 attention, target drift and 2K–32K qualification |
-| [docs/glm5-packed32-result.md](docs/glm5-packed32-result.md) | Optional B32 prefill, exact component/model proofs and conservative reservation |
-| [docs/arch-glm5-next.md](docs/arch-glm5-next.md) | GLM serving/runtime, measurements, plans and audit index |
+| [docs/arch-glm5-next.md](docs/arch-glm5-next.md) | GLM geometry, serving, DFlash2, bills, speed, KLD, lessons |
+| [docs/engine-glm5-kernels.md](docs/engine-glm5-kernels.md) | GLM kernels, exactness rules, drift screen, ruled-out list |
 | [docs/arch-mimo-v2.md](docs/arch-mimo-v2.md) | MiMo checkpoint, FP8 trunk, rank-local QKV, routing/sinks, sliding ring, bills, product policy |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | mlx-serve's pin of `sushi_exl3`, the API it calls, handoff |

@@ -48,7 +48,6 @@ pub fn cloneRequest(source: *const forward.Request) !forward.Request {
     var copy = try forward.Request.init(source.allocator, source.layers.len);
     errdefer copy.deinit();
     copy.offset = source.offset;
-    copy.profile = source.profile;
     copy.decode_async = source.decode_async;
     copy.dense_prefill = source.dense_prefill;
     copy.prefill_async = source.prefill_async;
@@ -98,7 +97,6 @@ fn argmax(logits: Arr, s: mlx.mlx_stream) !u32 {
 }
 
 /// Correctness oracle: one serial forward per node with an isolated ancestor state.
-/// This deliberately does not claim batched tree verification or a decode speedup.
 pub const Verification = struct {
     states: [16]?forward.Request = @splat(null),
     captures: [16]?Captures = @splat(null),
@@ -147,18 +145,11 @@ fn cloneContext(assistant: *const draft.DflashModel, source: *const draft.Dflash
     return copy;
 }
 
-var commit_window_calls: usize = 0;
-pub fn commitWindowCalls() usize {
-    return commit_window_calls;
-}
-
-fn cropCommitContext(assistant: *const draft.DflashModel, next: *draft.DflashCtx) !bool {
+fn cropCommitContext(assistant: *const draft.DflashModel, next: *draft.DflashCtx) !void {
     const cfg = &assistant.config;
-    if (assistant.layers.len != 5 or cfg.block_size != 8 or cfg.sliding_window != 2048 or next.cache.config.scheme != .off or next.cache.step < 2048) return false;
-    const diag = @import("transformer.zig");
-    if (!diag.diagEnvOn("SUSHI_GLM_DFLASH_BLOCK_TAIL") or !diag.diagEnvOn("SUSHI_GLM_DFLASH_COMMIT_WINDOW")) return false;
+    if (assistant.layers.len != 5 or cfg.block_size != 8 or cfg.sliding_window != 2048 or next.cache.config.scheme != .off or next.cache.step < 2048) return;
     for (assistant.layers, next.cache.entries) |layer, entry| {
-        if (layer.layer_type != .sliding_attention or !entry.initialized or entry.ringed or entry.base != 0 or entry.offset != next.cache.step or mlx.mlx_array_dtype(entry.keys) != .bfloat16 or mlx.mlx_array_dtype(entry.values) != .bfloat16) return false;
+        if (layer.layer_type != .sliding_attention or !entry.initialized or entry.ringed or entry.base != 0 or entry.offset != next.cache.step or mlx.mlx_array_dtype(entry.keys) != .bfloat16 or mlx.mlx_array_dtype(entry.values) != .bfloat16) return;
     }
     const keep = cfg.sliding_window - 1;
     const drop = next.cache.step - keep;
@@ -173,7 +164,6 @@ fn cropCommitContext(assistant: *const draft.DflashModel, next: *draft.DflashCtx
     }
     next.cache.step = keep;
     next.base_pos += drop;
-    return true;
 }
 
 fn evaluateContext(context: *draft.DflashCtx) !void {
@@ -196,7 +186,7 @@ pub fn commitVerified(assistant: *const draft.DflashModel, context: *draft.Dflas
     if (verified.states[last].?.offset != verified.offset + accepted.count) return error.InvalidGlmDraftOffset;
     var next_context = try cloneContext(assistant, context);
     errdefer next_context.deinit();
-    const windowed = try cropCommitContext(assistant, &next_context);
+    try cropCommitContext(assistant, &next_context);
     var ops = Ops{ .s = assistant.s };
     defer ops.deinit();
     var projected: [16]Arr = undefined;
@@ -213,7 +203,6 @@ pub fn commitVerified(assistant: *const draft.DflashModel, context: *draft.Dflas
     verified.states[last] = null;
     context.deinit();
     context.* = next_context;
-    if (windowed) commit_window_calls += 1;
     return accepted;
 }
 
@@ -239,15 +228,6 @@ pub fn proposeTree(assistant: *draft.DflashModel, context: *const draft.DflashCt
     return proposeTreeWithChildren(assistant, context, target, pending, max_nodes, 4);
 }
 
-var readout_horizon_calls: usize = 0;
-pub fn readoutHorizonCalls() usize {
-    return readout_horizon_calls;
-}
-fn readoutHorizonEnabled(max_nodes: usize, block_size: usize, mini: bool) bool {
-    if (max_nodes != 2 or block_size != 8 or mini) return false;
-    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_READOUT_HORIZON");
-}
-
 pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, pending: u32, max_nodes: usize, children: usize) !Proposal {
     try validatePair(assistant, target);
     if (max_nodes == 0 or max_nodes > 15 or children == 0 or children > 16 or pending >= target.cfg.vocab_size) return error.InvalidGlmDraftTree;
@@ -261,17 +241,14 @@ pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const dr
     const ids = try ops.own(mlx.mlx_array_new_data(&noise, &[_]c_int{ 1, @intCast(assistant.config.block_size) }, 2, .uint32));
     const embeds = try ops.own(try target.rawEmbedding(ids));
     const hidden = try ops.own(try draft.forwardBlock(assistant, &work, embeds, context.absLen()));
-    const bounded = readoutHorizonEnabled(max_nodes, assistant.config.block_size, assistant.draft_head != null);
+    // A two-node tree reads only the first two draft rows.
+    const bounded = max_nodes == 2 and assistant.config.block_size == 8;
     const readout_input = if (bounded) try ops.slice(hidden, 1, 1, 3) else hidden;
-    const projected = if (assistant.draft_head) |*coarse|
-        try ops.own(try @import("glm5_dflash_mini.zig").project(target.head, coarse, hidden, assistant.s))
-    else
-        try ops.own(try target.projectHead(readout_input));
+    const projected = try ops.own(try target.projectHead(readout_input));
     const transformed = try ops.own(try draft.applyLogitTransforms(projected, assistant.config.output_multiplier, assistant.config.logit_softcap, assistant.s));
-    const logits = if (bounded or assistant.draft_head != null) transformed else try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
+    const logits = if (bounded) transformed else try ops.slice(transformed, 1, 1, @intCast(assistant.config.block_size));
     const selector_input = if (bounded) try ops.slice(hidden, 1, 0, 3) else hidden;
     var lattice = try tree.lattice(assistant.allocator, &assistant.selector.?, assistant.config.selector_top_k, selector_input, logits, pending, assistant.s);
-    if (bounded) readout_horizon_calls += 1;
     defer lattice.deinit(assistant.allocator);
     var branches = try tree.bestFirstTree(assistant.allocator, &lattice, .{ .max_nodes = max_nodes, .children = children });
     defer branches.deinit(assistant.allocator);
@@ -461,7 +438,7 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     try std.testing.expectEqual(@as(usize, 5), round.verified_rows);
     try std.testing.expectEqual(@as(usize, 3) + round.count, request.offset);
     try std.testing.expectEqual(request.offset, context.absLen());
-    const stopped = try roundTreeLayerwise(std.Io.Threaded.global_single_threaded.io(), &assistant, &context, &target, &request, 0, 4, 3, &.{0});
+    const stopped = try roundTreeLayerwiseWithDecisions(std.Io.Threaded.global_single_threaded.io(), &assistant, &context, &target, &request, 0, 4, 3, &.{0}, .serial_rows, 4, null);
     try std.testing.expect(stopped.stopped and stopped.pending == null);
     try std.testing.expectEqual(@as(usize, 1), stopped.verified_rows);
     target.cfg.max_position_embeddings = 4096;
@@ -507,23 +484,6 @@ pub fn loadAssistantStored(io: std.Io, allocator: std.mem.Allocator, directory: 
     errdefer assistant.deinit();
     try validatePair(&assistant, target);
     _ = try assistantStorage(&assistant);
-    if (@import("transformer.zig").diagEnvOn("SUSHI_GLM_DFLASH_MINI_HEAD")) {
-        if (assistant.config.block_size > 8 or assistant.config.selector_top_k > 32 or assistant.config.logit_softcap > 0 or
-            !std.math.isFinite(assistant.config.output_multiplier) or assistant.config.output_multiplier <= 0) return error.UnsupportedGlmMiniHead;
-        const mini = @import("glm5_dflash_mini.zig");
-        assistant.draft_head = try mini.build(target.head, target.s);
-        assistant.draft_head_bits = mini.bits;
-        assistant.draft_head_group = mini.group_size;
-        @import("log.zig").info("[glm-dflash] mini draft readout: {d}-bit/gs{d} -> top-32 -> stored-head re-score; selector top-{d}; {d} resident bytes\n", .{ mini.bits, mini.group_size, assistant.config.selector_top_k, mini.residentBytes(target.head.output, target.head.input) });
-    }
-    return assistant;
-}
-
-/// Retained for callers that explicitly require the original BF16 assistant.
-pub fn loadAssistantBf16(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, target: *const forward.Model) !draft.DflashModel {
-    var assistant = try loadAssistantStored(io, allocator, directory, target);
-    errdefer assistant.deinit();
-    if ((try assistantStorage(&assistant)).affine_linears != 0) return error.GlmDraftRequiresBf16;
     return assistant;
 }
 
@@ -606,7 +566,7 @@ pub const RoundResult = struct {
     verifier: []const u8 = "serial_branch_oracle",
 };
 
-/// Explicit diagnostic entry point; all candidate nodes use the unchanged serial arithmetic.
+/// Test oracle round: every proposed node runs the serial target forward.
 pub fn roundTreeOracle(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32) !RoundResult {
     if (budget == 0) return error.InvalidGlmDraftBudget;
     if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
@@ -638,26 +598,13 @@ test {
     _ = @import("glm5_dflash_model.zig");
 }
 
-pub fn roundTreeLayerwise(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32) !RoundResult {
-    return roundTreeLayerwiseMode(io, assistant, context, target, request, pending, max_nodes, budget, eos, .serial_rows);
-}
-
-pub fn roundTreeLayerwiseMode(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode) !RoundResult {
-    return roundTreeLayerwiseConfigured(io, assistant, context, target, request, pending, max_nodes, budget, eos, mode, 4);
-}
-
 pub const DecisionHook = struct {
     ctx: *anyopaque,
     apply: *const fn (*anyopaque, *@import("glm5_dflash_model.zig").Verified, usize, []const u32) anyerror!void,
 };
 
-pub fn roundTreeLayerwiseConfigured(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode, children: usize) !RoundResult {
-    return roundTreeLayerwiseWithDecisions(io, assistant, context, target, request, pending, max_nodes, budget, eos, mode, children, null);
-}
-
 pub fn roundTreeLayerwiseWithDecisions(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode, children: usize, decisions: ?DecisionHook) !RoundResult {
     if (children == 0 or children > 16) return error.InvalidGlmDraftTree;
-    if (mode == .batched) return error.GlmBatchedVerifyUnqualified;
     try validatePair(assistant, target);
     if (budget == 0) return error.InvalidGlmDraftBudget;
     if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
@@ -683,10 +630,6 @@ pub fn roundTreeLayerwiseWithDecisions(io: std.Io, assistant: *draft.DflashModel
     var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = if (mode == .affine_rows_ffn) "layerwise_tree_affine_ffn_tiles" else if (mode == .affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections" };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
     return result;
-}
-
-test {
-    _ = @import("glm5_dflash_diagnostic.zig");
 }
 
 test {
@@ -766,228 +709,4 @@ test "GLM N2 best-first selection is independent of unused future lattice depths
         try std.testing.expectEqualSlices(i32, original.parents, bounded.parents);
         try std.testing.expectEqualSlices(u32, original.depth, bounded.depth);
     }
-}
-
-test "GLM N2 horizon production head and selector component" {
-    const head_path = std.c.getenv("SUSHI_GLM_HORIZON_HEAD_SHARD") orelse return error.SkipZigTest;
-    const selector_path = std.c.getenv("SUSHI_GLM_HORIZON_SELECTOR_SHARD") orelse return error.MissingGlmDiagnosticInput;
-    const output = std.c.getenv("SUSHI_GLM_HORIZON_OUT") orelse return error.MissingGlmDiagnosticOutput;
-    const s = mlx.gpuStream();
-    var ops = Ops{ .s = s };
-    defer ops.deinit();
-    var arrays = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(arrays);
-    var metadata = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(metadata);
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, head_path, cpu));
-    var head_arrays: [3]Arr = undefined;
-    for ([_][*:0]const u8{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }, 0..) |name, i| {
-        const slot = try ops.slot();
-        try mlx.check(mlx.mlx_map_string_to_array_get(slot, arrays, name));
-        head_arrays[i] = slot.*;
-    }
-    const native = @import("glm5_model.zig");
-    const head = native.Linear{ .w = head_arrays[0], .scales = head_arrays[1], .biases = head_arrays[2], .input = mlx.getShape(head_arrays[1])[1] * 128, .output = mlx.getShape(head_arrays[0])[0] };
-    try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, selector_path, cpu));
-    var selector_arrays: [3]Arr = undefined;
-    for ([_][*:0]const u8{ "candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook", "candidate_selector.hidden_projection.weight" }, 0..) |name, i| {
-        const slot = try ops.slot();
-        try mlx.check(mlx.mlx_map_string_to_array_get(slot, arrays, name));
-        selector_arrays[i] = slot.*;
-    }
-    const selector = draft.Selector{ .pred_codebook = selector_arrays[0], .succ_codebook = selector_arrays[1], .hidden_projection = .{ .w = try ops.transpose(selector_arrays[2], &.{ 1, 0 }), .scales = .{ .ctx = null }, .biases = .{ .ctx = null } } };
-    const key = try ops.slot();
-    try mlx.check(mlx.mlx_random_key(key, 0x53132));
-    const hidden = try ops.slot();
-    try mlx.check(mlx.mlx_random_normal(hidden, &[_]c_int{ 1, 8, head.input }, 3, .bfloat16, 0, 1, key.*, s));
-    try mlx.check(mlx.mlx_array_eval(hidden.*));
-    const original = try head.apply(&ops, hidden.*);
-    const bounded = try head.apply(&ops, try ops.slice(hidden.*, 1, 1, 3));
-    try mlx.check(mlx.mlx_array_eval(original));
-    try mlx.check(mlx.mlx_array_eval(bounded));
-    const vocab: usize = @intCast(head.output);
-    const expected = mlx.mlx_array_data_bfloat16(original) orelse return error.MlxArrayDataNull;
-    const actual = mlx.mlx_array_data_bfloat16(bounded) orelse return error.MlxArrayDataNull;
-    var logit_mismatches: usize = 0;
-    for (0..2 * vocab) |i| if (expected[vocab + i] != actual[i]) {
-        logit_mismatches += 1;
-    };
-    // Use the shipped selector on the same immutable eight-row fixture.
-    var full = try tree.lattice(std.testing.allocator, &selector, 16, hidden.*, try ops.slice(original, 1, 1, 8), 1, s);
-    defer full.deinit(std.testing.allocator);
-    var short = try tree.lattice(std.testing.allocator, &selector, 16, try ops.slice(hidden.*, 1, 0, 3), bounded, 1, s);
-    defer short.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(i32, full.cands[0..32], short.cands);
-    try std.testing.expectEqualSlices(f32, full.unary[0..32], short.unary);
-    try std.testing.expectEqualSlices(f32, full.e0, short.e0);
-    try std.testing.expectEqualSlices(f32, full.e[0..256], short.e);
-    for ([_]usize{ 1, 2, 4 }) |children| {
-        var before = try tree.bestFirstTree(std.testing.allocator, &full, .{ .max_nodes = 2, .children = children });
-        defer before.deinit(std.testing.allocator);
-        var after = try tree.bestFirstTree(std.testing.allocator, &short, .{ .max_nodes = 2, .children = children });
-        defer after.deinit(std.testing.allocator);
-        try std.testing.expectEqualSlices(u32, before.tokens, after.tokens);
-        try std.testing.expectEqualSlices(i32, before.parents, after.parents);
-        try std.testing.expectEqualSlices(u32, before.depth, after.depth);
-    }
-    // Isolated readout+lattice phase only; the proposal hot path has no clocks.
-    var full_ns: [4]u64 = undefined;
-    var horizon_ns: [4]u64 = undefined;
-    for (0..6) |iteration| {
-        for (0..2) |arm| {
-            const use_horizon = (iteration + arm) % 2 == 1;
-            var scope = Ops{ .s = s };
-            defer scope.deinit();
-            const watch = @import("io_util.zig").Stopwatch.init(std.testing.io);
-            const input = if (use_horizon) try scope.slice(hidden.*, 1, 1, 3) else hidden.*;
-            const projected = try head.apply(&scope, input);
-            const logits = if (use_horizon) projected else try scope.slice(projected, 1, 1, 8);
-            const selector_input = if (use_horizon) try scope.slice(hidden.*, 1, 0, 3) else hidden.*;
-            var lat = try tree.lattice(std.testing.allocator, &selector, 16, selector_input, logits, 1, s);
-            defer lat.deinit(std.testing.allocator);
-            var selected = try tree.bestFirstTree(std.testing.allocator, &lat, .{ .max_nodes = 2, .children = 4 });
-            defer selected.deinit(std.testing.allocator);
-            const ns = watch.read();
-            if (iteration >= 2) {
-                if (use_horizon) horizon_ns[iteration - 2] = ns else full_ns[iteration - 2] = ns;
-            }
-        }
-    }
-    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .head_bits = try native.storedAffineBits(head.w, head.scales, head.biases), .vocab = vocab, .hidden = head.input, .selector_rank = mlx.getShape(selector.pred_codebook)[1], .input = "fixed-seed random BF16 hidden, seed 0x53132; real target A6 head and real assistant BF16 selector; no full model loaded", .first_two_logit_bit_mismatches = logit_mismatches, .candidate_rows_equal = 2, .unary_rows_equal = 2, .anchor_and_first_edge_equal = true, .n2_tree_children_equal = .{ 1, 2, 4 }, .timing = "readout+lattice+N2 tree only; four interleaved pairs after two warmup pairs; ns", .full_ns = full_ns, .horizon_ns = horizon_ns }, .{ .whitespace = .indent_2 });
-    defer std.testing.allocator.free(json);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
-    try std.testing.expectEqual(@as(usize, 0), logit_mismatches);
-}
-
-test "GLM assistant commit window actual A6 preserves KV and proposals" {
-    const dir = std.c.getenv("SUSHI_GLM_COMMIT_WINDOW_ASSISTANT") orelse return error.SkipZigTest;
-    const head_path = std.c.getenv("SUSHI_GLM_COMMIT_WINDOW_HEAD_SHARD") orelse return error.MissingGlmDiagnosticInput;
-    const output = std.c.getenv("SUSHI_GLM_COMMIT_WINDOW_OUT") orelse return error.MissingGlmDiagnosticOutput;
-    const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const s = mlx.gpuStream();
-    var assistant = try draft.loadDflashQuant(io, allocator, s, std.mem.span(dir), 0);
-    defer assistant.deinit();
-    var source = try draft.DflashCtx.init(allocator, &assistant, 37);
-    defer source.deinit();
-    source.cache.reserve_tokens = 33024;
-    var ops = Ops{ .s = s };
-    defer ops.deinit();
-    const key = try ops.slot();
-    try mlx.check(mlx.mlx_random_key(key, 0x53132));
-    for (0..5) |li| {
-        const k = try ops.slot();
-        const v = try ops.slot();
-        for ([_]*Arr{ k, v }) |a| try mlx.check(mlx.mlx_random_normal(a, &[_]c_int{ 1, 8, 32768, 128 }, 4, .bfloat16, 0, 1, key.*, s));
-        _ = try source.cache.update(@intCast(li), k.*, v.*, s, 0);
-    }
-    try evaluateContext(&source);
-    const CacheHash = struct {
-        fn run(ctx: *const draft.DflashCtx) ![32]u8 {
-            var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            for (ctx.cache.entries) |entry| for ([_]Arr{ entry.keys, entry.values }) |a| {
-                const data = mlx.mlx_array_data_bfloat16(a) orelse return error.MlxArrayDataNull;
-                hash.update(std.mem.sliceAsBytes(data[0..mlx.mlx_array_size(a)]));
-            };
-            return hash.finalResult();
-        }
-    };
-    const source_hash = try CacheHash.run(&source);
-    var captures: [5]Arr = undefined;
-    for (&captures) |*capture| {
-        const a = try ops.slot();
-        try mlx.check(mlx.mlx_random_normal(a, &[_]c_int{ 1, 3, 4096 }, 3, .bfloat16, 0, 1, key.*, s));
-        capture.* = a.*;
-        try mlx.check(mlx.mlx_array_eval(a.*));
-    }
-    var full = try cloneContext(&assistant, &source);
-    defer full.deinit();
-    try draft.appendContext(&assistant, &full, &captures, source.absLen());
-    try evaluateContext(&full);
-    var windowed = try cloneContext(&assistant, &source);
-    defer windowed.deinit();
-    try std.testing.expect(try cropCommitContext(&assistant, &windowed));
-    try std.testing.expectEqual(source.absLen(), windowed.absLen());
-    try std.testing.expectEqual(@as(usize, 37 + 32768 - 2047), windowed.base_pos);
-    try draft.appendContext(&assistant, &windowed, &captures, source.absLen());
-    try evaluateContext(&windowed);
-    try std.testing.expectEqual(full.absLen(), windowed.absLen());
-    try std.testing.expectEqual(@as(usize, 32768 + 3), full.cache.step);
-    try std.testing.expectEqual(@as(usize, 2050), windowed.cache.step);
-    var compared: usize = 0;
-    for (full.cache.entries, windowed.cache.entries) |old, new| for ([_][2]Arr{ .{ old.keys, new.keys }, .{ old.values, new.values } }) |pair| {
-        const expected = try ops.contiguous(try ops.slice(pair[0], 2, 32768 - 2047, 32768 + 3));
-        const actual = try ops.contiguous(try ops.slice(pair[1], 2, 0, 2050));
-        try mlx.check(mlx.mlx_array_eval(expected));
-        try mlx.check(mlx.mlx_array_eval(actual));
-        const n = mlx.mlx_array_size(expected);
-        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..n], mlx.mlx_array_data_bfloat16(actual).?[0..n]);
-        compared += n;
-    };
-    const noise = try ops.slot();
-    try mlx.check(mlx.mlx_random_normal(noise, &[_]c_int{ 1, 8, 4096 }, 3, .bfloat16, 0, 1, key.*, s));
-    const hidden_full = try ops.own(try draft.forwardBlock(&assistant, &full, noise.*, full.absLen()));
-    const hidden_window = try ops.own(try draft.forwardBlock(&assistant, &windowed, noise.*, windowed.absLen()));
-    try mlx.check(mlx.mlx_array_eval(hidden_full));
-    try mlx.check(mlx.mlx_array_eval(hidden_window));
-    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(hidden_full).?[0 .. 8 * 4096], mlx.mlx_array_data_bfloat16(hidden_window).?[0 .. 8 * 4096]);
-    var arrays = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(arrays);
-    var metadata = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(metadata);
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, head_path, cpu));
-    var head_arrays: [3]Arr = undefined;
-    for ([_][*:0]const u8{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }, 0..) |name, i| {
-        const a = try ops.slot();
-        try mlx.check(mlx.mlx_map_string_to_array_get(a, arrays, name));
-        head_arrays[i] = a.*;
-    }
-    const head = @import("glm5_model.zig").Linear{ .w = head_arrays[0], .scales = head_arrays[1], .biases = head_arrays[2], .input = 4096, .output = mlx.getShape(head_arrays[0])[0] };
-    var logits: [2]Arr = undefined;
-    var lattices: [2]tree.Lattice = undefined;
-    for ([_]Arr{ hidden_full, hidden_window }, 0..) |hidden, arm| {
-        logits[arm] = try ops.own(try draft.applyLogitTransforms(try head.apply(&ops, try ops.slice(hidden, 1, 1, 3)), assistant.config.output_multiplier, assistant.config.logit_softcap, s));
-        lattices[arm] = try tree.lattice(allocator, &assistant.selector.?, 16, try ops.slice(hidden, 1, 0, 3), logits[arm], 1, s);
-    }
-    defer for (&lattices) |*lat| lat.deinit(allocator);
-    const logit_count = mlx.mlx_array_size(logits[0]);
-    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(logits[0]).?[0..logit_count], mlx.mlx_array_data_bfloat16(logits[1]).?[0..logit_count]);
-    try std.testing.expectEqualSlices(i32, lattices[0].cands, lattices[1].cands);
-    try std.testing.expectEqualSlices(f32, lattices[0].unary, lattices[1].unary);
-    try std.testing.expectEqualSlices(f32, lattices[0].e0, lattices[1].e0);
-    try std.testing.expectEqualSlices(f32, lattices[0].e, lattices[1].e);
-    for ([_]usize{ 1, 2, 4 }) |children| {
-        var before = try tree.bestFirstTree(allocator, &lattices[0], .{ .max_nodes = 2, .children = children });
-        defer before.deinit(allocator);
-        var after = try tree.bestFirstTree(allocator, &lattices[1], .{ .max_nodes = 2, .children = children });
-        defer after.deinit(allocator);
-        try std.testing.expectEqualSlices(u32, before.tokens, after.tokens);
-        try std.testing.expectEqualSlices(i32, before.parents, after.parents);
-        try std.testing.expectEqualSlices(u32, before.depth, after.depth);
-    }
-    var original_ns: [4]u64 = undefined;
-    var window_ns: [4]u64 = undefined;
-    for (0..6) |iteration| for (0..2) |arm| {
-        const crop = (iteration + arm) % 2 == 1;
-        const watch = @import("io_util.zig").Stopwatch.init(std.testing.io);
-        var work = try cloneContext(&assistant, &source);
-        defer work.deinit();
-        if (crop) try std.testing.expect(try cropCommitContext(&assistant, &work));
-        try draft.appendContext(&assistant, &work, &captures, source.absLen());
-        try evaluateContext(&work);
-        const ns = watch.read();
-        if (iteration >= 2) {
-            if (crop) window_ns[iteration - 2] = ns else original_ns[iteration - 2] = ns;
-        }
-    };
-    try std.testing.expectEqualSlices(u8, &source_hash, &(try CacheHash.run(&source)));
-    try std.testing.expectEqual(@as(usize, 32768), source.cache.step);
-    try std.testing.expectEqual(@as(usize, 37), source.base_pos);
-    const json = try std.json.Stringify.valueAlloc(allocator, .{ .input = "actual A6 assistant/head, fixedseed BF16 KV32768 +three accepted capture rows +full8 block, base37", .source_hash_unchanged = true, .retained_and_appended_kv_bits_equal = compared, .absolute_length = windowed.absLen(), .window_base = windowed.base_pos, .window_rows = windowed.cache.step, .replacement_capacity = mlx.getShape(windowed.cache.entries[0].keys)[2], .full8_hidden_bits_equal = 8 * 4096, .first_two_readout_bits_equal = logit_count, .lattice_scores_equal = true, .n2_trees_equal = true, .timing = "clone+optionalcrop+acceptedfeatureprojection+KVappend+eval; four alternating pairs after two warmups; ns", .full_ns = original_ns, .window_ns = window_ns }, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(output), .data = json });
 }

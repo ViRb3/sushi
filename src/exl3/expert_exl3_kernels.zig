@@ -1906,13 +1906,6 @@ const INDEXED_PAIR_COOP_SOURCE: [:0]const u8 = blk: {
 var indexed_pair_coop_kernel: KernelSlots = no_kernels;
 var indexed_pair_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var indexed_pair_coop_engaged: bool = false;
-var indexed_pair_coop_calls: usize = 0;
-pub fn pairedCooperativeCalls() usize {
-    return indexed_pair_coop_calls;
-}
-pub fn resetPairedCooperativeCalls() void {
-    indexed_pair_coop_calls = 0;
-}
 
 fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, slots: mlx.mlx_array) !?[2]mlx.mlx_array {
     const xs = mlx.getShape(xg);
@@ -1950,7 +1943,6 @@ fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, t
         _ = mlx.mlx_array_free(value);
     };
     for (&result, 0..) |*value, i| try mlx.check(mlx.mlx_vector_array_get(value, outputs, i));
-    indexed_pair_coop_calls += 1;
     if (!indexed_pair_coop_engaged) {
         indexed_pair_coop_engaged = true;
         if (!@import("builtin").is_test) log.info("[exl3-decode] paired cooperative gate/up engaged inner=f16 k_splits=1\n", .{});
@@ -3234,18 +3226,13 @@ pub fn moeSwigluClamped(
             const gs = mlx.getShape(gate_t);
             const us = mlx.getShape(up_t);
             const ds = mlx.getShape(down_t);
-            if (downLaneEnabled() and out_dtype == .bfloat16 and active_decode.codebook == .mcg and active_decode.window == .w12 and
+            if (out_dtype == .bfloat16 and active_decode.codebook == .mcg and active_decode.window == .w12 and
                 gs[3] == us[3] and gs[3] == ds[3] and gs[3] >= 32 and gs[3] <= 64 and @mod(gs[3], 2) == 0)
             {
                 const prepared = try downLanePrepare(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
                 defer _ = mlx.mlx_array_free(prepared);
-                const result = try downLaneCoop(s, prepared, down_t, slots);
-                down_lane_calls += 1;
-                break :blk result;
+                break :blk try downLaneCoop(s, prepared, down_t, slots);
             }
-            const eligible = hidden == 4096 and mlx.getShape(gate)[1] == 2048 and topk == 8 and out_dtype == .bfloat16 and
-                gs[3] == 36 and us[3] == gs[3] and ds[3] == gs[3] and active_decode.codebook == .mcg and active_decode.window == .w12 and clampedMiddleEnabled(rows);
-            if (eligible) if (try clampedMiddleDownCoop(s, gate, up, down_t, gate_svh, up_svh, down_suh, slots, limit, if (rows == 1) 4 else 8)) |fused| break :blk fused;
             const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
             defer _ = mlx.mlx_array_free(prepared);
             break :blk try indexedGemvCoopF16(s, prepared, down_t, slots);
@@ -9517,17 +9504,6 @@ test "exl3 clamped routing preserves staged bytes at every 2 to 4 bpw rate" {
 }
 
 test "exl3 clamped routing preserves GLM production width bytes" {
-    const previous_lane = lane_pair_enabled;
-    const previous_down = down_lane_enabled;
-    lane_pair_enabled = false;
-    down_lane_enabled = false;
-    defer {
-        lane_pair_enabled = previous_lane;
-        down_lane_enabled = previous_down;
-    }
-    const previous_mode = clamped_middle_enabled;
-    clamped_middle_enabled = .on;
-    defer clamped_middle_enabled = previous_mode;
     const s = mlx.gpuStream();
     const dec = exl3.Decode{ .codebook = .mcg, .window = .w12 };
     setDecodeParams(dec);
@@ -9554,10 +9530,8 @@ test "exl3 clamped routing preserves GLM production width bytes" {
         try mlx.check(mlx.mlx_astype(&x, a[8], .bfloat16, s));
         const old = try clampedSortedReference(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(old);
-        resetClampedMiddleDispatchCount();
         const got = try moeSwigluClamped(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(got);
-        try std.testing.expectEqual(@as(usize, if (rows <= 16) 1 else 0), clampedMiddleDispatchCount());
         var old32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(old32);
         var got32 = mlx.mlx_array_new();
@@ -9881,38 +9855,6 @@ const CLAMPED_MIDDLE_DOWN_SOURCE: [:0]const u8 = blk: {
 const ClampedMiddleKey = struct { input: c_int, output: c_int, slots: c_int, n: u32, limit: c_int, tiles: c_int };
 var clamped_middle_cfgs: CfgCache(ClampedMiddleKey, 8) = .{};
 var clamped_middle_kernels: KernelSlots = no_kernels;
-var clamped_middle_calls: usize = 0;
-var clamped_middle_engaged: bool = false;
-const ClampedMiddleMode = enum { auto, off, on };
-var clamped_middle_enabled: ?ClampedMiddleMode = null;
-fn clampedMiddleModeFor(raw: ?[*:0]const u8) ClampedMiddleMode {
-    const value = std.mem.span(raw orelse return .auto);
-    if (std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "off")) return .off;
-    if (std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "on")) return .on;
-    return .auto;
-}
-fn clampedMiddleModeAllows(mode: ClampedMiddleMode, rows: c_int) bool {
-    if (rows < 1 or rows > DECODE_ROWS_MAX) return false;
-    return switch (mode) {
-        .off => false,
-        .on => true,
-        .auto => rows > 1,
-    };
-}
-fn clampedMiddleEnabled(rows: c_int) bool {
-    const mode = clamped_middle_enabled orelse blk: {
-        const parsed = clampedMiddleModeFor(std.c.getenv("SUSHI_EXL3_CLAMPED_MIDDLE"));
-        clamped_middle_enabled = parsed;
-        break :blk parsed;
-    };
-    return clampedMiddleModeAllows(mode, rows);
-}
-pub fn clampedMiddleDispatchCount() usize {
-    return clamped_middle_calls;
-}
-pub fn resetClampedMiddleDispatchCount() void {
-    clamped_middle_calls = 0;
-}
 
 fn clampedMiddleDownCoop(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, down: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, limit: c_int, tiles: c_int) !?mlx.mlx_array {
     const x = mlx.getShape(ig);
@@ -9944,15 +9886,10 @@ fn clampedMiddleDownCoop(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_vector_array_get(&result, outputs, 0));
-    clamped_middle_calls += 1;
-    if (!clamped_middle_engaged) {
-        clamped_middle_engaged = true;
-        if (!@import("builtin").is_test) log.info("[exl3-decode] clamped middle/down fused inner=f16 k_splits=1\n", .{});
-    }
     return result;
 }
 
-fn clampedMiddleDownCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_int, timing: bool) !void {
+fn clampedMiddleDownCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_int) !void {
     const s = mlx.gpuStream();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -9983,63 +9920,23 @@ fn clampedMiddleDownCase(hidden: usize, inter: usize, rows: usize, rate: u32, ti
     const got = (try clampedMiddleDownCoop(s, planes[0], planes[1], v[2], v[4], up_scale, v[5], v[7], 10, tiles)) orelse return error.TestExpectedMiddleDownFusion;
     defer _ = mlx.mlx_array_free(got);
     try std.testing.expectEqualSlices(u8, try gemvOutBytes(old), try gemvOutBytes(got));
-    if (!timing) return;
-    var durations: [2][100]u64 = undefined;
-    for (0..120) |round| for (0..2) |position| {
-        const arm = if (round % 2 == 0) position else 1 - position;
-        var timer = io_util.Stopwatch.init(std.testing.io);
-        const result = if (arm == 0) blk: {
-            const middle = try midSwigluPrepWithLimit(s, planes[0], planes[1], v[4], up_scale, v[5], v[7], @intCast(inter), @intCast(rows * 8), 10);
-            defer _ = mlx.mlx_array_free(middle);
-            break :blk try indexedGemvCoopF16(s, middle, v[2], v[7]);
-        } else (try clampedMiddleDownCoop(s, planes[0], planes[1], v[2], v[4], up_scale, v[5], v[7], 10, tiles)).?;
-        try mlx.check(mlx.mlx_array_eval(result));
-        if (round >= 20) durations[arm][round - 20] = timer.read();
-        _ = mlx.mlx_array_free(result);
-    };
-    for (&durations) |*d| std.mem.sort(u64, d, {}, std.sort.asc(u64));
-    std.debug.print("[clamped-mid-down] rows={d} tiles={d} separate_us={d:.3} fused_us={d:.3}\n", .{ rows, tiles, @as(f64, @floatFromInt(durations[0][50])) / 1000, @as(f64, @floatFromInt(durations[1][50])) / 1000 });
 }
 
 test "exl3 clamped middle down cooperative fusion preserves F16 bytes" {
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
-    for (0..17) |i| for ([_]c_int{ 4, 8 }) |tiles| try clampedMiddleDownCase(256, 128, 1, @intCast(32 + 2 * i), tiles, false);
-    for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| try clampedMiddleDownCase(4096, 2048, rows, 36, if (rows == 1) 4 else 8, false);
+    for (0..17) |i| for ([_]c_int{ 4, 8 }) |tiles| try clampedMiddleDownCase(256, 128, 1, @intCast(32 + 2 * i), tiles);
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| try clampedMiddleDownCase(4096, 2048, rows, 36, if (rows == 1) 4 else 8);
 }
 
-test "exl3 clamped middle down warmed microbenchmark" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_MIDDLE_DOWN_BENCH"))) return error.SkipZigTest;
-    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    defer setDecodeParams(.mul1);
-    for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| try clampedMiddleDownCase(4096, 2048, rows, 36, if (rows == 1) 4 else 8, true);
-}
-
-test "exl3 clamped middle diagnostic auto off on keep serial conservative" {
-    try std.testing.expectEqual(ClampedMiddleMode.auto, clampedMiddleModeFor(null));
-    try std.testing.expectEqual(ClampedMiddleMode.auto, clampedMiddleModeFor("auto"));
-    try std.testing.expectEqual(ClampedMiddleMode.off, clampedMiddleModeFor("0"));
-    try std.testing.expectEqual(ClampedMiddleMode.off, clampedMiddleModeFor("off"));
-    try std.testing.expectEqual(ClampedMiddleMode.on, clampedMiddleModeFor("1"));
-    try std.testing.expectEqual(ClampedMiddleMode.on, clampedMiddleModeFor("on"));
-    try std.testing.expect(!clampedMiddleModeAllows(.auto, 1));
-    for (2..17) |rows| try std.testing.expect(clampedMiddleModeAllows(.auto, @intCast(rows)));
-    for ([_]c_int{ 1, 2, 16 }) |rows| {
-        try std.testing.expect(clampedMiddleModeAllows(.on, rows));
-        try std.testing.expect(!clampedMiddleModeAllows(.off, rows));
-    }
-    try std.testing.expect(!clampedMiddleModeAllows(.auto, 17));
-    try std.testing.expect(!clampedMiddleModeAllows(.on, 0));
-}
-
-// LANE_QUAD_CANDIDATE: opt-in exact layout; baseline remains the default.
+// Lane-ordered half4 gate/up pair; each row keeps the indexed pair's arithmetic.
 fn lanePairChain(s: mlx.mlx_stream, v: [10]mlx.mlx_array, x: mlx.mlx_array, hidden: c_int, rows: c_int, candidate: bool) ![2]mlx.mlx_array {
     const prepared = if (candidate) try lanePairPrepare(s, x, v[3], v[4], v[7], null, hidden, rows * 8, 8) else try pairPrepareFromTokens(s, x, v[3], v[4], v[7], null, hidden, rows * 8, 8);
     defer _ = mlx.mlx_array_free(prepared[0]);
     defer _ = mlx.mlx_array_free(prepared[1]);
     return (if (candidate) try lanePairCoop(s, prepared[0], prepared[1], v[0], v[1], v[7]) else try indexedPairCoopF16(s, prepared[0], prepared[1], v[0], v[1], v[7])) orelse error.TestExpectedLanePair;
 }
-fn lanePairCase(hidden: usize, inter: usize, rows: usize, rate: u32, timing: bool) !void {
+fn lanePairCase(hidden: usize, inter: usize, rows: usize, rate: u32) !void {
     const s = mlx.gpuStream();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -10062,35 +9959,12 @@ fn lanePairCase(hidden: usize, inter: usize, rows: usize, rate: u32, timing: boo
         _ = mlx.mlx_array_free(v);
     };
     for (expected, actual) |want, got| try std.testing.expectEqualSlices(u8, try gemvOutBytes(want), try gemvOutBytes(got));
-    if (!timing) return;
-    var samples: [2][40]u64 = undefined;
-    for (0..23) |round| for (0..4) |slot| {
-        const arm = if (slot < 2) slot else 3 - slot;
-        var timer = io_util.Stopwatch.init(std.testing.io);
-        const result = try lanePairChain(s, banks, x, @intCast(hidden), @intCast(rows), arm == 1);
-        const evals = mlx.mlx_vector_array_new_data(&result, 2);
-        try mlx.check(mlx.mlx_eval(evals));
-        if (round >= 3) samples[arm][2 * (round - 3) + @intFromBool(slot >= 2)] = timer.read();
-        _ = mlx.mlx_vector_array_free(evals);
-        for (result) |v| {
-            _ = mlx.mlx_array_free(v);
-        }
-    };
-    for (&samples) |*sample| std.mem.sort(u64, sample, {}, std.sort.asc(u64));
-    std.debug.print("[glm-lane-pair] rows={d} old_us={d:.3} half4_us={d:.3} exact=true\n", .{ rows, @as(f64, @floatFromInt(samples[0][20])) / 1000, @as(f64, @floatFromInt(samples[1][20])) / 1000 });
 }
 test "exl3 GLM lane half4 pair exact bytes" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR_TEST"))) return error.SkipZigTest;
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
-    for (0..17) |i| try lanePairCase(256, 128, 3, @intCast(32 + 2 * i), false);
-    for ([_]usize{ 1, 3, 7, 16 }) |rows| try lanePairCase(4096, 2048, rows, 36, false);
-}
-test "exl3 GLM lane half4 pair benchmark" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR_BENCH"))) return error.SkipZigTest;
-    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    defer setDecodeParams(.mul1);
-    for ([_]usize{ 1, 3, 7, 16 }) |rows| try lanePairCase(4096, 2048, rows, 36, true);
+    for (0..17) |i| try lanePairCase(256, 128, 3, @intCast(32 + 2 * i));
+    for ([_]usize{ 1, 3, 7, 16 }) |rows| try lanePairCase(4096, 2048, rows, 36);
 }
 
 const LANE_PREP_SOURCE: [:0]const u8 = blk: {
@@ -10182,11 +10056,10 @@ pub fn lanePairCoop(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg:
         _ = mlx.mlx_array_free(value);
     };
     for (&result, 0..) |*value, i| try mlx.check(mlx.mlx_vector_array_get(value, outputs, i));
-    lane_pair_calls += 1;
     return result;
 }
 
-// GROUP2_SUPPORT: isolated research seam; no production callsites use the candidate.
+// Kernels shared with the DFlash group-of-two expert path in glm_group2.zig.
 pub const Group2Support = struct {
     pub const Slots = KernelSlots;
     pub const empty = no_kernels;
@@ -10196,13 +10069,12 @@ pub const Group2Support = struct {
     pub const lane_middle = downLanePrepare;
     pub const lane_down = downLaneCoop;
     pub const fused_middle_down = clampedMiddleDownCoop;
-    pub const pair_reference = indexedPairCoopF16;
     pub fn makeKernel(storage: *Slots, comptime name: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
         return codebookKernel(storage, name, ins, outs, source);
     }
 };
 
-/// NAX source and helpers shared by the qualified GLM prefill grid permutation.
+/// NAX source and helpers shared by the GLM prefill grid permutation.
 pub const PrefillGridSupport = struct {
     pub const source = GEMM_NAX_SOURCE;
     pub const prepare = pairPrepareFromTokens;
@@ -10223,78 +10095,17 @@ pub const PrefillGridSupport = struct {
     }
 };
 
-var lane_pair_enabled: ?bool = null;
-var lane_pair_calls: usize = 0;
-var lane_chain_calls: usize = 0;
-pub fn lanePairCalls() usize {
-    return lane_pair_calls;
-}
-pub fn resetLanePairCalls() void {
-    lane_pair_calls = 0;
-}
-pub fn lanePairChainCalls() usize {
-    return lane_chain_calls;
-}
-pub fn resetLanePairChainCalls() void {
-    lane_chain_calls = 0;
-}
-fn lanePairEnabled() bool {
-    if (lane_pair_enabled == null) {
-        const value = std.c.getenv("SUSHI_GLM_LANE_PAIR");
-        lane_pair_enabled = if (value == null) true else diagEnvValueOn(value);
-    }
-    return lane_pair_enabled.?;
-}
 fn laneClampedPair(s: mlx.mlx_stream, x: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, sg: mlx.mlx_array, su: mlx.mlx_array, slots: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int) !?[2]mlx.mlx_array {
-    if (!lanePairEnabled() or !mlx.streamIsGpu(s) or active_decode.codebook != .mcg or active_decode.window != .w12 or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
+    if (!mlx.streamIsGpu(s) or active_decode.codebook != .mcg or active_decode.window != .w12 or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
     const gs = mlx.getShape(tg);
     if (gs.len != 4 or !std.mem.eql(c_int, gs, mlx.getShape(tu)) or gs[3] < 32 or gs[3] > 64 or @mod(gs[3], 2) != 0) return null;
     const prepared = try lanePairPrepare(s, x, sg, su, slots, null, hidden, rows * topk, topk);
     defer _ = mlx.mlx_array_free(prepared[0]);
     defer _ = mlx.mlx_array_free(prepared[1]);
-    const pair = try lanePairCoop(s, prepared[0], prepared[1], tg, tu, slots);
-    if (pair != null) lane_chain_calls += 1;
-    return pair;
+    return lanePairCoop(s, prepared[0], prepared[1], tg, tu, slots);
 }
 
-test "exl3 GLM lane half4 full clamped chain bytes and fallback" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR_TEST"))) return error.SkipZigTest;
-    const before = lane_pair_enabled;
-    defer lane_pair_enabled = before;
-    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    defer setDecodeParams(.mul1);
-    for (0..22) |case| {
-        const production = case >= 17;
-        const rows: usize = if (production) ([_]usize{ 1, 3, 4, 7, 16 })[case - 17] else 3;
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = if (production) 4096 else 256, .inter = if (production) 2048 else 128, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = if (production) 36 else @intCast(32 + case * 2) }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 86314 + case, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
-        defer f.deinit();
-        const v = f.arrays;
-        var x = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x);
-        try mlx.check(mlx.mlx_astype(&x, v[8], .bfloat16, mlx.gpuStream()));
-        lane_pair_enabled = false;
-        const expected = try moeSwigluClamped(mlx.gpuStream(), x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
-        defer _ = mlx.mlx_array_free(expected);
-        lane_pair_enabled = true;
-        resetLanePairChainCalls();
-        const actual = try moeSwigluClamped(mlx.gpuStream(), x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
-        defer _ = mlx.mlx_array_free(actual);
-        try std.testing.expectEqual(@as(usize, 1), lanePairChainCalls());
-        try mlx.check(mlx.mlx_array_eval(expected));
-        try mlx.check(mlx.mlx_array_eval(actual));
-        const size = mlx.mlx_array_size(expected);
-        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..size], mlx.mlx_array_data_bfloat16(actual).?[0..size]);
-        const mixed_data = if (case == 0) try arena.allocator().alloc(u16, 8 * 16 * 8 * 36) else f.up_t;
-        if (case == 0) @memset(mixed_data, 0);
-        const mixed = mlx.mlx_array_new_data(mixed_data.ptr, &.{ 8, @intCast((if (production) @as(usize, 4096) else 256) / 16), @intCast((if (production) @as(usize, 2048) else 128) / 16), if (production or case != 0) 32 else 36 }, 4, .uint16);
-        defer _ = mlx.mlx_array_free(mixed);
-        try std.testing.expect((try laneClampedPair(mlx.gpuStream(), x, v[0], mixed, v[3], v[3], v[7], if (production) 4096 else 256, @intCast(rows), 8)) == null);
-    }
-}
-
-// DOWN_LANE_CANDIDATE: opt-in staged layout; production default remains unchanged.
+// Lane-ordered half4 reads for the clamped middle and the down projection.
 fn downLaneReads(comptime source: [:0]const u8, comptime space: []const u8) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     var body = source;
@@ -10305,48 +10116,13 @@ fn downLaneReads(comptime source: [:0]const u8, comptime space: []const u8) [:0]
     return body;
 }
 const DOWN_LANE_MID_SOURCE = metalReplaceAll(MID_SOURCE, "yd[xb + lane", "yd[xb + " ++ LANE_ORDER_SLOT);
-const DOWN_LANE_FUSED_SOURCE = downLaneReads(metalReplaceAll(CLAMPED_MIDDLE_DOWN_SOURCE, "prepared[base + lane", "prepared[base + " ++ LANE_ORDER_SLOT), "threadgroup");
 const DOWN_LANE_COOP_SOURCE = downLaneReads(INDEXED_COOP_SOURCE, "device");
-var down_lane_cfgs: CfgCache(ClampedMiddleKey, 8) = .{};
-var down_lane_kernels: KernelSlots = no_kernels;
 var down_lane_mid_cfgs: CfgCache(MidKey, 8) = .{};
 var down_lane_mid_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var down_lane_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var down_lane_coop_kernel: KernelSlots = no_kernels;
 fn getDownLaneCoopKernel() !mlx.mlx_fast_metal_kernel {
     return codebookKernel(&down_lane_coop_kernel, "sushi_glm_down_lane_coop", &.{ "x", "trellis", "slots" }, &.{"y"}, DOWN_LANE_COOP_SOURCE);
-}
-fn downLaneFused(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, down: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, limit: c_int, tiles: c_int) !?mlx.mlx_array {
-    const x = mlx.getShape(ig);
-    const w = mlx.getShape(down);
-    const ids = mlx.getShape(slots);
-    if (!mlx.streamIsGpu(s) or x.len != 2 or w.len != 4 or ids.len != 1 or
-        !std.mem.eql(c_int, x, mlx.getShape(iu)) or x[0] != ids[0] or x[0] < 1 or x[1] < 128 or x[1] > 8192 or @mod(x[1], 128) != 0 or
-        w[0] < 1 or w[1] < 1 or w[1] > std.math.maxInt(c_int) / 16 or w[1] * 16 != x[1] or w[2] < 1 or w[2] > std.math.maxInt(c_int) / 128 or (tiles != 1 and tiles != 4 and tiles != 8) or @mod(w[2], tiles) != 0 or limit < 1 or limit > 128 or
-        mlx.mlx_array_dtype(ig) != .float16 or mlx.mlx_array_dtype(iu) != .float16 or mlx.mlx_array_dtype(down) != .uint16 or
-        (mlx.mlx_array_dtype(slots) != .uint32 and mlx.mlx_array_dtype(slots) != .int32)) return null;
-    for ([_]mlx.mlx_array{ svhg, svhu, suhd }) |a|
-        if (mlx.mlx_array_dtype(a) != .float16 or !std.mem.eql(c_int, &.{ w[0], x[1] }, mlx.getShape(a))) return null;
-    const rate = try packedRate(w[3]);
-    const key = ClampedMiddleKey{ .input = x[1], .output = w[2] * 16, .slots = x[0], .n = rate.n, .limit = limit, .tiles = tiles };
-    const cfg = down_lane_cfgs.get(key) orelse blk: {
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ x[0], key.output }, 2, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(w[2], tiles) * 128, x[0], 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
-        inline for (.{ .{ "IDIM", key.input }, .{ "ODIM", key.output }, .{ "NHW", @as(c_int, @intCast(rate.n)) }, .{ "CLAMP_LIMIT", limit }, .{ "OTPT", tiles } }) |p|
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, p[0], p[1]));
-        down_lane_cfgs.put(key, c);
-        break :blk c;
-    };
-    const k = try codebookKernel(&down_lane_kernels, "sushi_glm_down_lane_fused", &.{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots" }, &.{"y"}, DOWN_LANE_FUSED_SOURCE);
-    const outputs = try applyOuts(s, k, &.{ ig, iu, down, svhg, svhu, suhd, slots }, cfg, 1);
-    defer _ = mlx.mlx_vector_array_free(outputs);
-    var result = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(result);
-    try mlx.check(mlx.mlx_vector_array_get(&result, outputs, 0));
-    return result;
 }
 fn downLanePrepare(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, svhg: mlx.mlx_array, svhu: mlx.mlx_array, suhd: mlx.mlx_array, slots: mlx.mlx_array, dim: c_int, nslots: c_int, limit: c_int) !mlx.mlx_array {
     const key = MidKey{ .dim = dim, .nslots = nslots, .limit = limit };
@@ -10411,7 +10187,7 @@ fn downLaneCoop(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, slo
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     return out;
 }
-fn downLaneCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_int, timing: bool) !void {
+fn downLaneCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_int) !void {
     const s = mlx.gpuStream();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -10438,138 +10214,22 @@ fn downLaneCase(hidden: usize, inter: usize, rows: usize, rate: u32, tiles: c_in
     const args = DownLaneArgs{ .s = s, .g = planes[0], .u = planes[1], .v = v, .up_scale = up_scale, .inter = @intCast(inter), .slots = @intCast(rows * 8), .tiles = tiles };
     const expected = try downLaneArm(args, 0);
     defer _ = mlx.mlx_array_free(expected);
-    for (1..4) |arm| {
+    for (1..3) |arm| {
         const actual = try downLaneArm(args, arm);
         defer _ = mlx.mlx_array_free(actual);
         try std.testing.expectEqualSlices(u8, try gemvOutBytes(expected), try gemvOutBytes(actual));
     }
-    if (!timing) return;
-    var samples: [4][40]u64 = undefined;
-    for (0..23) |round| for (0..8) |slot| {
-        const arm = if (slot < 4) slot else 7 - slot;
-        var timer = io_util.Stopwatch.init(std.testing.io);
-        const result = try downLaneArm(args, arm);
-        try mlx.check(mlx.mlx_array_eval(result));
-        if (round >= 3) samples[arm][2 * (round - 3) + @intFromBool(slot >= 4)] = timer.read();
-        _ = mlx.mlx_array_free(result);
-    };
-    for (&samples) |*sample| std.mem.sort(u64, sample, {}, std.sort.asc(u64));
-    std.debug.print("[glm-down-lane] rows={d} tiles={d} staged_us={d:.3} fused_us={d:.3} lane_staged_us={d:.3} lane_fused_us={d:.3} exact=true\n", .{ rows, tiles, @as(f64, @floatFromInt(samples[0][20])) / 1000, @as(f64, @floatFromInt(samples[1][20])) / 1000, @as(f64, @floatFromInt(samples[2][20])) / 1000, @as(f64, @floatFromInt(samples[3][20])) / 1000 });
 }
 const DownLaneArgs = struct { s: mlx.mlx_stream, g: mlx.mlx_array, u: mlx.mlx_array, v: [10]mlx.mlx_array, up_scale: mlx.mlx_array, inter: c_int, slots: c_int, tiles: c_int };
 fn downLaneArm(a: DownLaneArgs, arm: usize) !mlx.mlx_array {
     if (arm == 1) return (try clampedMiddleDownCoop(a.s, a.g, a.u, a.v[2], a.v[4], a.up_scale, a.v[5], a.v[7], 10, a.tiles)) orelse error.TestExpectedMiddleDownFusion;
-    if (arm == 3) return (try downLaneFused(a.s, a.g, a.u, a.v[2], a.v[4], a.up_scale, a.v[5], a.v[7], 10, a.tiles)) orelse error.TestExpectedDownLane;
     const mid = if (arm == 2) try downLanePrepare(a.s, a.g, a.u, a.v[4], a.up_scale, a.v[5], a.v[7], a.inter, a.slots, 10) else try midSwigluPrepWithLimit(a.s, a.g, a.u, a.v[4], a.up_scale, a.v[5], a.v[7], a.inter, a.slots, 10);
     defer _ = mlx.mlx_array_free(mid);
     return if (arm == 2) try downLaneCoop(a.s, mid, a.v[2], a.v[7]) else try indexedGemvCoopF16(a.s, mid, a.v[2], a.v[7]);
 }
 test "exl3 GLM down lane exact staged and fused bytes" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_DOWN_LANE_TEST"))) return error.SkipZigTest;
     setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
     defer setDecodeParams(.mul1);
-    for (0..17) |i| try downLaneCase(256, 128, 3, @intCast(32 + 2 * i), 8, false);
-    for ([_]usize{ 1, 4, 8, 16 }) |rows| try downLaneCase(4096, 2048, rows, 36, 8, false);
-}
-test "exl3 GLM down lane staged and fused benchmark" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_DOWN_LANE_BENCH"))) return error.SkipZigTest;
-    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    defer setDecodeParams(.mul1);
-    for ([_]usize{ 1, 4, 8, 16 }) |rows| try downLaneCase(4096, 2048, rows, 36, 8, true);
-}
-
-var down_lane_enabled: ?bool = null;
-var down_lane_calls: usize = 0;
-pub fn downLaneCalls() usize {
-    return down_lane_calls;
-}
-pub fn resetDownLaneCalls() void {
-    down_lane_calls = 0;
-}
-fn downLaneEnabled() bool {
-    if (down_lane_enabled == null) {
-        const value = std.c.getenv("SUSHI_GLM_DOWN_LANE");
-        down_lane_enabled = if (value == null) true else diagEnvValueOn(value);
-    }
-    return down_lane_enabled.?;
-}
-test "exl3 GLM down lane full clamped chain bytes" {
-    if (!diagEnvValueOn(std.c.getenv("SUSHI_GLM_DOWN_LANE_TEST"))) return error.SkipZigTest;
-    const before = down_lane_enabled;
-    const before_pair = lane_pair_enabled;
-    lane_pair_enabled = false;
-    defer lane_pair_enabled = before_pair;
-    defer down_lane_enabled = before;
-    setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
-    defer setDecodeParams(.mul1);
-    for (0..22) |case| {
-        const production = case >= 17;
-        const rows: usize = if (production) ([_]usize{ 1, 3, 4, 7, 16 })[case - 17] else 3;
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        var f = try mimoMoeFixture(arena.allocator(), .{ .hidden = if (production) 4096 else 256, .inter = if (production) 2048 else 128, .e = 8, .rows = rows, .topk = 8, .rate = .{ .n = if (production) 36 else @intCast(32 + case * 2) }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = 86314 + case, .banks = .{ 0.125, 0.25, 0.125, 0.25 }, .x_scale = 8 });
-        defer f.deinit();
-        const v = f.arrays;
-        var x = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x);
-        try mlx.check(mlx.mlx_astype(&x, v[8], .bfloat16, mlx.gpuStream()));
-        down_lane_enabled = false;
-        const expected = try moeSwigluClamped(mlx.gpuStream(), x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
-        defer _ = mlx.mlx_array_free(expected);
-        down_lane_enabled = true;
-        resetDownLaneCalls();
-        const actual = try moeSwigluClamped(mlx.gpuStream(), x, v[0], v[3], v[4], v[1], v[3], v[4], v[2], v[5], v[6], v[7], v[9], 8, 10, .bfloat16);
-        defer _ = mlx.mlx_array_free(actual);
-        try std.testing.expectEqual(@as(usize, 1), downLaneCalls());
-        try mlx.check(mlx.mlx_array_eval(expected));
-        try mlx.check(mlx.mlx_array_eval(actual));
-        const size = mlx.mlx_array_size(expected);
-        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..size], mlx.mlx_array_data_bfloat16(actual).?[0..size]);
-    }
-}
-
-test "GLM fast opt-out lane pair defaults on and preserves explicit controls" {
-    const a = std.testing.allocator;
-    const name = "SUSHI_GLM_LANE_PAIR";
-    const previous_cache = lane_pair_enabled;
-    defer lane_pair_enabled = previous_cache;
-    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    defer {
-        if (previous) |value| {
-            _ = setenv(name, value, 1);
-            a.free(value);
-        } else _ = unsetenv(name);
-    }
-    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
-    lane_pair_enabled = null;
-    try std.testing.expect(lanePairEnabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
-    lane_pair_enabled = null;
-    try std.testing.expect(!lanePairEnabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
-    lane_pair_enabled = null;
-    try std.testing.expect(lanePairEnabled());
-}
-
-test "GLM fast opt-out down lane defaults on and preserves explicit controls" {
-    const a = std.testing.allocator;
-    const name = "SUSHI_GLM_DOWN_LANE";
-    const previous_cache = down_lane_enabled;
-    defer down_lane_enabled = previous_cache;
-    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    defer {
-        if (previous) |value| {
-            _ = setenv(name, value, 1);
-            a.free(value);
-        } else _ = unsetenv(name);
-    }
-    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
-    down_lane_enabled = null;
-    try std.testing.expect(downLaneEnabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
-    down_lane_enabled = null;
-    try std.testing.expect(!downLaneEnabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
-    down_lane_enabled = null;
-    try std.testing.expect(downLaneEnabled());
+    for (0..17) |i| try downLaneCase(256, 128, 3, @intCast(32 + 2 * i), 8);
+    for ([_]usize{ 1, 4, 8, 16 }) |rows| try downLaneCase(4096, 2048, rows, 36, 8);
 }

@@ -935,6 +935,8 @@ pub const StubMeta = struct {
     /// fallback for metadata-less checkpoints lives at the server's stub-cap
     /// site via `model.poolingFromDirName` (one shared rule, no copy here).
     has_embedding: bool = false,
+    /// generation_config.json's thinking default (`ModelConfig.gen_enable_thinking`).
+    enable_thinking: ?bool = null,
     model_type_buf: [64]u8 = @splat(0),
     model_type_len: u8 = 0,
 
@@ -1086,6 +1088,15 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
 
     var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
+    if (dir.openFile(io, "generation_config.json", .{})) |gen| {
+        defer gen.close(io);
+        var gbuf: [4096]u8 = undefined;
+        var gr = gen.reader(io, &gbuf);
+        if (gr.interface.allocRemaining(allocator, .limited(1024 * 1024))) |gen_bytes| {
+            defer allocator.free(gen_bytes);
+            meta.enable_thinking = @import("model.zig").parseGenerationDefaultsFromJson(gen_bytes).enable_thinking;
+        } else |_| {}
+    } else |_| {}
     // A sentence-transformers pooling sidecar marks embedding capability even
     // when config.json says nothing (the load path parses its mode; the stub
     // only needs existence). Issue #116.

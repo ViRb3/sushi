@@ -411,9 +411,6 @@ var post_calls: usize = 0;
 pub fn postDispatchCount() usize {
     return post_calls;
 }
-pub fn resetPostDispatchCount() void {
-    post_calls = 0;
-}
 
 fn postGeometryFits(tokens: c_int, heads: c_int) bool {
     if (tokens < 1 or heads < 1) return false;
@@ -519,50 +516,6 @@ fn stagedPost(ops: *@import("glm5_model.zig").Ops, input: Arr, gate: Arr, norm: 
     const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(epsilon, .float32)));
     const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(norm, .float32));
     return ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, try ops.cast(gate, .float32))), .bfloat16);
-}
-
-fn timePost(input: Arr, gate: Arr, norm: Arr, fused: bool) !u64 {
-    var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
-    defer ops.deinit();
-    var timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
-    const y = if (fused) try ops.own((try post(ops.s, input, gate, norm, 1e-5)).?) else try stagedPost(&ops, input, gate, norm, 1e-5);
-    try mlx.check(mlx.mlx_array_eval(y));
-    return timer.read();
-}
-
-test "GLM KDA fused post warmed benchmark" {
-    const path = std.c.getenv("SUSHI_GLM_POST_BENCH_OUT") orelse return error.SkipZigTest;
-    const count = 100;
-    const BenchCase = struct { rows: c_int, reference_ns: [count]u64, fused_ns: [count]u64 };
-    var results: [3]BenchCase = undefined;
-    for ([_]c_int{ 1, 17, 512 }, &results) |rows, *result| {
-        var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
-        defer ops.deinit();
-        const shape = [_]c_int{ 1, rows, 64, 128 };
-        const input = try ops.ones(&shape, .bfloat16);
-        const gate = try ops.binary(.mul, input, try ops.scalar(0.3, .bfloat16));
-        const norm = try ops.ones(&.{128}, .bfloat16);
-        const values = mlx.mlx_vector_array_new_data(&.{ input, gate, norm }, 3);
-        defer _ = mlx.mlx_vector_array_free(values);
-        try mlx.check(mlx.mlx_eval(values));
-        for (0..16) |_| {
-            _ = try timePost(input, gate, norm, false);
-            _ = try timePost(input, gate, norm, true);
-        }
-        result.rows = rows;
-        for (0..count) |i| {
-            if (i % 2 == 0) {
-                result.reference_ns[i] = try timePost(input, gate, norm, false);
-                result.fused_ns[i] = try timePost(input, gate, norm, true);
-            } else {
-                result.fused_ns[i] = try timePost(input, gate, norm, true);
-                result.reference_ns[i] = try timePost(input, gate, norm, false);
-            }
-        }
-    }
-    const raw = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .results = results, .warmup_pairs = 16, .method = "alternating AB/BA host construction and synchronous eval" }, .{ .whitespace = .indent_2 });
-    defer std.testing.allocator.free(raw);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = raw });
 }
 
 test "GLM KDA fused post validates guards and FP32 norm weights" {

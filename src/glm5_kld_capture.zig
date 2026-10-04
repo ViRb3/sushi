@@ -153,13 +153,6 @@ fn json(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-const teacher_off_flags = [_][:0]const u8{
-    "SUSHI_GLM_LANE_PAIR",            "SUSHI_GLM_DOWN_LANE",        "SUSHI_GLM_KDA_VALUE_ROWS",      "SUSHI_GLM_HC_PREFILL",         "SUSHI_GLM_HC_FUSED",
-    "SUSHI_GLM_A6_DENSE_PREFILL",     "SUSHI_GLM_PREFILL_DIRECT",   "SUSHI_GLM_MLA_PREFILL_BATCH",   "SUSHI_GLM_ATTENTION_PACKED",   "SUSHI_GLM_INDEX_SCORE_NAX",
-    "SUSHI_GLM_INDEX_SCORE_NAX_LONG", "SUSHI_GLM_KDA_KEEP_LEAF",    "SUSHI_GLM_KDA_PREFILL_CLUSTER", "SUSHI_GLM_PREFILL_CADENCE",    "SUSHI_GLM_PREFILL_GRID_TRANSPOSE",
-    "SUSHI_GLM_DECODE_BATCH",         "SUSHI_GLM_PREFILL_PACKED32", "SUSHI_GLM_HC_EXPAND_PREFILL",   "SUSHI_GLM_HC_COLLAPSE_SIMD32", "SUSHI_GLM_PREFILL_EXPERT_PAIR",
-    "SUSHI_GLM_KDA_TREE_CORE",        "SUSHI_EXL3_CLAMPED_MIDDLE",
-};
 
 fn normalizeTeacherTf32() !void {
     if (std.c.getenv("MLX_ENABLE_TF32")) |value| {
@@ -170,11 +163,7 @@ fn normalizeTeacherTf32() !void {
 fn teacherEnvironment() !void {
     try normalizeTeacherTf32();
     if (model.getConfigOverrides() != null) return error.NativeGlmTeacherOverrides;
-    for (teacher_off_flags) |name| {
-        if (std.c.getenv(name)) |v| {
-            if (!std.mem.eql(u8, std.mem.span(v), "0")) return error.NativeGlmTeacherOverrides;
-        } else if (setenv(name, "0", 0) != 0) return error.NativeGlmTeacherEnvironmentFailed;
-    }
+    @import("glm5_model.zig").reference_numerics = true;
 }
 
 /// Widening BF16 to F32 is exact. Any other native dtype is refused, never repaired.
@@ -441,25 +430,32 @@ test "GLM native KLD capture CPU rejects zero norm logits" {
     try std.testing.expectError(error.NativeGlmTeacherZeroNormLogits, exportRow(s, x, &row));
 }
 
-test "GLM standard4 teacher capture defaults only absent numerical flags" {
+test "GLM teacher capture selects reference numerics with TF32 off" {
     const a = std.testing.allocator;
-    const names = [_][:0]const u8{"MLX_ENABLE_TF32"} ++ teacher_off_flags;
-    var previous: [names.len]?[:0]u8 = @splat(null);
-    for (names, &previous) |name, *saved| if (std.c.getenv(name)) |value| {
-        saved.* = try a.dupeSentinel(u8, std.mem.span(value), 0);
-    };
-    defer for (names, previous) |name, saved| {
+    const base = @import("glm5_model.zig");
+    const saved = if (std.c.getenv("MLX_ENABLE_TF32")) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
         if (saved) |value| {
-            _ = setenv(name, value, 1);
+            _ = setenv("MLX_ENABLE_TF32", value, 1);
             a.free(value);
-        } else _ = unsetenv(name);
-    };
-    for (names) |name| _ = unsetenv(name);
+        } else _ = unsetenv("MLX_ENABLE_TF32");
+        base.reference_numerics = false;
+    }
+    _ = unsetenv("MLX_ENABLE_TF32");
+    try std.testing.expect(!base.reference_numerics);
     try teacherEnvironment();
-    for (names) |name| try std.testing.expectEqualStrings("0", std.mem.span(std.c.getenv(name).?));
+    try std.testing.expect(base.reference_numerics);
+    try std.testing.expectEqualStrings("0", std.mem.span(std.c.getenv("MLX_ENABLE_TF32").?));
+    const reference_switches = [_]bool{
+        @import("glm5_hc_prefill.zig").enabled(),
+        @import("glm5_hc_collapse_simd32.zig").enabled(),
+        @import("glm5_kda_prefill_cluster.zig").enabled(),
+        @import("glm5_attention_nax_packed.zig").enabled(),
+        @import("glm5_indexpool_nax.zig").enabled(),
+        @import("glm5_attention_decode_batch.zig").enabled(),
+    };
+    for (reference_switches) |fast| try std.testing.expect(!fast);
+    base.reference_numerics = false;
     _ = setenv("MLX_ENABLE_TF32", "1", 1);
     try std.testing.expectError(error.NativeGlmTeacherRequiresTf32Off, teacherEnvironment());
-    _ = setenv("MLX_ENABLE_TF32", "0", 1);
-    _ = setenv("SUSHI_GLM_HC_PREFILL", "1", 1);
-    try std.testing.expectError(error.NativeGlmTeacherOverrides, teacherEnvironment());
 }

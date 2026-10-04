@@ -1,29 +1,11 @@
-//! Exact physical grid transpose for qualified GLM routed prefill.
+//! Exact physical grid transpose for GLM routed prefill.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const base = @import("expert_exl3_kernels.zig");
 const api = @import("root.zig");
 const support = base.PrefillGridSupport;
 const Arr = mlx.mlx_array;
-threadlocal var enabled_override: ?bool = null;
 var calls: usize = 0;
-pub const Binding = struct {
-    previous: ?bool,
-    pub fn restore(self: Binding) void {
-        enabled_override = self.previous;
-    }
-};
-pub fn bind(on: bool) Binding {
-    const previous = enabled_override;
-    enabled_override = on;
-    return .{ .previous = previous };
-}
-pub fn enabled() bool {
-    return enabled_override orelse blk: {
-        const value = std.c.getenv("SUSHI_GLM_PREFILL_GRID_TRANSPOSE") orelse break :blk true;
-        break :blk std.mem.eql(u8, std.mem.span(value), "1");
-    };
-}
 pub fn dispatchCount() usize {
     return calls;
 }
@@ -81,7 +63,7 @@ fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr
     return true;
 }
 pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode, limit: c_int) !?Arr {
-    if (!enabled() or dec.codebook != .mcg or dec.window != .w12 or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
+    if (dec.codebook != .mcg or dec.window != .w12 or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
     if (std.c.getenv("SUSHI_EXL3_GEMM_WIN")) |value| if (!std.mem.eql(u8, std.mem.span(value), "32")) return null;
     if (std.c.getenv("SUSHI_EXL3_WIN_ALIGN")) |value| if (value[0] == '0') return null;
     base.setDecodeParams(dec);
@@ -140,48 +122,13 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr)
     return shaped;
 }
 
-test "GLM prefill grid opt out restores binding and declines guards before dispatch" {
-    const off = bind(false);
-    defer off.restore();
-    try std.testing.expect(!enabled());
+test "GLM prefill grid declines guards before dispatch" {
     const count = dispatchCount();
     const nil = Arr{ .ctx = null };
     const p = api.Proj{ .trellis = nil, .suh = nil, .svh = nil };
     const bank = api.Bank{ .gate = p, .up = p, .down = p };
-    {
-        const on = bind(true);
-        defer on.restore();
-        try std.testing.expect(enabled());
-        try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mul1, .window = .w12 }, 10)) == null);
-        try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 9)) == null);
-        try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 10)) == null);
-    }
-    try std.testing.expect(!enabled());
+    try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mul1, .window = .w12 }, 10)) == null);
+    try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 9)) == null);
+    try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 10)) == null);
     try std.testing.expectEqual(count, dispatchCount());
-}
-
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-test "GLM fast opt-out grid transpose defaults on and preserves explicit controls" {
-    const a = std.testing.allocator;
-    const name = "SUSHI_GLM_PREFILL_GRID_TRANSPOSE";
-    const previous_cache = enabled_override;
-    defer enabled_override = previous_cache;
-    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    defer {
-        if (previous) |value| {
-            _ = setenv(name, value, 1);
-            a.free(value);
-        } else _ = unsetenv(name);
-    }
-    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
-    enabled_override = null;
-    try std.testing.expect(enabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
-    enabled_override = null;
-    try std.testing.expect(!enabled());
-    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
-    enabled_override = null;
-    try std.testing.expect(enabled());
 }

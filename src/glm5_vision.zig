@@ -344,7 +344,7 @@ fn assertReference(actual: Arr, expected: Arr, stream: mlx.mlx_stream) !void {
     const mimo = @import("mimo_vision.zig");
     const cos = try mimo.cosineSim(actual, expected, stream);
     const ratio = try mimo.rmsRatio(actual, expected, stream);
-    std.debug.print("[glm-vision parity] cosine={d:.7} rms_ratio={d:.7}\n", .{ cos, ratio });
+    errdefer std.debug.print("[glm-vision parity] cosine={d:.7} rms_ratio={d:.7}\n", .{ cos, ratio });
     try std.testing.expect(cos > 0.99995);
     try std.testing.expect(ratio > 0.998 and ratio < 1.002);
 }
@@ -390,7 +390,7 @@ test "GLM vision processor matches original HF padded canvas CLIP pixels and pat
     const want = mlx.mlx_array_data_float32(expected).?[0..patches.len];
     var max_diff: f32 = 0;
     for (want, patches) |v, p| max_diff = @max(max_diff, @abs(v - p));
-    std.debug.print("[glm-vision preprocessing] max_abs={d:.7}\n", .{max_diff});
+    errdefer std.debug.print("[glm-vision preprocessing] max_abs={d:.7}\n", .{max_diff});
     // Torchvision uint8 bicubic and Pillow's uint8 kernel differ by at most one pixel.
     try std.testing.expect(max_diff < 0.016);
     const pad_index: usize = 39 * rs.w + 47;

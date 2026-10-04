@@ -152,9 +152,9 @@ oMLX, by jundot
 Copyright oMLX contributors
 Licensed under the Apache License, Version 2.0.
 
-Used in sushi (`src/glm5_hc_fused.zig`):
+Used in sushi (`src/glm5_hc_prefill.zig`):
 
-  * The one-token HC RMS reduction maps virtual MLX normalization threads
+  * The HC RMS reduction maps virtual MLX normalization threads
     as in `hc_mix1` from `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py`
     at 6745c39c. The following projection retains Sushi's own four-SIMD-group
     reduction order. The MLX-derived normalization arithmetic is MIT licensed.
@@ -403,15 +403,7 @@ The row-identical 8-bit projection kernel in `src/mtp_qmv.zig` adapts
 It shares packed weights across input rows while preserving each serial
 row's lane assignment, reduction order and output rounding.
 
-The isolated affine NAX scheduling experiment in `src/glm5_qmm_prefill.zig`
-and `src/kernels/glm5_qmm_prefill_header.metal` copies MLX
-`steel/gemm/nax.h`, its required steel headers, and the affine quantized loader
-and QMM body from `quantized_nax.h`, at revision
-1f8e74e3f12f31365464a6867c6579f0e9b29d85 (Copyright 2023-2025 Apple Inc.).
-Local includes are flattened and unused quantized symbols omitted; the wrapper
-remaps threadgroup coordinates without modifying the inner arithmetic.
-
-The HC kernel in `src/glm5_hc_fused.zig` adapts the four-value-per-thread
+The HC RMS kernel in `src/glm5_hc_prefill.zig` adapts the four-value-per-thread
 `rms_looped` reduction from MLX `backend/metal/kernels/rms_norm.metal`
 (Copyright 2024 Apple Inc.), also reflected in oMLX's HC normalization helper.
 It reads BF16 residuals directly and retains FP32 normalization before the mix.

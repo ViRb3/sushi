@@ -9,9 +9,8 @@ const kda = @import("glm5_dflash_kda.zig");
 const tree = @import("glm5_dflash_tree.zig");
 const adapter = @import("glm5_dflash.zig");
 const Arr = mlx.mlx_array;
-const profiling = @import("glm5_dflash_profile.zig");
 const Ops = base.Ops;
-// Scoped diagnostic policy; synchronous remains the default until full-model qualification.
+// Layers per asynchronous evaluation group; zero settles every layer synchronously.
 threadlocal var async_layers: usize = 0;
 var async_dispatches: usize = 0;
 var sync_dispatches: usize = 0;
@@ -108,11 +107,8 @@ fn forkAttention(source: *const attention.State) !attention.State {
 
 fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, mode: kda.ProjectionMode) !struct { output: Arr, tape: MlaTape } {
     const native = @import("glm5_attention_decode_batch.zig");
-    const native_mode = native.enabled() and (native.explicitlyRequested() or native.supportedConfig(cfg, mlx.mlx_array_dtype(x), ops.s));
-    if (native_mode) {
-        try native.admit(cfg, .bfloat16, ops.s);
-        if (parents.len > 3) return error.GlmDecodeNativeTreeUnsupported;
-    }
+    const native_mode = native.enabled() and native.supportedConfig(cfg, mlx.mlx_array_dtype(x), ops.s);
+    if (native_mode and parents.len > 3) return error.GlmDecodeNativeTreeUnsupported;
     const t: c_int = @intCast(parents.len);
     const heads: c_int = @intCast(cfg.num_attention_heads);
     const kd: c_int = @intCast(cfg.mla_qk_nope_head_dim);
@@ -130,7 +126,6 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         scratch.live_bytes = scratch.common_bytes + scratch.branches * scratch.per_branch_bytes + native.scratch_limit;
     }
     mla_scratch_bound = @max(mla_scratch_bound, scratch.live_bytes);
-    var profile = profiling.Timer.start(parents.len);
     const qr = try ops.rms(try kda.linearRows(ops, layer.qa, x, mode), layer.qa_norm, cfg.rms_norm_eps);
     const q = try ops.reshape(try kda.linearRows(ops, layer.qb, qr, mode), &.{ t, heads, 1, kd });
     const verify_batch = @import("glm5_mla_verify_batch.zig");
@@ -157,7 +152,6 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     tape.ape = try ops.result(layer.ape);
     // Dense prefixes do not consume index_q/index_weights. Keep them lazy here;
     // sparse branches naturally bill their necessary indexer work in mla_branches.
-    try profile.finish("mla_common", &.{ qa, latent, keys, gates });
     var result_rows: [16]Arr = undefined;
     var attention_rows: [16]Arr = undefined;
     var pending: [16]Arr = undefined;
@@ -232,9 +226,7 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
             result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
         }
     }
-    try profile.finish("mla_branches", result_rows[0..parents.len]);
     const output = try kda.linearRows(ops, layer.out, try ops.concat(result_rows[0..parents.len], 1), mode);
-    try profile.finish("mla_out", &.{output});
     return .{ .output = output, .tape = tape };
 }
 
@@ -332,8 +324,7 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     @memcpy(result.tokens[0..tokens.len], tokens);
     @memcpy(result.parents[0..tokens.len], parents);
     const rows: c_int = @intCast(tokens.len);
-    var embedding_profile = profiling.Timer.start(tokens.len);
-    const cadence = if (embedding_profile.profile != null) 0 else async_layers;
+    const cadence = async_layers;
     var h: Arr = undefined;
     {
         var ops = Ops{ .s = target.s };
@@ -343,18 +334,12 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
         h = try ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(embedding, &.{ 1, rows, 1, @intCast(target.cfg.hidden_size) }), &.{ 1, rows, 4, @intCast(target.cfg.hidden_size) })));
     }
     defer _ = mlx.mlx_array_free(h);
-    try embedding_profile.finish("embedding", &.{h});
     for (target.layers, request.layers, 0..) |*layer, *state, index| {
-        const scope = try profiling.enterLayer(index);
-        defer scope.restore();
-        var profile = profiling.Timer.start(tokens.len);
         var ops = Ops{ .s = target.s };
         defer ops.deinit();
         const pre = try layer.hc_attn.collapse(&ops, h, &target.cfg);
         defer pre.deinit();
-        try profile.finish("hc_attn", &.{ pre.mixed, pre.post, pre.comb });
         const x = try ops.rms(pre.mixed, layer.norm_attn, target.cfg.rms_norm_eps);
-        try profile.finish("attn_norm", &.{x});
         const attended = switch (layer.attn) {
             .kda => |weights| blk: {
                 const computed = try kda.applyLayer(weights, &ops, x, &target.cfg, &state.recurrent, parents, mode);
@@ -367,15 +352,11 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
                 break :blk computed.output;
             },
         };
-        profile = profiling.Timer.start(tokens.len);
         const joined = try ops.own(try primitive.hcExpand(h, attended, pre.post, pre.comb, target.s));
-        try profile.finish("expand_attn", &.{joined});
         const ff = try layer.hc_ffn.collapse(&ops, joined, &target.cfg);
         defer ff.deinit();
-        try profile.finish("hc_ffn", &.{ ff.mixed, ff.post, ff.comb });
         const fx = try ops.rms(ff.mixed, layer.norm_ffn, target.cfg.rms_norm_eps);
-        try profile.finish("ffn_norm", &.{fx});
-        const ffout = if (mode == .affine_rows_ffn) try @import("glm5_dflash_ffn.zig").apply(target, index, &ops, fx) else if (mode == .batched) try target.feedForwardLayer(index, &ops, fx) else blk: {
+        const ffout = if (mode == .affine_rows_ffn) try @import("glm5_dflash_ffn.zig").apply(target, index, &ops, fx) else blk: {
             var outputs: [16]Arr = undefined;
             var made: usize = 0;
             defer for (outputs[0..made]) |value| {
@@ -389,9 +370,7 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
             }
             break :blk try ops.concat(outputs[0..made], 1);
         };
-        try profile.finish("ffn_overall", &.{ffout});
         const next = try ops.own(try primitive.hcExpand(joined, ffout, ff.post, ff.comb, target.s));
-        try profile.finish("expand_ffn", &.{next});
         for (taps, 0..) |id, tap| if (id == index) {
             try mlx.check(mlx.mlx_array_set(&result.captures.hook.out[tap], try ops.reduce(next, 2, true, false)));
         };
@@ -411,12 +390,10 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
                 async_dispatches += 1;
             }
         }
-        profile.record("layer_settle");
         try mlx.check(mlx.mlx_array_set(&h, next));
     }
     var ops = Ops{ .s = target.s };
     defer ops.deinit();
-    var head_profile = profiling.Timer.start(tokens.len);
     const normalized = try ops.rms(try ops.reduce(h, 2, true, false), target.norm, target.cfg.rms_norm_eps);
     const logits = try target.samplingLogits(&ops, try kda.linearRows(&ops, target.head, normalized, mode));
     const decisions = try ops.slot();
@@ -432,7 +409,6 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     }
     try mlx.check(mlx.mlx_eval(final));
     sync_dispatches += 1;
-    head_profile.record("head");
     @memcpy(result.targets[0..tokens.len], (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..tokens.len]);
     result.logits = try ops.result(logits);
     return result;
@@ -442,7 +418,7 @@ test {
     _ = @import("glm5_dflash_memory.zig");
 }
 
-fn profileArrayEqual(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
+fn expectArrayBits(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
     if (a.ctx == null or b.ctx == null) return std.testing.expect(a.ctx == null and b.ctx == null);
     try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
     try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
@@ -457,130 +433,6 @@ fn profileArrayEqual(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(x).?[0..n]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(y).?[0..n]))
     else
         try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(x).?[0..n], mlx.mlx_array_data_bfloat16(y).?[0..n]);
-}
-
-test "GLM DFlash component profiling preserves nonzero captures and complete committed state" {
-    const a = std.testing.allocator;
-    const s = mlx.gpuStream();
-    const profile = @import("glm5_dflash_profile.zig");
-    var weights = @import("model.zig").Weights.init(a);
-    defer weights.deinit();
-    const cfg = try forward.completeFixture(&weights);
-    var iterator = weights.map.iterator();
-    var seed: usize = 13;
-    while (iterator.next()) |entry| {
-        const value = entry.value_ptr;
-        const sh = mlx.getShape(value.*);
-        if (sh.len < 2 or mlx.mlx_array_dtype(value.*) != .bfloat16 or std.mem.endsWith(u8, entry.key_ptr.*, ".scales") or std.mem.endsWith(u8, entry.key_ptr.*, ".biases")) continue;
-        const next = try @import("dflash.zig").TinyFix.bf16ArrShaped(sh, seed, s);
-        _ = mlx.mlx_array_free(value.*);
-        value.* = next;
-        seed += 1;
-    }
-    var codes: [4 * 32]u32 = undefined;
-    for (&codes, 0..) |*v, i| v.* = 0x01030205 + @as(u32, @intCast(i % 4)) * 0x01010101;
-    const embedding = weights.map.getPtr("model.language_model.embed_tokens.weight").?;
-    _ = mlx.mlx_array_free(embedding.*);
-    embedding.* = mlx.mlx_array_new_data(&codes, &.{ 4, 32 }, 2, .uint32);
-    var target = try forward.Model.load(a, cfg, &weights, s);
-    defer target.deinit();
-    var request = try forward.Request.init(a, target.layers.len);
-    defer request.deinit();
-    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32);
-    defer _ = mlx.mlx_array_free(ids);
-    const logits = try target.forwardLast(&request, ids, true);
-    defer _ = mlx.mlx_array_free(logits);
-    try mlx.check(mlx.mlx_array_eval(logits));
-    const tokens = [_]u32{ 1, 0, 2, 0, 3 };
-    const parents = [_]i32{ -1, 0, 0, 1, 2 };
-    const taps = [_]u32{ 0, 3 };
-    const disabled = profile.bind(null);
-    defer disabled.restore();
-    var ordinary = try verify(&target, &request, &tokens, &parents, &taps, .affine_rows_ffn);
-    defer ordinary.deinit();
-    var collected: profile.Profile = .{};
-    var measured = blk: {
-        const binding = profile.bind(&collected);
-        defer binding.restore();
-        break :blk try verify(&target, &request, &tokens, &parents, &taps, .affine_rows_ffn);
-    };
-    defer measured.deinit();
-    var disabled_again = try verify(&target, &request, &tokens, &parents, &taps, .affine_rows_ffn);
-    defer disabled_again.deinit();
-    try std.testing.expectEqualSlices(u32, ordinary.targets[0..ordinary.count], disabled_again.targets[0..disabled_again.count]);
-    for (ordinary.captures.hook.out, disabled_again.captures.hook.out) |left_capture, right_capture| try profileArrayEqual(left_capture, right_capture, s);
-    try std.testing.expectEqualSlices(u32, ordinary.targets[0..ordinary.count], measured.targets[0..measured.count]);
-    for (ordinary.captures.hook.out, measured.captures.hook.out) |left, right| try profileArrayEqual(left, right, s);
-    const capture = measured.captures.hook.out[0];
-    var nonzero = false;
-    const values = try @import("dflash.zig").TinyFix.readF32(capture, a, s);
-    defer a.free(values);
-    for (values) |v| if (v != 0 and std.math.isFinite(v)) {
-        nonzero = true;
-        break;
-    };
-    try std.testing.expect(nonzero);
-    var routes = try profile.RouteCapture.init(a, 4);
-    defer routes.deinit();
-    var captured = blk: {
-        const binding = profile.bindRoutes(&routes);
-        defer binding.restore();
-        try profile.beginRouteRound(7);
-        var candidate = try verify(&target, &request, &tokens, &parents, &taps, .affine_rows_ffn);
-        errdefer candidate.deinit();
-        var single = try verify(&target, &request, tokens[0..1], parents[0..1], &taps, .affine_rows_ffn);
-        defer single.deinit();
-        try std.testing.expectEqual(@as(usize, 1), routes.count);
-        try std.testing.expectEqual(@as(usize, 1), routes.skipped_single_calls);
-        break :blk candidate;
-    };
-    defer captured.deinit();
-    try std.testing.expectEqualSlices(u32, ordinary.targets[0..ordinary.count], captured.targets[0..captured.count]);
-    for (ordinary.captures.hook.out, captured.captures.hook.out) |left_capture, right_capture| try profileArrayEqual(left_capture, right_capture, s);
-    try std.testing.expectEqual(@as(u32, 7), routes.records[0].round_index);
-    try std.testing.expectEqual(@as(u8, 5), routes.records[0].rows);
-    var committed = try ordinary.prepareCommit(&request, 3, &.{}, s);
-    defer committed.deinit();
-    var profiled_commit = try measured.prepareCommit(&request, 3, &.{}, s);
-    defer profiled_commit.deinit();
-    const accepted = try tree.accept(&tokens, &parents, ordinary.targets[0..ordinary.count], 3, &.{});
-    const last = accepted.rows[accepted.count - 1];
-    var captured_commit = try captured.prepareCommit(&request, 3, &.{}, s);
-    defer captured_commit.deinit();
-    const left = committed.states[last].?;
-    const right = profiled_commit.states[last].?;
-    const captured_state = captured_commit.states[last].?;
-    try std.testing.expectEqual(left.offset, captured_state.offset);
-    for (left.layers, captured_state.layers) |x, y| {
-        try profileArrayEqual(x.recurrent.conv_state, y.recurrent.conv_state, s);
-        try profileArrayEqual(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
-        try std.testing.expectEqual(x.attention.processed, y.attention.processed);
-        for (x.attention.arrays(), y.attention.arrays()) |xx, yy| try profileArrayEqual(xx, yy, s);
-    }
-    try std.testing.expectEqual(left.offset, right.offset);
-    for (left.layers, right.layers) |x, y| {
-        try std.testing.expectEqual(x.recurrent.initialized, y.recurrent.initialized);
-        try profileArrayEqual(x.recurrent.conv_state, y.recurrent.conv_state, s);
-        try profileArrayEqual(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
-        try std.testing.expectEqual(x.attention.processed, y.attention.processed);
-        for (x.attention.arrays(), y.attention.arrays()) |xx, yy| try profileArrayEqual(xx, yy, s);
-    }
-    try std.testing.expectEqual(@as(u64, 1), collected.global.embedding.calls);
-    try std.testing.expectEqual(@as(u64, 1), collected.global.head.calls);
-    var kda_calls: u64 = 0;
-    var mla_calls: u64 = 0;
-    for (collected.layers[0..target.layers.len]) |layer| {
-        try std.testing.expectEqual(@as(u64, 1), layer.hc_attn.calls);
-        try std.testing.expectEqual(@as(u64, 1), layer.ffn_overall.calls);
-        try std.testing.expect(layer.ffn_overall.ns > 0);
-        inline for (.{ "kda_qkv", "kda_lowrank_beta", "kda_recurrence", "kda_gate_post", "kda_out" }) |field|
-            try std.testing.expectEqual(layer.kda_prework.calls, @field(layer, field).calls);
-        try std.testing.expectEqual(layer.mla_common.calls, layer.mla_branches.calls);
-        try std.testing.expectEqual(layer.mla_common.calls, layer.mla_out.calls);
-        kda_calls += layer.kda_prework.calls;
-        mla_calls += layer.mla_common.calls;
-    }
-    try std.testing.expect(kda_calls > 0 and mla_calls > 0);
 }
 
 test "GLM latent overlay three-node verifier commits independent serial ancestry" {
@@ -621,7 +473,7 @@ test "GLM latent overlay three-node verifier commits independent serial ancestry
         var captures = Ops{ .s = s };
         defer captures.deinit();
         for (0..3) |row| for (computed.captures.hook.out, oracle.captures[row].?.hook.out) |left, right| {
-            try profileArrayEqual(try captures.slice(left, 1, @intCast(row), @intCast(row + 1)), right, s);
+            try expectArrayBits(try captures.slice(left, 1, @intCast(row), @intCast(row + 1)), right, s);
         };
         for ([_]usize{ 1, 2, 3 }) |budget| {
             var committed = try computed.prepareCommit(&request, budget, &.{}, s);
@@ -632,9 +484,9 @@ test "GLM latent overlay three-node verifier commits independent serial ancestry
             const right = oracle.states[last].?;
             try std.testing.expectEqual(right.offset, left.offset);
             for (left.layers, right.layers) |x, y| {
-                for (x.attention.arrays(), y.attention.arrays()) |u, v| try profileArrayEqual(u, v, s);
-                try profileArrayEqual(x.recurrent.conv_state, y.recurrent.conv_state, s);
-                try profileArrayEqual(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
+                for (x.attention.arrays(), y.attention.arrays()) |u, v| try expectArrayBits(u, v, s);
+                try expectArrayBits(x.recurrent.conv_state, y.recurrent.conv_state, s);
+                try expectArrayBits(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
             }
         }
     }

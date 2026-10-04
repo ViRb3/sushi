@@ -1,4 +1,4 @@
-//! Diagnostic GLM model composition, kept separate from served architecture dispatch.
+//! GLM model forward: mHC-wrapped KDA/MLA layers, routed experts and per-request state.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
@@ -238,26 +238,14 @@ const Moe = struct {
         return .{ .streamed = streamed, .layer_index = layer_index, .weight = try tensor(weights, prefix, "gate.weight"), .correction = try tensor(weights, prefix, "gate.e_score_correction_bias"), .bank = .{ .gate = projs[0], .up = projs[1], .down = projs[2] }, .shared = if (cfg.shared_expert_intermediate_size > 0) try base.DenseMlp.load(weights, try std.fmt.bufPrint(&buf, "{s}.shared_experts", .{prefix}), cfg.hidden_size, cfg.shared_expert_intermediate_size) else null };
     }
     fn apply(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !Arr {
-        return self.applyTracked(ops, x, cfg, null);
-    }
-    fn applyTracked(self: Moe, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, component: ?*ComponentTimer) !Arr {
         const routing = try route(ops, x, self.weight, self.correction, @intCast(cfg.num_experts_per_tok), cfg.router_scaling_factor, cfg.moe_route_norm);
-        try @import("glm5_prefill_grid_capture.zig").capture(self.layer_index, x, routing.indices, routing.scores);
-        try ComponentTimer.mark(component, "router", &.{ routing.indices, routing.scores }, null);
         const routed = if (self.streamed) |store| try store.apply(self.layer_index, ops, x, routing.indices, routing.scores, cfg.glm_swiglu_limit) else resident: {
             const dec = exl3.format.Decode{ .codebook = cfg.expert_quant_codebook, .window = cfg.expert_quant_window };
             const limit: c_int = @intFromFloat(cfg.glm_swiglu_limit);
             if (cfg.glm_swiglu_limit == 10) if (try exl3.glm_prefill_grid.tryMoe(ops.s, x, self.bank, routing.indices, routing.scores, dec, limit)) |candidate| break :resident try ops.own(candidate);
             break :resident try ops.own(try exl3.moeClamped(ops.s, x, self.bank, routing.indices, routing.scores, dec, limit));
         };
-        try ComponentTimer.mark(component, "routed", &.{routed}, null);
-        if (self.shared) |shared| {
-            const y = try shared.apply(ops, x, cfg.glm_swiglu_limit);
-            try ComponentTimer.mark(component, "shared", &.{y}, null);
-            const combined = try ops.binary(.add, routed, y);
-            try ComponentTimer.mark(component, "combine_ffn", &.{combined}, null);
-            return combined;
-        }
+        if (self.shared) |shared| return ops.binary(.add, routed, try shared.apply(ops, x, cfg.glm_swiglu_limit));
         return routed;
     }
 };
@@ -293,85 +281,20 @@ const LayerState = struct {
     }
 };
 
-pub const ComponentTimes = struct {
-    hc_attn: u64 = 0,
-    attn_norm: u64 = 0,
-    attention: u64 = 0,
-    expand_attn: u64 = 0,
-    hc_ffn: u64 = 0,
-    ffn_norm: u64 = 0,
-    router: u64 = 0,
-    routed: u64 = 0,
-    shared: u64 = 0,
-    combine_ffn: u64 = 0,
-    dense_ffn: u64 = 0,
-    expand_ffn: u64 = 0,
-};
-
-const ComponentTimer = struct {
-    totals: *ComponentTimes,
-    clock: @import("io_util.zig").Stopwatch,
-
-    fn mark(self: ?*ComponentTimer, comptime field: []const u8, outputs: []const Arr, state: ?*LayerState) !void {
-        const timer = self orelse return;
-        const values = mlx.mlx_vector_array_new_data(outputs.ptr, outputs.len);
-        defer _ = mlx.mlx_vector_array_free(values);
-        if (state) |st| try appendLayerState(values, st);
-        try mlx.check(mlx.mlx_eval(values));
-        @field(timer.totals, field) += timer.clock.read();
-        timer.clock.reset();
-    }
-};
-
 pub const Capture = struct { ids: []const u32, out: []Arr };
-
-/// Caller owns snapshots. Each selected layer has attention then FFN records.
-/// Tensor order is stable for private fixture consumers; stored weights retain their dtype.
-pub const HcSnapshot = struct {
-    pub const names = [_][:0]const u8{ "input", "fn", "scale", "base", "mixes", "mixed", "post", "comb" };
-    values: [8]Arr = @splat(.{ .ctx = null }),
-    pub fn deinit(self: *HcSnapshot) void {
-        for (self.values) |v| if (v.ctx != null) {
-            _ = mlx.mlx_array_free(v);
-        };
-        self.* = .{};
-    }
-};
-pub const HcCapture = struct {
-    ids: []const u32,
-    records: []HcSnapshot,
-    fn retain(self: *HcCapture, index: usize, ffn: bool, ops: *Ops, hc: base.Hc, x: Arr, cfg: *const model.ModelConfig) !void {
-        for (self.ids, 0..) |id, i| if (id == index) {
-            const mixes = try hc.mixReference(ops, x, cfg);
-            const result = try primitive.hcCollapse(x, mixes, hc.scale, hc.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
-            defer result.deinit();
-            var record = HcSnapshot{};
-            errdefer record.deinit();
-            for (&record.values, [_]Arr{ x, hc.w, hc.scale, hc.base, mixes, result.mixed, result.post, result.comb }) |*out, value| out.* = try ops.result(value);
-            const at = i * 2 + @intFromBool(ffn);
-            self.records[at].deinit();
-            self.records[at] = record;
-        };
-    }
-};
 
 pub const Request = struct {
     allocator: std.mem.Allocator,
     layers: []LayerState,
     offset: usize = 0,
     failed: bool = false,
-    profile: bool = false,
-    profile_components: bool = false,
-    component_ns: [128]ComponentTimes = @splat(.{}),
     decode_async: bool = true,
     dense_prefill: bool = false,
     prefill_async: bool = false,
-    /// Bound pending prefill layers before a host wait; diagnostic experiments only.
+    /// Prefill layers queued between host waits.
     prefill_sync_layers: u8 = 2,
     capture: ?*Capture = null,
-    hc_capture: ?*HcCapture = null,
     stream_owner: ?*@import("glm5_stream.zig").Bf16 = null,
-    layer_ns: [128]u64 = @splat(0),
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
         for (layers) |*layer| layer.* = .init();
@@ -391,8 +314,6 @@ pub const Request = struct {
         }
         self.offset = 0;
         self.failed = false;
-        self.layer_ns = @splat(0);
-        self.component_ns = @splat(.{});
     }
 
     pub fn residentBytes(self: *const Request) u64 {
@@ -423,16 +344,9 @@ fn appendLayerState(evals: mlx.mlx_vector_array, state: *const LayerState) !void
     };
 }
 
-fn appendCaptures(evals: mlx.mlx_vector_array, capture: ?*Capture, hc_capture: ?*HcCapture, first: usize, end: usize) !void {
+fn appendCaptures(evals: mlx.mlx_vector_array, capture: ?*Capture, first: usize, end: usize) !void {
     if (capture) |c| for (c.ids, 0..) |id, i| {
         if (id >= first and id < end) try mlx.check(mlx.mlx_vector_array_append_value(evals, c.out[i]));
-    };
-    if (hc_capture) |c| for (c.ids, 0..) |id, i| {
-        if (id >= first and id < end) for (c.records[i * 2 ..][0..2]) |record| {
-            for (record.values) |v| if (v.ctx != null) {
-                try mlx.check(mlx.mlx_vector_array_append_value(evals, v));
-            };
-        };
     };
 }
 
@@ -498,17 +412,6 @@ pub const Model = struct {
         self.allocator.free(self.layers);
     }
 
-    pub fn kdaPrefillClusterBytes(self: *const Model) usize {
-        var bytes: usize = 0;
-        for (self.layers) |layer| switch (layer.attn) {
-            .kda => |kda| if (kda.prepared_cluster.ctx != null) {
-                bytes += mlx.mlx_array_size(kda.prepared_cluster) * mlx.mlx_array_itemsize(kda.prepared_cluster);
-            },
-            .mla => {},
-        };
-        return bytes;
-    }
-
     pub fn routeLayer(self: *const Model, index: usize, ops: *Ops, x: Arr) !Routed {
         if (index >= self.layers.len) return error.InvalidGlmLayer;
         return switch (self.layers[index].ffn) {
@@ -570,10 +473,6 @@ pub const Model = struct {
                 if (id >= self.layers.len or (i > 0 and id <= capture.ids[i - 1]) or capture.out[i].ctx == null) return error.InvalidGlmCapture;
             }
         }
-        if (request.hc_capture) |capture| {
-            if (capture.ids.len == 0 or capture.ids.len > self.layers.len or capture.records.len != capture.ids.len * 2) return error.InvalidGlmHcCapture;
-            for (capture.ids, 0..) |id, i| if (id >= self.layers.len or (i > 0 and id <= capture.ids[i - 1])) return error.InvalidGlmHcCapture;
-        }
         if (request.prefill_sync_layers == 0 or request.prefill_sync_layers > 8) return error.InvalidGlmPrefillSchedule;
         if (request.failed) return error.GlmRequestNeedsReset;
         if (request.offset + @as(usize, @intCast(ish[1])) > self.cfg.max_position_embeddings) return error.GlmContextExceeded;
@@ -583,8 +482,8 @@ pub const Model = struct {
             request.stream_owner = store;
         } else if (request.stream_owner != null) return error.GlmStreamRequestBusy;
         errdefer request.failed = true;
-        const staged_decode = self.expert_stream == null and ish[1] == 1 and request.decode_async and !request.profile and !request.profile_components;
-        const staged_prefill = self.expert_stream == null and ish[1] > 1 and request.prefill_async and !request.profile and !request.profile_components;
+        const staged_decode = self.expert_stream == null and ish[1] == 1 and request.decode_async;
+        const staged_prefill = self.expert_stream == null and ish[1] > 1 and request.prefill_async;
         var h: Arr = undefined;
         {
             var ops = Ops{ .s = self.s };
@@ -601,44 +500,24 @@ pub const Model = struct {
         }
         defer _ = mlx.mlx_array_free(h);
         for (self.layers, request.layers, 0..) |*layer, *state, layer_index| {
-            const timer = if (request.profile) @import("io_util.zig").Stopwatch.init(std.Io.Threaded.global_single_threaded.io()) else null;
             var ops = Ops{ .s = self.s };
             defer ops.deinit();
-            var component_clock: ComponentTimer = undefined;
-            const component: ?*ComponentTimer = if (request.profile_components) blk: {
-                try mlx.check(mlx.mlx_array_eval(h));
-                component_clock = .{ .totals = &request.component_ns[layer_index], .clock = .init(std.Io.Threaded.global_single_threaded.io()) };
-                break :blk &component_clock;
-            } else null;
-            if (request.hc_capture) |capture| try capture.retain(layer_index, false, &ops, layer.hc_attn, h, &self.cfg);
             const pre = try layer.hc_attn.collapse(&ops, h, &self.cfg);
             defer pre.deinit();
-            try ComponentTimer.mark(component, "hc_attn", &.{ pre.mixed, pre.post, pre.comb }, null);
             const x = try ops.rms(pre.mixed, layer.norm_attn, self.cfg.rms_norm_eps);
-            try ComponentTimer.mark(component, "attn_norm", &.{x}, null);
             const a = switch (layer.attn) {
                 .kda => |kda| try kda.apply(&ops, x, &self.cfg, &state.recurrent),
                 .mla => |*mla| try mla.applyMode(&ops, x, &self.cfg, &state.attention, request.dense_prefill),
             };
-            try ComponentTimer.mark(component, "attention", &.{a}, state);
             const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, self.s));
-            try ComponentTimer.mark(component, "expand_attn", &.{joined}, null);
-            if (request.hc_capture) |capture| try capture.retain(layer_index, true, &ops, layer.hc_ffn, joined, &self.cfg);
             const ff = try layer.hc_ffn.collapse(&ops, joined, &self.cfg);
             defer ff.deinit();
-            try ComponentTimer.mark(component, "hc_ffn", &.{ ff.mixed, ff.post, ff.comb }, null);
             const fx = try ops.rms(ff.mixed, layer.norm_ffn, self.cfg.rms_norm_eps);
-            try ComponentTimer.mark(component, "ffn_norm", &.{fx}, null);
             const y = switch (layer.ffn) {
-                .dense => |dense| blk: {
-                    const y = try dense.apply(&ops, fx, self.cfg.glm_swiglu_limit);
-                    try ComponentTimer.mark(component, "dense_ffn", &.{y}, null);
-                    break :blk y;
-                },
-                .moe => |moe| try moe.applyTracked(&ops, fx, &self.cfg, component),
+                .dense => |dense| try dense.apply(&ops, fx, self.cfg.glm_swiglu_limit),
+                .moe => |moe| try moe.apply(&ops, fx, &self.cfg),
             };
             const next = try ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
-            try ComponentTimer.mark(component, "expand_ffn", &.{next}, null);
             if (request.capture) |capture| {
                 for (capture.ids, 0..) |id, i| {
                     if (id == layer_index) try mlx.check(mlx.mlx_array_set(&capture.out[i], try ops.reduce(next, 2, true, false)));
@@ -649,7 +528,7 @@ pub const Model = struct {
                 defer _ = mlx.mlx_vector_array_free(evals);
                 const interval: usize = request.prefill_sync_layers;
                 const first = layer_index - layer_index % interval;
-                try appendCaptures(evals, request.capture, request.hc_capture, first, layer_index + 1);
+                try appendCaptures(evals, request.capture, first, layer_index + 1);
                 for (request.layers[first .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
                 if ((layer_index + 1) % interval != 0) {
                     try mlx.check(mlx.mlx_async_eval(evals));
@@ -662,19 +541,18 @@ pub const Model = struct {
                 const evals = mlx.mlx_vector_array_new_value(next);
                 defer _ = mlx.mlx_vector_array_free(evals);
                 if (staged_decode) {
-                    try appendCaptures(evals, request.capture, request.hc_capture, layer_index - 3, layer_index + 1);
+                    try appendCaptures(evals, request.capture, layer_index - 3, layer_index + 1);
                     for (request.layers[layer_index - 3 .. layer_index + 1]) |*pending| try appendLayerState(evals, pending);
                     try mlx.check(mlx.mlx_async_eval(evals));
                     if (@import("builtin").is_test) schedule_test_asyncs += 1;
                 } else {
-                    try appendCaptures(evals, request.capture, request.hc_capture, layer_index, layer_index + 1);
+                    try appendCaptures(evals, request.capture, layer_index, layer_index + 1);
                     try appendLayerState(evals, state);
                     try mlx.check(mlx.mlx_eval(evals));
                     if (@import("builtin").is_test) schedule_test_syncs += 1;
                 }
             }
             try mlx.check(mlx.mlx_array_set(&h, next));
-            if (timer) |clock| request.layer_ns[layer_index] += clock.read();
         }
         var ops = Ops{ .s = self.s };
         defer ops.deinit();
@@ -683,12 +561,12 @@ pub const Model = struct {
         const logits = try self.head.apply(&ops, normalized);
         const result = try ops.result(logits);
         errdefer _ = mlx.mlx_array_free(result);
-        if (staged_decode or staged_prefill or request.capture != null or request.hc_capture != null) {
+        if (staged_decode or staged_prefill or request.capture != null) {
             // Cache side outputs must settle even when they are not ancestors of logits.
             const evals = mlx.mlx_vector_array_new_value(result);
             defer _ = mlx.mlx_vector_array_free(evals);
             for (request.layers) |*state| try appendLayerState(evals, state);
-            try appendCaptures(evals, request.capture, request.hc_capture, 0, self.layers.len);
+            try appendCaptures(evals, request.capture, 0, self.layers.len);
             try mlx.check(mlx.mlx_eval(evals));
             if (@import("builtin").is_test) schedule_test_syncs += 1;
         }
@@ -800,7 +678,7 @@ pub fn completeFixture(weights: *model.Weights) !model.ModelConfig {
     return cfg;
 }
 
-test "GLM complete diagnostic forward advances and resets request state" {
+test "GLM complete forward advances and resets request state" {
     const a = std.testing.allocator;
     var weights = model.Weights.init(a);
     defer weights.deinit();
@@ -1021,7 +899,7 @@ test "GLM async decode preserves nonzero logits and every cache state" {
     try expectRequestBits(&sync, &staged);
 }
 
-test "GLM async decode settles graphs and profiling retains layer boundaries" {
+test "GLM async decode settles graphs" {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = model.Weights.init(a);
@@ -1044,15 +922,6 @@ test "GLM async decode settles graphs and profiling retains layer boundaries" {
     // Both snapshots end on a complete pool with the same reserved cache capacity.
     try std.testing.expect(active <= baseline + 64 * 1024);
     try std.testing.expectEqual(@as(usize, 80), request.offset);
-    request.profile = true;
-    schedule_test_syncs = 0;
-    schedule_test_asyncs = 0;
-    const result = try net.forwardLast(&request, ids, true);
-    defer _ = mlx.mlx_array_free(result);
-    try mlx.check(mlx.mlx_array_eval(result));
-    try std.testing.expectEqual(@as(usize, 4), schedule_test_syncs);
-    try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
-    for (request.layer_ns[0..4]) |ns| try std.testing.expect(ns > 0);
 }
 
 test "GLM two-layer prefill schedule preserves every nonzero cache bit" {
@@ -1084,16 +953,6 @@ test "GLM two-layer prefill schedule preserves every nonzero cache bit" {
         try expectArrayBits(expected, got);
         try expectRequestBits(&baseline, &pipelined);
     }
-    pipelined.profile = true;
-    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2 }, &[_]c_int{ 1, 2 }, 2, .uint32);
-    defer _ = mlx.mlx_array_free(ids);
-    schedule_test_asyncs = 0;
-    schedule_test_syncs = 0;
-    const y = try net.forwardLast(&pipelined, ids, true);
-    defer _ = mlx.mlx_array_free(y);
-    try mlx.check(mlx.mlx_array_eval(y));
-    try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
-    try std.testing.expectEqual(@as(usize, 4), schedule_test_syncs);
 }
 
 test "GLM post-layer capture and shared draft projections retain their contracts" {
@@ -1174,91 +1033,9 @@ test "GLM fused router matches FP32 scores and selected order at production widt
     };
 }
 
-test "GLM component profiling preserves logits and cache state and resets counters" {
-    const allocator = std.testing.allocator;
-    const stream = mlx.gpuStream();
-    var weights = model.Weights.init(allocator);
-    defer weights.deinit();
-    const cfg = try nonzeroDecodeFixture(&weights);
-    var net = try Model.load(allocator, cfg, &weights, stream);
-    defer net.deinit();
-    var reference = try Request.init(allocator, 4);
-    defer reference.deinit();
-    var measured = try Request.init(allocator, 4);
-    defer measured.deinit();
-    measured.profile_components = true;
-    for ([_]usize{ 3, 1, 1 }) |width| {
-        const tokens = [_]u32{ 1, 2, 3 };
-        const ids = mlx.mlx_array_new_data(&tokens, &.{ 1, @intCast(width) }, 2, .uint32);
-        defer _ = mlx.mlx_array_free(ids);
-        const x = try net.forward(&reference, ids);
-        defer _ = mlx.mlx_array_free(x);
-        schedule_test_asyncs = 0;
-        const y = try net.forward(&measured, ids);
-        defer _ = mlx.mlx_array_free(y);
-        try std.testing.expectEqual(@as(usize, 0), schedule_test_asyncs);
-        try expectArrayBits(x, y);
-        try expectRequestBits(&reference, &measured);
-    }
-    for (measured.component_ns[0..4]) |value| {
-        try std.testing.expect(value.hc_attn > 0);
-        try std.testing.expect(value.attention > 0);
-        try std.testing.expect(value.hc_ffn > 0);
-        try std.testing.expect(value.expand_ffn > 0);
-    }
-    try std.testing.expect(measured.component_ns[0].dense_ffn > 0);
-    try std.testing.expect(measured.component_ns[3].routed > 0);
-    measured.reset();
-    try std.testing.expectEqual(ComponentTimes{}, measured.component_ns[0]);
-    try std.testing.expectEqual(ComponentTimes{}, measured.component_ns[3]);
-}
-
-test "GLM HC capture retains reference fixtures without changing logits or state" {
-    const a = std.testing.allocator;
-    var weights = model.Weights.init(a);
-    defer weights.deinit();
-    var cfg = try nonzeroDecodeFixture(&weights);
-    cfg.max_position_embeddings = 64;
-    var net = try Model.load(a, cfg, &weights, mlx.gpuStream());
-    defer net.deinit();
-    var plain = try Request.init(a, 4);
-    defer plain.deinit();
-    var captured = try Request.init(a, 4);
-    defer captured.deinit();
-    var records: [4]HcSnapshot = @splat(.{});
-    defer for (&records) |*r| r.deinit();
-    var capture = HcCapture{ .ids = &.{ 0, 3 }, .records = &records };
-    captured.hc_capture = &capture;
-    for ([_]c_int{ 17, 1 }) |rows| {
-        var ops = Ops{ .s = net.s };
-        defer ops.deinit();
-        const ids = try ops.zeros(&.{ 1, rows }, .uint32);
-        const expected = try ops.own(try net.forwardLast(&plain, ids, true));
-        const got = try ops.own(try net.forwardLast(&captured, ids, true));
-        try expectArrayBits(expected, got);
-        try expectRequestBits(&plain, &captured);
-        for (&records) |*r| {
-            try std.testing.expectEqualSlices(c_int, &.{ 1, rows, 4, 128 }, mlx.getShape(r.values[0]));
-            try std.testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(r.values[4]));
-            for (r.values) |v| try std.testing.expect(v.ctx != null);
-        }
-    }
-    const offset = captured.offset;
-    var ops = Ops{ .s = net.s };
-    defer ops.deinit();
-    const ids = try ops.zeros(&.{ 1, 1 }, .uint32);
-    for ([_][]const u32{ &.{ 3, 0 }, &.{ 0, 0 }, &.{ 0, 4 }, &.{0}, &.{} }) |bad| {
-        capture.ids = bad;
-        try std.testing.expectError(error.InvalidGlmHcCapture, net.forwardLast(&captured, ids, true));
-        try std.testing.expectEqual(offset, captured.offset);
-        try std.testing.expect(!captured.failed);
-        try expectRequestBits(&plain, &captured);
-    }
-}
-
 test "GLM HC prefill policy preserves nonzero small model logits and every cache bit" {
     const hc_prefill = @import("glm5_hc_prefill.zig");
-    defer hc_prefill.testSetEnabled(null);
+    defer base.reference_numerics = false;
     var weights = model.Weights.init(std.testing.allocator);
     defer weights.deinit();
     const cfg = try nonzeroDecodeFixture(&weights);
@@ -1275,9 +1052,9 @@ test "GLM HC prefill policy preserves nonzero small model logits and every cache
         var tokens: [128]u32 = undefined;
         for (tokens[0..@intCast(rows)], 0..) |*v, i| v.* = @intCast(i % 4);
         const ids = try ops.own(mlx.mlx_array_new_data(&tokens, &.{ 1, rows }, 2, .uint32));
-        hc_prefill.testSetEnabled(false);
+        base.reference_numerics = true;
         const expected = try ops.own(try net.forwardLast(&reference, ids, true));
-        hc_prefill.testSetEnabled(true);
+        base.reference_numerics = false;
         const actual = try ops.own(try net.forwardLast(&candidate, ids, true));
         try expectArrayBits(expected, actual);
         try expectRequestBits(&reference, &candidate);
@@ -1336,15 +1113,6 @@ test "GLM DFlash asynchronous schedules preserve nonzero tapes captures and comm
                 if (a.*) |*left| try expectRequestBits(left, &b.*.?);
             }
         }
-        var profile: @import("glm5_dflash_profile.zig").Profile = .{};
-        const profile_binding = @import("glm5_dflash_profile.zig").bind(&profile);
-        defer profile_binding.restore();
-        verifier.resetStats();
-        var profiled = try verifier.verify(&net, &request, &tokens, &parents, &taps, .affine_rows_ffn);
-        defer profiled.deinit();
-        try std.testing.expectEqual(@as(usize, 0), verifier.asyncDispatchCount());
-        try std.testing.expectEqual(@as(usize, 5), verifier.syncDispatchCount());
-        try std.testing.expectEqualSlices(u32, reference.targets[0..reference.count], profiled.targets[0..profiled.count]);
     }
     // Three layers exercise both a partial final group and an entirely unqueued async4 group.
     var short_net = net;
@@ -1449,54 +1217,6 @@ test "GLM MLA A6 stored affine kv rows preserve both projection orientations" {
     try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(value_dense).?[0..512], mlx.mlx_array_data_float32(value_quant).?[0..512]);
     try std.testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(layer.wk));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(layer.sk));
-}
-
-test "GLM KLD native self teacher aligns prediction rows and forced token state" {
-    const compare = @import("glm5_kld.zig");
-    const a = std.testing.allocator;
-    var weights = model.Weights.init(a);
-    defer weights.deinit();
-    const cfg = try nonzeroDecodeFixture(&weights);
-    var net = try Model.load(a, cfg, &weights, mlx.gpuStream());
-    defer net.deinit();
-    var teacher = try Request.init(a, 4);
-    defer teacher.deinit();
-    teacher.dense_prefill = true;
-    teacher.prefill_async = true;
-    var student = try Request.init(a, 4);
-    defer student.deinit();
-    student.dense_prefill = true;
-    student.prefill_async = true;
-    const prompt = [_]u32{ 1, 2, 3 };
-    const generated = [_]u32{ 2, 1, 3 };
-    const rows = try a.alloc(f32, generated.len * cfg.vocab_size);
-    defer a.free(rows);
-    for (0..generated.len) |position| {
-        const ids: []const u32 = if (position == 0) &prompt else generated[position - 1 .. position];
-        const input = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, 2, .uint32);
-        defer _ = mlx.mlx_array_free(input);
-        const logits = try net.forwardLast(&teacher, input, true);
-        defer _ = mlx.mlx_array_free(logits);
-        try compare.copyLogits(net.s, logits, rows[position * cfg.vocab_size ..][0..cfg.vocab_size]);
-    }
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "logits.f32", .data = std.mem.sliceAsBytes(rows) });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/logits.f32", .{dir}, 0);
-    defer a.free(path);
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.TestFixtureOpen;
-    defer _ = std.c.close(fd);
-    const result = try compare.scorePrompt(a, &net, &student, &prompt, &generated, fd, &.{1}, 512);
-    defer result.deinit(a);
-    try std.testing.expectEqual(@as(usize, 3), result.all.positions);
-    try std.testing.expectEqual(@as(usize, 2), result.through_eos.positions);
-    try std.testing.expectEqual(@as(?usize, 1), result.first_eos);
-    for (result.per_position_kld) |value| try std.testing.expectApproxEqAbs(@as(f64, 0), value, 1e-12);
-    try std.testing.expectEqual(prompt.len + generated.len - 1, student.offset);
-    try expectRequestBits(&teacher, &student);
 }
 
 test "GLM stream GPU native forward binds BF16 experts and releases request admission" {

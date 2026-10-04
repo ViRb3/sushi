@@ -1,25 +1,13 @@
-//! Opt-in prefill clustering; original retained BF16 weights remain unchanged.
+//! One prefill GEMM over the concatenated KDA f_a/g_a/beta banks; the stored weights stay.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const native = @import("glm5_model.zig");
 pub const widths = [_]c_int{ 128, 128, 64 };
 pub const weight_bytes: usize = 320 * 4096 * 2;
 pub const transient_bytes: usize = 2048 * 320 * 2;
-threadlocal var enabled_override: ?bool = null;
 var calls: usize = 0;
-pub const Binding = struct {
-    previous: ?bool,
-    pub fn restore(self: Binding) void {
-        enabled_override = self.previous;
-    }
-};
-pub fn bind(on: bool) Binding {
-    const previous = enabled_override;
-    enabled_override = on;
-    return .{ .previous = previous };
-}
 pub fn enabled() bool {
-    return enabled_override orelse @import("transformer.zig").diagEnvOn("SUSHI_GLM_KDA_PREFILL_CLUSTER");
+    return !native.reference_numerics;
 }
 pub fn resetDispatchCount() void {
     calls = 0;

@@ -40,7 +40,7 @@ fn fixture() !model.Weights {
     return out;
 }
 
-fn compare(ops: *base.Ops, actual: Arr, expected: Arr, label: []const u8) !void {
+fn compare(ops: *base.Ops, actual: Arr, expected: Arr) !void {
     try std.testing.expectEqualSlices(c_int, mlx.getShape(expected), mlx.getShape(actual));
     const a = try ops.contiguous(try ops.cast(actual, .float32));
     const b = try ops.contiguous(try ops.cast(expected, .float32));
@@ -57,8 +57,6 @@ fn compare(ops: *base.Ops, actual: Arr, expected: Arr, label: []const u8) !void 
         reference_sum += @as(f64, want) * want;
     }
     const relative_l2 = @sqrt(error_sum / @max(reference_sum, 1e-30));
-    if (@import("transformer.zig").diagEnvOn("SUSHI_GLM_REFERENCE_STATS"))
-        std.debug.print("GLM MLA reference {s}: max_abs={e} relative_l2={e}\n", .{ label, max_abs, relative_l2 });
     // Expanded K/V and absorbed Q/V introduce different BF16 rounding points.
     // Bound the observed approximation without asserting bitwise equivalence.
     try std.testing.expect(max_abs <= 0.008);
@@ -104,7 +102,7 @@ fn runOracle(dense_prefill: bool) !void {
             defer ops.deinit();
             const x = try ops.slice(weights.get(case.input).?, 1, pos, pos + count);
             const y = try layer.applyMode(&ops, x, &cfg, &state, dense_prefill);
-            try compare(&ops, y, try ops.slice(expected, 1, pos, pos + count), case.name);
+            try compare(&ops, y, try ops.slice(expected, 1, pos, pos + count));
             for (state.arrays()) |a| if (a.ctx != null) try mlx.check(mlx.mlx_array_eval(a));
             pos += count;
             try std.testing.expectEqual(prefix + @as(usize, @intCast(pos)), state.processed);

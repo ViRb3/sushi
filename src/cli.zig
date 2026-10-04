@@ -755,13 +755,13 @@ pub fn parseThinkCommand(line: []const u8, accepted: []const model.Effort) ?Thin
     const word = std.mem.trim(u8, rest, " \t");
     if (word.len == 0) return .show;
     const e = model.parseEffort(word) orelse return .{ .refuse = word };
-    if (!effortAccepted(e, accepted)) return .{ .refuse = word };
-    return .{ .set = .{ .effort = e } };
+    return .{ .set = .{ .effort = acceptedEffort(e, accepted) orelse return .{ .refuse = word } } };
 }
 
-pub fn effortAccepted(e: model.Effort, accepted: []const model.Effort) bool {
-    if (accepted.len == 0) return true;
-    return std.mem.indexOfScalar(model.Effort, accepted, e) != null;
+/// The effort `e` selects among the server's listed words (`model.selectEffort`); null = refused.
+pub fn acceptedEffort(e: model.Effort, accepted: []const model.Effort) ?model.Effort {
+    if (accepted.len == 0) return e;
+    return model.selectEffort(accepted, e);
 }
 
 fn writeEffortOptions(w: *std.Io.Writer, accepted: []const model.Effort) !void {
@@ -1193,12 +1193,12 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     defer if (models_info) |m| m.deinit(allocator);
     const accepted: []const model.Effort = if (models_info) |m| m.efforts else &.{};
     var think = opts.think;
-    if (think == .effort and !effortAccepted(think.effort, accepted)) {
+    if (think == .effort) think = .{ .effort = acceptedEffort(think.effort, accepted) orelse {
         try writeEffortRefusal(w, @tagName(think.effort), if (models_info) |m| m.id else "this model", accepted);
         try w.writeAll("\n");
         try w.flush();
         return error.ReplThinkUnsupported;
-    }
+    } };
     // The initial load finishes BEFORE the listener binds, so an answering
     // /health is the post-load moment. `run` quieted the log to warn on a TTY,
     // so this one line is printed here rather than logged.
@@ -2407,10 +2407,18 @@ test "cli: one-shot and REPL omission keep the model default" {
 }
 
 
-test "thinking policy CLI consumes MiMo on and rejects levels outside each model vocabulary" {
+test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only their own words" {
     try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .on }, .consumed = true }, parseThinkFlag("on"));
-    try testing.expect(parseThinkCommand("/think low", &.{ .on, .off }).? == .refuse);
-    try testing.expect(parseThinkCommand("/think on", &.{ .on, .off }).? == .set);
+    try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .minimal }, .consumed = true }, parseThinkFlag("minimal"));
+    const mimo = [_]model.Effort{ .off, .on };
+    for ([_][]const u8{ "/think on", "/think minimal", "/think low", "/think medium", "/think high", "/think xhigh", "/think max" }) |line| {
+        try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .on } }), parseThinkCommand(line, &mimo));
+    }
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think none", &mimo));
+    try testing.expectEqual(@as(?model.Effort, .on), acceptedEffort(.high, &mimo));
     try testing.expect(parseThinkCommand("/think off", &.{ .low, .high, .max }).? == .refuse);
+    try testing.expect(parseThinkCommand("/think minimal", &.{ .low, .high, .max }).? == .refuse);
     try testing.expect(parseThinkCommand("/think high", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
+    try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
+    try testing.expectEqual(@as(?model.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
 }

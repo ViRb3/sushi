@@ -21,10 +21,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 - `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4, including boundary zero.
 - A `--prompts` jsonl line may carry `prompt_ids` (token ids, used as given, no template) instead of `prompt`.
 
-Native GLM capture uses the diagnostic forward through `sushi kld capture` with individual BF16 expert streaming,
+Native GLM capture runs the native forward through `sushi kld capture` with individual BF16 expert streaming,
 `--no-template --kv-quant off --ssd-budget-gb <total GiB>`. It audits indexed text headers before loading:
-the trunk must be BF16/F32 and routed experts BF16. Set `MLX_ENABLE_TF32=0` at startup for an explicit reference
-profile. Native GLM capture defaults absent TF32 and optional numerical switches to 0 before model operations; explicit conflicting settings are refused.
+the trunk must be BF16/F32 and routed experts BF16. The capture selects the reference arm of every GLM fast path
+(`glm5_model.reference_numerics`) and runs with `MLX_ENABLE_TF32=0`.
 Other architecture capture behavior, serving defaults and compare profiles remain unchanged. The total ledger includes
 the trunk, full expert union, I/O bounce slabs, per-layer LRU and at least8 GiB request reserve; allocator cache is0.
 Dense prefill uses at most512 tokens per chunk and synchronous layers, with BF16 compressed MLA and FP32 KDA state.
@@ -51,9 +51,8 @@ sushi kld compare --model "$STUDENT_MODEL" --fixture teacher-standard4 \
 ```
 
 If the teacher needs expert streaming, add `--ssd-budget-gb <total RAM GiB>`;
-choose a budget that fits the machine. Native BF16 GLM capture requires streaming.
-Resident GLM packs use public `sushi kld compare` through the native forward bridge.
-The older gated diagnostic comparison remains available for engine studies.
+choose a budget that fits the machine. Native BF16 GLM capture requires streaming;
+a resident GLM pack is scored with `sushi kld compare --model <pack> --fixture <teacher>`.
 
 The saved fixture contains token IDs and all 512 full-vocabulary rows per prompt,
 including rows after EOS. Compare reports all positions and the first-EOS-inclusive
@@ -249,26 +248,21 @@ are not comparable.
 The FP8-native teacher against the bf16-rounded teacher: 0.0034 nats.
 
 
-## GLM-5.3 raw FP8 pack, 2026-10-04
+## GLM-5.3-Flash: native BF16 teacher, 4x512 (2026-10-04)
 
-Public `sushi kld compare` scored GLM-5.3-Flash-Sushi-2.45bpw against the saved
-`glm53-sushi-bf16-4x512-raw` teacher: two code and two prose prompts, 512 positions
-each. The compare used every stored teacher token ID and full-vocabulary logit row,
-BF16 compressed MLA, FP32 KDA state, exact expert routing, MTP off, TF32 off and
-`taskpolicy -a`. GPU lock owner: `root-glm-fp8-kld`. The source was `3ab30727` plus
-the raw-FP8/serving changes in this landing; ReleaseFast binary SHA256:
-`0d48358da1ced68fe12a9135b0ce650359612c4543cab760705ff2d50662a781`.
+Teacher: the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
+standard4 --tokens 512 --no-template --kv-quant off --ssd-budget-gb 100` (streamed BF16 experts, dense prefill in
+chunks of at most 512, synchronous layers, BF16 MLA cache, FP32 KDA state). Native prompt lengths 242/261/190/183; no
+EOS in the 2,048 rows, so first-EOS and all-positions readings are the same. Students carry W12 MCG EXL3
+experts (K2.25 unless the row says K2.5), BF16 MLA and FP32 KDA state, one resident target, MTP and DFlash2 off.
 
-| Prompt | Mean KLD | Top1 matches | Mean NLL |
-| --- | ---: | ---: | ---: |
-| Python topological sort | 0.042175518 | 488/512 | 0.185114568 |
-| Zig byte reader | 0.045603492 | 487/512 | 0.187756538 |
-| Water cycle | 0.126661763 | 421/512 | 0.641875656 |
-| Navigation | 0.150624043 | 419/512 | 0.706800501 |
-| All positions | 0.091266204 | 1815/2048 (88.623%) | 0.430386816 |
+| Pack | Trunk | KLD | Top-1 | NLL | Code / prose KLD | Peak active | Commit, settings |
+|---|---|---:|---:|---:|---:|---:|---|
+| Sushi-2.3bpw | A6 g128 | 0.092950 | 88.96% | 0.4323 | 0.0468 / 0.1391 | 94.08 GB | `3ed533d7`+WIP, TF32 on, fast target kernels |
+| Sushi-2.4bpw | A8 g128 | 0.091519 | 88.87% | 0.4318 | 0.0441 / 0.1389 | 96.30 GB | same binary |
+| Sushi-2.45bpw | raw FP8 block-128 | 0.091266 | 88.62% | 0.4304 | 0.0439 / 0.1386 | 102.51 GB | `56017748`, TF32 off, `sushi kld compare` |
+| Sushi-2.5bpw (K2.5) | A6 g128 | 0.072071 | 89.94% | 0.4075 | 0.0314 / 0.1127 | 103.59 GB | `00668fcb`, `sushi kld compare` defaults; 2.3bpw reproduces its row bit for bit there |
 
-All 2,048 positions were also in the first-EOS-inclusive subset. Mean cosine
-similarity was 0.959473416. MLX reported 101,750,954,768 resident bytes before
-scoring and 102,511,216,292 peak active bytes. This is the four-prompt screen;
-the separate 2K–32K speed comparison was stopped by the user and has no completed
-comparison result. Evidence key: `glm53-raw-fp8-serving-20261004`.
+K2.5 experts cut KLD 22.5% from K2.25 on the same A6 trunk (byte-identical trunk tensors). The three trunks sit within 2% of each other under two numerical profiles; this four-prompt screen does not rank them
+and is not the 16x512 release reading. Code scores about 3x lower than prose on every pack.
+

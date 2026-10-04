@@ -8,6 +8,17 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
   instead of failing to compile mlx-c after a plain `git pull`.
+- **`--wired-margin-gib` defaults to 4 GiB (was 8)**, so a raised `iogpu.wired_limit_mb` admits 4 GiB more weights
+  and context.
+- **MiMo takes every thinking effort word** (`minimal` through `max`) as thinking on instead of answering 400, on
+  chat, Responses and Anthropic requests, `--think` and the REPL's `/think` alike; `off` and `none` still turn
+  thinking off.
+- **`--think` binds only the `--model` model**: another model loaded on demand that lacks the word now keeps its own
+  default instead of failing to load.
+- **`sushi launch pi`, `omp` and `zcode` give MiMo thinking on** for every thinking level they offer.
+- **The chat page's effort menu lists exactly the selected model's words and starts on its real default**, which
+  `/v1/models` now reports as `default_reasoning_effort`; every message sends the shown effort.
+
 - **`sushi launch omp` lets local buffered tool calls finish without the default five-minute retry**; the generated
   Sushi provider disables its model-progress deadline while preserving explicit user timeout overrides.
 

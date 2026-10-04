@@ -790,7 +790,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
           <div class="composer-row">
             <button class="icon-btn" id="attachButton" title="Attach images" aria-label="Attach images" hidden><svg><use href="#i-image"/></svg></button>
             <input id="attachInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple hidden>
-            <button class="chip-toggle" id="composerModelLabel" title="Choose the model and thinking effort" aria-label="Choose the model and thinking effort"><svg><use href="#i-box"/></svg><span id="composerModelName">no model</span><span>/</span><span id="composerEffortName">default</span></button>
+            <button class="chip-toggle" id="composerModelLabel" title="Choose the model and thinking effort" aria-label="Choose the model and thinking effort"><svg><use href="#i-box"/></svg><span id="composerModelName">no model</span><span>/</span><span id="composerEffortName">—</span></button>
             <button class="chip-toggle" id="directoryButton" title="Choose the folder for this chat's file tools" aria-haspopup="dialog"><span id="directoryName">Folder</span></button>
             <button class="chip-toggle" id="toolsButton" aria-pressed="false" title="Enable web search, page fetching and read-only files in the server folder">Tools off</button>
             <span class="spacer"></span>
@@ -1545,21 +1545,22 @@ function renderModelOptions() {
 }
 function renderEffortOptions() {
   const select = $("effortSelect");
-  const efforts = selectedModel()?.reasoning_efforts ?? [];
-  const values = ["default", ...efforts];
-  const wanted = select.value || readStore("sushi-effort") || "default";
-  if (select.dataset.signature !== values.join("|")) {
-    select.dataset.signature = values.join("|");
+  const model = selectedModel();
+  const efforts = model?.reasoning_efforts ?? [];
+  if (select.dataset.signature !== efforts.join("|")) {
+    select.dataset.signature = efforts.join("|");
     select.textContent = "";
-    for (const value of values) {
-      const option = el("option", null, value === "default" ? "model default" : value);
+    for (const value of efforts) {
+      const option = el("option", null, value);
       option.value = value;
       select.appendChild(option);
     }
   }
-  select.value = values.includes(wanted) ? wanted : "default";
+  // The stored choice is global; a model without that word starts on its own default.
+  const stored = readStore("sushi-effort");
+  select.value = efforts.includes(stored) ? stored : model?.default_reasoning_effort ?? efforts[0] ?? "";
   select.disabled = efforts.length === 0;
-  $("composerEffortName").textContent = select.value;
+  $("composerEffortName").textContent = select.value || "—";
 }
 function renderModelStatus() {
   const model = selectedModel();
@@ -2119,7 +2120,7 @@ function buildRequest(model, history, tools = null) {
   const body = { model, messages: wireMessages(history), stream: true, stream_options: { include_usage: true } };
   if (tools?.length) body.tools = tools;
   const effort = $("effortSelect").value;
-  if (effort && effort !== "default") body.reasoning_effort = effort;
+  if (effort) body.reasoning_effort = effort;
   const numeric = [
     ["optMaxTokens", "max_tokens", parseInt],
     ["optTemperature", "temperature", parseFloat],

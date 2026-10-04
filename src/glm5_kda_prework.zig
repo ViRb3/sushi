@@ -120,7 +120,7 @@ pub fn dispatchCount() usize {
 pub fn resetDispatchCount() void {
     count = 0;
 }
-// Arithmetic follows the qualified one-token body and oMLX's prework mapping;
+// Arithmetic follows the one-token body and oMLX's prework mapping;
 // retained BF16 convolution/SiLU stores and FP32 normalization order are explicit.
 const HEADER: [:0]const u8 =
     \\#include <metal_stdlib>
@@ -181,7 +181,7 @@ const SOURCE: [:0]const u8 =
     \\decay_out[base+tid]=EXP_F?metal::precise::exp(gate):metal::exp(gate);
     \\if(tid==0u) beta_out[row*uint(H)+head]=sigmoid<T,SIG_B>(beta[row*uint(H)+head]);
 ;
-// Reuse the qualified arithmetic verbatim, changing only history lookup and
+// Reuse that arithmetic verbatim, changing only history lookup and
 // omitting the linear-prefill tail materialization. Tape replay owns raw tails.
 const TREE_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(100000);
@@ -196,9 +196,6 @@ var tree_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var tree_count: usize = 0;
 pub fn treeDispatchCount() usize {
     return tree_count;
-}
-pub fn resetTreeDispatchCount() void {
-    tree_count = 0;
 }
 fn getTreeKernel() !mlx.mlx_fast_metal_kernel {
     if (tree_kernel) |k| return k;
@@ -416,66 +413,6 @@ test "GLM KDA prework refuses unsupported inputs before dispatch" {
     bad.exp_a = try ops.cast(valid.exp_a, .bfloat16);
     try std.testing.expect((try apply(ops.s, bad)) == null);
     try std.testing.expectEqual(count_before, dispatchCount());
-}
-
-fn timedPrework(in: Inputs, fused: bool) !u64 {
-    var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
-    defer ops.deinit();
-    var timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
-    const actual = if (fused) (try apply(ops.s, in)) orelse return error.TestExpectedPrework else null;
-    defer if (actual) |r| r.deinit();
-    const arrays = if (actual) |r| r.arrays() else try reference(&ops, in);
-    const outputs = mlx.mlx_vector_array_new_data(&arrays, arrays.len);
-    defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_eval(outputs));
-    return timer.read();
-}
-test "GLM KDA prework production microbenchmark" {
-    const path = std.c.getenv("SUSHI_GLM_PREWORK_BENCH_OUT") orelse return error.SkipZigTest;
-    var ops = @import("glm5_model.zig").Ops{ .s = mlx.gpuStream() };
-    defer ops.deinit();
-    const heads = 64;
-    const rows = 512;
-    const width = heads * 128;
-    const in = Inputs{
-        .qkv = try randomArray(&ops, &.{ 1, rows, 3 * width }, .bfloat16, 3, 3),
-        .a = try randomArray(&ops, &.{ 1, rows, width }, .bfloat16, 15, 12),
-        .beta = try randomArray(&ops, &.{ 1, rows, heads }, .bfloat16, 33, 8),
-        .conv_weight = try randomArray(&ops, &.{ 3 * width, 4, 1 }, .bfloat16, 45, 0.5),
-        .exp_a = try ops.unary(.exp, try randomArray(&ops, &.{heads}, .float32, 55, 1)),
-        .dt_bias = try randomArray(&ops, &.{width}, .float32, 67, 2),
-        .conv_state = try randomArray(&ops, &.{ 1, 3, 3 * width }, .bfloat16, 89, 2),
-        .heads = heads,
-    };
-    for (0..3) |_| {
-        _ = try timedPrework(in, false);
-        _ = try timedPrework(in, true);
-    }
-    var reference_ns: [24]u64 = undefined;
-    var fused_ns: [24]u64 = undefined;
-    for (0..24) |i| {
-        if (i % 2 == 0) {
-            reference_ns[i] = try timedPrework(in, false);
-            fused_ns[i] = try timedPrework(in, true);
-        } else {
-            fused_ns[i] = try timedPrework(in, true);
-            reference_ns[i] = try timedPrework(in, false);
-        }
-    }
-    const text = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
-        .reference_ns = reference_ns,
-        .fused_ns = fused_ns,
-        .warm_pairs = 3,
-        .timed_pairs = 24,
-        .rows = rows,
-        .heads = heads,
-        .head_dim = 128,
-        .all_six_outputs_evaluated = true,
-        .method = "single-process alternating AB/BA; graph build plus evaluation; hot nonzero conv tail",
-        .full_model = false,
-    }, .{ .whitespace = .indent_2 });
-    defer std.testing.allocator.free(text);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = text });
 }
 
 test "GLM KDA prework geometry guards every uint32 shader offset" {

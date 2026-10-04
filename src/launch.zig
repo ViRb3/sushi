@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const model_mod = @import("model.zig");
 
 pub const Budget = struct { context: u64, output: u64 };
 
@@ -44,8 +45,8 @@ pub const Entry = struct {
 
 /// pi's thinking levels, in its own order.
 const pi_levels = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh" };
-/// The server's effort vocabulary, in order (`model.Effort`).
-const server_efforts = [_][]const u8{ "off", "low", "medium", "high", "xhigh", "max" };
+/// The server's effort vocabulary, in order; `on` ranks below every graded word.
+const server_efforts = @typeInfo(model_mod.Effort).@"enum".field_names;
 
 fn listed(words: []const []const u8, w: []const u8) bool {
     for (words) |x| if (std.mem.eql(u8, x, w)) return true;
@@ -53,8 +54,9 @@ fn listed(words: []const []const u8, w: []const u8) bool {
 }
 
 /// The accepted word a pi level reaches the server as: the level itself, else the nearest
-/// accepted word above it (minimal reads as low), else below. A thinking level never lands
-/// on off; null = no accepted word, which pi's map reads as an unsupported level.
+/// accepted word above it (minimal reads as low), else below, which on an on/off model is `on`.
+/// A thinking level never lands on off; null = no accepted word, which pi's map reads as an
+/// unsupported level.
 pub fn piEffortFor(level: []const u8, accepted: []const []const u8) ?[]const u8 {
     if (std.mem.eql(u8, level, "off")) return if (listed(accepted, "off")) "off" else null;
     const want = if (std.mem.eql(u8, level, "minimal")) "low" else level;
@@ -913,15 +915,25 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
     }
 }
 
-const qwen4_efforts = [_][]const u8{ "off", "low", "medium", "xhigh" };
-const mimo_efforts = [_][]const u8{ "off", "low", "medium", "high", "xhigh", "max" };
+/// A served arch's `/v1/models` `reasoning_efforts`, read from the engine's own table.
+fn advertised(comptime model_type: []const u8) [model_mod.effortArms(model_type).?.len][]const u8 {
+    const arms = comptime model_mod.effortArms(model_type).?;
+    var words: [arms.len][]const u8 = undefined;
+    for (arms, 0..) |a, i| words[i] = @tagName(a.effort);
+    return words;
+}
+const qwen4_efforts = advertised("qwen4_exp");
+const mimo_efforts = advertised("mimo_v2");
+const glm5_efforts = advertised("glm5_next");
 
 test "piEffortFor: every pi level lands on a word the model accepts" {
     const want_qwen = [_][]const u8{ "off", "low", "low", "medium", "xhigh", "xhigh" };
-    const want_mimo = [_][]const u8{ "off", "low", "low", "medium", "high", "xhigh" };
-    for (pi_levels, want_qwen, want_mimo) |lvl, q, m| {
+    const want_mimo = [_][]const u8{ "off", "on", "on", "on", "on", "on" };
+    const want_glm = [_]?[]const u8{ null, "low", "low", "high", "high", "max" };
+    for (pi_levels, want_qwen, want_mimo, want_glm) |lvl, q, m, g| {
         try t.expectEqualStrings(q, piEffortFor(lvl, &qwen4_efforts).?);
         try t.expectEqualStrings(m, piEffortFor(lvl, &mimo_efforts).?);
+        if (g) |w| try t.expectEqualStrings(w, piEffortFor(lvl, &glm5_efforts).?) else try t.expect(piEffortFor(lvl, &glm5_efforts) == null);
     }
     // Rounds up first, then down, and a thinking level never becomes off.
     const only_low = [_][]const u8{ "off", "low" };
@@ -970,7 +982,10 @@ test "omp models.yml: off rides enable_thinking, every other level an accepted r
         "          mode: effort\n          requiresEffort: false\n          efforts: [minimal, low, medium, high, xhigh, max]\n" ++
         "          effortMap: {minimal: low, high: xhigh, max: xhigh}\n        input: [text]\n";
     try t.expect(std.mem.indexOf(u8, yml, qwen_block) != null);
-    try t.expect(std.mem.indexOf(u8, yml, "          effortMap: {minimal: low}\n") != null);
+    const mimo_block = "      - id: \"mimo\"\n        name: \"mimo (sushi)\"\n        reasoning: true\n        thinking:\n" ++
+        "          mode: effort\n          requiresEffort: false\n          efforts: [minimal, low, medium, high, xhigh, max]\n" ++
+        "          effortMap: {minimal: on, low: on, medium: on, high: on, xhigh: on, max: on}\n        input: [text]\n";
+    try t.expect(std.mem.indexOf(u8, yml, mimo_block) != null);
     try t.expectEqual(@as(usize, 2), std.mem.count(u8, yml, "thinking:\n"));
     try t.expect(std.mem.indexOf(u8, yml, "      - id: \"old\"\n        name: \"old (sushi)\"\n        reasoning: true\n        input: [text]\n") != null);
 }
@@ -1135,6 +1150,15 @@ test "zcode config escapes arbitrary model ids and declares server budgets and w
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE") != null);
     try t.expect(std.mem.indexOf(u8, script, "zcode '--prompt' 'it'\\''s a prompt'") != null);
+}
+
+test "zcode starts MiMo thinking, its own default" {
+    const entries = [_]Entry{.{ .id = "mimo", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &mimo_efforts }};
+    const json = try zcodeConfigJson(t.allocator, "http://localhost:12345", entries[0].id, &entries);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("on", parsed.value.object.get("config").?.object.get("defaultModelSelection").?.object.get("options").?.object.get("reasoningLevel").?.string);
 }
 
 test "zcode exposes only a model's advertised reasoning efforts" {

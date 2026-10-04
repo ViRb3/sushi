@@ -1,4 +1,4 @@
-//! Opt-in bounded IndexPool NAX scoring; top-512 retrieval policy is unchanged.
+//! Bounded IndexPool NAX scoring; top-512 retrieval policy is unchanged.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -7,19 +7,9 @@ pub const dot_limit: usize = 2 * 1024 * 1024;
 pub const tile_pools: usize = 2048;
 pub const max_rows: usize = 16;
 pub const transient_bytes: usize = 8 * 1024 * 1024;
-threadlocal var enabled_override: ?bool = null;
 var calls: usize = 0;
-pub const Binding = struct {
-    previous: ?bool,
-    pub fn restore(self: Binding) void { enabled_override = self.previous; }
-};
-pub fn bind(on: bool) Binding {
-    const result = Binding{ .previous = enabled_override };
-    enabled_override = on;
-    return result;
-}
 pub fn enabled() bool {
-    return enabled_override orelse @import("transformer.zig").diagEnvOn("SUSHI_GLM_INDEX_SCORE_NAX");
+    return !@import("glm5_model.zig").reference_numerics;
 }
 pub fn resetDispatchCount() void { calls = 0; }
 pub fn dispatchCount() usize { return calls; }
@@ -48,24 +38,6 @@ const EPILOGUE: [:0]const u8 =
     \\}
     \\out[i]=float(InT(total));
 ;
-// Original production SCORE arithmetic, used only as the component reference.
-const REFERENCE: [:0]const u8 =
-    \\#pragma clang fp contract(off)
-    \\const uint lane=thread_position_in_threadgroup.x;
-    \\const uint p=threadgroup_position_in_grid.y;
-    \\const uint row=threadgroup_position_in_grid.z;
-    \\const uint pools=uint(count);
-    \\if ((p+1u)*4u > uint(offset)+row+1u) { if(lane==0) out[row*pools+p]=-INFINITY; return; }
-    \\float total=0.0f;
-    \\for(uint h=0;h<32u;++h) {
-    \\  float dot=0.0f;
-    \\  for(uint d=lane;d<128u;d+=32u) dot+=float(q[(row*32u+h)*128u+d])*float(keys[p*128u+d]);
-    \\  dot=simd_sum(dot);
-    \\  const float rounded=float(InT(dot));
-    \\  total+=float(InT(max(rounded,0.0f)*float(weights[row*32u+h])));
-    \\}
-    \\if(lane==0) out[row*pools+p]=float(InT(total));
-;
 fn kernel(comptime name: [:0]const u8, ins: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
     const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
     defer _ = mlx.mlx_vector_string_free(iv);
@@ -76,7 +48,6 @@ fn kernel(comptime name: [:0]const u8, ins: []const [*:0]const u8, source: [:0]c
     return result;
 }
 var epi_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var ref_kernel: ?mlx.mlx_fast_metal_kernel = null;
 fn apply(ops: *Ops, k: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, inputs: []const Arr) !Arr {
     const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -146,44 +117,18 @@ pub fn scores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: m
     try mlx.check(mlx.mlx_concatenate_axis(&out, parts, 1, s));
     return out;
 }
-pub fn reference(ops: *Ops, q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize) !Arr {
-    const rows = mlx.getShape(q)[0];
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, @as(c_int, @intCast(pools)) }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, @intCast(pools), rows));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", .bfloat16));
-    if (ref_kernel == null) ref_kernel = try kernel("sushi_glm_index_score_reference", &.{ "q", "keys", "weights", "offset", "count" }, REFERENCE);
-    return apply(ops, ref_kernel.?, cfg, &.{ q, keys, weights, try scalar(ops, offset), try scalar(ops, pools) });
-}
-pub fn topPools(ops: *Ops, values: Arr) !Arr {
-    const rows = mlx.getShape(values)[0];
-    const pools = mlx.getShape(values)[1];
-    const neg = try ops.unary(.negative, values);
-    const partition = try ops.slot();
-    try mlx.check(mlx.mlx_argpartition_axis(partition, neg, @min(pools, 512) - 1, -1, ops.s));
-    const out = try ops.slot();
-    try mlx.check(mlx.mlx_slice(out, partition.*, &.{ 0, 0 }, 2, &.{ rows, @min(pools, 512) }, 2, &.{ 1, 1 }, 2, ops.s));
-    return out.*;
-}
 test "GLM IndexPool NAX dot plane remains within original bound" {
     try std.testing.expectEqual(dot_limit, try dotBytes(16, 2048));
     try std.testing.expectEqual(@as(usize, 524288), try outputBytes(16, 8192));
     try std.testing.expect(geometry(&.{ 16, 32, 128 }, &.{ 8192, 128 }, &.{ 16, 32 }, 32752, 8192));
     try std.testing.expect(!geometry(&.{ 17, 32, 128 }, &.{ 8192, 128 }, &.{ 17, 32 }, 32751, 8192));
 }
-test "GLM IndexPool NAX controls reserve transient copies per pending layer" {
-    const off = bind(false);
-    defer off.restore();
+test "GLM IndexPool NAX reserves transient copies per pending layer" {
+    try std.testing.expectEqual(transient_bytes * 2, try transientBudget(2048, 2));
+    try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
+    try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));
+    const model = @import("glm5_model.zig");
+    model.reference_numerics = true;
+    defer model.reference_numerics = false;
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(2048, 2));
-    {
-        const on = bind(true);
-        defer on.restore();
-        try std.testing.expect(enabled());
-        try std.testing.expectEqual(transient_bytes * 2, try transientBudget(2048, 2));
-        try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
-        try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));
-    }
-    try std.testing.expect(!enabled());
 }

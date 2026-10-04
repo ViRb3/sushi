@@ -1,9 +1,8 @@
 //! Request-local IndexPool and NoPE latent attention. All caches are lossless.
-//! GLM production policy is BF16 compressed MLA cache; do not inherit generic KV8
-//! defaults when integrating this state into serving. KDA separately keeps FP32 state.
+//! The served MLA cache is BF16 compressed latent; generic KV8 defaults do not apply.
 const std = @import("std");
 const mlx = @import("mlx.zig");
-const prefill_direct = @import("glm5_attention_prefill.zig");
+const partials = @import("glm5_attention_prefill.zig");
 const packed_nax = @import("glm5_attention_nax_packed.zig");
 const latent_overlay = @import("glm5_attention_overlay.zig");
 const Arr = mlx.mlx_array;
@@ -14,60 +13,10 @@ const pool_budget = 512;
 const selected_width = pool_size * pool_budget + pool_size - 1;
 pub const score_scratch_bytes: usize = 2 * 1024 * 1024;
 pub const attention_scratch_bytes: usize = 8 * 1024 * 1024;
-threadlocal var packed_cadence: ?bool = null;
-var cadence_calls: usize = 0;
-pub const CadenceBinding = struct {
-    previous: ?bool,
-    pub fn restore(self: CadenceBinding) void {
-        packed_cadence = self.previous;
-    }
-};
-pub fn bindPackedCadence(on: bool) CadenceBinding {
-    const binding = CadenceBinding{ .previous = packed_cadence };
-    packed_cadence = on;
-    return binding;
-}
-pub fn packedCadenceEnabled() bool {
-    return packed_cadence orelse @import("transformer.zig").diagEnvOn("SUSHI_GLM_PREFILL_CADENCE");
-}
-pub fn packedCadenceCalls() usize {
-    return cadence_calls;
-}
-pub fn resetPackedCadenceCalls() void {
-    cadence_calls = 0;
-}
+/// Paired packed tiles keep a second tile live beside the first.
 pub fn packedCadenceTransientBudget(chunk: usize, pending_layers: usize) !usize {
-    if (!packed_nax.enabled() or !packedCadenceEnabled() or chunk <= packed_nax.batchRows()) return 0;
-    return std.math.mul(usize, packed_nax.scratchLimit(), pending_layers);
-}
-
-threadlocal var captured_cadence: bool = false;
-fn captureCadence(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32) !void {
-    if (captured_cadence or mlx.getShape(q)[0] != 2048) return;
-    const path = std.c.getenv("SUSHI_GLM_PREFILL_CADENCE_CAPTURE") orelse return;
-    const history_target = if (std.c.getenv("SUSHI_GLM_PREFILL_CADENCE_CAPTURE_HISTORY")) |raw|
-        try std.fmt.parseInt(usize, std.mem.span(raw), 10)
-    else
-        8192;
-    if (history_target != 8192 and history_target != 16384) return error.InvalidCadenceCaptureHistory;
-    if (state.processed != history_target) return;
-    var ops = Ops{ .s = mlx.gpuStream() };
-    defer ops.deinit();
-    const off: u32 = @intCast(offset);
-    const history: u32 = @intCast(state.processed);
-    const values = [_]Arr{ q, iq, weights, state.latent, state.pooled, try ops.own(mlx.mlx_array_new_data(&off, &.{}, 0, .uint32)), try ops.own(mlx.mlx_array_new_data(&history, &.{}, 0, .uint32)), try ops.own(mlx.mlx_array_new_data(&scale, &.{}, 0, .float32)) };
-    const ev = mlx.mlx_vector_array_new_data(&values, values.len);
-    defer _ = mlx.mlx_vector_array_free(ev);
-    try mlx.check(mlx.mlx_eval(ev));
-    const arrays = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(arrays);
-    const metadata = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(metadata);
-    for ([_][*:0]const u8{ "q", "index_q", "weights", "latent", "pooled", "offset", "processed", "scale" }, values) |name, value|
-        try mlx.check(mlx.mlx_map_string_to_array_insert(arrays, name, value));
-    try mlx.check(mlx.mlx_map_string_to_string_insert(metadata, "provenance", "first real MLA T2048 at selected history; capture forces evaluation; not a throughput run"));
-    try mlx.check(mlx.mlx_save_safetensors(path, arrays, metadata));
-    captured_cadence = true;
+    if (!packed_nax.enabled() or chunk <= packed_nax.wide_rows) return 0;
+    return std.math.mul(usize, packed_nax.scratch_limit, pending_layers);
 }
 
 const Scope = struct {
@@ -314,7 +263,7 @@ const EXPAND: [:0]const u8 =
     \\}
     \\out[i]=token;
 ;
-const ATTENTION: [:0]const u8 = prefill_direct.common ++ prefill_direct.partial_tail;
+const ATTENTION: [:0]const u8 = partials.common ++ partials.partial_tail;
 const MERGE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint i=thread_position_in_grid.x;
@@ -377,13 +326,6 @@ fn selectChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, o
     return kernelOutput(scope, ev, 0);
 }
 
-/// Isolated probes retain the original ordered selector without changing dispatch.
-pub fn probeSelect(state: *const State, index_q: Arr, weights: Arr, offset: usize, s: mlx.mlx_stream) !Arr {
-    var scope = Scope{ .s = s };
-    defer scope.deinit();
-    return scope.result(try selectChunk(&scope, state, index_q, weights, offset));
-}
-
 fn selectPackedChunk(scope: *Scope, state: *const State, index_q: Arr, weights: Arr, offset: usize) !Arr {
     const rows = mlx.getShape(index_q)[0];
     if (rows <= packed_nax.max_rows) return selectChunk(scope, state, index_q, weights, offset);
@@ -391,12 +333,6 @@ fn selectPackedChunk(scope: *Scope, state: *const State, index_q: Arr, weights: 
     const first = try selectChunk(scope, state, try scope.cut(index_q, 0, 16), try scope.cut(weights, 0, 16), offset);
     const second = try selectChunk(scope, state, try scope.cut(index_q, 16, 32), try scope.cut(weights, 16, 32), offset + 16);
     return scope.join(first, second);
-}
-
-pub fn probePackedSelect(state: *const State, index_q: Arr, weights: Arr, offset: usize, s: mlx.mlx_stream) !Arr {
-    var scope = Scope{ .s = s };
-    defer scope.deinit();
-    return scope.result(try selectPackedChunk(&scope, state, index_q, weights, offset));
 }
 
 /// The same per-node rule is used for serial decode and verifier ancestry.
@@ -413,7 +349,7 @@ pub fn decodeSelected(state: *const State, index_q: Arr, weights: Arr, offset: u
     return scope.result(try scope.shape(ids.*, &.{ 1, selected_width }));
 }
 
-fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, direct: bool, headpack: bool, overlay: ?latent_overlay.View) !Arr {
+fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, offset: usize, scale: f32, splits: c_int, headpack: bool, overlay: ?latent_overlay.View) !Arr {
     if (headpack) {
         var ops = @import("glm5_model.zig").Ops{ .s = scope.s };
         defer ops.deinit();
@@ -431,7 +367,6 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
     const length = try scope.own(mlx.mlx_array_new_int(@intCast(state.processed)));
     const scaling = try scope.own(mlx.mlx_array_new_float(scale));
     const indices = selected orelse try scope.zeros(&.{1}, .int32);
-    if (direct) return scope.own(try prefill_direct.attend(q, state.latent, indices, off, length, scaling, selected != null, scope.s));
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, heads, splits, dim }, 4, .float32));
@@ -481,15 +416,6 @@ pub fn attendOverlay(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, 
     return attendImpl(state, q, index_q, weights, offset, scale, view, s);
 }
 
-/// Scalar split-eight control on common selected IDs and immutable branch views.
-pub fn probeSelectedOverlay(state: *const State, q: Arr, selected: Arr, offset: usize, scale: f32, view: latent_overlay.View, s: mlx.mlx_stream) !Arr {
-    try view.validate(q);
-    if (state.processed != view.length() or offset + 1 != state.processed) return error.InvalidGlmOverlay;
-    var scope = Scope{ .s = s };
-    defer scope.deinit();
-    return scope.result(try attentionChunk(&scope, state, q, selected, offset, scale, 8, false, false, view));
-}
-
 const PackedTile = struct {
     scope: Scope,
     ops: Ops,
@@ -518,7 +444,7 @@ test "GLM packed32 scheduling keeps every remainder in original selector geometr
     try std.testing.expectEqual(@as(usize, 5), packedTileRows(5, 16));
 }
 
-fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32, max_rows: usize, direct: bool, s: mlx.mlx_stream) !Arr {
+fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset: usize, scale: f32, max_rows: usize, s: mlx.mlx_stream) !Arr {
     const rows: usize = @intCast(mlx.getShape(q)[0]);
     const parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
@@ -538,7 +464,7 @@ fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset:
             const qc = try tile.scope.cut(q, @intCast(start), @intCast(end));
             const selected = try selectPackedChunk(&tile.scope, state, try tile.scope.cut(iq, @intCast(start), @intCast(end)), try tile.scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
             tile.out = (try packed_nax.run(&tile.ops, qc, state.latent, selected, offset + start, state.processed, scale)) orelse
-                try attentionChunk(&tile.scope, state, qc, selected, offset + start, scale, 1, direct, false, null);
+                try attentionChunk(&tile.scope, state, qc, selected, offset + start, scale, 1, false, null);
             const submit = mlx.mlx_vector_array_new_data(&.{tile.out}, 1);
             defer _ = mlx.mlx_vector_array_free(submit);
             tile.pending = true;
@@ -578,27 +504,19 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
             mlx.mlx_array_dtype(w) != mlx.mlx_array_dtype(iq)) return error.InvalidGlmAttentionShape;
     }
     const native = @import("glm5_attention_decode_batch.zig");
-    if (native.enabled() and sh[0] <= 8 and
-        (native.explicitlyRequested() or native.supportedQuery(sh, mlx.mlx_array_dtype(q), s)))
+    if (native.enabled() and sh[0] <= 8 and native.supportedQuery(sh, mlx.mlx_array_dtype(q), s))
         return attendNativeDecode(state, q, index_q, weights, offset, scale, overlay, s);
     const splits: c_int = if (sh[0] <= 8) 8 else 1;
     const headpack = overlay == null and sparse and splits == 1 and sh[1] == 64 and sh[2] == 512 and
         mlx.mlx_array_dtype(q) == .bfloat16 and packed_nax.enabled();
-    const direct = splits == 1 and prefill_direct.enabled();
-    const per_row = if (direct) try prefill_direct.rowBytes(@intCast(sh[1]), @intCast(sh[2]), mlx.mlx_array_itemsize(q)) else try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
+    const per_row = try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
     const pool_bytes = @max(@as(usize, 4), state.processed / 4 * 4);
     if (per_row > attention_scratch_bytes or (sparse and pool_bytes > score_scratch_bytes)) return error.GlmAttentionScratchBudget;
-    const wide_chunk = headpack and packedCadenceEnabled() and packed_nax.batch32Enabled() and sh[0] >= 32;
-    const packed_rows = if (wide_chunk) packed_nax.batchRows() else packed_nax.max_rows;
+    const wide_chunk = headpack and sh[0] >= 32;
+    const packed_rows = if (wide_chunk) packed_nax.wide_rows else packed_nax.max_rows;
     const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), if (headpack) packed_rows else 128));
-    if (headpack) {
-        try captureCadence(state, q, index_q.?, weights.?, offset, scale);
-        if (packedCadenceEnabled() and (@as(usize, @intCast(sh[0])) > max_rows or (wide_chunk and max_rows == 32))) {
-            const out = try attendPackedPairs(state, q, index_q.?, weights.?, offset, scale, max_rows, direct, s);
-            cadence_calls += 1;
-            return out;
-        }
-    }
+    if (headpack and (@as(usize, @intCast(sh[0])) > max_rows or (wide_chunk and max_rows == 32)))
+        return attendPackedPairs(state, q, index_q.?, weights.?, offset, scale, max_rows, s);
     const parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
     var start: usize = 0;
@@ -608,7 +526,7 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
         defer scope.deinit();
         const qc = try scope.cut(q, @intCast(start), @intCast(end));
         const selected = if (sparse) try selectChunk(&scope, state, try scope.cut(index_q.?, @intCast(start), @intCast(end)), try scope.cut(weights.?, @intCast(start), @intCast(end)), offset + start) else null;
-        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits, direct, headpack, overlay);
+        const out = try attentionChunk(&scope, state, qc, selected, offset + start, scale, splits, headpack, overlay);
         // Settle bounded chunks before dropping their score/partial buffers.
         if (@as(usize, @intCast(sh[0])) > max_rows) try mlx.check(mlx.mlx_array_eval(out));
         try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
@@ -923,17 +841,7 @@ test "GLM attention rejects invalid append without advancing request state" {
     try std.testing.expectEqual(@as(usize, 0), other.processed);
 }
 
-test "GLM native decode default fallback preserves unsupported tiny attention bits" {
-    const a = std.testing.allocator;
-    const name = "SUSHI_GLM_DECODE_BATCH";
-    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    defer {
-        if (previous) |value| {
-            _ = setenv(name, value, 1);
-            a.free(value);
-        } else _ = unsetenv(name);
-    }
-    _ = unsetenv(name);
+test "GLM native decode falls back for unsupported tiny attention bits" {
     const native = @import("glm5_attention_decode_batch.zig");
     const s = mlx.gpuStream();
     const latent = array(&.{ 0.25, -0.5, 1, 2 }, &.{ 2, 2 });
@@ -947,9 +855,10 @@ test "GLM native decode default fallback preserves unsupported tiny attention bi
     var state = State.init();
     defer state.deinit();
     _ = try state.append(latent, keys, keys, ape, s);
+    const model = @import("glm5_model.zig");
     const reference = blk: {
-        const off = native.bind(false);
-        defer off.restore();
+        model.reference_numerics = true;
+        defer model.reference_numerics = false;
         break :blk try attend(&state, q, null, null, 1, 0.5, s);
     };
     defer _ = mlx.mlx_array_free(reference);
@@ -965,5 +874,14 @@ test "GLM native decode default fallback preserves unsupported tiny attention bi
     try std.testing.expectEqual(@as(usize, 0), native.b3Calls());
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+test "GLM packed cadence bills a second tile only beyond one wide tile" {
+    const packed_attention = @import("glm5_attention_nax_packed.zig");
+    try std.testing.expectEqual(@as(usize, 0), try packedCadenceTransientBudget(32, 2));
+    try std.testing.expectEqual(packed_attention.scratch_limit, try packedCadenceTransientBudget(33, 1));
+    try std.testing.expectEqual(packed_attention.scratch_limit * 2, try packedCadenceTransientBudget(2048, 2));
+    try std.testing.expectError(error.Overflow, packedCadenceTransientBudget(2048, std.math.maxInt(usize)));
+    const model = @import("glm5_model.zig");
+    model.reference_numerics = true;
+    defer model.reference_numerics = false;
+    try std.testing.expectEqual(@as(usize, 0), try packedCadenceTransientBudget(2048, 2));
+}

@@ -1,4 +1,4 @@
-//! Partial GLM layer assembly; not yet connected to the served model forward.
+//! GLM trunk layers: affine/FP8 projections, mHC, KDA and the dense MLP.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
@@ -6,6 +6,9 @@ const primitive = @import("glm5_next.zig");
 const exl3 = @import("sushi_exl3");
 const Arr = mlx.mlx_array;
 const fp8_block = @import("fp8_block.zig");
+
+/// Set by the BF16 teacher capture: every GLM fast kernel defers to its reference arm.
+pub var reference_numerics = false;
 
 pub const Ops = struct {
     s: mlx.mlx_stream,
@@ -372,12 +375,6 @@ pub const Hc = struct {
                 return primitive.hcCollapse(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
             }
         }
-        if (@import("glm5_hc_fused.zig").enabled()) {
-            if (try @import("glm5_hc_fused.zig").mix(ops.s, x, self.w, cfg.rms_norm_eps)) |candidate| {
-                const mixes = try ops.own(candidate);
-                return primitive.hcCollapse(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
-            }
-        }
         return self.collapseReference(ops, x, cfg);
     }
 
@@ -588,11 +585,7 @@ pub const KdaLayer = struct {
         };
         const recurrent = if (state.initialized) state.ssm_state else try ops.zeros(&.{ sh[0], heads, dim, dim }, .float32);
         const inputs = primitive.KdaInputs{ .q = prepared.q, .k = prepared.k, .v = prepared.v, .decay = prepared.decay, .beta = prepared.beta, .state = recurrent };
-        const value_rows = @import("glm5_kda_value_rows.zig");
-        const scheduled = if (sh[1] >= 128) blk: {
-            const rows = try value_rows.configuredRows() orelse break :blk null;
-            break :blk try value_rows.run(inputs, rows, ops.s);
-        } else null;
+        const scheduled = if (sh[1] >= 128 and !reference_numerics) try @import("glm5_kda_value_rows.zig").run(inputs, 4, ops.s) else null;
         const result = scheduled orelse try primitive.kda(inputs, ops.s);
         defer result.deinit();
         try mlx.check(mlx.mlx_array_set(&state.conv_state, prepared.conv));
@@ -745,15 +738,8 @@ fn expectLayerReference(actual: Arr, expected: Arr, abs: f32, rel: f32) !void {
     try mlx.check(mlx.mlx_array_eval(a));
     try mlx.check(mlx.mlx_array_eval(e));
     const size = mlx.mlx_array_size(a);
-    var maximum: f32 = 0;
-    var relative: f32 = 0;
-    for (mlx.mlx_array_data_float32(a).?[0..size], mlx.mlx_array_data_float32(e).?[0..size]) |v, want| {
-        maximum = @max(maximum, @abs(v - want));
-        relative = @max(relative, @abs(v - want) / @max(@abs(want), 1e-8));
+    for (mlx.mlx_array_data_float32(a).?[0..size], mlx.mlx_array_data_float32(e).?[0..size]) |v, want|
         try std.testing.expectApproxEqAbs(want, v, abs + rel * @abs(want));
-    }
-    if (@import("transformer.zig").diagEnvOn("SUSHI_GLM_REFERENCE_STATS"))
-        std.debug.print("GLM reference {s} {any}: max_abs={e} max_rel={e}\n", .{ @tagName(mlx.mlx_array_dtype(actual)), mlx.getShape(actual), maximum, relative });
 }
 
 test "GLM reference full KDA apply matches oMLX serial and irregular chunks" {

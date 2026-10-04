@@ -3446,10 +3446,47 @@ fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64
     return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
 }
 
+/// A just-exited process returns its Metal memory over seconds: while a short reading keeps
+/// rising, poll every 500 ms; stop at enough, after 2 s without growth, or after 15 s.
+fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
+    var avail = first;
+    var stalled: u32 = 0;
+    var polls: u32 = 0;
+    while (avail > 0 and avail < needed and stalled < 4 and polls < 30) : (polls += 1) {
+        reader.sleep();
+        const next = reader.read();
+        stalled = if (next > avail) 0 else stalled + 1;
+        avail = next;
+    }
+    return avail;
+}
+
 /// A resident Sushi load shares the working-set cap with already active model buffers.
 fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64) u64 {
     const available = effectiveAvailableBytes(host_avail, proc_avail, gpu_limit);
     return if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
+}
+
+test "load preflight waits for a prior process's memory to come back, and only while it does" {
+    const gib: u64 = 1 << 30;
+    const Fake = struct {
+        seq: []const u64,
+        i: usize = 0,
+        fn read(f: *@This()) u64 {
+            const v = f.seq[@min(f.i, f.seq.len - 1)];
+            f.i += 1;
+            return v;
+        }
+        fn sleep(_: *@This()) void {}
+    };
+    var rising = Fake{ .seq = &.{ 80 * gib, 95 * gib, 110 * gib } };
+    try testing.expectEqual(@as(u64, 110 * gib), settleAvailableBytes(69 * gib, 100 * gib, &rising));
+    var short = Fake{ .seq = &.{ 70 * gib, 70 * gib, 70 * gib, 70 * gib, 70 * gib, 200 * gib } };
+    try testing.expectEqual(@as(u64, 70 * gib), settleAvailableBytes(69 * gib, 100 * gib, &short));
+    try testing.expectEqual(@as(usize, 5), short.i);
+    var never = Fake{ .seq = &.{200 * gib} };
+    try testing.expectEqual(@as(u64, 120 * gib), settleAvailableBytes(120 * gib, 100 * gib, &never));
+    try testing.expectEqual(@as(usize, 0), never.i);
 }
 
 test "Sushi quant memory subtracts existing resident buffers from the GPU limit" {
@@ -3530,13 +3567,11 @@ fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelCo
     // A draft block grows a 2047-row window to the next 256-row allocation.
     config.glm_dflash_window_bytes = per_token * ((@as(u64, cfg.sliding_window) + cfg.block_size + 255) / 256 * 256);
     config.glm_dflash_capture_bytes_per_token = (@as(u64, cfg.target_layer_ids.len) * cfg.hidden_size + @as(u64, cfg.hidden_size) * 2) * 2 + per_token;
-    const mini = if (transformer_mod.diagEnvOn("SUSHI_GLM_DFLASH_MINI_HEAD")) @import("glm5_dflash_mini.zig").residentBytes(@intCast(config.vocab_size), @intCast(config.hidden_size)) else 0;
     const runtime_cache = @import("glm5_dflash_cache.zig");
-    const weights = if (runtime_cache.isShippedSource(directory, model_dir))
+    return if (runtime_cache.isShippedSource(directory, model_dir))
         try runtime_cache.plannedResidentBytes(io, allocator, directory)
     else
         try @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
-    return weights +| mini;
 }
 
 fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, load_vision: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
@@ -3795,15 +3830,36 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (!skip_mem_preflight) {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const gpu_limit = mlx.maxRecommendedWorkingSet();
-        var active: usize = 0;
-        if (model_mod.usesSushiQuantMemoryBill(params.config)) _ = mlx.mlx_get_active_memory(&active);
-        const avail_bytes = if (model_mod.usesSushiQuantMemoryBill(params.config))
-            effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), gpu_limit, active)
-        else
-            effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), gpu_limit);
+        const Reader = struct {
+            io: std.Io,
+            gpu_limit: usize,
+            sushi: bool,
+            fn read(r: *@This()) u64 {
+                if (!r.sushi) return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
+                var active: usize = 0;
+                _ = mlx.mlx_get_active_memory(&active);
+                return effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active);
+            }
+            fn sleep(r: *@This()) void {
+                std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
+            }
+        };
+        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
+        var avail_bytes = reader.read();
         const ctx_bytes = preflightCtxBytes(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.ane_prefill, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
-        const serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
-        const needed = @max(loadRequirementForConfig(params.config, weights_bytes, ctx_bytes), weights_bytes +| (if (serving) |b| b.needed else 0));
+        var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
+        var needed = @max(loadRequirementForConfig(params.config, weights_bytes, ctx_bytes), weights_bytes +| (if (serving) |b| b.needed else 0));
+        if (weights_bytes > 0 and avail_bytes > 0 and avail_bytes < needed) {
+            log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
+                @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
+                @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
+            });
+            avail_bytes = settleAvailableBytes(avail_bytes, needed, &reader);
+            serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
+            needed = @max(loadRequirementForConfig(params.config, weights_bytes, ctx_bytes), weights_bytes +| (if (serving) |b| b.needed else 0));
+        }
+        var active: usize = 0;
+        if (reader.sushi) _ = mlx.mlx_get_active_memory(&active);
         log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),

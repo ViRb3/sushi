@@ -1,29 +1,13 @@
-//! Opt-in mode-matched B1/B3 native decode attention.
+//! Mode-matched B1/B3 native decode attention.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 pub const scratch_limit: usize = 8 * 1024 * 1024;
-threadlocal var mode_override: ?bool = null;
 var b1_calls: usize = 0;
 var b3_calls: usize = 0;
-pub const Binding = struct {
-    previous: ?bool,
-    pub fn restore(self: Binding) void {
-        mode_override = self.previous;
-    }
-};
-pub fn bind(on: bool) Binding {
-    const result = Binding{ .previous = mode_override };
-    mode_override = on;
-    return result;
-}
 pub fn enabled() bool {
-    return mode_override orelse @import("transformer.zig").diagEnvOn("SUSHI_GLM_DECODE_BATCH");
-}
-// Explicit opt-in remains strict; the qualified default can decline other models.
-pub fn explicitlyRequested() bool {
-    return mode_override orelse @import("transformer.zig").diagEnvValueOn(std.c.getenv("SUSHI_GLM_DECODE_BATCH"));
+    return !@import("glm5_model.zig").reference_numerics;
 }
 pub fn supportedConfig(cfg: *const @import("model.zig").ModelConfig, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) bool {
     return cfg.num_attention_heads == 64 and cfg.mla_kv_lora_rank == 512 and cfg.mla_qk_nope_head_dim == 256 and
@@ -43,10 +27,6 @@ pub fn b3Calls() usize {
 pub fn resetCalls() void {
     b1_calls = 0;
     b3_calls = 0;
-}
-pub fn admit(cfg: *const @import("model.zig").ModelConfig, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !void {
-    if (!enabled() or !explicitlyRequested()) return;
-    if (!supportedConfig(cfg, dtype, s)) return error.GlmDecodeNativeUnsupported;
 }
 pub const Branch = struct {
     offset: usize,
@@ -178,53 +158,10 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
     bad[2].path = .{ 0, 0, 0 };
     try std.testing.expect(!geometry(&.{ 3, 64, 512 }, &.{ 16384, 512 }, 16381, &.{ 3, 512 }, &.{ 3, 2051 }, &bad));
     try std.testing.expect(try temporaryBytes(3) <= scratch_limit);
-    const off = bind(false);
-    defer off.restore();
+    try std.testing.expectEqual(scratch_limit * 4, try transientBudget(4));
+    try std.testing.expectError(error.Overflow, transientBudget(std.math.maxInt(usize)));
+    const model = @import("glm5_model.zig");
+    model.reference_numerics = true;
+    defer model.reference_numerics = false;
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(4));
-    {
-        const on = bind(true);
-        defer on.restore();
-        try std.testing.expect(enabled());
-        try std.testing.expectEqual(scratch_limit * 4, try transientBudget(4));
-        try std.testing.expectError(error.Overflow, transientBudget(std.math.maxInt(usize)));
-    }
-    try std.testing.expect(!enabled());
 }
-
-test "GLM native decode default fallback admission preserves explicit requests" {
-    const a = std.testing.allocator;
-    const name = "SUSHI_GLM_DECODE_BATCH";
-    const prior = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    defer {
-        if (prior) |value| {
-            _ = setenv(name, value, 1);
-            a.free(value);
-        } else _ = unsetenv(name);
-    }
-    const previous = mode_override;
-    mode_override = null;
-    defer mode_override = previous;
-    _ = unsetenv(name);
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    const unsupported = @import("model.zig").ModelConfig{};
-    try std.testing.expect(enabled());
-    try admit(&unsupported, .bfloat16, cpu);
-    try std.testing.expect(!explicitlyRequested());
-    try std.testing.expect(!supportedQuery(&.{ 1, 2, 2 }, .float32, cpu));
-    const gpu = mlx.gpuStream();
-    try std.testing.expectEqual(@import("glm5_kda_fused.zig").hardwareSupported(), supportedQuery(&.{ 3, 64, 512 }, .bfloat16, gpu));
-    try std.testing.expect(!supportedQuery(&.{ 3, 64, 512 }, .float32, gpu));
-    {
-        const explicit = bind(true);
-        defer explicit.restore();
-        try std.testing.expectError(error.GlmDecodeNativeUnsupported, admit(&unsupported, .bfloat16, cpu));
-    }
-    _ = setenv(name, "1", 1);
-    try std.testing.expectError(error.GlmDecodeNativeUnsupported, admit(&unsupported, .bfloat16, cpu));
-    _ = setenv(name, "0", 1);
-    try admit(&unsupported, .bfloat16, cpu);
-}
-
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;

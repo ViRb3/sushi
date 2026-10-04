@@ -3,69 +3,28 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
-pub const scratch_limit: usize = 64 * 1024 * 1024;
 pub const max_rows: usize = 16;
 pub const wide_rows: usize = 32;
-pub const wide_scratch_limit: usize = 128 * 1024 * 1024;
-threadlocal var batch32_override: ?bool = null;
-pub const Batch32Binding = struct {
-    previous: ?bool,
-    pub fn restore(self: Batch32Binding) void {
-        batch32_override = self.previous;
-    }
-};
-pub fn bind32(on: bool) Batch32Binding {
-    const old = Batch32Binding{ .previous = batch32_override };
-    batch32_override = on;
-    return old;
-}
-pub fn batch32Enabled() bool {
-    return batch32_override orelse @import("transformer.zig").diagEnvOn("SUSHI_GLM_PREFILL_PACKED32");
-}
-pub fn batchRows() usize {
-    return if (batch32Enabled()) wide_rows else max_rows;
-}
-pub fn scratchLimit() usize {
-    return if (batch32Enabled()) wide_scratch_limit else scratch_limit;
-}
-var wide_calls: usize = 0;
-pub fn wideDispatchCount() usize {
-    return wide_calls;
-}
-threadlocal var enabled_override: ?bool = null;
+/// Bounds one tile of either width; a pending layer holds at most one.
+pub const scratch_limit: usize = 128 * 1024 * 1024;
 var calls: usize = 0;
-pub const Binding = struct {
-    previous: ?bool,
-    pub fn restore(self: Binding) void {
-        enabled_override = self.previous;
-    }
-};
-pub fn bind(on: bool) Binding {
-    const result = Binding{ .previous = enabled_override };
-    enabled_override = on;
-    return result;
-}
 pub fn enabled() bool {
-    if (enabled_override) |on| return on;
-    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_ATTENTION_PACKED");
+    return !@import("glm5_model.zig").reference_numerics;
 }
 pub fn resetDispatchCount() void {
     calls = 0;
-    wide_calls = 0;
 }
 pub fn dispatchCount() usize {
     return calls;
 }
 pub fn transientBudget(chunk: usize, pending_layers: usize) !usize {
     if (!enabled() or chunk <= 8) return 0;
-    return std.math.mul(usize, scratchLimit(), pending_layers);
+    return std.math.mul(usize, scratch_limit, pending_layers);
 }
 pub fn temporaryBytes(rows: usize) !usize {
     if (rows == 0 or (rows > max_rows and rows != wide_rows)) return error.UnsupportedGlmPackedAttention;
-    // One contiguous gathered BF16 KV bank; native K/V share it without copies.
-    // Query,
-    // result, result-zeroing and native contiguity copies; expanded bool mask,
-    // predicate/index bookkeeping. No [Q,H,K] floating score tensor.
+    // One gathered BF16 KV bank shared by K/V; query, result, zeroing and contiguity
+    // copies; the bool mask and index bookkeeping. No [Q,H,K] floating score tensor.
     return std.math.mul(usize, rows, 2051 * 512 * 2 + 64 * 512 * 2 * 4 + 64 * 2051 + 2051 * 9 + 16);
 }
 const gather_source: [:0]const u8 =
@@ -123,7 +82,7 @@ fn gather(ops: *Ops, cache: Arr, ids: Arr, offset: usize, history: usize) !struc
     return .{ .kv = kv.*, .mask = mask.* };
 }
 fn geometry(q: []const c_int, cache: []const c_int, ids: []const c_int, offset: usize, history: usize) bool {
-    return q.len == 3 and q[0] > 0 and (q[0] <= max_rows or (q[0] == wide_rows and batch32Enabled())) and q[1] == 64 and q[2] == 512 and
+    return q.len == 3 and q[0] > 0 and (q[0] <= max_rows or q[0] == wide_rows) and q[1] == 64 and q[2] == 512 and
         cache.len == 2 and cache[0] >= history and cache[1] == 512 and ids.len == 2 and ids[0] == q[0] and ids[1] == 2051 and
         history > 0 and history <= 1048576 and offset <= history and q[0] <= history - offset;
 }
@@ -138,7 +97,7 @@ pub fn run(ops: *Ops, q: Arr, cache: Arr, selected: Arr, offset: usize, history:
     const cs = mlx.mlx_array_strides(cache);
     if (cs[0] != 512 or cs[1] != 1) return null;
     const rows = mlx.getShape(q)[0];
-    if (try temporaryBytes(@intCast(rows)) > scratchLimit()) return error.GlmPackedAttentionScratchBudget;
+    if (try temporaryBytes(@intCast(rows)) > scratch_limit) return error.GlmPackedAttentionScratchBudget;
     const is = mlx.mlx_array_strides(selected);
     const ids = if (is[0] == 2051 and is[1] == 1) selected else try ops.contiguous(selected);
     const bank = try gather(ops, cache, ids, offset, history);
@@ -155,7 +114,6 @@ pub fn run(ops: *Ops, q: Arr, cache: Arr, selected: Arr, offset: usize, history:
     try mlx.check(mlx.mlx_where(safe, try ops.reshape(populated.*, &.{ rows, 1, 1, 1 }), out.*, try ops.scalar(0, .bfloat16), ops.s));
     const result = try ops.reshape(safe.*, &.{ rows, 64, 512 });
     calls += 1;
-    if (rows == wide_rows) wide_calls += 1;
     return result;
 }
 test "GLM packed NAX geometry and fixed scratch bound" {
@@ -164,26 +122,17 @@ test "GLM packed NAX geometry and fixed scratch bound" {
     try std.testing.expect(!geometry(&.{ 16, 64, 512 }, &.{ 32768, 512 }, &.{ 16, 2051 }, 32753, 32768));
     try std.testing.expect(try temporaryBytes(16) <= scratch_limit);
 }
-test "GLM packed NAX scoped controls bill every pending layer" {
-    const legacy16 = @import("glm5_attention_nax_packed.zig").bind32(false);
-    defer legacy16.restore();
-    const off = bind(false);
-    defer off.restore();
-    try std.testing.expect(!enabled());
+test "GLM packed NAX bills every pending layer" {
+    try std.testing.expectEqual(scratch_limit, try transientBudget(16, 1));
+    try std.testing.expectEqual(scratch_limit * 2, try transientBudget(2048, 2));
+    try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
+    try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));
+    const model = @import("glm5_model.zig");
+    model.reference_numerics = true;
+    defer model.reference_numerics = false;
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(2048, 2));
-    {
-        const on = bind(true);
-        defer on.restore();
-        try std.testing.expect(enabled());
-        try std.testing.expectEqual(scratch_limit, try transientBudget(16, 1));
-        try std.testing.expectEqual(scratch_limit * 2, try transientBudget(2048, 2));
-        try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
-        try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));
-    }
-    try std.testing.expect(!enabled());
 }
 test "GLM packed NAX invalid gather cannot poison output with masked nonfinite key zero" {
-    if (std.c.getenv("SUSHI_GLM_PACKED_NAX_PROBE_OUT") == null) return error.SkipZigTest;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     var data: [4 * 512]u16 = @splat(0);
@@ -208,7 +157,6 @@ test "GLM packed NAX invalid gather cannot poison output with masked nonfinite k
     }
 }
 test "GLM packed NAX preserves head order real-row selection and final ragged slot" {
-    if (std.c.getenv("SUSHI_GLM_PACKED_NAX_PROBE_OUT") == null) return error.SkipZigTest;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     var data: [4 * 512]u16 = @splat(0);
@@ -239,21 +187,10 @@ test "GLM packed NAX preserves head order real-row selection and final ragged sl
     }
 }
 
-test "GLM packed32 fixed policy geometry and conservative graph bill" {
-    const off = bind32(false);
-    defer off.restore();
-    try std.testing.expectEqual(@as(usize, 16), batchRows());
-    try std.testing.expectEqual(scratch_limit, scratchLimit());
-    try std.testing.expect(!geometry(&.{ 32, 64, 512 }, &.{ 16384, 512 }, &.{ 32, 2051 }, 16352, 16384));
-    const on = bind32(true);
-    try std.testing.expect(batch32Enabled());
-    try std.testing.expectEqual(@as(usize, 32), batchRows());
-    try std.testing.expectEqual(wide_scratch_limit, scratchLimit());
+test "GLM packed32 geometry and conservative graph bill" {
     try std.testing.expect(geometry(&.{ 32, 64, 512 }, &.{ 16384, 512 }, &.{ 32, 2051 }, 16352, 16384));
     for ([_]c_int{ 17, 24, 31 }) |rows| try std.testing.expect(!geometry(&.{ rows, 64, 512 }, &.{ 16384, 512 }, &.{ rows, 2051 }, 16352, 16384));
     try std.testing.expect(!geometry(&.{ 32, 64, 512 }, &.{ 16384, 512 }, &.{ 32, 2051 }, 16353, 16384));
-    try std.testing.expect(try temporaryBytes(32) <= wide_scratch_limit);
+    try std.testing.expect(try temporaryBytes(32) <= scratch_limit);
     for ([_]usize{ 17, 24, 31 }) |rows| try std.testing.expectError(error.UnsupportedGlmPackedAttention, temporaryBytes(rows));
-    on.restore();
-    try std.testing.expect(!batch32Enabled());
 }

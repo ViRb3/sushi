@@ -4,7 +4,6 @@ const mlx = @import("mlx.zig");
 const primitive = @import("glm5_next.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
-const profiling = @import("glm5_dflash_profile.zig");
 
 const SOURCE =
     \\constexpr int N = Dk / 32;
@@ -39,21 +38,6 @@ const SOURCE =
 ;
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var leaf_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var cached_hits: usize = 0;
-var cached_misses: usize = 0;
-pub fn leafHits() usize {
-    return cached_hits;
-}
-pub fn leafMisses() usize {
-    return cached_misses;
-}
-pub fn resetLeafStats() void {
-    cached_hits = 0;
-    cached_misses = 0;
-}
-pub fn leafEnabled() bool {
-    return @import("transformer.zig").diagEnvOn("SUSHI_GLM_KDA_KEEP_LEAF");
-}
 pub fn cachedLeafRow(parents: []const i32) u32 {
     var row: u32 = 0;
     for (parents[1..], 1..) |parent, child| if (parent == row) {
@@ -188,16 +172,15 @@ test "GLM DFlash KDA tree follows per-channel parent state exactly" {
     }
 }
 
-pub const ProjectionMode = enum { serial_rows, affine_rows, affine_rows_ffn, batched };
+pub const ProjectionMode = enum { serial_rows, affine_rows, affine_rows_ffn };
 
 pub fn linearRows(ops: *Ops, linear: @import("glm5_model.zig").Linear, x: Arr, mode: ProjectionMode) !Arr {
     const shape = mlx.getShape(x);
     if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > 16) return error.InvalidGlmDraftShape;
-    if (mode == .batched or shape[1] == 1) return linear.apply(ops, x);
+    if (shape[1] == 1) return linear.apply(ops, x);
     if (mode == .affine_rows or mode == .affine_rows_ffn) {
         if (try @import("glm5_dflash_qmm.zig").project(ops.s, x, linear)) |output| return ops.own(output);
-        const dense = @import("glm5_dflash_dense_rows.zig");
-        if (dense.enabled()) if (try dense.project(ops, linear, x)) |output| return output;
+        if (try @import("glm5_dflash_dense_rows.zig").project(ops, linear, x)) |output| return output;
     }
     var rows: [16]Arr = undefined;
     var made: usize = 0;
@@ -234,12 +217,7 @@ pub const Tape = struct {
         defer ops.deinit();
         const indices = try ops.own(mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .uint32));
         const reused = self.retained_state.ctx != null and path[path.len - 1] == self.retained_row;
-        const state = if (reused) blk: {
-            const value = try ops.result(self.retained_state);
-            cached_hits += 1;
-            break :blk value;
-        } else blk: {
-            if (self.retained_state.ctx != null) cached_misses += 1;
+        const state = if (reused) try ops.result(self.retained_state) else blk: {
             const output = try primitive.kda(.{ .q = try ops.take(self.inputs.q, indices, 1), .k = try ops.take(self.inputs.k, indices, 1), .v = try ops.take(self.inputs.v, indices, 1), .decay = try ops.take(self.inputs.decay, indices, 1), .beta = try ops.take(self.inputs.beta, indices, 1), .state = self.inputs.state }, s);
             defer output.deinit();
             break :blk try ops.result(output.state);
@@ -263,7 +241,7 @@ pub fn forceStagedForTest(on: bool) void {
     if (@import("builtin").is_test) force_staged_for_tests = on;
 }
 
-/// Projections may be tested in batches; the default mode preserves one-row projection geometry.
+/// `.serial_rows` keeps one-row projection geometry; the affine modes batch rows exactly.
 pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const @import("transformer.zig").SSMCacheEntry, parents: []const i32, mode: ProjectionMode) !LayerResult {
     const sh = mlx.getShape(x);
     if (sh.len != 3 or sh[0] != 1 or sh[1] < 1 or sh[1] > 16 or sh[1] != parents.len or cfg.linear_conv_kernel_dim != 4) return error.InvalidGlmDraftShape;
@@ -273,12 +251,10 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     const dim: c_int = @intCast(cfg.linear_key_head_dim);
     const width = heads * dim;
     const dtype = mlx.mlx_array_dtype(x);
-    var profile = profiling.Timer.start(parents.len);
     const qraw = try linearRows(ops, layer.q, x, mode);
     const kraw = try linearRows(ops, layer.k, x, mode);
     const vraw = try linearRows(ops, layer.v, x, mode);
     const raw = try ops.concat(&.{ qraw, kraw, vraw }, -1);
-    try profile.finish("kda_qkv", &.{raw});
     const old = if (state.initialized) state.conv_state else try ops.zeros(&.{ 1, 3, width * 3 }, dtype);
     const conv_input = try ops.concat(&.{ old, raw }, 1);
     const conv_w = if (layer.prepared_conv.ctx != null) layer.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ layer.conv_q, layer.conv_k, layer.conv_v }, 0), &.{ 0, 2, 1 }));
@@ -286,7 +262,6 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     const dims = [_]c_int{ 1, sh[1], heads, dim };
     const a_raw = try linearRows(ops, layer.fb, try linearRows(ops, layer.fa, x, mode), mode);
     const beta_raw = try linearRows(ops, layer.beta, x, mode);
-    try profile.finish("kda_lowrank_beta", &.{ a_raw, beta_raw });
     const fused = if (!force_staged_for_tests and dim == 128) try @import("glm5_kda_prework.zig").applyTree(ops.s, .{
         .qkv = raw,
         .a = a_raw,
@@ -328,13 +303,11 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
         const beta = try ops.unary(.sigmoid, beta_raw);
         break :blk [_]Arr{ q, k, values, decay, beta };
     };
-    try profile.finish("kda_prework", &.{ work[0], work[1], work[2], work[3], work[4], conv_input });
     const initial = if (state.initialized) state.ssm_state else try ops.zeros(&.{ 1, heads, dim, dim }, .float32);
     const inputs = primitive.KdaInputs{ .q = work[0], .k = work[1], .v = work[2], .decay = work[3], .beta = work[4], .state = initial };
-    const retained: ?LeafResult = if (leafEnabled() and parents.len <= 3) try recurrentLeaf(inputs, parents, ops.s) else null;
+    const retained: ?LeafResult = if (parents.len <= 3) try recurrentLeaf(inputs, parents, ops.s) else null;
     defer if (retained) |value| value.deinit();
     const y_bf = try ops.own(if (retained) |value| try ops.result(value.y) else try recurrent(inputs, parents, ops.s));
-    try profile.finish("kda_recurrence", &.{y_bf});
     const gate_bf = try ops.reshape(try linearRows(ops, layer.gb, try linearRows(ops, layer.ga, x, mode), mode), &dims);
     const post = if (!force_staged_for_tests and sh[1] > 1) try @import("glm5_kda_fused.zig").post(ops.s, y_bf, gate_bf, layer.out_norm, cfg.rms_norm_eps) else null;
     const gated = if (post) |value| try ops.own(value) else blk: {
@@ -345,9 +318,7 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
         const gate = try ops.cast(gate_bf, .float32);
         break :blk try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, gate)), dtype);
     };
-    try profile.finish("kda_gate_post", &.{gated});
     const output = try linearRows(ops, layer.out, try ops.reshape(gated, &.{ 1, sh[1], width }), mode);
-    try profile.finish("kda_out", &.{output});
     var tape = Tape{ .inputs = .{ .q = .{ .ctx = null }, .k = .{ .ctx = null }, .v = .{ .ctx = null }, .decay = .{ .ctx = null }, .beta = .{ .ctx = null }, .state = .{ .ctx = null } }, .conv_input = .{ .ctx = null } };
     errdefer tape.deinit();
     inline for (.{ "q", "k", "v", "decay", "beta", "state" }) |name| @field(tape.inputs, name) = try ops.result(@field(inputs, name));
@@ -530,9 +501,8 @@ test "GLM DFlash KDA replay keeps raw BF16 one-token history bits" {
     }
 }
 
-test "GLM DFlash opt-in dense rows preserve integrated serial outputs" {
+test "GLM DFlash dense rows preserve integrated serial outputs" {
     const dense = @import("glm5_dflash_dense_rows.zig");
-    if (!dense.enabled()) return error.SkipZigTest;
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
     const key = try ops.slot();

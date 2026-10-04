@@ -1,4 +1,4 @@
-//! Qualified prefill schedule: one SIMD group carries independent value rows.
+//! Prefill KDA recurrence: one SIMD group carries independent value rows.
 //! FP32 state and each member's original 32-lane reductions remain.
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -53,18 +53,7 @@ const SOURCE =
     \\GLM_VALUE_UNROLL for(uint r=0;r<uint(R);++r) GLM_VALUE_UNROLL for(uint i=0;i<4u;++i)
     \\ state_out[(size_t(n)*128u+dv0+r)*128u+4u*lane+i]=state[r][i];
 ;
-// Zero selects the original recurrence; valid explicit schedules remain available.
-var selected_rows: ?u32 = null;
 var dispatches: usize = 0;
-pub fn configuredRows() !?u32 {
-    if (selected_rows == null) {
-        const raw = std.c.getenv("SUSHI_GLM_KDA_VALUE_ROWS");
-        const rows = if (raw) |value| std.fmt.parseInt(u32, std.mem.span(value), 10) catch return error.InvalidKdaValueRows else 4;
-        if (rows != 0 and rows != 1 and rows != 2 and rows != 4) return error.InvalidKdaValueRows;
-        selected_rows = rows;
-    }
-    return if (selected_rows.? == 0) null else selected_rows.?;
-}
 pub fn dispatchCount() usize {
     return dispatches;
 }
@@ -225,97 +214,4 @@ test "GLM KDA value-row admission rejects unchecked spans and decode" {
     const in = try fixture(&ops, 1, 1, 1, .bfloat16, .bfloat16, false);
     try std.testing.expect((try run(in, 2, s)) == null);
     try std.testing.expectError(error.InvalidKdaValueRows, run(in, 3, s));
-}
-
-fn timed(input: primitive.KdaInputs, rows: u32, repeats: usize, s: mlx.mlx_stream) !u64 {
-    var timer = @import("io_util.zig").Stopwatch.init(std.testing.io);
-    for (0..repeats) |_| {
-        const got = if (rows == 0) try primitive.kda(input, s) else (try run(input, rows, s)) orelse return error.TestExpectedValueRows;
-        defer got.deinit();
-        const arrays = [_]Arr{ got.y, got.state };
-        const outputs = mlx.mlx_vector_array_new_data(&arrays, arrays.len);
-        defer _ = mlx.mlx_vector_array_free(outputs);
-        try mlx.check(mlx.mlx_eval(outputs));
-    }
-    return timer.read();
-}
-
-test "GLM KDA value-row isolated timing" {
-    const path = std.c.getenv("SUSHI_GLM_VALUE_ROWS_BENCH_OUT") orelse return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const arms = [_]u32{ 0, 1, 2, 4 };
-    var samples: [2][4][11]u64 = undefined;
-    for ([_]c_int{ 512, 2048 }, 0..) |tokens, geometry| {
-        var ops = Ops{ .s = s };
-        defer ops.deinit();
-        const input = try fixture(&ops, 1, tokens, 64, .bfloat16, .bfloat16, false);
-        const inputs = [_]Arr{ input.q, input.k, input.v, input.decay, input.beta, input.state };
-        const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
-        defer _ = mlx.mlx_vector_array_free(iv);
-        try mlx.check(mlx.mlx_eval(iv));
-        const expected = try primitive.kda(input, s);
-        defer expected.deinit();
-        for (arms[1..]) |rows| {
-            const got = (try run(input, rows, s)) orelse return error.TestExpectedValueRows;
-            defer got.deinit();
-            try exact(expected.y, got.y, s);
-            try exact(expected.state, got.state, s);
-        }
-        for (0..12) |_| for (arms) |rows| {
-            _ = try timed(input, rows, 1, s);
-        };
-        for (0..11) |round| for (0..4) |position| {
-            const arm = if (round % 2 == 0) position else 3 - position;
-            samples[geometry][arm][round] = try timed(input, arms[arm], 4, s);
-        };
-    }
-    const result = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
-        .samples_ns = samples,
-        .tokens = [_]c_int{ 512, 2048 },
-        .rows_per_simd = arms,
-        .heads = 64,
-        .batch = 1,
-        .head_dim = 128,
-        .warmups_per_arm = 12,
-        .rounds = 11,
-        .repetitions_per_sample = 4,
-        .inputs_materialized = true,
-        .outputs_evaluated = "y and FP32 state",
-        .method = "single-process alternating forward/reverse; fresh apply/eval/free; native and R1/R2/R4",
-        .full_model = false,
-    }, .{ .whitespace = .indent_2 });
-    defer std.testing.allocator.free(result);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = result });
-}
-
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-test "GLM fast opt-out KDA value rows defaults four and preserves valid overrides" {
-    const a = std.testing.allocator;
-    const name = "SUSHI_GLM_KDA_VALUE_ROWS";
-    const previous_cache = selected_rows;
-    defer selected_rows = previous_cache;
-    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
-    defer {
-        if (previous) |value| {
-            _ = setenv(name, value, 1);
-            a.free(value);
-        } else _ = unsetenv(name);
-    }
-    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
-    selected_rows = null;
-    try std.testing.expectEqual(@as(?u32, 4), try configuredRows());
-    const values = [_][:0]const u8{ "0", "1", "2", "4" };
-    const expected = [_]?u32{ null, 1, 2, 4 };
-    for (values, expected) |value, rows| {
-        try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
-        selected_rows = null;
-        try std.testing.expectEqual(rows, try configuredRows());
-    }
-    for ([_][:0]const u8{ "3", "-1", "invalid" }) |value| {
-        try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
-        selected_rows = null;
-        try std.testing.expectError(error.InvalidKdaValueRows, configuredRows());
-    }
 }
