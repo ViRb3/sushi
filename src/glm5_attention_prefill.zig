@@ -1,4 +1,5 @@
 //! Split-softmax latent attention partials shared by the serial and overlay kernels.
+//! Needs `glm5_latent.header` for `SUSHI_LATENT`.
 pub const common: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint lane=thread_position_in_threadgroup.x;
@@ -17,7 +18,7 @@ pub const common: [:0]const u8 =
     \\  const int token=SELECTED?selected[row*2051u+k]:int(k);
     \\  if(token<0 || uint(token)>pos || uint(token)>=uint(length)) continue;
     \\  float values[ITEMS]; float dot=0.0f;
-    \\  for(uint j=0;j<ITEMS;++j) {uint d=lane+j*32u;values[j]=d<uint(D)?float(cache[uint(token)*uint(D)+d]):0.0f;dot+=query[j]*values[j];}
+    \\  for(uint j=0;j<ITEMS;++j) {uint d=lane+j*32u;values[j]=d<uint(D)?float(SUSHI_LATENT(cache,uint(token),d,uint(D))):0.0f;dot+=query[j]*values[j];}
     \\  dot=simd_sum(dot)*float(scale);
     \\  float next=max(maximum,dot),old=precise::exp(maximum-next),p=precise::exp(dot-next);
     \\  denom=denom*old+p;

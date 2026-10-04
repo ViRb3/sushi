@@ -89,6 +89,7 @@ test {
     _ = @import("glm5_attention_decode_batch.zig");
     _ = @import("glm5_attention_nax_packed.zig");
     _ = @import("glm5_attention_overlay.zig");
+    _ = @import("glm5_latent.zig");
     _ = @import("glm5_indexpool_nax.zig");
     _ = @import("glm5_a6_dense_once.zig");
     _ = @import("glm5_mla_prefill_batch.zig");

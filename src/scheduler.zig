@@ -1630,8 +1630,8 @@ pub const Scheduler = struct {
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
         const eff_kv_quant = params.kv_quant_config orelse
-            transformer_mod.KvCacheChoice.resolveForModel(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit, slot_config.model_type).config;
-        if (slot_config.isGlm5() and eff_kv_quant.isQuant()) return error.GlmKvQuantUnsupported;
+            transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
+        if (slot_config.isGlm5() and eff_kv_quant.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
         errdefer slot.deinit();
 
@@ -2642,7 +2642,7 @@ const LaunchPicks = struct {
             .mtp = mtpChoiceFor(mtp_flag orelse true, mtp_flag != null, config),
             .acceptance = generate_mod.mtpAcceptanceFor(config.mtp_acceptance_override),
             .greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
-            .kv = transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, kv_flag orelse transformer_mod.KVQuantConfig.engine_default, kv_flag != null, config.model_type),
+            .kv = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_flag orelse transformer_mod.KVQuantConfig.engine_default, kv_flag != null),
         };
     }
 };
@@ -3794,9 +3794,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         streaming_resident_bytes = split.trunk +| split.mtp;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
     } else if (params.config.isGlm5()) {
-        const kv = transformer_mod.KvCacheChoice.resolveForModel(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit, params.config.model_type);
-        if (kv.config.isQuant()) {
-            log.err("[glm] native MLA cache requires BF16; use --kv-quant off\n", .{});
+        const kv = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
+        if (kv.config.glmLatentBits() == null) {
+            log.err("[glm] native MLA cache supports --kv-quant 8 or off\n", .{});
             return error.GlmKvQuantUnsupported;
         }
         streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, params.load_vision and params.config.glm5_vision);
@@ -3945,7 +3945,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
     // An explicit launch flag outranks the per-model settings stamped on the config at BOTH construction sites.
-    const kv_cache = transformer_mod.KvCacheChoice.resolveForModel(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit, params.config.model_type);
+    const kv_cache = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
     const load_ctx = model_settings.contextPick(sch.ctx_size_flag, params.config.ctx_override);
     var ctx_buf: [16]u8 = undefined;
     log.info("[kv-cache] {s} ({s}); ctx {s} ({s})\n", .{
@@ -3964,7 +3964,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     });
     const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5();
     if (params.config.isGlm5()) {
-        log.info("[glm] native BF16 MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ params.config.kvBytesPerToken(), params.config.qsaHistoryBytesPerToken() });
+        const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
+        log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (kv_quant_config.isQuant()) "kv8" else "BF16", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] native vision {s}\n", .{if (params.load_vision and params.config.glm5_vision) "enabled (included in resident weight bill)" else "off (--no-vision or absent tower)"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0) log.warn("[glm] native recurrent state has no prefix-cache restore yet; RAM/disk prefix reuse off\n", .{});

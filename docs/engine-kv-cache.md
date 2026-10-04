@@ -14,9 +14,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   `[kv-cache] <kv8|kv4|off> (<default|--kv-quant|model-settings.json>)`
   (scheduler adds `; ctx N (source)`); `/props` reports `settings.kv_cache`, `/v1/models` `meta.kv_cache`.
   `kld capture|compare` teachers stay dense; the qwen4 MTP head KV is dense unless `--mtp-head-kv-quant`.
-- `--kv-quant 4|8|off` (`src/kv_quant.zig`, `configuredKvQuantFor(config)`); an explicit flag beats
+- `--kv-quant 8|4|16` (16 = dense BF16, also spelled `off`/`0`; `src/kv_quant.zig`, `configuredKvQuantFor(config)`); an explicit flag beats
   `model-settings.json` `kv_quant`, which beats the default. A per-model setting of `kv_quant: off` still wins over
   the default.
+- GLM (`glm5_next`) takes the kv8 default too, through its own MLA latent backend (`glm5_latent.zig`,
+  [arch-glm5-next](arch-glm5-next.md#scope)); kv4 is refused.
 - `--kv-attn-mode auto|dense|fused` picks the packed-read arm (`auto` from an 8K PROMPT, fixed at admission); MiMo's
   global-layer decode ignores it and picks per step from the cache's length. `--decode-attn-quant` (default ON,
   LOSSY) requants dense attention at decode AND verify.

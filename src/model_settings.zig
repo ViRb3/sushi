@@ -294,7 +294,7 @@ test "model_settings: the greedy tail (mtp_greedy_tail) is a bool, anything else
 
 test "model_settings: bad values ignored, bad JSON = empty" {
     var s = try parse(std.testing.allocator,
-        \\{"/m/a": {"ctx_size": 0, "kv_quant": "16", "mtp": "yes", "future": 1}}
+        \\{"/m/a": {"ctx_size": 0, "kv_quant": "3", "mtp": "yes", "future": 1}}
     );
     defer s.deinit();
     try std.testing.expect(s.lookup("/m/a").isEmpty());

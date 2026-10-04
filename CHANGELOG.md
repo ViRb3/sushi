@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
   instead of failing to compile mlx-c after a plain `git pull`.
+- **GLM-5.3 now stores its MLA latent at 8 bits by default**, like every model: 6,688 instead of 11,968 bytes per
+  token. `--kv-quant 16` (or a request's `kv_quant: 16`) keeps it BF16; `16` is accepted for every model.
 - **GLM's first load prepares its DFlash2 assistant as A4/group-64** (was A6/group-128), 0.24 GB smaller with identical
   output; an existing A6 cache is rebuilt once.
 - **`--wired-margin-gib` defaults to 4 GiB (was 8)**, so a raised `iogpu.wired_limit_mb` admits 4 GiB more weights

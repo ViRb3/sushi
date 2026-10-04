@@ -2,18 +2,21 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
+const latent_store = @import("glm5_latent.zig");
+const Latent = latent_store.Latent;
 const Arr = mlx.mlx_array;
 
 pub fn tailBytes(width: usize, rows: usize, bytes: usize) !usize {
     if (width == 0 or rows == 0 or rows > 3 or (bytes != 2 and bytes != 4)) return error.InvalidGlmOverlay;
     return std.math.mul(usize, try std.math.mul(usize, rows, width), bytes);
 }
+/// `tail` holds rows as attention reads them: under kv8, their quantize-dequantize round trip.
 pub const View = struct {
-    prefix: Arr,
+    prefix: Latent,
     prefix_rows: usize,
     tail: Arr,
-    pub fn storage(self: View) Arr {
-        return if (self.prefix_rows == 0) self.tail else self.prefix;
+    pub fn storage(self: View) Latent {
+        return if (self.prefix_rows == 0) .{ .data = self.tail } else self.prefix;
     }
     pub fn length(self: View) usize {
         return self.prefix_rows + @as(usize, @intCast(mlx.getShape(self.tail)[0]));
@@ -29,11 +32,8 @@ pub const View = struct {
         const tt = mlx.mlx_array_strides(self.tail);
         if (qt[1] != qs[2] or qt[2] != 1 or tt[0] != qs[2] or tt[1] != 1) return error.InvalidGlmOverlay;
         if (self.prefix_rows != 0) {
-            if (self.prefix.ctx == null) return error.InvalidGlmOverlay;
-            const ps = mlx.getShape(self.prefix);
-            const pt = mlx.mlx_array_strides(self.prefix);
-            if (ps.len != 2 or ps[0] < self.prefix_rows or ps[1] != qs[2] or pt[0] != qs[2] or pt[1] != 1 or
-                mlx.mlx_array_dtype(self.prefix) != mlx.mlx_array_dtype(q)) return error.InvalidGlmOverlay;
+            const p = self.prefix;
+            if (!p.rowMajor() or p.rows() < self.prefix_rows or p.width() != qs[2] or p.dtype() != mlx.mlx_array_dtype(q)) return error.InvalidGlmOverlay;
         }
     }
 };
@@ -54,9 +54,9 @@ const shader_source: [:0]const u8 =
     \\for(uint k=begin;k<end;++k) {
     \\  const int token=SELECTED?selected[row*2051u+k]:int(k);
     \\  if(token<0 || uint(token)>pos || uint(token)>=uint(length)) continue;
-    \\  const device auto* values_row=uint(token)<uint(prefix_length)?cache+uint(token)*uint(D):tail+(uint(token)-uint(prefix_length))*uint(D);
+    \\  const bool cached=uint(token)<uint(prefix_length);
     \\  float values[ITEMS]; float dot=0.0f;
-    \\  for(uint j=0;j<ITEMS;++j) {uint d=lane+j*32u;values[j]=d<uint(D)?float(values_row[d]):0.0f;dot+=query[j]*values[j];}
+    \\  for(uint j=0;j<ITEMS;++j) {uint d=lane+j*32u;values[j]=d<uint(D)?float(cached?SUSHI_LATENT(cache,uint(token),d,uint(D)):tail[(uint(token)-uint(prefix_length))*uint(D)+d]):0.0f;dot+=query[j]*values[j];}
     \\  dot=simd_sum(dot)*float(scale);
     \\  float next=max(maximum,dot),old=precise::exp(maximum-next),p=precise::exp(dot-next);
     \\  denom=denom*old+p;
@@ -65,7 +65,7 @@ const shader_source: [:0]const u8 =
     \\}
     \\const uint base=((row*uint(H)+head)*uint(SPLITS)+part);
 ;
-var cached: ?mlx.mlx_fast_metal_kernel = null;
+var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 pub const Partials = struct {
     partial: Arr,
     stats: Arr,
@@ -86,22 +86,32 @@ pub fn partials(q: Arr, view: View, ids: Arr, offset: Arr, length: Arr, scale: A
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, sh[1], sh[0] * splits));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
     for ([_][*:0]const u8{ "H", "D", "SPLITS", "SELECTED" }, [_]c_int{ sh[1], sh[2], splits, @intFromBool(selected) }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name, value));
-    if (cached == null) {
-        const ins = mlx.mlx_vector_string_new_data(&.{ "q", "cache", "tail", "selected", "offset", "length", "scale", "prefix_length" }, 8);
+    const cache = view.storage();
+    const quantized = cache.quantized();
+    const slot = &kernels[@intFromBool(quantized)];
+    if (slot.* == null) {
+        const names: []const [*:0]const u8 = if (quantized)
+            &.{ "q", "cache", "cache_scales", "cache_biases", "tail", "selected", "offset", "length", "scale", "prefix_length" }
+        else
+            &.{ "q", "cache", "tail", "selected", "offset", "length", "scale", "prefix_length" };
+        const ins = mlx.mlx_vector_string_new_data(names.ptr, names.len);
         defer _ = mlx.mlx_vector_string_free(ins);
         const outs = mlx.mlx_vector_string_new_data(&.{ "partial", "stats" }, 2);
         defer _ = mlx.mlx_vector_string_free(outs);
-        const kernel = mlx.mlx_fast_metal_kernel_new("sushi_glm_verify_latent_overlay", ins, outs, shader_source ++ @import("glm5_attention_prefill.zig").partial_tail, "", false, false);
+        const kernel = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_verify_latent8_overlay" else "sushi_glm_verify_latent_overlay", ins, outs, shader_source ++ @import("glm5_attention_prefill.zig").partial_tail, latent_store.header(quantized), false, false);
         if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-        cached = kernel;
+        slot.* = kernel;
     }
     const base: u32 = @intCast(view.prefix_rows);
     const ba = try ops.own(mlx.mlx_array_new_data(&base, &.{}, 0, .uint32));
-    const inputs = mlx.mlx_vector_array_new_data(&.{ q, view.storage(), view.tail, ids, offset, length, scale, ba }, 8);
+    const inputs = if (quantized)
+        mlx.mlx_vector_array_new_data(&.{ q, cache.data, cache.scales, cache.biases, view.tail, ids, offset, length, scale, ba }, 10)
+    else
+        mlx.mlx_vector_array_new_data(&.{ q, cache.data, view.tail, ids, offset, length, scale, ba }, 8);
     defer _ = mlx.mlx_vector_array_free(inputs);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, cached.?, inputs, cfg, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, slot.*.?, inputs, cfg, s));
     const pa = try ops.slot();
     const st = try ops.slot();
     try mlx.check(mlx.mlx_vector_array_get(pa, outputs, 0));
@@ -119,16 +129,7 @@ test "GLM latent overlay byte bill excludes immutable prefix" {
 }
 
 fn fork(source: *const @import("glm5_attention.zig").State) !@import("glm5_attention.zig").State {
-    var copy = @import("glm5_attention.zig").State{ .processed = source.processed };
-    errdefer copy.deinit();
-    inline for (.{ "latent", "pooled", "tail_keys", "tail_gates" }) |name| {
-        const value = @field(source.*, name);
-        if (value.ctx != null) {
-            @field(copy, name) = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&@field(copy, name), value));
-        }
-    }
-    return copy;
+    return source.share();
 }
 fn exact(a: Arr, b: Arr) !void {
     try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
@@ -192,7 +193,7 @@ test "GLM latent overlay branch outputs index state and commit match full append
             const weights = try ops.slice(iw, 0, row, row + 1);
             const offset = prefix + path.len - 1;
             const baseline = try ops.own(try attention.attend(&original, q, index_q, weights, offset, 0.25, s));
-            const candidate = try ops.own(try attention.attendOverlay(&virtual, q, index_q, weights, offset, 0.25, .{ .prefix = source.latent, .prefix_rows = prefix, .tail = tail }, s));
+            const candidate = try ops.own(try attention.attendOverlay(&virtual, q, index_q, weights, offset, 0.25, .{ .prefix = source.latentView(), .prefix_rows = prefix, .tail = tail }, s));
             try exact(baseline, candidate);
             var commit = try fork(&source);
             defer commit.deinit();
@@ -204,3 +205,46 @@ test "GLM latent overlay branch outputs index state and commit match full append
     _ = a;
 }
 
+
+test "GLM kv8 latent overlay reads round-tripped tails exactly as the committed kv8 append" {
+    const attention = @import("glm5_attention.zig");
+    const s = mlx.gpuStream();
+    const Case = struct { prefix: usize, heads: c_int, width: c_int };
+    for ([_]Case{ .{ .prefix = 1, .heads = 2, .width = 64 }, .{ .prefix = 255, .heads = 2, .width = 64 }, .{ .prefix = 2052, .heads = 2, .width = 64 }, .{ .prefix = 2052, .heads = 64, .width = 512 } }) |case| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        var source = attention.State{ .latent_bits = latent_store.kv8_bits };
+        defer source.deinit();
+        const ape = try ops.zeros(&.{ 4, 8 }, .bfloat16);
+        _ = try source.append(try normal(&ops, &.{ @intCast(case.prefix), case.width }, .bfloat16, 51), try normal(&ops, &.{ @intCast(case.prefix), 8 }, .bfloat16, 52), try ops.zeros(&.{ @intCast(case.prefix), 8 }, .bfloat16), ape, s);
+        try source.evaluate();
+        const latents = try normal(&ops, &.{ 3, case.width }, .bfloat16, 53);
+        const readable = try ops.own(try latent_store.readable(latents, latent_store.kv8_bits, s));
+        const keys = try normal(&ops, &.{ 3, 8 }, .bfloat16, 54);
+        const gates = try ops.zeros(&.{ 3, 8 }, .bfloat16);
+        const queries = try normal(&ops, &.{ 3, case.heads, case.width }, .bfloat16, 55);
+        const iq = try normal(&ops, &.{ 3, 2, 8 }, .bfloat16, 56);
+        const iw = try ops.ones(&.{ 3, 2 }, .bfloat16);
+        for ([_][]const u32{ &.{0}, &.{ 0, 1 }, &.{ 0, 1, 2 }, &.{ 0, 2 } }) |path| {
+            var original = try source.share();
+            defer original.deinit();
+            var virtual = try source.share();
+            defer virtual.deinit();
+            const ids = try ops.own(mlx.mlx_array_new_data(path.ptr, &.{@intCast(path.len)}, 1, .uint32));
+            const k = try ops.take(keys, ids, 0);
+            const g = try ops.take(gates, ids, 0);
+            _ = try original.append(try ops.take(latents, ids, 0), k, g, ape, s);
+            _ = try virtual.appendIndexOnly(try ops.take(latents, ids, 0), k, g, ape, s);
+            try std.testing.expect(virtual.latent.ctx != null and virtual.latent_scales.ctx != null);
+            const row: c_int = @intCast(path[path.len - 1]);
+            const q = try ops.slice(queries, 0, row, row + 1);
+            const index_q = try ops.slice(iq, 0, row, row + 1);
+            const weights = try ops.slice(iw, 0, row, row + 1);
+            const offset = case.prefix + path.len - 1;
+            const view = View{ .prefix = source.latentView(), .prefix_rows = case.prefix, .tail = try ops.take(readable, ids, 0) };
+            const baseline = try ops.own(try attention.attend(&original, q, index_q, weights, offset, 1.0 / 16.0, s));
+            const candidate = try ops.own(try attention.attendOverlay(&virtual, q, index_q, weights, offset, 1.0 / 16.0, view, s));
+            try attention.expectSameBits(baseline, candidate);
+        }
+    }
+}

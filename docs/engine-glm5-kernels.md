@@ -15,6 +15,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 | `glm5_forward.zig` | `Model`/`Request`, layer loop, routing, async2 prefill and async4 decode schedules, captures |
 | `glm5_model.zig` / `glm5_next.zig` | KDA layer, dense MLP, affine linears; KDA recurrence, HC collapse/expand primitives |
 | `glm5_attention.zig` | IndexPool state, absorbed latent attention, packed prefill orchestration |
+| `glm5_latent.zig` | latent storage view (BF16 or kv8), the `SUSHI_LATENT` kernel helper, kv8 row bytes |
 | `glm5_attention_nax_packed.zig` / `glm5_indexpool_nax.zig` | head-packed native sparse attention (B16/B32); NAX prefill index scores |
 | `glm5_attention_decode_batch.zig` / `glm5_attention_overlay.zig` | native B1/B3 decode and verify attention; verify latent overlays |
 | `glm5_mla_prefill_batch.zig` / `glm5_mla_verify_batch.zig` | head-batched MLA prefill projections; three-row verify projections |
@@ -44,6 +45,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - Scalar fallback attention runs FP32 online softmax over the latent cache with split partials merged into the query
   dtype; no query×head×history score tensor or full mask exists, and per query chunk the index-score plane is capped at
   2 MiB and the partials at 8 MiB.
+- **kv8 latent** (the default; `--kv-quant 16` keeps BF16): append quantizes each new row once (MLX affine, group 64). Every kernel that reads
+  the latent (packed and B1/B3 gathers, scalar and overlay partials) dequantizes through `SUSHI_LATENT`, whose
+  expression matches MLX's dequantizer bit for bit; dense prefill and the B1 tail row use MLX's dequantizer. Verify
+  tails are the rows' quantize-dequantize round trip and commits quantize the raw rows, so verify equals serial decode.
 - **Model gate**: a component win counts only if a loaded-model ABBA gain exceeds control drift,
   |A_last − A_first| / mean(A), on each workload. Several 8–26% component wins below failed that gate.
 

@@ -187,7 +187,7 @@ pub const USAGE =
     \\  --no-template         feed the raw prompt text, no chat template
     \\  --json <file>         compare: write the numbers as JSON
     \\  --ctx-size <n>        context length override
-    \\  --kv-quant <off|4|8>  KV cache quantization
+    \\  --kv-quant <16|8|4>   KV cache quantization (16 = BF16, also off)
     \\  --ssd-budget-gb <n>   bf16 expert streaming budget (GiB)
     \\  --expert-cache-gb <n> bf16 expert cache size (GB), outranks --ssd-budget-gb
     \\  --mtp                 keep the MTP head resident (refused under streaming)
@@ -990,18 +990,39 @@ fn renderPrompt(allocator: std.mem.Allocator, l: *Loaded, opts: Options, p: Prom
     return chat_mod.renderChatTemplate(allocator, &messages, &l.chat_config, null, null, false, null, false);
 }
 
+/// GLM prefills in serving-width chunks, identically at capture and compare: the chunk width is
+/// part of GLM's numerics, and a 128K-token prompt does not fit one forward.
+const glm_prompt_chunk: usize = 2048;
+
 fn forwardPrompt(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
+    return forwardPromptChunks(allocator, l, ctx, ids, if (l.config.isGlm5()) glm_prompt_chunk else ids.len);
+}
+
+fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, chunk: usize) !mlx.mlx_array {
+    if (ids.len == 0 or chunk == 0) return error.EmptyPrompt;
     const prompt_i32 = try allocator.alloc(i32, ids.len);
     defer allocator.free(prompt_i32);
     for (ids, 0..) |t, i| prompt_i32[i] = @intCast(t);
-    const prompt_array = mlx.mlx_array_new_data(prompt_i32.ptr, &[_]c_int{ 1, @intCast(prompt_i32.len) }, 2, .int32);
-    defer _ = mlx.mlx_array_free(prompt_array);
-    return l.xfm.forwardWith(ctx, prompt_array);
+    var logits = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(logits);
+    var start: usize = 0;
+    while (start < ids.len) {
+        const end = @min(ids.len, start + chunk);
+        const part = mlx.mlx_array_new_data(prompt_i32[start..end].ptr, &[_]c_int{ 1, @intCast(end - start) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(part);
+        const next = try l.xfm.forwardWith(ctx, part);
+        _ = mlx.mlx_array_free(logits);
+        logits = next;
+        start = end;
+    }
+    return logits;
 }
 
 /// The prompt forward; with `hidden`, every block boundary of it is appended there.
 fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, hidden: ?*hidden_capture.Writer) !mlx.mlx_array {
     const w = hidden orelse return forwardPrompt(allocator, l, ctx, ids);
+    // Each chunk would replace the previous chunk's captured boundaries.
+    if (l.config.isGlm5() and ids.len > glm_prompt_chunk) return error.GlmHiddenCaptureNeedsOneChunk;
     const layers = l.config.num_hidden_layers;
     const layer_ids = try allocator.alloc(u32, layers);
     defer allocator.free(layer_ids);
@@ -2545,4 +2566,91 @@ test "kld standard4 bundled texts identifiers and limits" {
 
 test {
     _ = @import("glm5_kld_capture.zig");
+}
+
+fn jsonNumber(value: std.json.Value) !f64 {
+    return switch (value) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => error.NotANumber,
+    };
+}
+
+test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and compare scores kv8 against it" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var metal: bool = false;
+    mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;
+    if (!metal) return error.SkipZigTest;
+    const glm = @import("glm5_forward.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"pre_tokenizer":{"type":"ByteLevel"},"model":{"type":"BPE",
+        \\ "vocab":{"a":0,"b":1,"c":2,"d":3},"merges":[]}}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts.jsonl", .data =
+        \\{"id":"p0","prompt_ids":[1,3,0,2,2,1,3]}
+        \\{"id":"p1","prompt_ids":[2,0,1]}
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try arena.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
+
+    var weights = model_mod.Weights.init(allocator);
+    defer weights.deinit();
+    var cfg = try glm.completeFixture(&weights);
+    cfg.max_position_embeddings = 64;
+    var loaded = Loaded{ .allocator = allocator, .io = io, .config = cfg, .tok = try tokenizer_mod.loadTokenizer(io, allocator, root), .chat_config = undefined, .weights = undefined, .xfm = undefined };
+    defer loaded.tok.deinit();
+    loaded.xfm = try transformer_mod.Transformer.init(io, allocator, cfg, &weights);
+    defer loaded.xfm.deinit();
+
+    // Chunked prompt forwards continue one request exactly as the native model run in the same chunks.
+    var reference = try glm.Model.load(allocator, cfg, &weights, loaded.xfm.s);
+    defer reference.deinit();
+    var request = try glm.Request.init(allocator, cfg.num_hidden_layers);
+    defer request.deinit();
+    request.dense_prefill = true;
+    request.prefill_async = true;
+    const ids = [_]u32{ 1, 3, 0, 2, 2, 1, 3 };
+    try loaded.xfm.resetCache();
+    var ctx = loaded.xfm.defaultCtx();
+    const chunked = try forwardPromptChunks(allocator, &loaded, &ctx, &ids, 3);
+    defer _ = mlx.mlx_array_free(chunked);
+    var expected = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(expected);
+    for ([_][2]usize{ .{ 0, 3 }, .{ 3, 6 }, .{ 6, 7 } }) |r| {
+        const part = mlx.mlx_array_new_data(ids[r[0]..r[1]].ptr, &[_]c_int{ 1, @intCast(r[1] - r[0]) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(part);
+        _ = mlx.mlx_array_free(expected);
+        expected = try reference.forwardLast(&request, part, true);
+    }
+    var same = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(same);
+    try mlx.check(mlx.mlx_array_equal(&same, chunked, expected, true, loaded.xfm.s));
+    var equal = false;
+    try mlx.check(mlx.mlx_array_item_bool(&equal, same));
+    try testing.expect(equal);
+    try testing.expectEqual(@as(usize, 7), loaded.xfm.glm5_request.?.offset);
+
+    var quiet: Out = .{ .silent = true };
+    const fixture = try std.fmt.allocPrint(arena, "{s}/reference", .{root});
+    try runCapture(io, allocator, &loaded, .{ .model_dir = root, .prompts = try std.fmt.allocPrint(arena, "{s}/prompts.jsonl", .{root}), .out_dir = fixture, .tokens = 4, .no_template = true }, &quiet);
+    for ([_]transformer_mod.KVQuantConfig{ .dense, .affine(8) }) |kv| {
+        // As `loadModel` applies the flag to the loaded cache.
+        if (kv.isQuant()) try loaded.xfm.cache.reinit(cfg.num_hidden_layers, kv);
+        const json_path = try std.fmt.allocPrint(arena, "{s}/compare-{s}.json", .{ root, kvCacheFormat(kv) });
+        try runCompare(io, allocator, &loaded, .{ .command = .compare, .model_dir = root, .fixture = fixture, .json_out = json_path, .kv_quant_config = kv }, &quiet);
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, json_path, arena, .limited(1 << 20));
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, text, .{});
+        const kld = try jsonNumber(parsed.value.object.get("mean_kld").?);
+        try testing.expectEqual(@as(f64, 8), try jsonNumber(parsed.value.object.get("positions").?));
+        try testing.expect(std.math.isFinite(kld));
+        if (!kv.isQuant()) try testing.expectEqual(@as(f64, 0), kld);
+        try testing.expectEqual(@as(u8, if (kv.isQuant()) 8 else 0), loaded.xfm.glm5_request.?.latent_bits);
+    }
 }

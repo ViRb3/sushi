@@ -49,23 +49,31 @@ pub const KVQuantConfig = struct {
     }
 
     /// The wire vocabulary shared by the per-request `kv_quant` body field and
-    /// `model-settings.json`: "off"/0, "4", "8". Null = unrecognized.
+    /// `model-settings.json`: "off"/0/16 (BF16), "4", "8". Null = unrecognized.
     pub fn fromJsonValue(v: std.json.Value) ?KVQuantConfig {
         switch (v) {
             .string => |s| {
-                if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return dense;
+                if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "16")) return dense;
                 if (std.mem.eql(u8, s, "4")) return affine(4);
                 if (std.mem.eql(u8, s, "8")) return affine(8);
                 return null;
             },
             .integer => |i| {
-                if (i == 0) return dense;
+                if (i == 0 or i == 16) return dense;
                 if (i == 4) return affine(4);
                 if (i == 8) return affine(8);
                 return null;
             },
             else => return null,
         }
+    }
+
+    /// GLM's MLA latent bits for this scheme (`glm5_latent.zig`); null = no GLM backend (kv4).
+    pub fn glmLatentBits(self: KVQuantConfig) ?u8 {
+        return switch (self.scheme) {
+            .off => 0,
+            .affine => if (self.bits == 8 and self.group_size == 64) 8 else null,
+        };
     }
 
     /// The same vocabulary, for reporting (`/v1/models` `meta.kv_quant`).
@@ -83,16 +91,6 @@ pub const KVQuantConfig = struct {
 pub const KvCacheChoice = struct {
     config: KVQuantConfig,
     source: model_settings.Source,
-
-    /// GLM's native MLA stores one BF16 latent; it has no affine-cache backend.
-    /// Keep flags/settings visible so the loader can refuse unsupported schemes.
-    pub fn resolveForModel(setting: ?KVQuantConfig, launch: KVQuantConfig, launch_explicit: bool, model_type: []const u8) KvCacheChoice {
-        if (std.mem.eql(u8, model_type, "glm5_next")) {
-            const p = model_settings.pick(KVQuantConfig, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, KVQuantConfig.dense);
-        return .{ .config = p.value, .source = p.source };
-        }
-        return resolve(setting, launch, launch_explicit);
-    }
 
     pub fn resolve(setting: ?KVQuantConfig, launch: KVQuantConfig, launch_explicit: bool) KvCacheChoice {
         const p = model_settings.pickLaunch(KVQuantConfig, .kv_quant, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, launch);
@@ -1207,16 +1205,18 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
     try testing.expect(max_err < 0.05);
 }
 
-test "GLM serving cache defaults to BF16 even under fast, with explicit choices preserved" {
-    const saved = model_settings.fast;
-    defer model_settings.fast = saved;
-    for ([_]bool{ false, true }) |fast| {
-        model_settings.fast = fast;
-        const choice = KvCacheChoice.resolveForModel(null, KVQuantConfig.engine_default, false, "glm5_next");
-        try std.testing.expectEqual(KVQuantConfig.dense, choice.config);
-        try std.testing.expectEqualStrings("default", choice.sourceName());
-    }
-    try std.testing.expectEqual(KVQuantConfig.affine(4), KvCacheChoice.resolveForModel(null, KVQuantConfig.affine(4), true, "glm5_next").config);
-    try std.testing.expectEqual(KVQuantConfig.affine(8), KvCacheChoice.resolveForModel(KVQuantConfig.affine(8), KVQuantConfig.dense, false, "glm5_next").config);
-    try std.testing.expectEqual(KVQuantConfig.dense, KvCacheChoice.resolveForModel(KVQuantConfig.affine(8), KVQuantConfig.dense, true, "glm5_next").config);
+test "every model, GLM included, defaults to kv8 and 16 selects BF16" {
+    const choice = KvCacheChoice.resolve(null, KVQuantConfig.engine_default, false);
+    try std.testing.expectEqual(KVQuantConfig.affine(8), choice.config);
+    try std.testing.expectEqualStrings("default", choice.sourceName());
+    try std.testing.expectEqual(KVQuantConfig.dense, KVQuantConfig.fromJsonValue(.{ .string = "16" }).?);
+    try std.testing.expectEqual(KVQuantConfig.dense, KVQuantConfig.fromJsonValue(.{ .integer = 16 }).?);
+    try std.testing.expectEqual(KVQuantConfig.dense, KvCacheChoice.resolve(null, KVQuantConfig.fromJsonValue(.{ .string = "16" }).?, true).config);
+}
+
+test "GLM latent stores BF16 or kv8 and names kv4 unsupported" {
+    try std.testing.expectEqual(@as(?u8, 0), KVQuantConfig.dense.glmLatentBits());
+    try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.affine(8).glmLatentBits());
+    try std.testing.expectEqual(@as(?u8, null), KVQuantConfig.affine(4).glmLatentBits());
+    try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.fromJsonValue(.{ .integer = 8 }).?.glmLatentBits());
 }

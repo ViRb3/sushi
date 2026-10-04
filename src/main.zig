@@ -241,9 +241,9 @@ fn printUsage(io: std.Io) void {
         \\                        for the last <n> (default: 0 = full history;
         \\                        windowing costs acceptance on stock Qwen heads).
         \\  --kv-quant <mode>   KV-cache quantization scheme:
-        \\                        off, 4, 8 — affine group quant; default 8.
-        \\                          GLM defaults to off (BF16 compressed MLA).
-        \\                          `off` keeps dense bf16 KV. It outranks a
+        \\                        8 or 4 — affine group quant; default 8 on
+        \\                          every model (GLM refuses 4). 16 (or `off`)
+        \\                          keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`
         \\                          body field.
@@ -944,16 +944,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             kv_quant_explicit = true;
-            if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.dense;
-            } else if (std.mem.eql(u8, args[i], "4")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.affine(4);
-            } else if (std.mem.eql(u8, args[i], "8")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.affine(8);
-            } else {
-                log.err("--kv-quant: expected one of {{off, 4, 8}}; got '{s}'\n", .{args[i]});
+            kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
+                log.err("--kv-quant: expected one of {{16, 8, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
-            }
+            };
         } else if (std.mem.eql(u8, args[i], "--expert-cache-gb") and i + 1 < args.len) {
             i += 1;
             expert_cache_bytes = server_mod.parseExpertCacheGb(args[i]) catch {
@@ -1537,7 +1531,7 @@ pub fn main(init: std.process.Init) !void {
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
-        const kv_cache = transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, kv_quant_config, kv_quant_explicit, config.model_type);
+        const kv_cache = transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, kv_quant_config, kv_quant_explicit);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
         const mtp_choice = scheduler_mod.mtpChoiceFor(enable_mtp, mtp_explicit, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });

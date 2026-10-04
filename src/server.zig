@@ -769,9 +769,9 @@ var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
 
 /// THIS model's KV scheme and its source, the one answer the load log, `/props` and every bill read.
 pub fn kvCacheFor(config: *const model_mod.ModelConfig) transformer_mod.KvCacheChoice {
-    if (global_scheduler) |sch| return transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, sch.kv_quant_config, sch.kv_quant_explicit, config.model_type);
+    if (global_scheduler) |sch| return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, sch.kv_quant_config, sch.kv_quant_explicit);
     const launch = configured_kv_quant orelse transformer_mod.KVQuantConfig.engine_default;
-    return transformer_mod.KvCacheChoice.resolveForModel(config.kv_quant_override, launch, configured_kv_quant != null, config.model_type);
+    return transformer_mod.KvCacheChoice.resolve(config.kv_quant_override, launch, configured_kv_quant != null);
 }
 
 pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
@@ -3318,7 +3318,7 @@ pub fn prefillTransientReserveAtKv(
     kv_len: u64,
 ) u64 {
     const seq: u64 = @max(kv_len, chunk);
-    if (config.isGlm5()) return glm5TransientBytes(config, seq, chunk);
+    if (config.isGlm5()) return glm5TransientBytes(config, seq, chunk, kv_bits);
     return prefillMemoryNeeded(
         seq,
         config.num_attention_heads,
@@ -6193,22 +6193,24 @@ fn mtpHeadStateBytesPerToken(config: *const model_mod.ModelConfig) u64 {
 }
 
 fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
-    if (config.isGlm5()) return config.kvBytesPerToken() + config.qsaHistoryBytesPerToken();
+    if (config.isGlm5()) return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + config.qsaHistoryBytesPerToken();
     const head: u64 = if (mtpHeadDefaultOn(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
     return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
 }
 
 /// Native MLA fuses attention and bounds index scores internally. It stores no
 /// per-head K/V, affine rebuild, QSA score bank or generic SSM checkpoints.
-fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64, kv_bits: u64) u64 {
     const rows = @min(chunk, @max(seq, 1));
     const width = @as(u64, config.linear_num_value_heads) * config.linear_value_head_dim;
     const per_row = @as(u64, config.hidden_size) * 64 + width * 64 +
         @as(u64, config.num_experts_per_tok) * (@as(u64, config.moe_intermediate_size) * 8 + @as(u64, config.hidden_size) * 4);
     // A growing latent/pool layer retains its old allocation through evaluation.
-    const grow = seq * (@as(u64, config.mla_kv_lora_rank) * 2 + @as(u64, config.indexer_head_dim) * 2 / @max(config.indexer_compress_ratio, 1));
+    const latent_row = kvBytesPerTokenAtBits(@as(u64, config.mla_kv_lora_rank) * 2, kv_bits);
+    const grow = seq * (latent_row + @as(u64, config.indexer_head_dim) * 2 / @max(config.indexer_compress_ratio, 1));
     const pending = 2; // glm5_forward.Request.prefill_sync_layers
     const n = std.math.cast(usize, rows) orelse return std.math.maxInt(u64);
+    const kv8: u64 = if (kv_bits < 16) @import("glm5_latent.zig").kv8ScratchBytes(config.mla_kv_lora_rank, n, pending) else 0;
     const native = (@import("glm5_a6_dense_once.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_mla_prefill_batch.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_attention_nax_packed.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
@@ -6217,7 +6219,7 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
         (@import("glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
     const dflash = if (config.glm_dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
-    return rows *| per_row +| grow +| slotRingBytes(config, 16) +| native +| dflash +| glmFp8DequantScratchBytes(config, rows, pending) +|
+    return rows *| per_row +| grow +| kv8 +| slotRingBytes(config, 16) +| native +| dflash +| glmFp8DequantScratchBytes(config, rows, pending) +|
         @import("glm5_attention.zig").score_scratch_bytes +| @import("glm5_attention.zig").attention_scratch_bytes +| PREFILL_RUNTIME_FLOOR_BYTES;
 }
 
@@ -6513,7 +6515,7 @@ pub fn prefillNeededAtChunk(
         const reserved = @max(seq, @min(seq +| max_tokens, ctx));
         // Native appendRows rounds latent and pooled capacities separately to 256 rows.
         const rows = (reserved +| 1023) / 1024 * 1024;
-        return (sessionBytesPerToken(config, 16) *| rows +| glm5TransientBytes(config, seq, chunk)) *| 5 / 4;
+        return (sessionBytesPerToken(config, kv_bits) *| rows +| glm5TransientBytes(config, seq, chunk, kv_bits)) *| 5 / 4;
     }
     // deepseek_v4 gets its own estimator: it sub-chunks prefill internally and its state is module-owned f32.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
@@ -6977,8 +6979,8 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
-    if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).isQuant()) {
-        const msg = "GLM native MLA cache requires BF16; set kv_quant to off.";
+    if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).glmLatentBits() == null) {
+        const msg = "GLM native MLA cache supports kv_quant 8 or off.";
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -25990,14 +25992,21 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
 }
 
-test "GLM serving memory bills one BF16 latent and pooled index per token" {
+test "GLM serving memory bills one latent at the request's KV width and pooled index per token" {
     const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const saved = configured_kv_quant;
     defer configured_kv_quant = saved;
     configured_kv_quant = null;
-    try std.testing.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
+    try std.testing.expectEqual(@as(u64, 8), defaultKvBits(&cfg));
     try std.testing.expectEqual(@as(u64, 11968), sessionBytesPerToken(&cfg, 16));
-    try std.testing.expectEqual(@as(u64, 11968), sessionBytesPerToken(&cfg, 8));
+    // kv8: 11 layers x (512 codes + 8 BF16 scale/bias pairs) beside the BF16 pooled index.
+    try std.testing.expectEqual(@as(u64, 11 * 544 + 704), sessionBytesPerToken(&cfg, 8));
+    configured_kv_quant = transformer_mod.KVQuantConfig.dense;
+    try std.testing.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
+    configured_kv_quant = null;
+    // kv8 retains 480 fewer growth bytes per token and adds two pending layers' dequant and quantizer scratch.
+    try std.testing.expectEqual(prefillTransientReserveAtKv(&cfg, 16, 2048, 65536) + 2 * (2051 * 1024 + 2048 * 544), prefillTransientReserveAtKv(&cfg, 8, 2048, 65536) + 65536 * 480);
+    try std.testing.expect(prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{}) < prefillNeededAtChunk(&cfg, 65536, 1024, 16, 2048, .{}));
     try std.testing.expectEqual(cfg.ssmCheckpointBytes() + cfg.qsaRingBytes(), slotRingBytes(&cfg, 16));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
     try std.testing.expectEqual(@as(u64, 704), statePerTokenBilled(&cfg));

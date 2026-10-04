@@ -12,8 +12,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
 
 - One request at a time. MTP and RAM/disk prefix reuse are off: native KDA state has no prefix-cache restore and the
   checkpoint's MTP layer is not integrated.
-- Cache: BF16 compressed MLA plus FP32 KDA state. GLM never inherits the kv8 default or a `--fast` preset; an explicit
-  `--kv-quant 4|8` is refused (`GlmKvQuantUnsupported`).
+- Cache: kv8 compressed MLA latent plus FP32 KDA state, the engine default; it passed its KLD gate
+  ([quality-kld](quality-kld.md)). `--kv-quant 16` (or `kv_quant: 16` per request or in model-settings) keeps the
+  latent BF16. The pooled index and KDA state stay lossless. kv4 is refused (`GlmKvQuantUnsupported`), and the KLD teacher capture refuses any kv-quant.
 - Thinking: `low`, `high`, `max` (the template's `effective_reasoning_effort`); Sushi defaults to `high` (the HF
   template defaults to `max`); thinking off is refused. The effort words impose no token cap.
 - Image and video input through the native tower, on when present; `--no-vision` drops its weights and buffers.
@@ -98,15 +99,20 @@ inside 1.46% drift) because verification per round grew 20.6%.
 ## Memory
 
 - Load bill: text weights, the enabled tower, the selected assistant and warmup. Request bill: BF16 latent 11,264
-  plus pooled-index 704 bytes per token (11,968), capacity growth (256-row rounding), the raw key/gate ring and FP32
-  KDA state (147,619,840 bytes), plus native kernel transients at two pending layers: A6 expansion 512 MiB, head-batched
-  MLA copies 768 MiB, packed attention with its second tile and B32 512 MiB, index scores 8 MiB per pending layer,
-  B1/B3 decode attention 32 MiB, KDA cluster 1.25 MiB per pending layer.
+  plus pooled-index 704 bytes per token (11,968); under kv8 the latent is 5,984 (11 × 512 codes + 8 BF16 scale/bias
+  pairs, 6,688 per token). Then capacity growth (256-row rounding, at the stored row width), the raw key/gate ring
+  and FP32 KDA state (147,619,840 bytes), plus native kernel transients at two pending layers: A6 expansion 512 MiB,
+  head-batched MLA copies 768 MiB, packed attention with its second tile and B32 512 MiB, index scores 8 MiB per
+  pending layer, B1/B3 decode attention 32 MiB, KDA cluster 1.25 MiB per pending layer; kv8 adds its dense-prefill
+  dequantization (≤ 2051 rows) and one chunk's quantizer output, 6.1 MiB.
+- `max_safe_context` = (ceiling − active − transients) × 0.8 × 0.8 / per-token bill. The kv8 default drops the bill
+  44%: Sushi-2.5bpw + vision + A4 assistant boots at 104.32 GB active with `max_safe_context` 1,048,576 (the position
+  cap; about 1.36M by the bill), against 758,793 at `--kv-quant 16` (976a0dbb, auto context, margin 4 GiB).
 - Measured: Sushi-2.3bpw plus the A6 assistant settles at 94.55 GB active (88.06 GiB) under a 115.45 GB limit on the
   128 GB box; a 16K prefill peaks at 96.43 GB without an assistant. Sushi-2.45bpw (raw FP8) is 101.75 GB resident,
   102.51 GB peak while scoring KLD. Sushi-2.5bpw with the A6 assistant and vision is 104.56 GB active, leaving
   `max_safe_context` 746,036 tokens (A4 assistant: 104.32 GB, 758,793; BF16 cache with no assistant, no vision and
-  `--wired-margin-gib 2`: 955,781) under `iogpu.wired_limit_mb=120000` (margin 4 GiB): 1M context does not fit there.
+  `--wired-margin-gib 2`: 955,781) under `iogpu.wired_limit_mb=120000` (margin 4 GiB): 1M context fits only at kv8.
 - An explicit `--ctx-size` is not checked against that bill at load (GLM is outside the load-time serving bill), so
   `n_ctx` can advertise more than a request may use; request admission refuses past the affordable context.
 

@@ -28,6 +28,10 @@ the trunk must be BF16/F32 and routed experts BF16. The capture selects the refe
 Other architecture capture behavior, serving defaults and compare profiles remain unchanged. The total ledger includes
 the trunk, full expert union, I/O bounce slabs, per-layer LRU and at least8 GiB request reserve; allocator cache is0.
 Dense prefill uses at most512 tokens per chunk and synchronous layers, with BF16 compressed MLA and FP32 KDA state.
+Capture refuses any kv-quant; `kld compare --kv-quant 8` scores a GLM student with its served kv8 latent.
+A GLM pack (not `bf16_individual`) captures through the generic path instead: a student self-reference of its served
+forward at a BF16 latent (kv4/kv8 refused), `reference_numerics` off. Generic GLM capture and compare prefill
+prompts in 2048-token chunks, so 128K-token prompts fit and both sides chunk alike.
 All requested greedy full-vocabulary rows are captured through EOS, with native logits dtype recorded and exact
 F32 export. Output first stays in `<out>.partial`; only a full capture publishes a completed baseline and native
 identity atomically, without replacing existing output. A one-prompt study is not the standard release verdict.
@@ -265,4 +269,13 @@ experts (K2.25 unless the row says K2.5), BF16 MLA and FP32 KDA state, one resid
 
 K2.5 experts cut KLD 22.5% from K2.25 on the same A6 trunk (byte-identical trunk tensors). The three trunks sit within 2% of each other under two numerical profiles; this four-prompt screen does not rank them
 and is not the 16x512 release reading. Code scores about 3x lower than prose on every pack.
+
+GLM kv8 latent (`--kv-quant 8`, Sushi-2.5bpw, binary `694e36a3`, `taskpolicy -a`, GPU lock):
+- Same 4x512 teacher: KLD 0.071762 / top-1 89.70% against the BF16 latent's 0.072071 / 89.94% (-0.43%, inside the
+  noise floor); peak active unchanged at 103.59 GB.
+- Long context, against the pack's own BF16-latent reference (2 prompts of 59k and 66k tokens x 2048 teacher-forced
+  tokens): KLD to first EOS 0.00715, top-1 96.8% over 496 positions; per-256-position means stay at 0.0006-0.0094 on
+  the prose prompt. Past EOS the code prompt's continuation degenerates and its KLD climbs to 0.18, outside the
+  scored window.
+- Greedy free-run at those prompts diverges early (token 16 and 118) at near ties; the answers reword the same facts.
 

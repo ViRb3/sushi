@@ -52,20 +52,14 @@ pub fn cloneRequest(source: *const forward.Request) !forward.Request {
     copy.dense_prefill = source.dense_prefill;
     copy.prefill_async = source.prefill_async;
     copy.prefill_sync_layers = source.prefill_sync_layers;
+    copy.latent_bits = source.latent_bits;
     for (copy.layers, source.layers) |*dst, src| {
         if (src.recurrent.initialized) {
             try mlx.check(mlx.mlx_array_set(&dst.recurrent.conv_state, src.recurrent.conv_state));
             try mlx.check(mlx.mlx_array_set(&dst.recurrent.ssm_state, src.recurrent.ssm_state));
             dst.recurrent.initialized = true;
         }
-        dst.attention.processed = src.attention.processed;
-        inline for (.{ "latent", "pooled", "tail_keys", "tail_gates" }) |field| {
-            const value = @field(src.attention, field);
-            if (value.ctx != null) {
-                @field(dst.attention, field) = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_array_set(&@field(dst.attention, field), value));
-            }
-        }
+        dst.attention = try src.attention.share();
     }
     return copy;
 }

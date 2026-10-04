@@ -2,6 +2,8 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
+const latent_store = @import("glm5_latent.zig");
+const Latent = latent_store.Latent;
 const Arr = mlx.mlx_array;
 pub const scratch_limit: usize = 8 * 1024 * 1024;
 var b1_calls: usize = 0;
@@ -64,21 +66,20 @@ const gather_source: [:0]const u8 =
     \\const bool valid=id>=0 && uint(id)<lengths[row] && uint(id)<=offsets[row];
     \\if(d==0u) mask[slot]=valid;
     \\if(!valid) {for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=OutT(0);return;}
-    \\const device OutT* values=uint(id)<uint(prefix_length)?prefix+size_t(uint(id))*512u:
-    \\ tape+size_t(paths[row*3u+uint(id)-uint(prefix_length)])*512u;
+    \\if(uint(id)<uint(prefix_length)) {for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=SUSHI_LATENT(prefix,uint(id),d+j,512u);return;}
+    \\const device OutT* values=tape+size_t(paths[row*3u+uint(id)-uint(prefix_length)])*512u;
     \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=values[d+j];
 ;
-var gather_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var gather_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var configs: [2]?mlx.mlx_fast_metal_kernel_config = @splat(null);
-pub fn run(ops: *Ops, q: Arr, prefix: Arr, prefix_rows: usize, tape: Arr, branches: []const Branch, selected: Arr, scale: f32) !?Arr {
+pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, branches: []const Branch, selected: Arr, scale: f32) !?Arr {
     if (!mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported() or !std.math.isFinite(scale) or scale <= 0) return null;
-    for ([_]Arr{ q, prefix, tape, selected }) |a| if (a.ctx == null) return null;
-    for ([_]Arr{ q, prefix, tape }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16) return null;
-    if (mlx.mlx_array_dtype(selected) != .int32 or !geometry(mlx.getShape(q), mlx.getShape(prefix), prefix_rows, mlx.getShape(tape), mlx.getShape(selected), branches)) return null;
-    for ([_]Arr{ prefix, tape }) |a| {
-        const strides = mlx.mlx_array_strides(a);
-        if (strides[0] != 512 or strides[1] != 1) return null;
-    }
+    for ([_]Arr{ q, prefix.data, tape, selected }) |a| if (a.ctx == null) return null;
+    if (!prefix.rowMajor() or prefix.dtype() != .bfloat16) return null;
+    for ([_]Arr{ q, tape }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16) return null;
+    if (mlx.mlx_array_dtype(selected) != .int32 or !geometry(mlx.getShape(q), &.{ prefix.rows(), prefix.width() }, prefix_rows, mlx.getShape(tape), mlx.getShape(selected), branches)) return null;
+    const ts = mlx.mlx_array_strides(tape);
+    if (ts[0] != 512 or ts[1] != 1) return null;
     const qs = mlx.mlx_array_strides(q);
     if (qs[1] != 512 or qs[2] != 1) return null;
     const batch: c_int = @intCast(branches.len);
@@ -111,21 +112,30 @@ pub fn run(ops: *Ops, q: Arr, prefix: Arr, prefix_rows: usize, tape: Arr, branch
         configs[cfg_index] = c;
         break :blk c;
     };
-    if (gather_kernel == null) {
-        const inputs = mlx.mlx_vector_string_new_data(&.{ "prefix", "tape", "selected", "offsets", "lengths", "paths", "prefix_length", "batch_count" }, 8);
+    const quantized = prefix.quantized();
+    const kernel = &gather_kernels[@intFromBool(quantized)];
+    if (kernel.* == null) {
+        const names: []const [*:0]const u8 = if (quantized)
+            &.{ "prefix", "prefix_scales", "prefix_biases", "tape", "selected", "offsets", "lengths", "paths", "prefix_length", "batch_count" }
+        else
+            &.{ "prefix", "tape", "selected", "offsets", "lengths", "paths", "prefix_length", "batch_count" };
+        const inputs = mlx.mlx_vector_string_new_data(names.ptr, names.len);
         defer _ = mlx.mlx_vector_string_free(inputs);
         const outputs = mlx.mlx_vector_string_new_data(&.{ "kv", "mask" }, 2);
         defer _ = mlx.mlx_vector_string_free(outputs);
         // Admitted strides avoid wrapper copies of the immutable full prefix.
-        const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_decode_batch_gather", inputs, outputs, gather_source, "", false, false);
+        const k = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_decode_batch_gather8" else "sushi_glm_decode_batch_gather", inputs, outputs, gather_source, latent_store.header(quantized), false, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
-        gather_kernel = k;
+        kernel.* = k;
     }
-    const inputs = mlx.mlx_vector_array_new_data(&.{ prefix, tape, ids, oa, la, pa, ba, batches_array }, 8);
+    const inputs = if (quantized)
+        mlx.mlx_vector_array_new_data(&.{ prefix.data, prefix.scales, prefix.biases, tape, ids, oa, la, pa, ba, batches_array }, 10)
+    else
+        mlx.mlx_vector_array_new_data(&.{ prefix.data, tape, ids, oa, la, pa, ba, batches_array }, 8);
     defer _ = mlx.mlx_vector_array_free(inputs);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, gather_kernel.?, inputs, cfg, ops.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel.*.?, inputs, cfg, ops.s));
     const bank = try ops.slot();
     const mask = try ops.slot();
     try mlx.check(mlx.mlx_vector_array_get(bank, outputs, 0));
@@ -164,4 +174,43 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
     model.reference_numerics = true;
     defer model.reference_numerics = false;
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(4));
+}
+
+test "GLM kv8 B1 and B3 decode gathers match BF16 over the round-tripped prefix" {
+    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const prefix_rows = 3000;
+    var q = try latent_store.quantize(try ops.own(try latent_store.randomRows(prefix_rows, 512, 61, s)), s);
+    defer q.deinit();
+    const kv8 = Latent{ .data = q.q, .scales = q.scales, .biases = q.biases };
+    const bf16 = Latent{ .data = try ops.own(try kv8.dense(0, prefix_rows, s)) };
+    const tape = try ops.own(try latent_store.readable(try ops.own(try latent_store.randomRows(3, 512, 62, s)), latent_store.kv8_bits, s));
+    const branches = [_]Branch{
+        .{ .offset = prefix_rows, .length = prefix_rows + 1, .path = .{ 0, 0, 0 } },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 1, 0 } },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 2, 0 } },
+    };
+    var ids: [3 * 2051]i32 = undefined;
+    for (branches, 0..) |branch, row| for (0..2051) |k| {
+        ids[row * 2051 + k] = @intCast(branch.length - 2051 + k);
+    };
+    const selected = try ops.own(mlx.mlx_array_new_data(&ids, &.{ 3, 2051 }, 2, .int32));
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 63));
+    const query = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(query, &.{ 3, 64, 512 }, 3, .bfloat16, 0, 0.05, key, s));
+    resetCalls();
+    const got = (try run(&ops, query.*, kv8, prefix_rows, tape, &branches, selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+    const want = (try run(&ops, query.*, bf16, prefix_rows, tape, &branches, selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+    try @import("glm5_attention.zig").expectSameBits(want, got);
+    const one = try ops.slice(query.*, 0, 0, 1);
+    const one_ids = try ops.slice(selected, 0, 0, 1);
+    const got1 = (try run(&ops, one, kv8, prefix_rows, tape, branches[0..1], one_ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+    const want1 = (try run(&ops, one, bf16, prefix_rows, tape, branches[0..1], one_ids, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+    try @import("glm5_attention.zig").expectSameBits(want1, got1);
+    try std.testing.expectEqual(@as(usize, 2), b3Calls());
+    try std.testing.expectEqual(@as(usize, 2), b1Calls());
 }

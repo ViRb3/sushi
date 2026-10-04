@@ -44615,7 +44615,10 @@ fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 
 fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
     const request = &self.glm5_request.?;
-    if (ctx.cache.step == 0) request.reset();
+    if (ctx.cache.step == 0) {
+        request.reset();
+        try request.setLatentBits(ctx.cache.config.glmLatentBits() orelse return error.GlmKvQuantUnsupported);
+    }
     if (request.offset != ctx.cache.step) return error.GlmCachePositionMismatch;
     mdl.s = self.s;
     mdl.suppress_mask = self.suppress_mask;
@@ -75930,6 +75933,52 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
     const captured = try xfm.forwardWith(&ctx, ids);
     defer _ = mlx.mlx_array_free(captured);
     try testing.expectEqualSlices(c_int, &.{ 1, 1, 128 }, mlx.getShape(out[0]));
+}
+
+test "GLM serving stores the latent its slot cache names and refuses kv4 by name" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glm5_mod.completeFixture(&weights);
+    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer xfm.deinit();
+    var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
+    defer reference.deinit();
+    var request = try glm5_mod.Request.init(a, cfg.num_hidden_layers);
+    defer request.deinit();
+    request.dense_prefill = true;
+    request.prefill_async = true;
+    try request.setLatentBits(8);
+    try xfm.cache.reinit(cfg.num_hidden_layers, KVQuantConfig.affine(8));
+    for ([_]usize{ 3, 1 }) |n| {
+        const ids = mlx.mlx_array_new_data(&[_]u32{ 0, 1, 2 }, &[_]c_int{ 1, @intCast(n) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const actual = try xfm.forward(ids);
+        defer _ = mlx.mlx_array_free(actual);
+        const expected = try reference.forwardLast(&request, ids, true);
+        defer _ = mlx.mlx_array_free(expected);
+        var equal = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(equal);
+        try mlx.check(mlx.mlx_array_equal(&equal, actual, expected, true, xfm.s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, equal));
+        try testing.expect(same);
+    }
+    const served = &xfm.glm5_request.?;
+    try testing.expectEqual(@as(u8, 8), served.latent_bits);
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(served.layers[3].attention.latent));
+    const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    try xfm.cache.reinit(cfg.num_hidden_layers, KVQuantConfig.affine(4));
+    try xfm.resetCache();
+    try testing.expectError(error.GlmKvQuantUnsupported, xfm.forward(ids));
+    try xfm.cache.reinit(cfg.num_hidden_layers, KVQuantConfig.dense);
+    try xfm.resetCache();
+    const plain = try xfm.forward(ids);
+    defer _ = mlx.mlx_array_free(plain);
+    try testing.expectEqual(@as(u8, 0), served.latent_bits);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(served.layers[3].attention.latent));
 }
 
 test "GLM vision native serving splices media before HC expansion and preserves layer capture" {

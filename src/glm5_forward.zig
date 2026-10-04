@@ -172,7 +172,7 @@ pub const Mla = struct {
     fn densePrefill(self: *const Mla, ops: *Ops, q: Arr, cfg: *const model.ModelConfig, state: anytype) !Arr {
         const rows = mlx.getShape(q)[0];
         const latent: c_int = @intCast(cfg.mla_kv_lora_rank);
-        const valid_cache = try ops.slice(state.latent, 0, 0, @intCast(state.processed));
+        const valid_cache = try ops.own(try state.latentView().dense(0, @intCast(state.processed), ops.s));
         const cached = try ops.reshape(valid_cache, &.{ 1, 1, @intCast(state.processed), latent });
         const keys = if (self.quantized) try ops.qmm(cached, self.wk, self.sk, self.bk, true) else try ops.binary(.mm, cached, try ops.transpose(self.wk, &.{ 0, 2, 1 }));
         const values = if (self.quantized) try ops.qmm(cached, self.wv, self.sv, self.bv, true) else try ops.binary(.mm, cached, try ops.transpose(self.wv, &.{ 0, 2, 1 }));
@@ -295,6 +295,8 @@ pub const Request = struct {
     prefill_sync_layers: u8 = 2,
     capture: ?*Capture = null,
     stream_owner: ?*@import("glm5_stream.zig").Bf16 = null,
+    /// MLA latent storage of every layer: 0 = BF16, 8 = kv8 (`glm5_latent.zig`).
+    latent_bits: u8 = 0,
     pub fn init(allocator: std.mem.Allocator, count: usize) !Request {
         const layers = try allocator.alloc(LayerState, count);
         for (layers) |*layer| layer.* = .init();
@@ -311,9 +313,20 @@ pub const Request = struct {
         for (self.layers) |*layer| {
             layer.deinit();
             layer.* = .init();
+            layer.attention.latent_bits = self.latent_bits;
         }
         self.offset = 0;
         self.failed = false;
+    }
+
+    /// Picks the latent storage before the first token; the lossless teacher stays BF16.
+    pub fn setLatentBits(self: *Request, bits: u8) !void {
+        if (bits != 0 and bits != @import("glm5_latent.zig").kv8_bits) return error.GlmKvQuantUnsupported;
+        if (bits != 0 and base.reference_numerics) return error.GlmTeacherLatentMustBeBf16;
+        if (bits == self.latent_bits) return;
+        if (self.offset != 0) return error.GlmLatentBitsAfterStart;
+        self.latent_bits = bits;
+        for (self.layers) |*layer| layer.attention.latent_bits = bits;
     }
 
     pub fn residentBytes(self: *const Request) u64 {
@@ -1269,4 +1282,44 @@ test "GLM stream GPU native forward binds BF16 experts and releases request admi
     try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(y).?[0..12], mlx.mlx_array_data_bfloat16(z).?[0..12]);
     try std.testing.expectError(error.GlmStreamingSpecUnsupported, @import("glm5_dflash_ffn.zig").apply(&net, 3, undefined, undefined));
     try std.testing.expectError(error.GlmStreamRequestBudgetExceeded, store.admit(7, 3));
+}
+
+test "GLM kv8 dense prefill expands the stored latent exactly as BF16 over the round-tripped rows" {
+    const s = mlx.gpuStream();
+    const latent_store = @import("glm5_latent.zig");
+    const attention = @import("glm5_attention.zig");
+    var weights = model.Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    const cfg = try mlaOrientationFixture(&weights);
+    var layer = try Mla.load(&weights, "mla", &cfg, s);
+    defer layer.deinit();
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const latent = try ops.own(try latent_store.randomRows(40, 128, 71, s));
+    const keys = try ops.zeros(&.{ 40, 4 }, .bfloat16);
+    const ape = try ops.zeros(&.{ 4, 4 }, .bfloat16);
+    var kv8 = attention.State{ .latent_bits = latent_store.kv8_bits };
+    defer kv8.deinit();
+    var twin = attention.State{};
+    defer twin.deinit();
+    _ = try kv8.append(latent, keys, keys, ape, s);
+    _ = try twin.append(try ops.own(try latent_store.readable(latent, latent_store.kv8_bits, s)), keys, keys, ape, s);
+    const q = try ops.reshape(try ops.own(try latent_store.randomRows(24, 128, 72, s)), &.{ 12, 2, 1, 128 });
+    try expectArrayBits(try layer.densePrefill(&ops, q, &cfg, &twin), try layer.densePrefill(&ops, q, &cfg, &kv8));
+}
+
+test "GLM request picks its latent storage before the first token and keeps the teacher BF16" {
+    var req = try Request.init(std.testing.allocator, 4);
+    defer req.deinit();
+    try req.setLatentBits(8);
+    for (req.layers) |layer| try std.testing.expectEqual(@as(u8, 8), layer.attention.latent_bits);
+    try std.testing.expectError(error.GlmKvQuantUnsupported, req.setLatentBits(4));
+    req.offset = 3;
+    try std.testing.expectError(error.GlmLatentBitsAfterStart, req.setLatentBits(0));
+    req.reset();
+    for (req.layers) |layer| try std.testing.expectEqual(@as(u8, 8), layer.attention.latent_bits);
+    base.reference_numerics = true;
+    defer base.reference_numerics = false;
+    try std.testing.expectError(error.GlmTeacherLatentMustBeBf16, req.setLatentBits(8));
+    try req.setLatentBits(0);
 }

@@ -9,7 +9,12 @@ const streaming = @import("glm5_stream.zig");
 const Arr = mlx.mlx_array;
 pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (!cfg.isGlm5() or opts.command != .capture) return false;
-    if (cfg.expert_layout != .bf16_individual or cfg.quant_bits != 0 or
+    // A pack captures its own served path (a student reference, not the teacher) at a BF16 latent.
+    if (cfg.expert_layout != .bf16_individual) {
+        if (opts.kv_quant_config.isQuant()) return error.GlmStudentReferenceNeedsBf16Latent;
+        return false;
+    }
+    if (cfg.quant_bits != 0 or
         opts.tokens == 0 or opts.ssd_budget_bytes == 0 or opts.expert_cache_bytes != 0 or opts.pick_tolerance != 0 or
         !opts.no_template or opts.enable_mtp or opts.hidden_out.len != 0 or
         opts.kv_quant_config.scheme != .off or opts.wired_margin_bytes != 0)
@@ -458,4 +463,28 @@ test "GLM teacher capture selects reference numerics with TF32 off" {
     base.reference_numerics = false;
     _ = setenv("MLX_ENABLE_TF32", "1", 1);
     try std.testing.expectError(error.NativeGlmTeacherRequiresTf32Off, teacherEnvironment());
+}
+
+test "GLM KLD capture sends a pack to the generic student reference, at a BF16 latent only" {
+    var cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .exl3_k4 };
+    const kv = @import("kv_quant.zig").KVQuantConfig;
+    var opts = kld.Options{ .command = .capture, .no_template = true, .tokens = 256 };
+    try std.testing.expect(!(try accepts(&cfg, opts)));
+    for ([_]kv{ kv.affine(4), kv.affine(8) }) |quant| {
+        opts.kv_quant_config = quant;
+        try std.testing.expectError(error.GlmStudentReferenceNeedsBf16Latent, accepts(&cfg, opts));
+    }
+    opts.command = .compare;
+    try std.testing.expect(!(try accepts(&cfg, opts)));
+    cfg.expert_layout = .bf16_individual;
+    opts = .{ .command = .capture, .no_template = true, .tokens = 256 };
+    try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
+    opts.ssd_budget_bytes = 100 << 30;
+    try std.testing.expect(try accepts(&cfg, opts));
+}
+
+test "GLM native KLD capture refuses a kv8 latent cache" {
+    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .bf16_individual };
+    const opts = kld.Options{ .command = .capture, .no_template = true, .tokens = 512, .ssd_budget_bytes = 100 << 30, .kv_quant_config = @import("kv_quant.zig").KVQuantConfig.affine(8) };
+    try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
 }

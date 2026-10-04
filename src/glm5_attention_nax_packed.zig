@@ -2,6 +2,8 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
+const latent_store = @import("glm5_latent.zig");
+const Latent = latent_store.Latent;
 const Arr = mlx.mlx_array;
 pub const max_rows: usize = 16;
 pub const wide_rows: usize = 32;
@@ -35,11 +37,11 @@ const gather_source: [:0]const u8 =
     \\const bool valid=id>=0 && uint(id)<uint(length) && uint(id)<=uint(offset)+row;
     \\if(d==0u) mask[slot]=valid;
     \\if(!valid) {for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=OutT(0);return;}
-    \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=cache[size_t(uint(id))*512u+d+j];
+    \\for(uint j=0u;j<4u;++j) kv[size_t(slot)*512u+d+j]=SUSHI_LATENT(cache,uint(id),d+j,512u);
 ;
-var gather_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var gather_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var gather_configs: [wide_rows]?mlx.mlx_fast_metal_kernel_config = @splat(null);
-fn gather(ops: *Ops, cache: Arr, ids: Arr, offset: usize, history: usize) !struct { kv: Arr, mask: Arr } {
+fn gather(ops: *Ops, cache: Latent, ids: Arr, offset: usize, history: usize) !struct { kv: Arr, mask: Arr } {
     const rows = mlx.getShape(ids)[0];
     const index: usize = @intCast(rows - 1);
     const cfg = gather_configs[index] orelse blk: {
@@ -54,26 +56,29 @@ fn gather(ops: *Ops, cache: Arr, ids: Arr, offset: usize, history: usize) !struc
         gather_configs[index] = c;
         break :blk c;
     };
-    if (gather_kernel == null) {
-        const ins = mlx.mlx_vector_string_new_data(&.{ "cache", "selected", "offset", "length" }, 4);
+    const quantized = cache.quantized();
+    const kernel = &gather_kernels[@intFromBool(quantized)];
+    if (kernel.* == null) {
+        const names: []const [*:0]const u8 = if (quantized) &.{ "cache", "cache_scales", "cache_biases", "selected", "offset", "length" } else &.{ "cache", "selected", "offset", "length" };
+        const ins = mlx.mlx_vector_string_new_data(names.ptr, names.len);
         defer _ = mlx.mlx_vector_string_free(ins);
         const outs = mlx.mlx_vector_string_new_data(&.{ "kv", "mask" }, 2);
         defer _ = mlx.mlx_vector_string_free(outs);
         // Strides are explicitly admitted below; disable the wrapper's flag-
         // based copies so false row-contiguous flags cannot copy full history.
-        const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_sparse_head_gather", ins, outs, gather_source, "", false, false);
+        const k = mlx.mlx_fast_metal_kernel_new(if (quantized) "sushi_glm_sparse_head_gather8" else "sushi_glm_sparse_head_gather", ins, outs, gather_source, latent_store.header(quantized), false, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
-        gather_kernel = k;
+        kernel.* = k;
     }
     const off: u32 = @intCast(offset);
     const len: u32 = @intCast(history);
     const oa = try ops.own(mlx.mlx_array_new_data(&off, &.{}, 0, .uint32));
     const la = try ops.own(mlx.mlx_array_new_data(&len, &.{}, 0, .uint32));
-    const iv = mlx.mlx_vector_array_new_data(&.{ cache, ids, oa, la }, 4);
+    const iv = if (quantized) mlx.mlx_vector_array_new_data(&.{ cache.data, cache.scales, cache.biases, ids, oa, la }, 6) else mlx.mlx_vector_array_new_data(&.{ cache.data, ids, oa, la }, 4);
     defer _ = mlx.mlx_vector_array_free(iv);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, gather_kernel.?, iv, cfg, ops.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel.*.?, iv, cfg, ops.s));
     if (mlx.mlx_vector_array_size(outputs) != 2) return error.MetalKernelBadOutputCount;
     const kv = try ops.slot();
     try mlx.check(mlx.mlx_vector_array_get(kv, outputs, 0));
@@ -87,15 +92,14 @@ fn geometry(q: []const c_int, cache: []const c_int, ids: []const c_int, offset: 
         history > 0 and history <= 1048576 and offset <= history and q[0] <= history - offset;
 }
 /// Valid IDs must be unique per real query, as guaranteed by IndexPool selection.
-pub fn run(ops: *Ops, q: Arr, cache: Arr, selected: Arr, offset: usize, history: usize, scale: f32) !?Arr {
+pub fn run(ops: *Ops, q: Arr, cache: Latent, selected: Arr, offset: usize, history: usize, scale: f32) !?Arr {
     if (!mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported() or !std.math.isFinite(scale) or scale <= 0) return null;
-    for ([_]Arr{ q, cache, selected }) |a| if (a.ctx == null) return null;
-    if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(cache) != .bfloat16 or mlx.mlx_array_dtype(selected) != .int32 or
-        !geometry(mlx.getShape(q), mlx.getShape(cache), mlx.getShape(selected), offset, history)) return null;
+    for ([_]Arr{ q, cache.data, selected }) |a| if (a.ctx == null) return null;
     // Refuse a cache that would require the generic gather wrapper to copy
     // full history; actual State latent buffers have these contiguous strides.
-    const cs = mlx.mlx_array_strides(cache);
-    if (cs[0] != 512 or cs[1] != 1) return null;
+    if (!cache.rowMajor()) return null;
+    if (mlx.mlx_array_dtype(q) != .bfloat16 or cache.dtype() != .bfloat16 or mlx.mlx_array_dtype(selected) != .int32 or
+        !geometry(mlx.getShape(q), &.{ cache.rows(), cache.width() }, mlx.getShape(selected), offset, history)) return null;
     const rows = mlx.getShape(q)[0];
     if (try temporaryBytes(@intCast(rows)) > scratch_limit) return error.GlmPackedAttentionScratchBudget;
     const is = mlx.mlx_array_strides(selected);
@@ -140,7 +144,7 @@ test "GLM packed NAX invalid gather cannot poison output with masked nonfinite k
         data[i] = if (i % 2 == 0) 0x7fc0 else 0x7f80;
         data[512 + i] = 0x3e80; // exact BF16 0.25
     }
-    const cache = try ops.own(mlx.mlx_array_new_data(&data, &.{ 4, 512 }, 2, .bfloat16));
+    const cache = Latent{ .data = try ops.own(mlx.mlx_array_new_data(&data, &.{ 4, 512 }, 2, .bfloat16)) };
     var indices: [2 * 2051]i32 = @splat(-1);
     indices[0] = std.math.minInt(i32);
     indices[1] = std.math.maxInt(i32);
@@ -162,7 +166,7 @@ test "GLM packed NAX preserves head order real-row selection and final ragged sl
     var data: [4 * 512]u16 = @splat(0);
     data[0] = 0x3f80; // BF16 +1
     data[512] = 0xbf80; // BF16 -1
-    const cache = try ops.own(mlx.mlx_array_new_data(&data, &.{ 4, 512 }, 2, .bfloat16));
+    const cache = Latent{ .data = try ops.own(mlx.mlx_array_new_data(&data, &.{ 4, 512 }, 2, .bfloat16)) };
     var query: [2 * 64 * 512]u16 = @splat(0);
     for (0..2) |row| for (0..64) |head| {
         query[(row * 64 + head) * 512] = if (head % 2 == 0) 0x4180 else 0xc180; // +/-16

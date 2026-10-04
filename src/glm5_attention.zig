@@ -1,7 +1,9 @@
-//! Request-local IndexPool and NoPE latent attention. All caches are lossless.
-//! The served MLA cache is BF16 compressed latent; generic KV8 defaults do not apply.
+//! Request-local IndexPool and NoPE latent attention. IndexPool state is lossless; the
+//! latent is BF16, or kv8 when the request asks for it (`State.latent_bits`).
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const latent_store = @import("glm5_latent.zig");
+pub const Latent = latent_store.Latent;
 const partials = @import("glm5_attention_prefill.zig");
 const packed_nax = @import("glm5_attention_nax_packed.zig");
 const latent_overlay = @import("glm5_attention_overlay.zig");
@@ -128,11 +130,16 @@ fn compress(scope: *Scope, keys: Arr, gates: Arr, ape: Arr, ready: c_int) !Arr {
 }
 
 pub const State = struct {
+    /// BF16 rows, or kv8 u32 codes with `latent_scales` and `latent_biases` beside them.
     latent: Arr = nil,
+    latent_scales: Arr = nil,
+    latent_biases: Arr = nil,
     pooled: Arr = nil,
     tail_keys: Arr = nil,
     tail_gates: Arr = nil,
     processed: usize = 0,
+    /// 0 stores BF16 latent rows, 8 stores kv8; kept across reset.
+    latent_bits: u8 = 0,
 
     pub fn init() State {
         return .{};
@@ -141,13 +148,29 @@ pub const State = struct {
         for (self.arrays()) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
-        self.* = .{};
+        self.* = .{ .latent_bits = self.latent_bits };
     }
     pub fn reset(self: *State) void {
         self.deinit();
     }
-    pub fn arrays(self: *const State) [4]Arr {
-        return .{ self.latent, self.pooled, self.tail_keys, self.tail_gates };
+    pub fn arrays(self: *const State) [6]Arr {
+        return .{ self.latent, self.latent_scales, self.latent_biases, self.pooled, self.tail_keys, self.tail_gates };
+    }
+    pub fn latentView(self: *const State) Latent {
+        return .{ .data = self.latent, .scales = self.latent_scales, .biases = self.latent_biases };
+    }
+    /// A second owner of the same immutable arrays; appends replace handles, never contents.
+    pub fn share(self: *const State) !State {
+        var copy = State{ .processed = self.processed, .latent_bits = self.latent_bits };
+        errdefer copy.deinit();
+        inline for (.{ "latent", "latent_scales", "latent_biases", "pooled", "tail_keys", "tail_gates" }) |name| {
+            const value = @field(self.*, name);
+            if (value.ctx != null) {
+                @field(copy, name) = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&@field(copy, name), value));
+            }
+        }
+        return copy;
     }
     pub fn evaluate(self: *const State) !void {
         const vec = mlx.mlx_vector_array_new();
@@ -170,22 +193,36 @@ pub const State = struct {
             !std.mem.eql(c_int, ks, mlx.getShape(gates)) or !std.mem.eql(c_int, &.{ 4, ks[1] }, mlx.getShape(ape)) or
             !supported(mlx.mlx_array_dtype(latent)) or !supported(mlx.mlx_array_dtype(keys)) or
             mlx.mlx_array_dtype(gates) != mlx.mlx_array_dtype(keys) or mlx.mlx_array_dtype(ape) != mlx.mlx_array_dtype(keys)) return error.InvalidGlmAttentionShape;
-        if (self.processed != 0 and (mlx.getShape(self.latent)[1] != ls[1] or mlx.mlx_array_dtype(self.latent) != mlx.mlx_array_dtype(latent))) return error.InvalidGlmAttentionShape;
+        if (self.latent_bits != 0 and (self.latent_bits != latent_store.kv8_bits or mlx.mlx_array_dtype(latent) != .bfloat16 or
+            @mod(ls[1], @as(c_int, latent_store.group_size)) != 0)) return error.InvalidGlmAttentionShape;
+        if (self.processed != 0 and (self.latentView().width() != ls[1] or self.latentView().dtype() != mlx.mlx_array_dtype(latent))) return error.InvalidGlmAttentionShape;
         if (self.tail_keys.ctx != null and (mlx.getShape(self.tail_keys)[1] != ks[1] or mlx.mlx_array_dtype(self.tail_keys) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
         if (self.pooled.ctx != null and (mlx.getShape(self.pooled)[1] != ks[1] or mlx.mlx_array_dtype(self.pooled) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
         const next = try std.math.add(usize, self.processed, @intCast(ls[0]));
         var scope = Scope{ .s = s };
         defer scope.deinit();
-        const l = if (store_latent) try scope.appendRows(self.latent, self.processed, latent) else self.latent;
+        var l = self.latent;
+        var l_scales = self.latent_scales;
+        var l_biases = self.latent_biases;
+        if (store_latent and self.latent_bits == 0) l = try scope.appendRows(self.latent, self.processed, latent);
+        if (store_latent and self.latent_bits != 0) {
+            var q = try latent_store.quantize(latent, s);
+            defer q.deinit();
+            l = try scope.appendRows(self.latent, self.processed, q.q);
+            l_scales = try scope.appendRows(self.latent_scales, self.processed, q.scales);
+            l_biases = try scope.appendRows(self.latent_biases, self.processed, q.biases);
+        }
         const k = try scope.join(self.tail_keys, keys);
         const g = try scope.join(self.tail_gates, gates);
         const ready = @divTrunc(mlx.getShape(k)[0], 4) * 4;
         const p = if (ready > 0) try scope.appendRows(self.pooled, self.processed / 4, try compress(&scope, k, g, ape, ready)) else self.pooled;
         const tail_k = try scope.copy(try scope.cut(k, ready, mlx.getShape(k)[0]));
         const tail_g = try scope.copy(try scope.cut(g, ready, mlx.getShape(g)[0]));
-        var new = State{ .processed = next };
+        var new = State{ .processed = next, .latent_bits = self.latent_bits };
         errdefer new.deinit();
         if (l.ctx != null) new.latent = try scope.result(l);
+        if (l_scales.ctx != null) new.latent_scales = try scope.result(l_scales);
+        if (l_biases.ctx != null) new.latent_biases = try scope.result(l_biases);
         if (p.ctx != null) new.pooled = try scope.result(p);
         new.tail_keys = try scope.result(tail_k);
         new.tail_gates = try scope.result(tail_g);
@@ -198,16 +235,19 @@ pub const State = struct {
 
 var score_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var attention_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var attention_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn kernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, inputs: []const [*:0]const u8, outputs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+    return kernelWithHeader(slot, name, inputs, outputs, source, "");
+}
+fn kernelWithHeader(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, inputs: []const [*:0]const u8, outputs: []const [*:0]const u8, source: [:0]const u8, header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
     if (slot.*) |k| return k;
     const iv = mlx.mlx_vector_string_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(outputs.ptr, outputs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, header, true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = k;
     return k;
@@ -353,7 +393,7 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
     if (headpack) {
         var ops = @import("glm5_model.zig").Ops{ .s = scope.s };
         defer ops.deinit();
-        if (try packed_nax.run(&ops, q, state.latent, selected.?, offset, state.processed, scale)) |out| {
+        if (try packed_nax.run(&ops, q, state.latentView(), selected.?, offset, state.processed, scale)) |out| {
             // Materialize the small result before releasing the gathered bank.
             try mlx.check(mlx.mlx_array_eval(out));
             return scope.own(try ops.result(out));
@@ -385,8 +425,15 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
         partial = try scope.own(try scope.result(result.partial));
         stats = try scope.own(try scope.result(result.stats));
     } else {
-        const k = try kernel(&attention_kernel, "sushi_glm_latent_partial", &.{ "q", "cache", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION);
-        const ov = try apply(k, &.{ q, state.latent, indices, off, length, scaling }, cfg, scope.s);
+        const cache = state.latentView();
+        const k = if (cache.quantized())
+            try kernelWithHeader(&attention_kernels[1], "sushi_glm_latent8_partial", &.{ "q", "cache", "cache_scales", "cache_biases", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION, latent_store.header(true))
+        else
+            try kernelWithHeader(&attention_kernels[0], "sushi_glm_latent_partial", &.{ "q", "cache", "selected", "offset", "length", "scale" }, &.{ "partial", "stats" }, ATTENTION, latent_store.header(false));
+        const ov = if (cache.quantized())
+            try apply(k, &.{ q, cache.data, cache.scales, cache.biases, indices, off, length, scaling }, cfg, scope.s)
+        else
+            try apply(k, &.{ q, cache.data, indices, off, length, scaling }, cfg, scope.s);
         defer _ = mlx.mlx_vector_array_free(ov);
         partial = try kernelOutput(scope, ov, 0);
         stats = try kernelOutput(scope, ov, 1);
@@ -463,7 +510,7 @@ fn attendPackedPairs(state: *const State, q: Arr, iq: Arr, weights: Arr, offset:
             const end = start + packedTileRows(rows - start, max_rows);
             const qc = try tile.scope.cut(q, @intCast(start), @intCast(end));
             const selected = try selectPackedChunk(&tile.scope, state, try tile.scope.cut(iq, @intCast(start), @intCast(end)), try tile.scope.cut(weights, @intCast(start), @intCast(end)), offset + start);
-            tile.out = (try packed_nax.run(&tile.ops, qc, state.latent, selected, offset + start, state.processed, scale)) orelse
+            tile.out = (try packed_nax.run(&tile.ops, qc, state.latentView(), selected, offset + start, state.processed, scale)) orelse
                 try attentionChunk(&tile.scope, state, qc, selected, offset + start, scale, 1, false, null);
             const submit = mlx.mlx_vector_array_new_data(&.{tile.out}, 1);
             defer _ = mlx.mlx_vector_array_free(submit);
@@ -488,10 +535,10 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
     if (!mlx.streamIsGpu(s)) return error.GlmAttentionGpuRequired;
     if (q.ctx == null) return error.InvalidGlmAttentionShape;
     const sh = mlx.getShape(q);
-    const cache = if (overlay) |view| view.storage() else state.latent;
+    const cache = if (overlay) |view| view.storage() else state.latentView();
     if (sh.len != 3 or sh[0] <= 0 or sh[1] <= 0 or sh[2] <= 0 or !supported(mlx.mlx_array_dtype(q)) or
-        !std.math.isFinite(scale) or scale <= 0 or cache.ctx == null or
-        sh[2] != mlx.getShape(cache)[1] or mlx.mlx_array_dtype(q) != mlx.mlx_array_dtype(cache) or
+        !std.math.isFinite(scale) or scale <= 0 or cache.data.ctx == null or
+        sh[2] != cache.width() or mlx.mlx_array_dtype(q) != cache.dtype() or
         offset > state.processed or @as(usize, @intCast(sh[0])) > state.processed - offset) return error.InvalidGlmAttentionShape;
     const sparse = offset + @as(usize, @intCast(sh[0])) > pool_size * (pool_budget + 1) - 1;
     if (sparse) {
@@ -554,9 +601,9 @@ fn attendNativeDecode(state: *const State, q: Arr, iq: ?Arr, weights: ?Arr, offs
             const pos = offset + row;
             const query = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
             const indices = try ops.own(try decodeSelected(state, if (iq) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil, if (weights) |a| try ops.slice(a, 0, @intCast(row), @intCast(row + 1)) else nil, pos, s));
-            const prefix = if (view) |v| v.storage() else state.latent;
+            const prefix = if (view) |v| v.storage() else state.latentView();
             const prefix_rows = if (view) |v| v.prefix_rows else pos;
-            const tail = if (view) |v| v.tail else try ops.slice(state.latent, 0, @intCast(pos), @intCast(pos + 1));
+            const tail = if (view) |v| v.tail else try ops.own(try state.latentView().dense(@intCast(pos), @intCast(pos + 1), s));
             const branch = native.Branch{ .offset = pos, .length = pos + 1, .path = .{ 0, 1, 2 } };
             const out = (try native.run(&ops, query, prefix, prefix_rows, tail, &.{branch}, indices, scale)) orelse return error.GlmDecodeNativeUnsupported;
             try mlx.check(mlx.mlx_vector_array_append_value(outputs, out));
@@ -884,4 +931,106 @@ test "GLM packed cadence bills a second tile only beyond one wide tile" {
     model.reference_numerics = true;
     defer model.reference_numerics = false;
     try std.testing.expectEqual(@as(usize, 0), try packedCadenceTransientBudget(2048, 2));
+}
+
+fn normal(scope: *Scope, shape: []const c_int, seed: u64, deviation: f32) !Arr {
+    const key = try scope.slot();
+    try mlx.check(mlx.mlx_random_key(key, seed));
+    const out = try scope.slot();
+    try mlx.check(mlx.mlx_random_normal(out, shape.ptr, shape.len, .bfloat16, 0, deviation, key.*, scope.s));
+    return out.*;
+}
+
+/// A kv8 state and its BF16 twin fed the kv8 round trip of the same rows, in the same chunks.
+fn kv8Twins(scope: *Scope, latent: Arr, keys: Arr, chunks: []const c_int) ![2]State {
+    const ape = try scope.zeros(&.{ 4, mlx.getShape(keys)[1] }, .bfloat16);
+    var states = [2]State{ .{ .latent_bits = latent_store.kv8_bits }, .{} };
+    errdefer for (&states) |*st| st.deinit();
+    var start: c_int = 0;
+    for (chunks) |len| {
+        const rows = try scope.cut(latent, start, start + len);
+        const k = try scope.cut(keys, start, start + len);
+        _ = try states[0].append(rows, k, k, ape, scope.s);
+        _ = try states[1].append(try scope.own(try latent_store.readable(rows, latent_store.kv8_bits, scope.s)), k, k, ape, scope.s);
+        start += len;
+    }
+    return states;
+}
+
+pub fn expectSameBits(a: Arr, b: Arr) !void {
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const x = try ops.contiguous(a);
+    const y = try ops.contiguous(b);
+    try mlx.check(mlx.mlx_array_eval(x));
+    try mlx.check(mlx.mlx_array_eval(y));
+    const n = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+    const left: [*]const u8 = @ptrCast(mlx.mlx_array_data_uint8(x) orelse return error.MlxArrayDataNull);
+    const right: [*]const u8 = @ptrCast(mlx.mlx_array_data_uint8(y) orelse return error.MlxArrayDataNull);
+    try std.testing.expectEqualSlices(u8, left[0..n], right[0..n]);
+}
+
+test "GLM kv8 latent append quantizes each row once across prefill chunks and decode rows" {
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const n = 600;
+    const latent = try scope.own(try latent_store.randomRows(n, 512, 3, s));
+    var twins = try kv8Twins(&scope, latent, try normal(&scope, &.{ n, 8 }, 4, 1), &.{ 1, 255, 1, 300, 3, 40 });
+    defer for (&twins) |*st| st.deinit();
+    const kv8 = twins[0].latentView();
+    try std.testing.expect(kv8.quantized() and kv8.rowMajor());
+    try std.testing.expectEqual(mlx.getShape(twins[1].latent)[0], kv8.rows());
+    try expectSameBits(try scope.own(try kv8.dense(0, n, s)), try scope.cut(twins[1].latent, 0, n));
+    var whole = try latent_store.quantize(latent, s);
+    defer whole.deinit();
+    for ([_]Arr{ whole.q, whole.scales, whole.biases }, [_]Arr{ kv8.data, kv8.scales, kv8.biases }) |want, got| try expectSameBits(want, try scope.cut(got, 0, n));
+    twins[0].reset();
+    try std.testing.expectEqual(latent_store.kv8_bits, twins[0].latent_bits);
+    for (twins[0].arrays()) |a| try std.testing.expect(a.ctx == null);
+}
+
+test "GLM kv8 scalar latent attention matches BF16 attention over the round-tripped rows" {
+    const s = mlx.gpuStream();
+    for ([_]c_int{ 40, 2055 }) |n| {
+        var scope = Scope{ .s = s };
+        defer scope.deinit();
+        var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 64 }, 5, 1), try normal(&scope, &.{ n, 8 }, 6, 1), &.{ n - 8, 8 });
+        defer for (&twins) |*st| st.deinit();
+        for ([_]c_int{ 1, 8, 12 }) |rows| {
+            const offset: usize = @intCast(n - rows);
+            const q = try normal(&scope, &.{ rows, 2, 64 }, 7, 0.5);
+            const iq = try normal(&scope, &.{ rows, 2, 8 }, 8, 1);
+            const w = try normal(&scope, &.{ rows, 2 }, 9, 1);
+            const got = try scope.own(try attend(&twins[0], q, iq, w, offset, 1.0 / 16.0, s));
+            const want = try scope.own(try attend(&twins[1], q, iq, w, offset, 1.0 / 16.0, s));
+            try expectSameBits(want, got);
+        }
+    }
+}
+
+test "GLM kv8 native decode and packed prefill attention match BF16 over the round-tripped rows" {
+    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
+    const native = @import("glm5_attention_decode_batch.zig");
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const n = 2100;
+    var twins = try kv8Twins(&scope, try normal(&scope, &.{ n, 512 }, 10, 1), try normal(&scope, &.{ n, 8 }, 11, 1), &.{ 2048, n - 2048 });
+    defer for (&twins) |*st| st.deinit();
+    native.resetCalls();
+    packed_nax.resetDispatchCount();
+    for ([_]c_int{ 1, 3, 16, 32 }) |rows| {
+        const offset: usize = @intCast(n - rows);
+        const q = try normal(&scope, &.{ rows, 64, 512 }, 12, 0.05);
+        const iq = try normal(&scope, &.{ rows, 2, 8 }, 13, 1);
+        const w = try normal(&scope, &.{ rows, 2 }, 14, 1);
+        const got = try scope.own(try attend(&twins[0], q, iq, w, offset, 1.0 / 16.0, s));
+        const want = try scope.own(try attend(&twins[1], q, iq, w, offset, 1.0 / 16.0, s));
+        try expectSameBits(want, got);
+    }
+    try std.testing.expectEqual(@as(usize, 2 * (1 + 3)), native.b1Calls());
+    try std.testing.expectEqual(@as(usize, 2 * 2), packed_nax.dispatchCount());
 }

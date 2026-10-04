@@ -82,28 +82,15 @@ pub const MlaTape = struct {
         const indices = try ops.own(mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .uint32));
         _ = try state.append(try ops.take(self.latent, indices, 0), try ops.take(self.keys, indices, 0), try ops.take(self.gates, indices, 0), self.ape, s);
     }
-    fn appendIndex(self: *const MlaTape, state: *attention.State, path: []const u32, s: mlx.mlx_stream) !Arr {
+    /// Returns the overlay tail: the path's rows of `readable`.
+    fn appendIndex(self: *const MlaTape, state: *attention.State, path: []const u32, readable: Arr, s: mlx.mlx_stream) !Arr {
         var ops = Ops{ .s = s };
         defer ops.deinit();
         const indices = try ops.own(mlx.mlx_array_new_data(path.ptr, &.{@intCast(path.len)}, 1, .uint32));
-        const tail = try ops.take(self.latent, indices, 0);
-        _ = try state.appendIndexOnly(tail, try ops.take(self.keys, indices, 0), try ops.take(self.gates, indices, 0), self.ape, s);
-        return ops.result(tail);
+        _ = try state.appendIndexOnly(try ops.take(self.latent, indices, 0), try ops.take(self.keys, indices, 0), try ops.take(self.gates, indices, 0), self.ape, s);
+        return ops.result(try ops.take(readable, indices, 0));
     }
 };
-
-fn forkAttention(source: *const attention.State) !attention.State {
-    var state = attention.State{ .processed = source.processed };
-    errdefer state.deinit();
-    inline for (.{ "latent", "pooled", "tail_keys", "tail_gates" }) |name| {
-        const a = @field(source.*, name);
-        if (a.ctx != null) {
-            @field(state, name) = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&@field(state, name), a));
-        }
-    }
-    return state;
-}
 
 fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, mode: kda.ProjectionMode) !struct { output: Arr, tape: MlaTape } {
     const native = @import("glm5_attention_decode_batch.zig");
@@ -150,6 +137,8 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     tape.keys = try ops.result(keys);
     tape.gates = try ops.result(gates);
     tape.ape = try ops.result(layer.ape);
+    // Branch rows are read as serial decode would read them once stored.
+    const readable = try ops.own(try @import("glm5_latent.zig").readable(latent, state.latent_bits, ops.s));
     // Dense prefixes do not consume index_q/index_weights. Keep them lazy here;
     // sparse branches naturally bill their necessary indexer work in mla_branches.
     var result_rows: [16]Arr = undefined;
@@ -160,12 +149,12 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
     var native_ids: [3]Arr = undefined;
     var native_branches: [3]native.Branch = undefined;
     for (0..parents.len) |row| {
-        var branch = try forkAttention(state);
+        var branch = try state.share();
         defer branch.deinit();
         var path: [16]u32 = undefined;
         const kept = ancestry(parents, row, &path);
         const overlay = parents.len <= 3;
-        const tail = if (overlay) try ops.own(try tape.appendIndex(&branch, kept, ops.s)) else blk: {
+        const tail = if (overlay) try ops.own(try tape.appendIndex(&branch, kept, readable, ops.s)) else blk: {
             try tape.append(&branch, kept, ops.s);
             break :blk Arr{ .ctx = null };
         };
@@ -182,7 +171,7 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
             continue;
         }
         const y = try ops.own(if (overlay)
-            try attention.attendOverlay(&branch, query, index_query, weights, offset, scale, .{ .prefix = state.latent, .prefix_rows = state.processed, .tail = tail }, ops.s)
+            try attention.attendOverlay(&branch, query, index_query, weights, offset, scale, .{ .prefix = state.latentView(), .prefix_rows = state.processed, .tail = tail }, ops.s)
         else
             try attention.attend(&branch, query, index_query, weights, offset, scale, ops.s));
         pending[pending_count] = y;
@@ -203,12 +192,12 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         }
     }
     if (batched_native) {
-        const prefix = if (state.processed == 0) latent else state.latent;
+        const prefix = if (state.processed == 0) attention.Latent{ .data = readable } else state.latentView();
         const selected = try ops.concat(&native_ids, 0);
         const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
-        const batched = try native.run(ops, qa, prefix, state.processed, latent, &native_branches, selected, scale);
+        const batched = try native.run(ops, qa, prefix, state.processed, readable, &native_branches, selected, scale);
         for (0..parents.len) |row| {
-            const y = if (batched) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else (try native.run(ops, try ops.slice(qa, 0, @intCast(row), @intCast(row + 1)), prefix, state.processed, latent, native_branches[row .. row + 1], native_ids[row], scale)) orelse return error.GlmDecodeNativeUnsupported;
+            const y = if (batched) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else (try native.run(ops, try ops.slice(qa, 0, @intCast(row), @intCast(row + 1)), prefix, state.processed, readable, native_branches[row .. row + 1], native_ids[row], scale)) orelse return error.GlmDecodeNativeUnsupported;
             const y4 = try ops.reshape(y, &.{ 1, heads, 1, width });
             attention_rows[row] = y4;
             if (broadcast_q == null) {
@@ -428,14 +417,19 @@ fn expectArrayBits(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
     const y = try ops.contiguous(b);
     try mlx.check(mlx.mlx_array_eval(x));
     try mlx.check(mlx.mlx_array_eval(y));
-    const n = mlx.mlx_array_size(x);
-    if (mlx.mlx_array_dtype(x) == .float32)
-        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(x).?[0..n]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(y).?[0..n]))
-    else
-        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(x).?[0..n], mlx.mlx_array_data_bfloat16(y).?[0..n]);
+    const n = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+    try std.testing.expectEqualSlices(u8, mlx.mlx_array_data_uint8(x).?[0..n], mlx.mlx_array_data_uint8(y).?[0..n]);
 }
 
 test "GLM latent overlay three-node verifier commits independent serial ancestry" {
+    try verifierCommitCase(0);
+}
+
+test "GLM kv8 latent overlay verifier commits independent serial ancestry" {
+    try verifierCommitCase(8);
+}
+
+fn verifierCommitCase(latent_bits: u8) !void {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);
@@ -456,6 +450,7 @@ test "GLM latent overlay three-node verifier commits independent serial ancestry
     defer target.deinit();
     var request = try forward.Request.init(a, target.layers.len);
     defer request.deinit();
+    try request.setLatentBits(latent_bits);
     const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     const logits = try target.forwardLast(&request, ids, true);
@@ -483,6 +478,7 @@ test "GLM latent overlay three-node verifier commits independent serial ancestry
             const left = committed.states[last].?;
             const right = oracle.states[last].?;
             try std.testing.expectEqual(right.offset, left.offset);
+            try std.testing.expectEqual(@as(mlx.mlx_dtype, if (latent_bits == 0) .bfloat16 else .uint32), mlx.mlx_array_dtype(left.layers[3].attention.latent));
             for (left.layers, right.layers) |x, y| {
                 for (x.attention.arrays(), y.attention.arrays()) |u, v| try expectArrayBits(u, v, s);
                 try expectArrayBits(x.recurrent.conv_state, y.recurrent.conv_state, s);
