@@ -3528,16 +3528,29 @@ pub fn resolvePrefillChunk(
     ctx_kv_bytes: u64,
     hot_cache_ask: u64,
 ) u32 {
+    if (config.isGlm5()) return glmPrefillChunk(config, kv_bits, ceiling, active_mem);
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
-        // A wider GLM rung would make output depend on free memory and on whether an assistant loaded.
-        if (config.isGlm5() and chunk > @import("glm5_forward.zig").prefill_chunk) continue;
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
     // Nothing fits the share — the model barely fits at all. Take the narrowest
     // rung: it is the smallest bill this box can be asked for, and returning 0
     // would read as "not pinned" and hand the forward the launch width.
     return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+}
+
+/// GLM's widest rung, at most its numerics width, that admits the same capped context as the
+/// narrowest: the bill `max_safe_context` and admission charge decides, not a share of free memory.
+fn glmPrefillChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64) u32 {
+    const narrowest = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+    const cap = if (config.contextCap() > 0) config.contextCap() else std.math.maxInt(u32);
+    const floor = @min(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, narrowest), cap);
+    for (PREFILL_CHUNK_LADDER) |chunk| {
+        // A rung wider than this would make output depend on whether an assistant loaded.
+        if (chunk > @import("glm5_forward.zig").prefill_chunk) continue;
+        if (@min(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), cap) >= floor) return chunk;
+    }
+    return narrowest;
 }
 
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
@@ -3826,7 +3839,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         const kv_bits: u64 = defaultKvBits(config);
         // Which ask: the gated arch reads the resolved budget; every other arch reads the raw
         // ask as before (the accessor would pin a second model against the first's budget).
-        const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk();
+        const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk(config);
         // The override's precedence is the second gated input: ungated, `--prefill-chunk`
         // still outranks the pin only at forward time, as before (a known inconsistency).
         const pin_override: u32 = if (config.longCtxGated()) explicitPrefillChunk() else 0;
@@ -4059,9 +4072,11 @@ fn ssdFirstBudgetForLoad(
 const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
-/// ungated archs so their advertised `context_length` does not move.
-fn legacyPrefixCacheAsk() u64 {
+/// ungated archs so their advertised `context_length` does not move. None when RAM retention
+/// is off or the model's hot cache never loads.
+fn legacyPrefixCacheAsk(config: *const model_mod.ModelConfig) u64 {
     if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
+    if (!prefix_cache_mod.HotPrefixCache.shouldUse(config, ssm_checkpoint_stride > 0)) return 0;
     return prefix_cache_mem_bytes; // legacy_ask_read
 }
 
@@ -5729,13 +5744,6 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 
 /// `computeMemoryContext` at one reading of the ceiling and MLX's active memory.
 fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64) u32 {
-    const heads: u64 = config.num_attention_heads;
-    if (heads == 0) return 16384;
-
-    //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
-    const kv_bits: u64 = defaultKvBits(config);
-    const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
-
     // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
     const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
         config.prefillScoreHeadDim(),
@@ -5746,7 +5754,14 @@ fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_me
         config.longCtxGated(),
         config.pinned_prefill_chunk,
     ));
+    return memoryContextAtChunk(config, defaultKvBits(config), ceiling, active_mem, chunk);
+}
 
+/// `memoryContextAt` for a given prefill width, before the checkpoint's position cap.
+fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
+    if (config.num_attention_heads == 0) return 16384;
+    //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
+    const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
     return safeContextForBudget(
         // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
         ceiling,
@@ -5767,7 +5782,7 @@ fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_me
 fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
     if (config.isGlm5()) return 0; // native state cannot restore generic prefix snapshots
     if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
-    return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
+    return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk(config);
 }
 
 /// Pure memory model behind checkAttentionMemory. All quantities in bytes,
@@ -6200,6 +6215,19 @@ fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 
     return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
 }
 
+/// Most MLA layers among any `pending` consecutive layers: MLA-only prefill scratch is held
+/// once per MLA layer in flight, not per pending layer.
+fn glmMlaLayersPending(config: *const model_mod.ModelConfig, pending: u32) u32 {
+    var most: u32 = 0;
+    var start: u32 = 0;
+    while (start + pending <= config.num_hidden_layers) : (start += 1) {
+        var count: u32 = 0;
+        for (start..start + pending) |i| count += @intFromBool(!config.isLinearLayer(@intCast(i)));
+        most = @max(most, count);
+    }
+    return most;
+}
+
 /// Native MLA fuses attention and bounds index scores internally. It stores no
 /// per-head K/V, affine rebuild, QSA score bank or generic SSM checkpoints.
 fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64, kv_bits: u64) u64 {
@@ -6211,13 +6239,14 @@ fn glm5TransientBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64
     const latent_row = kvBytesPerTokenAtBits(@as(u64, config.mla_kv_lora_rank) * 2, kv_bits);
     const grow = seq * (latent_row + @as(u64, config.indexer_head_dim) * 2 / @max(config.indexer_compress_ratio, 1));
     const pending = 2; // glm5_forward.Request.prefill_sync_layers
+    const mla_pending = glmMlaLayersPending(config, pending);
     const n = std.math.cast(usize, rows) orelse return std.math.maxInt(u64);
-    const kv8: u64 = if (kv_bits < 16) @import("glm5_latent.zig").kv8ScratchBytes(config.mla_kv_lora_rank, n, pending) else 0;
+    const kv8: u64 = if (kv_bits < 16) @import("glm5_latent.zig").kv8ScratchBytes(config.mla_kv_lora_rank, n, mla_pending) else 0;
     const native = (@import("glm5_a6_dense_once.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_mla_prefill_batch.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_attention_nax_packed.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_attention.zig").packedCadenceTransientBudget(n, pending) catch return std.math.maxInt(u64)) +|
-        (@import("glm5_indexpool_nax.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_mla_prefill_batch.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_attention_nax_packed.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_attention.zig").packedCadenceTransientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
+        (@import("glm5_indexpool_nax.zig").transientBudget(n, mla_pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_kda_prefill_cluster.zig").transientBudget(n, pending) catch return std.math.maxInt(u64)) +|
         (@import("glm5_attention_decode_batch.zig").transientBudget(4) catch return std.math.maxInt(u64));
     const dflash = if (config.glm_dflash_loaded) glmDflashRequestBytes(config, rows) else 0;
@@ -25992,13 +26021,13 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
         for (configs) |cfg| {
             try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
         }
-        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
+        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk(&other));
         prefix_cache_capacity = 32;
         prefix_cache_ram_enabled = false;
         for (configs) |cfg| {
             try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
         }
-        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
+        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk(&other));
         prefix_cache_ram_enabled = true;
     }
     prefix_cache_capacity = 32;
@@ -26006,7 +26035,16 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     prefix_cache_mem_bytes = 10 << 30;
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
-    try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+    try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk(&other));
+    // A model whose hot cache never loads asks for none.
+    const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk(&glm));
+    // `--no-prefix-cache-ram --prefix-cache-disk 12GB` keeps no idle RAM.
+    const saved_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = saved_disk;
+    prefix_cache_disk_bytes = 12 << 30;
+    prefix_cache_ram_enabled = false;
+    try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk(&other));
 }
 
 test "GLM serving memory bills one latent at the request's KV width and pooled index per token" {
@@ -26021,8 +26059,8 @@ test "GLM serving memory bills one latent at the request's KV width and pooled i
     configured_kv_quant = transformer_mod.KVQuantConfig.dense;
     try std.testing.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
     configured_kv_quant = null;
-    // kv8 retains 480 fewer growth bytes per token and adds two pending layers' dequant and quantizer scratch.
-    try std.testing.expectEqual(prefillTransientReserveAtKv(&cfg, 16, 2048, 65536) + 2 * (2051 * 1024 + 2048 * 544), prefillTransientReserveAtKv(&cfg, 8, 2048, 65536) + 65536 * 480);
+    // kv8 retains 480 fewer growth bytes per token and adds the pending MLA layer's dequant and quantizer scratch.
+    try std.testing.expectEqual(prefillTransientReserveAtKv(&cfg, 16, 2048, 65536) + (2051 * 1024 + 2048 * 544), prefillTransientReserveAtKv(&cfg, 8, 2048, 65536) + 65536 * 480);
     try std.testing.expect(prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{}) < prefillNeededAtChunk(&cfg, 65536, 1024, 16, 2048, .{}));
     try std.testing.expectEqual(cfg.ssmCheckpointBytes() + cfg.qsaRingBytes(), slotRingBytes(&cfg, 16));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
@@ -26118,6 +26156,46 @@ test "thinking policy HTTP: Qwen and GLM accept their own words, MiMo takes ever
     }
     for ([_][]const u8{ "off", "none" }) |w| try std.testing.expect(!(try reasoningEffortFromWord(w, -1, true, mimo)).enable);
     try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, true, mimo));
+}
+
+fn glmAssistantFixture() !model_mod.ModelConfig {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.glm_dflash_loaded = true;
+    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    cfg.glm_dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
+    return cfg;
+}
+
+test "GLM MLA prefill scratch is held by the MLA layers a pending window can contain" {
+    var cfg = try glmAssistantFixture();
+    // Layers 3, 7, ..., 43: two consecutive layers never hold two of them.
+    try std.testing.expectEqual(@as(u32, 1), glmMlaLayersPending(&cfg, 2));
+    try std.testing.expectEqual(@as(u32, 2), glmMlaLayersPending(&cfg, 5));
+    var adjacent = cfg;
+    adjacent.full_attention_interval = 1;
+    try std.testing.expectEqual(@as(u32, 2), glmMlaLayersPending(&adjacent, 2));
+}
+
+test "GLM prefill chunk takes the widest rung that costs no admissible context" {
+    var cfg = try glmAssistantFixture();
+    cfg.pinned_prefill_chunk = 0;
+    const kv_bits: u64 = 8;
+    // Sushi-2.5bpw with vision and the A4 assistant: ~104.5 GB active under a 115.9 GB ceiling.
+    const ceiling: u64 = 115_904 * 1024 * 1024;
+    const active: u64 = 104_500_000_000;
+    try std.testing.expectEqual(@as(u32, 2048), resolvePrefillChunk(&cfg, kv_bits, ceiling, active, 0, 0));
+    // The least free memory at which a 1024-row prefill still admits the position cap: there a
+    // 2048-row prefill would cost context, so the sizer keeps 1024.
+    var low: u64 = 0;
+    var high: u64 = ceiling - active;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (memoryContextAtChunk(&cfg, kv_bits, active + mid, active, 1024) >= cfg.contextCap()) high = mid else low = mid + 1;
+    }
+    try std.testing.expect(memoryContextAtChunk(&cfg, kv_bits, active + low, active, 2048) < cfg.contextCap());
+    try std.testing.expectEqual(@as(u32, 1024), resolvePrefillChunk(&cfg, kv_bits, active + low, active, 0, 0));
+    // Far less memory: every widening costs context.
+    try std.testing.expectEqual(@as(u32, 512), resolvePrefillChunk(&cfg, kv_bits, active + 8 * 1024 * 1024 * 1024, active, 0, 0));
 }
 
 test "GLM prefill chunk never widens past the width its numerics are built for" {

@@ -88,6 +88,10 @@ architectures need their own measured envelope. These runs do not simulate a 64 
   `getEffectiveContextLength`. It bills KV at the CONFIGURED width and activations ONCE.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
+- GLM's chunk is the widest rung up to 2048 that costs no admissible context: the same bill `max_safe_context` and
+  admission charge picks it, not a quarter of free memory ([arch-glm5-next](arch-glm5-next.md#memory)).
+- The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
+  never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp and the ringed mimo_v2) re-picks the width for every
   request: the widest rung whose admission bill fits live memory (`chooseRequestPrefillChunk`), stepping down per
   chunk under pressure; the load-time pin is only the fallback. `boundedPrefillChunk` still caps the rung per arch

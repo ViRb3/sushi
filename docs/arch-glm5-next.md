@@ -134,10 +134,16 @@ inside 1.46% drift) because verification per round grew 20.6%.
   plus pooled-index 704 bytes per token (11,968); under kv8 the latent is 5,984 (11 × 512 codes + 8 BF16 scale/bias
   pairs, 6,688 per token). Then capacity growth (256-row rounding, at the stored row width), the raw key/gate ring
   and FP32 KDA state (147,619,840 bytes), plus native kernel transients at two pending layers: A6 expansion 512 MiB,
-  head-batched MLA copies 768 MiB, packed attention with its second tile and B32 512 MiB, index scores 8 MiB per
-  pending layer, B1/B3 decode attention 32 MiB, KDA cluster 1.25 MiB per pending layer; kv8 adds its dense-prefill
-  dequantization (≤ 2051 rows) and one chunk's quantizer output, 6.1 MiB. Without NAX the packed tiles (the
-  FP32 composite) keep their 512 MiB, B1/B3 rise to 128 MiB, and the A6, MLA, index and cluster terms drop.
+  B1/B3 decode attention 32 MiB, KDA cluster 1.25 MiB per pending layer. The MLA-only terms are held by the one MLA
+  layer a two-layer pending window can contain (`glmMlaLayersPending`): head-batched MLA copies 384 MiB, packed
+  attention with its second tile 256 MiB, index scores 8 MiB, and under kv8 the dense-prefill dequantization
+  (≤ 2051 rows) plus one chunk's quantizer output, 3.1 MiB. Without NAX the packed tiles (the FP32 composite) keep
+  their 256 MiB, B1/B3 rise to 128 MiB, and the A6, MLA, index and cluster terms drop.
+- Prefill width: the widest rung up to 2048 that admits the same capped context as 512 (`glmPrefillChunk`, the
+  `max_safe_context` bill), not the quarter-share rule. Sushi-2.5bpw + vision + A4 at ~104.5 GB active gets 2048:
+  1.376M / 1.311M / 1.130M tokens at 512 / 1024 / 2048 by the bill, all past the 1,048,576 cap. The quarter share had
+  pinned it to 512 (bill 5,635 MiB at 2048 against a 3,549 MiB cap that also held a 2 GiB hot-cache ask for a cache
+  GLM never loads).
 - `max_safe_context` = (ceiling − active − transients) × 0.8 × 0.8 / per-token bill. The kv8 default drops the bill
   44%: Sushi-2.5bpw + vision + A4 assistant boots at 104.32 GB active with `max_safe_context` 1,048,576 (the position
   cap; about 1.36M by the bill), against 758,793 at `--kv-quant 16` (976a0dbb, auto context, margin 4 GiB).
