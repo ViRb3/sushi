@@ -44,9 +44,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
 - A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`
   stay OBJECTS; history tool_calls carry `"id"`; only a refusing template gets `noThinkTailSuffix`.
-- **A system turn past index 0 renders where the template allows it**: a template that raises on it (Qwen3.8) or
-  drops it gets it folded into the leading system (`templateProbeRendersLateSystem`, every surface); MiMo's role
-  loop keeps it in place, byte for byte.
+- **A system turn past index 0 renders where the template allows it**: a template that raises on it or drops it gets
+  it folded into the leading system (`templateProbeRendersLateSystem`, every surface); MiMo's role loop keeps it in
+  place, byte for byte. The fold rewrites every earlier byte of the prompt, so the two byte-pinned stock Qwen3.8
+  templates (`qwenLateSystemTemplate`: the one the Flash-Next packs ship, and the 2.4T one) get ONLY their
+  "System message must be at the beginning" branch replaced and render the note in place; any other revision keeps
+  the fold. The adapter runs only when a late system turn exists, so a prompt without one is byte-identical; a second
+  LEADING system turn is now a turn of its own too. `QWEN_MID_SYSTEM_MODEL_DIR=<pack> zig build test
+  -Dtest-filter="real Qwen pack"` proves a loaded pack engages.
 - **A surface never folds before the render**: a pre-fold moved Codex's mid-input `developer` turn and Claude Code's
   hook output to the front, so on MiMo turn N's prompt stopped being a prefix of turn N+1's. Responses' fresh
   `instructions` replace only the stored history's LEADING system turn.

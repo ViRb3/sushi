@@ -25813,7 +25813,8 @@ test "a late system turn keeps each turn's prompt a prefix of the next where the
     const Template = struct { tpl: []const u8, places_late_system: bool };
     const templates = [_]Template{
         .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .places_late_system = true },
-        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .places_late_system = false },
+        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .places_late_system = true },
+        .{ .tpl = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .places_late_system = false },
     };
     for (templates) |t| {
         inline for (.{ .{ .responses, responses_n, responses_next, "approvals: never" }, .{ .messages, messages_n, messages_next, "hook: started" } }) |c| {
