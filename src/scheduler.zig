@@ -5071,6 +5071,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const has_ssm_layers = params.config.has_hybrid_layers or
             params.config.full_attention_interval > 0;
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
+        entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5();
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
             const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
