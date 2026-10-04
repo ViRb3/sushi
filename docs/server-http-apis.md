@@ -72,6 +72,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   non-stream answer.
   A non-stream surface also feeds the gate per token (`EarlyStop`) and cancels the slot when a stop completes, only if
   the whole decoded text holds it too, so the answer bytes stay `earliest`'s and generation ends within one token.
+  The cancelled slot is quiesced (`Scheduler.quiesce`, waits out `in_pass`) BEFORE its statistics are read, and usage
+  counts the tokens returned, not the ones a speculative block decoded past the stop.
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s

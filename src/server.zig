@@ -10212,6 +10212,14 @@ fn drainSlotTokens(slot: anytype, conn: ?*Conn, allocator: std.mem.Allocator, ou
     }
 }
 
+/// `drainSlotTokens`, then, after an early stop, wait out the inference pass still publishing and accounting
+/// the cancelled slot: its statistics are plain fields that only a quiet slot lets the caller read.
+fn drainSettled(sch: *scheduler_mod.Scheduler, slot: *scheduler_mod.Slot, conn: ?*Conn, allocator: std.mem.Allocator, output_ids: *std.ArrayList(u32), early: ?*EarlyStop) !DrainEnd {
+    const end = try drainSlotTokens(slot, conn, allocator, output_ids, early);
+    if (end == .stopped) sch.quiesce(slot);
+    return end;
+}
+
 /// Run a non-streaming generation through the scheduler. Returns the same
 /// shape as `generate.generate` so the calling handler's response builder
 /// is unchanged.
@@ -10297,7 +10305,7 @@ fn nonStreamingViaScheduler(
         .strip_leading = tok.tok_type == .sentencepiece_bpe and (sampling.constraint == null or sampling.constraint.?.proto == null),
     } else null;
     defer if (early) |*e| e.gate.deinit(allocator);
-    const end = try drainSlotTokens(slot, conn, allocator, &output_ids, if (early) |*e| e else null);
+    const end = try drainSettled(sch, slot, conn, allocator, &output_ids, if (early) |*e| e else null);
     if (end == .failed) return slotFailure(slot);
     const client_gone = end == .client_gone;
 
@@ -10347,7 +10355,8 @@ fn nonStreamingViaScheduler(
         .text = text,
         .token_ids = token_ids,
         .prompt_tokens = slot.prompt_tokens,
-        .completion_tokens = slot.completion_tokens,
+        // An early stop reports the tokens it returned, not the ones decoded past the stop.
+        .completion_tokens = if (end == .stopped) @intCast(token_ids.len) else slot.completion_tokens,
         .finish_reason = nonStreamFinishReason(client_gone, slot.finish_reason),
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
@@ -26746,6 +26755,81 @@ test "a request refused after its media was encoded hands the embeddings to the 
         try std.testing.expectEqual(@as(usize, 1), Probe.frees);
         try std.testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
     }
+}
+
+/// Plays the inference thread's decode tick: publishes `n` tokens, then accounts them one by one
+/// with `gap_ms` between steps, all inside one `in_pass`.
+const TickPlayer = struct {
+    slot: *scheduler_mod.Slot,
+    n: u32,
+    gap_ms: i64,
+
+    fn run(self: *TickPlayer) void {
+        const io = self.slot.io;
+        var i: u32 = 0;
+        while (i < self.n) : (i += 1) self.slot.pushTokenWithLogprob(i + 1, null);
+        std.Io.sleep(io, .fromMilliseconds(self.gap_ms), .real) catch {};
+        i = 0;
+        while (i < self.n) : (i += 1) {
+            self.slot.completion_tokens += 1;
+            std.Io.sleep(io, .fromMilliseconds(self.gap_ms), .real) catch {};
+        }
+        self.slot.decode_ns +|= 777;
+        _ = self.slot.in_pass.fetchSub(1, .acq_rel);
+    }
+};
+
+fn expectSettledAfterEarlyStop(published: u32) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    try tok.id_to_token.put(1, "S");
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.io = io;
+    sch.queue_mu = .init;
+    var slot: scheduler_mod.Slot = undefined;
+    slot.io = io;
+    slot.allocator = a;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.out_buf = .empty;
+    defer slot.out_buf.deinit(a);
+    slot.logprobs_buf = .empty;
+    slot.out_idx = 0;
+    slot.handover_token = null;
+    slot.cancelled = .init(false);
+    slot.finished = false;
+    slot.error_code = null;
+    slot.completion_tokens = 0;
+    slot.decode_ns = 0;
+    slot.in_pass = .init(1);
+
+    var player = TickPlayer{ .slot = &slot, .n = published, .gap_ms = 20 };
+    const t = try std.Thread.spawn(.{}, TickPlayer.run, .{&player});
+    const stops = [_][]const u8{"S"};
+    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null, .strip_leading = false };
+    defer early.gate.deinit(a);
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(a);
+    const end = try drainSettled(&sch, &slot, null, a, &out, &early);
+    // Read exactly as the result builder does, before the player is joined.
+    const settled_tokens = slot.completion_tokens;
+    const settled_ns = slot.decode_ns;
+    t.join();
+    try std.testing.expectEqual(DrainEnd.stopped, end);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(published, settled_tokens);
+    try std.testing.expectEqual(@as(u64, 777), settled_ns);
+}
+
+test "a non-stream early stop reads usage and timing only after the tick that published its token settles" {
+    try expectSettledAfterEarlyStop(1);
+}
+
+test "a non-stream early stop inside a speculative block settles the whole block's accounting" {
+    try expectSettledAfterEarlyStop(4);
 }
 
 const FakeSlot = struct {

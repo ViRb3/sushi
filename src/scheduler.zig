@@ -864,7 +864,7 @@ pub const Slot = struct {
     /// buffer at completion and is blind to both, which is why the streaming
     /// gap survived: it is invisible to output-equality tests AND to llmprobe,
     /// which probes logprobs non-streaming only.
-    fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
+    pub fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
         if (self.takeHandoverEcho(t)) return;
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -1807,6 +1807,15 @@ pub const Scheduler = struct {
         if (self.in_flight > 0) self.in_flight -= 1;
         self.queue_cond.broadcast(self.io); // wake inference thread to drain
         self.submit_cond.broadcast(self.io); // wake any blocked submitter
+        self.queue_mu.unlock(self.io);
+    }
+
+    /// Wait out the inference pass that holds a cancelled slot, so its statistics stop changing.
+    /// The tick filters cancelled slots under `queue_mu`, so no new pass can take it afterwards.
+    pub fn quiesce(self: *Scheduler, slot: *Slot) void {
+        std.debug.assert(slot.cancelled.load(.acquire));
+        self.queue_mu.lockUncancelable(self.io);
+        waitPassesOut(self.io, &self.queue_mu, &slot.in_pass);
         self.queue_mu.unlock(self.io);
     }
 
