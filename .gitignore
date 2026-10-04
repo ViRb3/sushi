@@ -67,3 +67,4 @@ ssd-fill-bench/
 
 # Local measurement dumps
 measurements/
+output/

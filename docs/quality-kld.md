@@ -165,6 +165,7 @@ n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi pack
 | pack | GiB | KLD | top-1 |
 |---|---|---|---|
 | oMLX oQ5e (GBP-DE) | 83.97 | 0.0625 | 92.40% |
+| mlx-serve iQ-MLX 4.7bpw (2026-10-02 build; see below) | 70.13 | 0.0676 | 92.26% |
 | mlx-serve mixed-4-8bit (ddalcu; the control above) | 70.13 | 0.0818 | 91.39% |
 | oMLX oQ4e (Jundot) | 69.21 | 0.1370 | 88.87% |
 | affine q3 | 54.94 | 0.1444 | 88.05% |
@@ -177,6 +178,15 @@ n-gram table. Sizes are GiB of the weight files the engine loads (the Sushi pack
 | Sushi-2.6bpw (binary ad5e6be8, 2026-09-27; Sushi-3bpw's 0.10123 and 0.1047 reproduce on it bit for bit) | 43.95 | 0.1303 | 89.33% |
 | Sushi-2.6bpw with the 4-bit g32 table (the published Sushi-2.6bpw) | 43.95 | 0.1355 | 89.08% |
 | Sushi-2bpw with the 4-bit g32 table (the published Sushi-2bpw; bf16 KV, see below) | 34.97 | 0.2080 | 85.94% |
+
+iQ-MLX 4.7bpw, measured 2026-10-02: ReleaseFast at `3e700850` plus existing working-tree edits,
+binary SHA-256 `f5f5a56ef11396d066cd6577121147fdb93fe3fa0eb6a4854ef3c8ec67ac6a07`
+(mtime 2026-10-02 01:28:37 +0700). Flash-Next `mlx-serve-bf16-16x512-raw`, kv8,
+`--tokens 512 --top-k 10 --ctx-size 8192 --no-mtp`, shipped 4-bit g32 n-gram table.
+First-EOS KLD **0.067597376**, top-1 **92.2627%**, NLL **0.396296626**, 7186 positions;
+all-position KLD **0.062826856**, top-1 **93.0298%**, 8192 positions. Weight shards total 70.13 GiB,
+excluding the n-gram table. `taskpolicy -a`, GPU lock `kld-iq47-codex`. This row uses a newer binary than
+the historical comparison rows; differences under ~1% are within the measured rounding-flip floor.
 
 Release 1.0.4 check: `ad4a3ce0` plus the context-bill change, ReleaseFast binary SHA-256
 `2aeee2e678521727e66994d75260c25cd4cffd0d05ecb797c73210a2b0ea9704` (mtime 2026-09-26 15:26:43 +0700),

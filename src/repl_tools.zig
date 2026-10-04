@@ -361,6 +361,7 @@ pub fn htmlToText(allocator: std.mem.Allocator, html: []const u8, base_url: ?[]c
     defer if (link) |l| allocator.free(l);
     var link_start: usize = 0;
     var in_pre = false;
+    var image_count: usize = 0;
     var i: usize = 0;
     while (i < html.len and !t.full) {
         const lt = std.mem.indexOfScalarPos(u8, html, i, '<') orelse html.len;
@@ -412,6 +413,22 @@ pub fn htmlToText(allocator: std.mem.Allocator, html: []const u8, base_url: ?[]c
             t.brk(1);
         } else if (std.ascii.eqlIgnoreCase(tag.name, "td") or std.ascii.eqlIgnoreCase(tag.name, "th")) {
             if (t.pending_breaks == 0) t.pending_space = true;
+        } else if (!tag.closing and std.ascii.eqlIgnoreCase(tag.name, "img") and image_count < 20) {
+            if (attrValue(tag.attrs, "data-src") orelse attrValue(tag.attrs, "src")) |src| {
+                const decoded = try decodeEntities(allocator, src);
+                defer allocator.free(decoded);
+                if (try resolveUrl(allocator, base_url, decoded)) |url| {
+                    defer allocator.free(url);
+                    t.brk(1);
+                    try t.raw("Image: ");
+                    try t.text(attrValue(tag.attrs, "alt") orelse "image", false);
+                    try t.raw(" (");
+                    try t.raw(url);
+                    try t.raw(")");
+                    t.brk(1);
+                    image_count += 1;
+                }
+            }
         } else if (std.ascii.eqlIgnoreCase(tag.name, "a")) {
             if (!tag.closing) {
                 if (link) |l| allocator.free(l);
@@ -789,12 +806,12 @@ fn tool(comptime name: []const u8, comptime description: []const u8, comptime pr
 }
 
 const text_tools = tool("web_search", "Search the web with DuckDuckGo. Returns up to 8 results with title, url and snippet.", "\"query\":{\"type\":\"string\",\"description\":\"What to search for\"}", "\"query\"") ++ "," ++
-    tool("fetch_url", "Fetch a public http(s) page and return its readable text (at most 20000 characters).", "\"url\":{\"type\":\"string\",\"description\":\"The http or https URL\"}", "\"url\"") ++ "," ++
+    tool("fetch_url", "Fetch a public http(s) page and return its readable text and image URLs (at most 20000 characters).", "\"url\":{\"type\":\"string\",\"description\":\"The http or https URL\"}", "\"url\"") ++ "," ++
     tool("read_file", "Read a text file inside the current folder.", "\"path\":{\"type\":\"string\",\"description\":\"Path relative to the current folder\"}", "\"path\"") ++ "," ++
     tool("list_dir", "List a folder inside the current folder.", "\"path\":{\"type\":\"string\",\"description\":\"Folder relative to the current folder; default .\"}", "") ++ "," ++
     tool("search_files", "Find lines matching a text or regex pattern in the text files under a folder.", "\"pattern\":{\"type\":\"string\",\"description\":\"Text or regex to find\"},\"path\":{\"type\":\"string\",\"description\":\"Folder to search; default .\"}", "\"pattern\"");
 
-const image_tool = tool("view_image", "Look at an image: a file inside the current folder or a public image URL.", "\"path_or_url\":{\"type\":\"string\",\"description\":\"Image path or http(s) URL\"}", "\"path_or_url\"");
+const image_tool = tool("view_image", "Look at an image: a file inside the current folder or a public image URL. To show an online image to the user, include ![description](https://direct-image-url) in your answer.", "\"path_or_url\":{\"type\":\"string\",\"description\":\"Image path or http(s) URL\"}", "\"path_or_url\"");
 
 /// The OpenAI `tools` array; `view_image` only for a model that sees images.
 pub fn definitionsJson(vision: bool) []const u8 {
@@ -1760,4 +1777,13 @@ test "repl tools: links and redirects resolve against the page url" {
     const root_rel = (try resolveUrl(allocator, "https://example.org", "a.html")).?;
     defer allocator.free(root_rel);
     try testing.expectEqualStrings("https://example.org/a.html", root_rel);
+}
+
+test "repl tools: page images expose resolved public-scheme URLs for vision workflows" {
+    const a = testing.allocator;
+    const text = try htmlToText(a, "<p>Photos</p><img alt=\"Cat &amp; dog\" src=\"/cat.png\"><img src=\"data:image/png;base64,x\"><img data-src=\"../bird.jpg\" alt=\"Bird\">", "https://example.com/news/", 20000);
+    defer a.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "Cat & dog (https://example.com/cat.png)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Bird (https://example.com/news/../bird.jpg)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "data:") == null);
 }

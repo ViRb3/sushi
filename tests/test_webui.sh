@@ -84,6 +84,28 @@ if boot; then
         "$(is "$(code -X POST "$BASE/v1/tools" -d '{}')" 403)"
     check "file tools refuse paths outside the server folder" \
         "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{"name":"read_file","arguments":"{\"path\":\"../outside\"}"}' | grep -q 'refused' && echo 1 || echo 0)"
+    mkdir -p "$WORK/picked/child"
+    echo 'chosen folder fixture' > "$WORK/picked/note.txt"
+    curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
+        -d "{\"browse\":true,\"directory\":\"$WORK/picked\"}" > "$WORK/folders.json"
+    check "folder picker lists directories in the chosen folder" \
+        "$(python3 -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["directories"] == ["child"]; assert x["parent"]' "$WORK/folders.json" 2>/dev/null && echo 1 || echo 0)"
+    python3 - "$WORK" <<'PYDATA'
+import json, pathlib, sys
+work = pathlib.Path(sys.argv[1])
+for filename, path in [("read.json", "note.txt"), ("outside.json", "../outside")]:
+    (work / filename).write_text(json.dumps({"directory": str(work / "picked"), "name": "read_file", "arguments": json.dumps({"path": path})}))
+PYDATA
+    check "tools read from the chosen folder" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
+        --data-binary @"$WORK/read.json" | grep -q 'chosen folder fixture' && echo 1 || echo 0)"
+    check "selected folder still confines file reads" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' \
+        --data-binary @"$WORK/outside.json" | grep -q 'refused' && echo 1 || echo 0)"
+    check "choosing a folder does not change the server default" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{}' | python3 -c 'import json,os,sys; assert json.load(sys.stdin)["root"] == os.path.realpath(".")' && echo 1 || echo 0)"
+    check "invalid selected directory is rejected" \
+        "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{"directory":"/sushi-folder-does-not-exist"}')" 400)"
     check "POST / is 405" "$(is "$(code -X POST "$BASE/" -d '{}')" 405)"
     check "GET /health still answers ok" "$(is "$(curl -s "$BASE/health")" '{"status":"ok"}')"
     check "GET /v1/models still lists" "$(is "$(curl -s "$BASE/v1/models")" '{"object":"list","data":[]}')"

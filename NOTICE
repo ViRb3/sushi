@@ -626,3 +626,12 @@ and they are listed because they made that work possible.
 
 Model weights downloaded at runtime carry their own licenses from their
 publishers. sushi does not redistribute them.
+
+--------------------------------------------------------------------------------
+DOMPurify 3.4.16
+https://github.com/cure53/DOMPurify/tree/3.4.16
+Copyright Cure53 and other contributors.
+Dual-licensed under Apache-2.0 OR MPL-2.0; used here under Apache-2.0.
+The minified production bundle is vendored inline in src/webui/index.html
+(with only the source-map comment removed). Full upstream license text:
+src/webui/DOMPurify.LICENSE.

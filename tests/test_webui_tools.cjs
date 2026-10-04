@@ -40,9 +40,9 @@ const call = (id) => ({ id, type: 'function', function: { name: 'web_search', ar
     assert.equal(defs, null);
     return { text: 'Done', tool_calls: [] };
   };
-  context.callResearchTools = async () => { executed++; return { text: 'Result' }; };
+  context.callResearchTools = async (body) => { assert.equal(body.directory, "/selected/chat/folder"); executed++; return { text: 'Result' }; };
   const messages = [];
-  await context.runResearchTurn('test', messages, { aborted: false }, tools, false);
+  await context.runResearchTurn('test', messages, { aborted: false }, tools, false, '/selected/chat/folder');
   assert.equal(count, 9);
   assert.equal(executed, 8);
   assert.equal(messages.at(-1).content, 'Done');
@@ -95,3 +95,12 @@ vm.runInContext(script.slice(streamStart, script.indexOf('function setChatBusy('
   }
   console.log('Web UI streaming: fragmented calls and token-limit truncation passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
+const labelStart = script.indexOf('function toolCallLabel(');
+vm.runInContext(script.slice(labelStart, script.indexOf('function appendMessageNode(', labelStart)), context);
+assert.equal(context.toolCallLabel(history[1].tool_calls[0]), 'web_search · sushi');
+assert.equal(context.toolCallLabel({ function: { name: 'fetch_url', arguments: '{"url":"https://example.com/article"}' } }), 'fetch_url · https://example.com/article');
+assert.equal(context.toolCallLabel({ function: { name: 'web_search', arguments: '{"query":"one\\ntwo"}' } }), 'web_search · one two');
+assert.equal(context.toolCallLabel({ function: { name: 'read_file', arguments: '{"path":"README.md"}' } }), 'read_file · README.md');
+assert.equal(context.toolCallLabel({ function: { name: 'fetch_url', arguments: '{' } }), 'fetch_url');
+assert.equal(context.toolCallLabel({ function: { name: 'web_search', arguments: 'null' } }), 'web_search');
+console.log('Web UI tool labels: passed');

@@ -929,9 +929,23 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const 
         return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Expected a JSON object", 400);
     defer parsed.deinit();
     if (parsed.value != .object) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Expected a JSON object", 400);
-    const root = try std.Io.Dir.cwd().realPathFileAlloc(stream.io, ".", allocator);
-    defer allocator.free(root);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(stream.io, ".", allocator);
+    defer allocator.free(cwd);
     const pack = @import("repl_tools.zig");
+    const directory = parsed.value.object.get("directory");
+    if (directory) |d| {
+        if (d != .string or !std.fs.path.isAbsolute(d.string))
+            return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Directory must be an absolute folder path", 400);
+    }
+    const root = switch (try pack.changeRoot(allocator, stream.io, cwd, cwd, if (directory) |d| d.string else cwd)) {
+        .ok => |path| path,
+        .refused => |reason| return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400),
+    };
+    defer allocator.free(root);
+    if (parsed.value.object.get("browse")) |browse| {
+        if (browse != .bool) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Browse must be a boolean", 400);
+        if (browse.bool) return sendWebToolFolders(allocator, stream, root);
+    }
     const vision = if (parsed.value.object.get("vision")) |v| v == .bool and v.bool else false;
     const name = parsed.value.object.get("name");
     if (name == null) {
@@ -947,6 +961,43 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const 
     const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision }, name.?.string, args.?.string);
     defer result.deinit(allocator);
     const json = try std.json.Stringify.valueAlloc(allocator, result, .{});
+    defer allocator.free(json);
+    try sendResponse(stream, "200 OK", "application/json", json);
+}
+
+/// Explicit folder-picker navigation, separate from the model's confined file tools.
+fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *Conn, root: []const u8) !void {
+    var dir = std.Io.Dir.openDirAbsolute(stream.io, root, .{ .iterate = true }) catch
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Cannot browse this folder", 400);
+    defer dir.close(stream.io);
+    var directories = std.ArrayList([]u8).empty;
+    defer {
+        for (directories.items) |name| allocator.free(name);
+        directories.deinit(allocator);
+    }
+    var iterator = dir.iterate();
+    var truncated = false;
+    while (iterator.next(stream.io) catch return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Cannot read this folder", 400)) |entry| {
+        if (entry.kind != .directory or entry.name.len == 0 or entry.name[0] == '.' or @import("repl_tools.zig").isSecretName(entry.name)) continue;
+        if (directories.items.len == 1000) {
+            truncated = true;
+            break;
+        }
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try directories.append(allocator, name);
+    }
+    std.mem.sort([]u8, directories.items, {}, struct {
+        fn less(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    const json = try std.json.Stringify.valueAlloc(allocator, .{
+        .root = root,
+        .parent = std.fs.path.dirname(root) orelse root,
+        .directories = directories.items,
+        .truncated = truncated,
+    }, .{});
     defer allocator.free(json);
     try sendResponse(stream, "200 OK", "application/json", json);
 }
@@ -3832,6 +3883,7 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
 /// ungated archs so their advertised `context_length` does not move.
 fn legacyPrefixCacheAsk() u64 {
+    if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
     return prefix_cache_mem_bytes; // legacy_ask_read
 }
 
@@ -5535,6 +5587,7 @@ fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_me
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
 /// the raw `--prefix-cache-mem`. Both load-time wrappers must pass the same value.
 fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
     return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
@@ -25482,6 +25535,9 @@ test "web tools: list, confined execution, and browser origin guard" {
         .{ .origin = "http://evil.test", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
         .{ .origin = "null", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
         .{ .origin = "http://localhost:12345", .body = "[]", .status = "400 Bad Request", .contains = "object" },
+        .{ .origin = "http://localhost:12345", .body = "{\"browse\":true}", .status = "200 OK", .contains = "directories" },
+        .{ .origin = "http://localhost:12345", .body = "{\"directory\":3}", .status = "400 Bad Request", .contains = "absolute" },
+        .{ .origin = "http://localhost:12345", .body = "{\"directory\":\"/sushi-folder-does-not-exist\"}", .status = "400 Bad Request", .contains = "no such folder" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside\\\"}\"}", .status = "200 OK", .contains = "refused" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"exec\",\"arguments\":\"{}\"}", .status = "200 OK", .contains = "unknown tool" },
     };
@@ -25506,4 +25562,38 @@ test "resolvedPrefixCacheMem: RAM-off bills zero despite a configured disk tier"
     prefix_cache_ram_enabled = true;
     prefix_cache_capacity = 0;
     try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+}
+
+test "disabled prefix cache: sizing releases the cache reserve on every arch" {
+    const saved_capacity = prefix_cache_capacity;
+    const saved_ask = prefix_cache_mem_bytes;
+    defer prefix_cache_capacity = saved_capacity;
+    defer prefix_cache_mem_bytes = saved_ask;
+    const saved_ram = prefix_cache_ram_enabled;
+    defer prefix_cache_ram_enabled = saved_ram;
+    var gated = longCtxTestConfig();
+    var other = longCtxTestConfig();
+    other.model_type = "qwen3_5_moe";
+    const configs = [_]*model_mod.ModelConfig{ &gated, &other };
+    for ([_]u64{ 0, 2 << 30, 60 << 30 }) |ask| {
+        prefix_cache_mem_bytes = ask;
+        prefix_cache_capacity = 0;
+        for (configs) |cfg| {
+            try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
+        }
+        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
+        prefix_cache_capacity = 32;
+        prefix_cache_ram_enabled = false;
+        for (configs) |cfg| {
+            try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
+        }
+        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
+        prefix_cache_ram_enabled = true;
+    }
+    prefix_cache_capacity = 32;
+    prefix_cache_ram_enabled = true;
+    prefix_cache_mem_bytes = 10 << 30;
+    try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
+    try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
+    try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
 }

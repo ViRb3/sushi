@@ -124,6 +124,8 @@ KV snapshots in the RAM cache. The live request still needs KV memory, and queue
 buffers temporarily. The entry count must remain positive: `--prefix-cache-entries 0` disables both tiers.
 With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports
 `settings.prefix_cache.ram_enabled=false` and `mem_bytes=0` when RAM retention is off.
+Context and prefill-chunk sizing also reserve zero idle-cache bytes in this mode, regardless
+of `--prefix-cache-mem`; live KV and temporary SSD write buffers still consume memory.
 
 Qwen prefill chunks write through continuously in SSD-only mode. Hybrid SSM checkpoints and MiMo ring
 restore points survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD defaults

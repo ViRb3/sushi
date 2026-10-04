@@ -245,16 +245,38 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   The preference persists in this browser. It is fixed for a turn; the button is disabled while a reply runs.
 - The browser sends definitions, assembles streamed tool calls, executes them through `POST /v1/tools`, and
   sends results back to the model. Eight tool rounds maximum, followed by a final request without tools.
-  Results are collapsible in the transcript. Stop cancels browser requests and records cancelled results for
+  Results are collapsible in the transcript. Tool rows show the query, URL or file argument on one line,
+  ellipsized to fit with the full label on hover (including saved conversations).
+  Stop cancels browser requests and records cancelled results for
   remaining calls so the conversation stays valid. An already-running server tool may finish its bounded work.
+- The **Folder** button opens a folder picker: browse subfolders, move to the parent, or enter an absolute
+  path, then choose **Use this folder**. The selection is saved per chat; new chats start at the server's
+  working folder. Selection is disabled during a turn. It never changes the server process's working directory.
 - `POST /v1/tools` with `{ "vision": false }` lists definitions and the file root. With `name`, JSON-string
   `arguments`, and `vision`, it executes one call and returns `text` plus optional `image` data URL.
-  Vision models get `view_image`; returned images remain in memory only.
+  `directory` optionally selects an absolute folder, resolved and validated with the REPL's `/cd` checks.
+  With `browse: true`, the endpoint instead returns `root`, `parent`, `directories`, and `truncated` for the
+  picker (up to 1000 visible, non-secret subfolders). The browser passes the selected canonical directory
+  separately from model arguments on every call. Vision models get `view_image`; returned images remain in memory only.
 - This bridge requires a loopback bind and peer, the chat page's Origin, and the normal API-key policy.
   It works from `localhost` or `127.0.0.1`, not a remote browser or wildcard bind. File tools are confined to
-  the server's working folder, with the existing hidden/secret-file and symlink checks; network tools keep
+  the chat's selected folder, with the existing hidden/secret-file and symlink checks; network tools keep
   the REPL's public-address restrictions. No MCP configuration is added.
-- Checks: `node tests/test_webui_tools.cjs`, `tests/test_webui.sh`, and the `web tools:` unit test.
+- Image workflow: `web_search` finds pages, `fetch_url` exposes up to 20 resolved image URLs from `img src`
+  or `data-src`, and vision models use `view_image` to inspect them. This is page-based discovery, not a
+  dedicated image-search index. Tool image results are visible when expanded; the answer can show a direct
+  image URL using Markdown `![description](https://...)`. Displaying images does not require a vision model.
+- Markdown image previews fetch through the existing public-address-checked `view_image` bridge (including
+  redirect checks and the 2 MB limit), never directly from a model-selected browser URL. A source link remains
+  when previewing fails. The page caches up to 32 image requests; pixels are not persisted in chat storage.
+- SVG code blocks offer **Render SVG** / **Hide SVG**. Only clicking renders: the bundled DOMPurify 3.4.16
+  SVG profile removes active content; styles, embedded HTML, images, animation and external references are
+  disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
+  copyable. The upstream minified bundle is inline to keep the page self-contained; its license is in
+  `src/webui/DOMPurify.LICENSE`. Updates should use a reviewed upstream release and rerun the renderer checks.
+- Checks: `node tests/test_webui_tools.cjs`, `tests/test_webui.sh`, and the `web tools:` unit test. Generate the
+  browser renderer suite with `node tests/test_webui_render.cjs /tmp/sushi-render-tests/index.html`, serve that
+  directory locally (or open the HTML), and require **All renderer checks passed**.
 
 ## `sushi run` research tools (client-side)
 
