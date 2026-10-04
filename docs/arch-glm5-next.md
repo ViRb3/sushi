@@ -146,11 +146,11 @@ inside 1.46% drift) because verification per round grew 20.6%.
   plus pooled-index 704 bytes per token (11,968); under kv8 the latent is 5,984 (11 × 512 codes + 8 BF16 scale/bias
   pairs, 6,688 per token). Then capacity growth (256-row rounding, at the stored row width), the raw key/gate ring
   and FP32 KDA state (147,619,840 bytes), plus native kernel transients at two pending layers: A6 expansion 512 MiB,
-  B1/B3 decode attention 32 MiB, KDA cluster 1.25 MiB per pending layer. The MLA-only terms are held by the one MLA
+  B1/B3 decode attention 128 MiB, KDA cluster 1.25 MiB per pending layer. The MLA-only terms are held by the one MLA
   layer a two-layer pending window can contain (`glmMlaLayersPending`): head-batched MLA copies 384 MiB, packed
   attention with its second tile 256 MiB, index scores 8 MiB, and under kv8 the dense-prefill dequantization
   (≤ 2051 rows) plus one chunk's quantizer output, 3.1 MiB. Without NAX the packed tiles (the FP32 composite) keep
-  their 256 MiB, B1/B3 rise to 128 MiB, and the A6, MLA, index and cluster terms drop. With the prefix cache on, a
+  their 256 MiB and the A6, MLA, index and cluster terms drop. With the prefix cache on, a
   prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit
   ([prefix cache](engine-prefix-cache.md#glm)).
 - Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with

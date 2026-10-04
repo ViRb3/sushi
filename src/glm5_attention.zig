@@ -1431,12 +1431,21 @@ fn fp32GemmExact(s: mlx.mlx_stream) !bool {
     return mlx.mlx_array_data_float32(x).?[0] == one_plus;
 }
 
-test "GLM decode attention without NAX: the FP32 composite B3 is three B1, held to an FP64 oracle" {
+test "GLM decode attention: the FP32 composite B3 is three B1, held to an FP64 oracle on every GPU" {
     const transformer = @import("transformer.zig");
-    const native = @import("glm5_attention_decode_batch.zig");
     const saved = transformer.vqmm_nax_probe_override;
     defer transformer.vqmm_nax_probe_override = saved;
+    // A NAX GPU's composite runs block-masked GEMMs, exact FP32 whatever MLX's TF32 default: within one
+    // BF16 ulp of the oracle (the fused D512 SDPA misses it on ~70% of the cells, a TF32 GEMM on a few).
+    if (@import("glm5_model.zig").naxArms()) try decodeCompositeCase(null);
     transformer.vqmm_nax_probe_override = false;
+    try decodeCompositeCase(if (try fp32GemmExact(mlx.gpuStream())) 1.0 / 2048.0 else 1.0 / 64.0);
+}
+
+/// `fraction` of the peak |V| an off-NAX cell may add beyond 1/128 of its value; null holds every cell
+/// to one BF16 ulp of the oracle.
+fn decodeCompositeCase(fraction: ?f64) !void {
+    const native = @import("glm5_attention_decode_batch.zig");
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
@@ -1474,7 +1483,6 @@ test "GLM decode attention without NAX: the FP32 composite B3 is three B1, held 
     try bf16Values(tape, &tape_rows);
     var peak: f32 = 0;
     for (rows[0 .. prefix_rows * 512]) |x| peak = @max(peak, @abs(x));
-    const fraction: f64 = if (try fp32GemmExact(s)) 1.0 / 2048.0 else 1.0 / 64.0;
     var qv: [64 * 512]f32 = undefined;
     var got: [64 * 512]f32 = undefined;
     for (branches, 0..) |branch, r| {
@@ -1484,7 +1492,11 @@ test "GLM decode attention without NAX: the FP32 composite B3 is three B1, held 
         try bf16Values(b1[r], &got);
         const want = try attentionOracle(a, rows, &qv, ids[r * 2051 ..][0..2051], 1, 1.0 / 16.0);
         defer a.free(want);
-        for (got, want) |c, o| try std.testing.expect(std.math.isFinite(c) and @abs(c - o) <= @abs(o) / 128 + peak * fraction);
+        for (got, want) |c, o| {
+            const ulp = std.math.pow(f64, 2, @floor(std.math.log2(@max(@abs(o), 1e-30))) - 7);
+            const bar = if (fraction) |f| @abs(o) / 128 + peak * f else ulp + peak / 65536.0;
+            try std.testing.expect(std.math.isFinite(c) and @abs(c - o) <= bar);
+        }
     }
 }
 

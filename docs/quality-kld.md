@@ -311,4 +311,6 @@ GLM kv8 latent (`--kv-quant 8`, Sushi-2.5bpw, binary `694e36a3`, `taskpolicy -a`
   the prose prompt. Past EOS the code prompt's continuation degenerates and its KLD climbs to 0.18, outside the
   scored window.
 - Greedy free-run at those prompts diverges early (token 16 and 118) at near ties; the answers reword the same facts.
+- FP32 composite B1/B3 decode attention against the fused NAX SDPA, one binary (`cc56be2b` diag arms): KLD 0.071569 /
+  top-1 90.33% against 0.071762 / 89.70% (−0.27%, inside the noise floor); with MLX's TF32 GEMMs 0.071602 / 89.84%.
 

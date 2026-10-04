@@ -30,11 +30,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - **Exact** means every output and state bit equals the staged chain (for verify: the serial row), proven on real
   checkpoint captures as well as synthetic fixtures. A dispatch counter proves engagement; a flag never does.
 - Four paths change numerics (BF16 operands, FP32 accumulators, NAX reduction order): head-batched MLA prefill
-  projections, NAX prefill index scores, packed prefill attention and native B1/B3 decode attention. The owner accepted
+  projections, NAX prefill index scores, packed prefill attention and B1/B3 decode attention. The owner accepted
   plain NAX rounding on same-pack forced-logit drift checks that predate the frozen screen below (MLA projections at
-  4K/64: mean KL 0.0116, max 0.396; the prefill trio at 16K/32: mean 0.0040, max 0.068; B1/B3 at 8K/64: mean 0.0032,
-  max 0.048). B1 decode attention runs inside the 4x512 teacher KLD; the three prefill paths engage only past the
-  KLD prompts' lengths, so none of them has a long-context teacher KLD.
+  4K/64: mean KL 0.0116, max 0.396; the prefill trio at 16K/32: mean 0.0040, max 0.068). B1 decode attention runs
+  inside the 4x512 teacher KLD; the three prefill paths engage only past the KLD prompts' lengths, so none of them has
+  a long-context teacher KLD.
 - **Drift screen** for a numerics change: two frozen nonrepeated 16,384-ID prompts (code, prose), 24 late-prefix plus
   192 forced rows each; per prompt mean KL ≤ 0.01, max KL ≤ 0.15, top-1 ≥ 95%, mean NLL increase ≤ 0.02, no new
   nonfinite. Bounds are fixed before results; late-prefix rows are far more sensitive than forced continuation.
@@ -102,9 +102,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   recurrence, gated output norm. Its unary math variants are chosen by probe at first use.
 - Router: FP32 GEMV with sigmoid and correction, then stable top-8 and unbiased normalization (two dispatches; BF16
   weights widened locally). Dense/shared activation: one dispatch over the exhaustive BF16 sigmoid table (128 KiB).
-- Attention: native B1 per decode row and B3 for three verify branches, from one gather source (`[B,2051,512]` bank,
-  Q `[B,1,64,512]`). B3 equals three B1 bit for bit; against the old scalar split-8: rel L2 0.0013, 64-position mean KL
-  0.0032, top-1 61/64. 32 MiB at async4.
+- Attention: B1 per decode row and B3 for three verify branches, from one gather source (`[B,2051,512]` bank,
+  Q `[B,1,64,512]`), through FP32 GEMMs and a precise softmax on every GPU. A NAX GPU multiplies with MLX's
+  block-masked GEMM, which never takes the TF32 path, so the bits do not depend on `MLX_ENABLE_TF32`. B3 runs three B1
+  (equal bit for bit), and DFlash2 greedy output equals serial. Every cell sits within one BF16 ulp of an FP64 oracle;
+  the fused D512 NAX SDPA it replaced missed that on ~70% of cells (rel L2 1.2e-2 against 1.6e-3). Gate (`cc56be2b`
+  diag arms, Sushi-2.5bpw, kv8, 4x512 teacher): KLD 0.071569 against the fused arm's 0.071762 (−0.27%), top-1 90.33%
+  against 89.70%. Serial decode 34.07 → 32.54 ms/token at 8K and 33.84 → 32.66 at 32K, arms interleaved in one
+  process on a contended box; DFlash2 verification per round is unchanged (~60 ms). 32 MiB per pending layer.
 - HC collapse on three verify rows: one SIMD32 subgroup runs the coefficients and 20 Sinkhorn iterations that thread 0
   ran alone while 255 threads waited (exact; −27.6% component, 8K model −2.65% vs 1.99% drift).
 
@@ -120,8 +125,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   latent buffer (1.97× at 32K); the native gather and the overlay both read four-row tails (`max_tail`), exact against
   those rows committed. Query and value projections broadcast the one-row geometry over three rows (exact, −3.6%).
   Accepted rows append at commit. Live branch scratch is capped at 256 MiB; overlay trees bill only the branch
-  pooled copy, so four branches fit even at a full-context reservation (three beside the off-NAX B1/B3 scratch, B3
-  intact), while wider trees still bill a latent copy per branch. Branch groups that do not fit settle in turn and B3 falls back to per-node B1.
+  pooled copy, so three branches fit beside the B1/B3 scratch even at a full-context reservation (B3 intact; a
+  four-node tree settles its fourth branch separately there), while wider trees still bill a latent copy per branch. Branch groups that do not fit settle in turn and B3 falls back to per-node B1.
 - **Commit**: the commit hands the request's latent (kv8: codes, scales, biases) and pooled buffers to the accepted
   state before evaluating, so MLX appends in place; a buffer the committed request still shares is copied whole,
   reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,
@@ -147,15 +152,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - One decision: `glm5_model.naxArms()` is `verifyQmmNaxAvailable()`, the Qwen/MiMo gate; `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
   turns it off on an M5. The load line `[glm] NAX arms on|off` names the result.
 - MLX has no fused D512 SDPA without NAX and `force_fused` throws there, so the fused arms may never run on a wrong
-  gate. Off NAX the packed sparse tiles and B1/B3 send the same gathered bank through FP32 GEMMs and a precise
-  softmax (`[glm-attn] FP32 composite sparse|B1/B3 ... engaged`), held per element to an FP64 oracle no worse than
+  gate. Off NAX the packed sparse tiles send the same gathered bank through FP32 GEMMs and a precise softmax, as
+  B1/B3 do on every GPU (`[glm-attn] FP32 composite sparse|B1/B3 ... engaged`), held per element to an FP64 oracle no worse than
   the scalar arm plus a store flip and 2^-11 of max|V|. At 16K: 0.628 vs 1.845 ms per 8-row tile, 0.505 vs 1.045 ms
   per decode row against the scalar latent attention, the same error ([perf-baselines](perf-baselines.md#glm-nonnax)).
 - Packed tiles take eight rows (67 MB, inside the 128 MiB tile bill). B3 runs its three rows as three B1 GEMMs:
-  MLX picks GEMM tiles and split-K by batch size, so a batched B3 differed from B1 in the last bit. Off NAX B1/B3
-  bill 32 MiB per pending layer (8 MiB on NAX).
-- MLX runs FP32 GEMMs as TF32 on a NAX GPU (`MLX_ENABLE_TF32` defaults on), so the composite rehearsed on the stock
-  libmlx is looser than on an M1–M4; its tests widen the bar only when a probe GEMM shows TF32.
+  MLX picks GEMM tiles and split-K by batch size, so a batched B3 differed from B1 in the last bit. B1/B3 bill
+  32 MiB per pending layer.
+- MLX runs FP32 GEMMs as TF32 on a NAX GPU (`MLX_ENABLE_TF32` defaults on), so the sparse composite rehearsed on the
+  stock libmlx is looser than on an M1–M4; its tests widen the bar only when a probe GEMM shows TF32. Another GLM
+  decode op still follows that default: with the fused decode attention, `MLX_ENABLE_TF32=0` moved the 4x512 KLD
+  0.071762 → 0.071636 (op not yet identified).
 - The scalar latent attention stays the teacher's arm and serves every shape the native arms decline
   (`[glm-attn] scalar dense|sparse latent attention engaged`).
 - Also off: NAX index scores (the tree scorer serves them), the KDA cluster (three GEMMs), A6 dense-once and MLA head/verify batches

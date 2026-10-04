@@ -1,4 +1,4 @@
-//! Mode-matched B1/B3 native decode attention; FP32 GEMMs over the same bank without NAX.
+//! Mode-matched B1/B3 native decode attention: FP32 GEMMs over one gathered bank on every GPU.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -11,9 +11,9 @@ var b3_calls: usize = 0;
 pub fn enabled() bool {
     return !@import("glm5_model.zig").reference_numerics;
 }
-/// Per pending layer: the fused NAX arm's bank, or the FP32 composite's three-row planes.
+/// Per pending layer: the FP32 composite's three-row planes.
 pub fn scratchLimit() usize {
-    return if (@import("glm5_model.zig").naxArms()) 8 * 1024 * 1024 else 32 * 1024 * 1024;
+    return 32 * 1024 * 1024;
 }
 pub fn supportedConfig(cfg: *const @import("model.zig").ModelConfig, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) bool {
     return cfg.num_attention_heads == 64 and cfg.mla_kv_lora_rank == 512 and cfg.mla_qk_nope_head_dim == 256 and
@@ -42,7 +42,7 @@ pub const Branch = struct {
 };
 pub fn temporaryBytes(batch: usize) !usize {
     if (batch != 1 and batch != 3) return error.UnsupportedGlmDecodeBatch;
-    return if (@import("glm5_model.zig").naxArms()) packed_attention.temporaryBytes(batch) else packed_attention.compositeBytes(batch);
+    return packed_attention.compositeBytes(batch);
 }
 pub fn transientBudget(pending_layers: usize) !usize {
     if (!enabled()) return 0;
@@ -145,23 +145,16 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
     const mask = try ops.slot();
     try mlx.check(mlx.mlx_vector_array_get(bank, outputs, 0));
     try mlx.check(mlx.mlx_vector_array_get(mask, outputs, 1));
-    const out = if (@import("glm5_model.zig").naxArms()) blk: {
-        const queries = try ops.reshape(try ops.contiguous(q), &.{ batch, 1, 64, 512 });
-        const kv = try ops.reshape(bank.*, &.{ batch, 1, 2051, 512 });
-        const masked = try ops.reshape(mask.*, &.{ batch, 1, 1, 2051 });
-        const attended = try ops.slot();
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(attended, queries, kv, kv, scale, "array", masked, .{ .ctx = null }, true, ops.s));
-        break :blk attended.*;
-    } else blk: {
-        if (b1_calls + b3_calls == 0) @import("log.zig").info("[glm-attn] FP32 composite B1/B3 decode attention engaged\n", .{});
-        // Row by row: MLX picks GEMM tiles and split-K by batch size, and B3 must equal three B1.
-        var rows: [3]Arr = undefined;
-        for (rows[0..branches.len], 0..) |*row, r| {
-            const at: c_int = @intCast(r);
-            row.* = try packed_attention.composite(ops, try ops.slice(q, 0, at, at + 1), try ops.slice(bank.*, 0, at, at + 1), try ops.slice(mask.*, 0, at, at + 1), scale);
-        }
-        break :blk if (branches.len == 1) rows[0] else try ops.concat(rows[0..branches.len], 0);
-    };
+    // A NAX GPU runs FP32 GEMMs as TF32 by default; the block-masked GEMM keeps them FP32 there.
+    const how: packed_attention.Gemm = if (@import("glm5_model.zig").naxArms()) .block_masked else .matmul;
+    if (b1_calls + b3_calls == 0) @import("log.zig").info("[glm-attn] FP32 composite B1/B3 decode attention engaged ({s})\n", .{@tagName(how)});
+    // Row by row: MLX picks GEMM tiles and split-K by batch size, and B3 must equal three B1.
+    var rows: [3]Arr = undefined;
+    for (rows[0..branches.len], 0..) |*row, r| {
+        const at: c_int = @intCast(r);
+        row.* = try packed_attention.compositeWith(ops, try ops.slice(q, 0, at, at + 1), try ops.slice(bank.*, 0, at, at + 1), try ops.slice(mask.*, 0, at, at + 1), scale, how);
+    }
+    const out = if (branches.len == 1) rows[0] else try ops.concat(rows[0..branches.len], 0);
     const populated = try ops.slot();
     try mlx.check(mlx.mlx_any_axes(populated, mask.*, &.{1}, 1, true, ops.s));
     const safe = try ops.slot();

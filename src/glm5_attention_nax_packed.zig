@@ -109,12 +109,30 @@ fn geometry(q: []const c_int, cache: []const c_int, ids: []const c_int, offset: 
 /// Attention of q [R,64,512] over its own gathered bank [R,2051,512] in FP32 GEMMs and a precise
 /// softmax, as [R,1,64,512] BF16. Off NAX MLX has no fused D512 SDPA.
 pub fn composite(ops: *Ops, q: Arr, kv_bank: Arr, mask: Arr, scale: f32) !Arr {
+    return compositeWith(ops, q, kv_bank, mask, scale, .matmul);
+}
+
+/// `block_masked` multiplies through MLX's block-masked GEMM, which never takes the NAX TF32 path,
+/// so a NAX GPU's products stay FP32 whatever `MLX_ENABLE_TF32` says.
+pub const Gemm = enum { matmul, block_masked };
+
+fn gemm(ops: *Ops, a: Arr, b: Arr, how: Gemm) !Arr {
+    if (how == .matmul) return ops.binary(.mm, a, b);
+    const sa = mlx.getShape(a);
+    const sb = mlx.getShape(b);
+    const blocks = try ops.ones(&.{ sa[0], @divTrunc(sa[1] + 31, 32), @divTrunc(sb[2] + 31, 32) }, .bool_);
+    const out = try ops.slot();
+    try mlx.check(mlx.mlx_block_masked_mm(out, a, b, 32, blocks, .{ .ctx = null }, .{ .ctx = null }, ops.s));
+    return out.*;
+}
+
+pub fn compositeWith(ops: *Ops, q: Arr, kv_bank: Arr, mask: Arr, scale: f32, how: Gemm) !Arr {
     const rows = mlx.getShape(q)[0];
     const kv = try ops.cast(kv_bank, .float32);
     const queries = try ops.binary(.mul, try ops.cast(q, .float32), try ops.scalar(scale, .float32));
     const masked = try ops.slot();
-    try mlx.check(mlx.mlx_where(masked, try ops.reshape(mask, &.{ rows, 1, 2051 }), try ops.binary(.mm, queries, try ops.transpose(kv, &.{ 0, 2, 1 })), try ops.scalar(-std.math.inf(f32), .float32), ops.s));
-    return ops.reshape(try ops.cast(try ops.binary(.mm, try ops.softmax(masked.*, -1), kv), .bfloat16), &.{ rows, 1, 64, 512 });
+    try mlx.check(mlx.mlx_where(masked, try ops.reshape(mask, &.{ rows, 1, 2051 }), try gemm(ops, queries, try ops.transpose(kv, &.{ 0, 2, 1 }), how), try ops.scalar(-std.math.inf(f32), .float32), ops.s));
+    return ops.reshape(try ops.cast(try gemm(ops, try ops.softmax(masked.*, -1), kv, how), .bfloat16), &.{ rows, 1, 64, 512 });
 }
 /// Valid IDs must be unique per real query, as guaranteed by IndexPool selection.
 pub fn run(ops: *Ops, q: Arr, cache: Latent, selected: Arr, offset: usize, history: usize, scale: f32) !?Arr {

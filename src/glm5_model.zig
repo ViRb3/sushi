@@ -1104,7 +1104,7 @@ test "GLM NAX arms and their bills follow the one NAX gate" {
         const composites = packed_nax.compositeCount();
         try std.testing.expect((try packed_nax.run(&ops, try ops.zeros(&.{ 1, 64, 512 }, .bfloat16), latent, selected, 3, 4, 1.0 / 16.0)) != null);
         try std.testing.expectEqual(!on, packed_nax.compositeCount() > composites);
-        try std.testing.expectEqual(@as(usize, if (on) 8 else 32) * 1024 * 1024, decode_batch.scratchLimit());
+        try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), decode_batch.scratchLimit());
         const scores = try index_nax.tryScores(try ops.zeros(&.{ 16, 32, 128 }, .bfloat16), try ops.zeros(&.{ 3584, 128 }, .bfloat16), try ops.zeros(&.{ 16, 32 }, .bfloat16), 3584 * 4 - 16, 3584, s);
         if (scores) |value| _ = try ops.own(value);
         try std.testing.expectEqual(on, scores != null);
