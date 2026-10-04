@@ -322,10 +322,10 @@ fn printUsage(io: std.Io) void {
         \\                        rendering identical messages on warm reuse.
         \\                        0 disables.
         \\  --expert-cache-gb <n>
-        \\                      Stream qwen4_exp routed experts (bf16 checkpoint
-        \\                        or Sushi pack) with a decimal-GB cache.
-        \\  --ssd-budget-gb <n> Stream qwen4_exp routed experts (bf16 checkpoint
-        \\                        or Sushi pack) with a
+        \\                      Stream routed experts from SSD (Sushi pack or
+        \\                        source checkpoint) with a decimal-GB cache.
+        \\  --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
+        \\                        source checkpoint) with a
         \\                        TOTAL resident target of <n> GiB; the expert
         \\                        cache is what is left after the trunk, the
         \\                        prefill union and the fill buffers.

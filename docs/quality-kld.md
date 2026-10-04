@@ -56,7 +56,8 @@ sushi kld compare --model "$STUDENT_MODEL" --fixture teacher-standard4 \
 
 If the teacher needs expert streaming, add `--ssd-budget-gb <total RAM GiB>`;
 choose a budget that fits the machine. Native BF16 GLM capture requires streaming;
-a resident GLM pack is scored with `sushi kld compare --model <pack> --fixture <teacher>`.
+a GLM pack is scored with `sushi kld compare --model <pack> --fixture <teacher>`, resident or with
+`--ssd-budget-gb` (streamed experts score the same logits).
 
 The saved fixture contains token IDs and all 512 full-vocabulary rows per prompt,
 including rows after EOS. Compare reports all positions and the first-EOS-inclusive

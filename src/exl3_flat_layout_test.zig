@@ -288,7 +288,7 @@ test "flat EXL3 resident split drops co-located routed banks and isolates MTP" {
     const model_path = try createFixture(io, allocator, &tmp);
     defer allocator.free(model_path);
 
-    const split = try model.streamingResidentSplit(io, allocator, model_path, .exl3_k4);
+    const split = try model.streamingResidentSplit(io, allocator, model_path, &.{ .expert_layout = .exl3_k4 });
     // embed (64) + lm_head (1024) + two trunk tensors (2048); the nine routed EXL3
     // tensors, the MTP routed tensor, and model.visual are not trunk bytes.
     try std.testing.expectEqual(@as(u64, 3136), split.trunk);
@@ -346,11 +346,11 @@ test "EXL3 streaming CPU config engages only with a budget and refuses MTP" {
         .expert_layout = .exl3_k4,
         .quant_bits = 8,
     };
-    try std.testing.expect(cfg.streamsExperts());
+    try std.testing.expect(cfg.supportsExpertStreaming());
     try std.testing.expect(!cfg.expertStreamingRequired());
-    try std.testing.expect(!stream.expertStreamingEngaged(cfg.streamsExperts(), cfg.expertStreamingRequired(), 0, 0));
-    try std.testing.expect(stream.expertStreamingEngaged(cfg.streamsExperts(), cfg.expertStreamingRequired(), 0, 20 << 30));
-    try std.testing.expect(stream.expertStreamingEngaged(cfg.streamsExperts(), cfg.expertStreamingRequired(), 1 << 30, 0));
+    try std.testing.expect(!stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 0, 0));
+    try std.testing.expect(stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 0, 20 << 30));
+    try std.testing.expect(stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 1 << 30, 0));
     try std.testing.expect(stream.mtpRefusal(true, true) != null);
     try std.testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false));
 }
@@ -556,7 +556,7 @@ test "EXL3 streaming GPU slab matches resident decode prefill hits misses and un
 test "EXL3 streaming CPU refusals survive the registry and HTTP boundary" {
     const registry = @import("model_registry.zig").ModelRegistry;
     const server = @import("server.zig");
-    inline for (.{ error.Exl3RateGroupsStreamingUnsupported, error.Exl3NonuniformStreamingUnsupported, error.Exl3GateUpRateMismatch }) |err| {
+    inline for (.{ error.Exl3RateGroupsStreamingUnsupported, error.Exl3GateUpRateMismatch }) |err| {
         try std.testing.expectEqual(err, registry.loadErrorFromName(@errorName(err)));
         const refusal = server.loadRefusalFor(err) orelse return error.MissingNamedRefusal;
         try std.testing.expect(refusal.type.len > 0 and refusal.message.len > 0);

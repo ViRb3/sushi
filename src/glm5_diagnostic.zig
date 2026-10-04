@@ -66,6 +66,15 @@ pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
 
 /// Counts exactly the enabled trunk and vision tensors retained by the loader.
 pub fn residentBytesWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize, vision: bool) !u64 {
+    return selectedBytes(io, allocator, model_dir, layers, false, vision);
+}
+
+/// What a streamed load keeps resident: the text trunk without its routed experts.
+pub fn streamedTrunkBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize) !u64 {
+    return selectedBytes(io, allocator, model_dir, layers, true, false);
+}
+
+fn selectedBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize, trunk_only: bool, vision: bool) !u64 {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer dir.close(io);
     const raw = try dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(16 * 1024 * 1024));
@@ -80,7 +89,7 @@ pub fn residentBytesWithVision(io: std.Io, allocator: std.mem.Allocator, model_d
     var it = wm.object.iterator();
     var expected: usize = 0;
     while (it.next()) |entry| {
-        if (!keepLoadKey(entry.key_ptr.*, layers, false, vision)) continue;
+        if (!keepLoadKey(entry.key_ptr.*, layers, trunk_only, vision)) continue;
         const value = entry.value_ptr.*;
         if (value != .string or value.string.len == 0 or std.mem.indexOfAny(u8, value.string, "/\\") != null or std.mem.eql(u8, value.string, "..")) return error.InvalidGlmShardName;
         try files.put(value.string, {});
@@ -109,7 +118,7 @@ pub fn residentBytesWithVision(io: std.Io, allocator: std.mem.Allocator, model_d
         var tensors = header.value.object.iterator();
         while (tensors.next()) |entry| {
             const name = entry.key_ptr.*;
-            if (!keepLoadKey(name, layers, false, vision)) continue;
+            if (!keepLoadKey(name, layers, trunk_only, vision)) continue;
             const owner = wm.object.get(name) orelse continue;
             if (owner != .string or !std.mem.eql(u8, owner.string, file.*)) continue;
             if (entry.value_ptr.* != .object) return error.InvalidSafetensorsTensor;
@@ -354,6 +363,30 @@ test "GLM stream CPU trunk loader never opens expert shards and refuses a reside
     defer weights.deinit();
     try std.testing.expectEqual(@as(u32, 1), weights.count());
     try std.testing.expectEqual(@as(u16, 0x3f80), mlx.mlx_array_data_bfloat16(weights.get("lm_head.weight").?).?[0]);
+}
+
+test "GLM streamed load and bill keep only the text trunk: no routed experts, MTP layer or vision" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const one = "{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]}";
+    try fixture(tmp.dir, "trunk.safetensors", "{\"lm_head.weight\":" ++ one ++ "}", &.{ 128, 63 });
+    try fixture(tmp.dir, "experts.safetensors", "{\"model.language_model.layers.3.mlp.experts.0.gate_proj.weight\":" ++ one ++ ",\"model.language_model.layers.3.mlp.switch_mlp.gate_proj.trellis\":{\"dtype\":\"U16\",\"shape\":[1],\"data_offsets\":[2,4]}}", &.{ 128, 63, 1, 0 });
+    try fixture(tmp.dir, "mtp.safetensors", "{\"model.language_model.layers.4.mlp.gate.weight\":" ++ one ++ "}", &.{ 128, 63 });
+    try fixture(tmp.dir, "vision.safetensors", "{\"model.visual.patch_embed.weight\":" ++ one ++ "}", &.{ 128, 63 });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"num_hidden_layers\":4}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"lm_head.weight\":\"trunk.safetensors\",\"model.language_model.layers.3.mlp.experts.0.gate_proj.weight\":\"experts.safetensors\",\"model.language_model.layers.3.mlp.switch_mlp.gate_proj.trellis\":\"experts.safetensors\",\"model.language_model.layers.4.mlp.gate.weight\":\"mtp.safetensors\",\"model.visual.patch_embed.weight\":\"vision.safetensors\"}}" });
+    const path = try tmpPath(tmp);
+    defer a.free(path);
+    for ([_]@import("expert_quant.zig").Layout{ .bf16_individual, .exl3_k4 }) |layout| {
+        const cfg = model.ModelConfig{ .model_type = "glm5_next", .num_hidden_layers = 4, .expert_streaming = true, .expert_layout = layout, .glm5_vision = true };
+        try std.testing.expectEqual(model.ResidentSplit{ .trunk = 2, .mtp = 0 }, try model.streamingResidentSplit(std.testing.io, a, path, &cfg));
+    }
+    const cfg = model.ModelConfig{ .model_type = "glm5_next", .num_hidden_layers = 4, .expert_streaming = true, .expert_layout = .bf16_individual, .glm5_vision = true };
+    var weights = try model.loadWeightsForConfig(std.testing.io, a, path, &cfg, true);
+    defer weights.deinit();
+    try std.testing.expectEqual(@as(u32, 1), weights.count());
+    try std.testing.expect(weights.get("lm_head.weight") != null);
 }
 
 test "GLM vision enabled payload bill and CPU loader retain exactly the same indexed tensors" {

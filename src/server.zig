@@ -3154,8 +3154,7 @@ fn expertStreamingPlannedSeq(config: *const model_mod.ModelConfig) u64 {
 /// budget-vs-wired-limit admission.
 fn expertStreamingPlannedKvBytes(config: *const model_mod.ModelConfig) u64 {
     const kv_bits = defaultKvBits(config);
-    return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| expertStreamingPlannedSeq(config) +|
-        slotRingBytes(config, kv_bits);
+    return sessionBytesPerToken(config, kv_bits) *| expertStreamingPlannedSeq(config) +| slotRingBytes(config, kv_bits);
 }
 
 fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
@@ -6515,7 +6514,8 @@ pub fn prefillNeededAtChunk(
         const reserved = @max(seq, @min(seq +| max_tokens, ctx));
         // Native appendRows rounds latent and pooled capacities separately to 256 rows.
         const rows = (reserved +| 1023) / 1024 * 1024;
-        return (sessionBytesPerToken(config, kv_bits) *| rows +| glm5TransientBytes(config, seq, chunk, kv_bits)) *| 5 / 4;
+        return (sessionBytesPerToken(config, kv_bits) *| rows +| glm5TransientBytes(config, seq, chunk, kv_bits)) *| 5 / 4 +|
+            (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
     }
     // deepseek_v4 gets its own estimator: it sub-chunks prefill internally and its state is module-owned f32.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
@@ -13041,7 +13041,6 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3RouterGroupsUnsupported => .{ .type = "exl3_router_groups_unsupported", .message = "Reordered or pruned EXL3 experts require n_group=1 routing." },
         error.Exl3TopKExceedsReduceBank => .{ .type = "exl3_topk_exceeds_reduce_bank", .message = "This EXL3 pack's num_experts_per_tok exceeds the decode reduce-bank (32). Re-convert with top-k <= 32." },
         error.Exl3RateGroupsStreamingUnsupported => .{ .type = "exl3_rate_groups_streaming_unsupported", .message = "SSD streaming does not support EXL3 rate-group (.gN) packs. Use uniform leading-index expert banks." },
-        error.Exl3NonuniformStreamingUnsupported => .{ .type = "exl3_nonuniform_streaming_unsupported", .message = "SSD streaming requires the same EXL3 packed rate for each projection across layers. This pack varies its bank geometry." },
         error.Exl3GateUpRateMismatch => .{ .type = "exl3_gate_up_rate_mismatch", .message = "The EXL3 gate and up trellises must use the same packed rate." },
         error.Exl3TrellisGeometry => .{ .type = "exl3_trellis_geometry", .message = "This EXL3 pack has a routed-expert trellis this build cannot decode, or one that disagrees with the expert count, shape or k its config.json names. Re-convert the pack." },
         error.Exl3WindowUnsupported => .{ .type = "exl3_window_unsupported", .message = "This EXL3 pack names a codeword window this build cannot decode: expert_quant.window must be an integer from 8 to 16, or absent for 16." },
@@ -26013,6 +26012,39 @@ test "GLM serving memory bills one latent at the request's KV width and pooled i
     try std.testing.expectEqual(@as(u64, 0), cfg.layerKvBytes(0));
     try std.testing.expectEqual(@as(u64, 1024), cfg.layerKvBytes(3));
     try std.testing.expect(prefillTransientReserveAtKv(&cfg, 16, 2048, 500000) < 6 * 1024 * 1024 * 1024);
+}
+
+test "a streamed GLM bills its fill peak per request and its latent at the KV width plus the pooled index per planned token" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const saved = configured_kv_quant;
+    defer configured_kv_quant = saved;
+    var planned: [2]u64 = undefined;
+    for ([_]transformer_mod.KVQuantConfig{ .dense, transformer_mod.KVQuantConfig.affine(8) }, [_]u64{ 16, 8 }, &planned) |kv, bits, *bytes| {
+        configured_kv_quant = kv;
+        try std.testing.expectEqual(bits, defaultKvBits(&cfg));
+        cfg.expert_streaming = false;
+        const resident = prefillNeededAtChunk(&cfg, 4096, 2048, bits, 2048, .{});
+        cfg.expert_streaming = true;
+        cfg.expert_fill_peak_bytes = 3 << 30;
+        try std.testing.expectEqual(resident + (3 << 30), prefillNeededAtChunk(&cfg, 4096, 2048, bits, 2048, .{}));
+        bytes.* = expertStreamingPlannedKvBytes(&cfg);
+        try std.testing.expectEqual(sessionBytesPerToken(&cfg, bits) * expertStreamingPlannedSeq(&cfg) + slotRingBytes(&cfg, bits), bytes.*);
+    }
+    try std.testing.expect(planned[1] < planned[0]);
+}
+
+test "a streamed Qwen plans its QSA history beside its KV for every planned token" {
+    const fused_guard = qsaScoreFusedOffGuard();
+    defer fused_guard.deinit();
+    var cfg = qwen4RequestTestConfig();
+    cfg.expert_streaming = true;
+    const saved = configured_kv_quant;
+    defer configured_kv_quant = saved;
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const state = statePerTokenBilled(&cfg);
+    try std.testing.expect(state > 0);
+    const per_token = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + state;
+    try std.testing.expectEqual(per_token * expertStreamingPlannedSeq(&cfg) + slotRingBytes(&cfg, 8), expertStreamingPlannedKvBytes(&cfg));
 }
 
 test "thinking policy HTTP: Qwen and GLM accept their own words, MiMo takes every thinking word as on" {

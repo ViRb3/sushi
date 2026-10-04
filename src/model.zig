@@ -1104,9 +1104,16 @@ pub const ModelConfig = struct {
             self.num_experts_per_tok > 0 and self.hidden_size > 0 and self.moe_intermediate_size > 0;
     }
 
-    /// Can a load of THIS checkpoint stream its experts?
-    pub fn streamsExperts(self: *const ModelConfig) bool {
-        return self.supportsExpertStreaming();
+    /// The routed-expert geometry every streamed store, cache and bill reads.
+    pub fn expertGeometry(self: *const ModelConfig) expert_quant.Geometry {
+        return .{
+            .layers = @intCast(self.num_hidden_layers),
+            .experts = @intCast(self.num_experts),
+            .hidden = self.hidden_size,
+            .intermediate = self.moe_intermediate_size,
+            .first_moe_layer = @intCast(self.first_k_dense_replace),
+            .exl3_n = self.expert_quant_rate.n,
+        };
     }
 
     /// Dense banks and raw individual experts require the streaming loader.
@@ -4333,23 +4340,16 @@ pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_d
     return indexedResidentSplit(io, allocator, model_dir, null, vision, mtp_on);
 }
 
-pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !ResidentSplit {
-    if (layout == .mxfp4_individual)
-        return .{ .trunk = try @import("mimo_source.zig").residentBytes(io, allocator, model_dir), .mtp = 0 };
-    if (layout == .exl3_k4) {
-        var config_dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
-        defer config_dir.close(io);
-        const raw = try config_dir.readFileAlloc(io, "config.json", allocator, .limited(16 * 1024 * 1024));
-        defer allocator.free(raw);
-        const meta = model_discovery.parseStubMeta(allocator, raw, false);
-        if (std.mem.eql(u8, meta.modelType(), "mimo_v2")) {
-            var config = try parseConfig(io, allocator, model_dir);
-            defer config.deinit(allocator);
-            config.expert_streaming = true;
-            return .{ .trunk = try @import("mimo_source.zig").residentBytesWithConfig(io, allocator, model_dir, &config), .mtp = 0 };
-        }
+/// What a streamed load keeps resident under `config.expert_layout`: everything but the routed banks.
+pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !ResidentSplit {
+    if (config.isGlm5())
+        return .{ .trunk = try @import("glm5_diagnostic.zig").streamedTrunkBytes(io, allocator, model_dir, config.num_hidden_layers), .mtp = 0 };
+    if (config.usesMimoSourceTrunk()) {
+        var streamed = config.*;
+        streamed.expert_streaming = true;
+        return .{ .trunk = try @import("mimo_source.zig").residentBytesWithConfig(io, allocator, model_dir, &streamed), .mtp = 0 };
     }
-    return indexedResidentSplit(io, allocator, model_dir, layout, false, true);
+    return indexedResidentSplit(io, allocator, model_dir, config.expert_layout, false, true);
 }
 
 fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, streaming: ?expert_quant.Layout, vision: bool, mtp_on: bool) !ResidentSplit {
@@ -4567,8 +4567,9 @@ pub fn loadWeightsForConfig(
     }
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
-        if (config.expert_streaming) return error.ExpertStreamingUnsupportedLayout;
-        return @import("glm5_diagnostic.zig").loadWeightsWithVision(io, allocator, model_dir, mlx.gpuStream(), load_vision and config.glm5_vision);
+        const glm = @import("glm5_diagnostic.zig");
+        if (config.expert_streaming) return glm.loadWeightsBounded(io, allocator, model_dir, mlx.gpuStream(), true, std.math.maxInt(u64));
+        return glm.loadWeightsWithVision(io, allocator, model_dir, mlx.gpuStream(), load_vision and config.glm5_vision);
     }
     if (config.expert_streaming and config.usesMimoSourceTrunk()) {
         logMimoSourceLoad(config, false);
@@ -8214,7 +8215,7 @@ test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":\"s.safetensors\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":\"s.safetensors\",\"model.visual.x\":\"s.safetensors\",\"model.language_model.layers.0.mlp.gate.weight\":\"s.safetensors\",\"mtp.layers.0.mlp.experts.down_proj\":\"s.safetensors\"}}" });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(io, &path_buf);
-    const split = try streamingResidentSplit(io, t.allocator, path_buf[0..path_len], .bf16_fused);
+    const split = try streamingResidentSplit(io, t.allocator, path_buf[0..path_len], &.{ .expert_layout = .bf16_fused });
     try t.expectEqual(@as(u64, 6), split.trunk);
     try t.expectEqual(@as(u64, 12), split.mtp);
 }
@@ -8224,7 +8225,7 @@ test "real qwen streaming resident estimate is trunk plus MTP only" {
     const path = try @import("test_models.zig").packPath(&path_buf, "Qwen/Qwen3.8-Flash-Next");
     var dir = std.Io.Dir.openDirAbsolute(std.testing.io, path, .{}) catch return error.SkipZigTest;
     dir.close(std.testing.io);
-    const split = try streamingResidentSplit(std.testing.io, std.testing.allocator, path, .bf16_fused);
+    const split = try streamingResidentSplit(std.testing.io, std.testing.allocator, path, &.{ .expert_layout = .bf16_fused });
     const bytes = split.trunk +| split.mtp;
     try std.testing.expect(bytes > 14_000_000_000 and bytes < 16_000_000_000);
 }
@@ -9120,8 +9121,11 @@ test "a non-ringing sliding arch keeps the uniform KV bill" {
 test "real mimo_v2 original and converted packs bill the same resident trunk" {
     const source = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
     const reference = std.c.getenv("MIMO_PACK_REFERENCE") orelse return error.SkipZigTest;
-    const original = try streamingResidentSplit(testing.io, testing.allocator, std.mem.span(source), .mxfp4_individual);
-    const converted = try streamingResidentSplit(testing.io, testing.allocator, std.mem.span(reference), .mxfp4_split);
+    var config = try parseConfig(testing.io, testing.allocator, std.mem.span(source));
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(expert_quant.Layout.mxfp4_individual, config.expert_layout);
+    const original = try streamingResidentSplit(testing.io, testing.allocator, std.mem.span(source), &config);
+    const converted = try streamingResidentSplit(testing.io, testing.allocator, std.mem.span(reference), &.{ .expert_layout = .mxfp4_split });
     try testing.expect(original.trunk > 0);
     try testing.expectEqual(converted, original);
 }
@@ -9179,7 +9183,6 @@ test "mimo_v2 EXL3 routed banks stream on request and take the source trunk load
         .expert_layout = .exl3_k4,
     };
     try testing.expect(c.supportsExpertStreaming());
-    try testing.expect(c.streamsExperts());
     try testing.expect(!c.expertStreamingRequired());
     try testing.expect(c.usesMimoSourceTrunk());
     c.expert_layout = .mxfp4_individual;
@@ -9288,10 +9291,10 @@ test "parseConfig releases owned paths when an EXL3 pack is refused" {
 test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default" {
     const stream = @import("expert_stream.zig");
     const c = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 48, .first_k_dense_replace = 1, .num_experts = 256, .num_experts_per_tok = 8, .hidden_size = 4096, .moe_intermediate_size = 2048, .expert_layout = .exl3_k4 };
-    try testing.expect(c.streamsExperts());
+    try testing.expect(c.supportsExpertStreaming());
     try testing.expectEqual(@as(u32, 47), c.expertLayerCount());
-    try testing.expect(!stream.expertStreamingEngaged(c.streamsExperts(), c.expertStreamingRequired(), 0, 0));
-    try testing.expect(stream.expertStreamingEngaged(c.streamsExperts(), c.expertStreamingRequired(), 0, 20 << 30));
+    try testing.expect(!stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 0));
+    try testing.expect(stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 20 << 30));
     try testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_settings, stream.mtpUnderStreaming(true, true, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_default, stream.mtpUnderStreaming(true, false, true));

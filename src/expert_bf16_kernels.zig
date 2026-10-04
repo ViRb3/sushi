@@ -653,7 +653,7 @@ fn randomSlots(alloc: std.mem.Allocator, rnd: std.Random, R: usize, topk: usize,
     return slots;
 }
 
-fn runGateUpShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U: c_int, R: c_int, topk: c_int, N: c_int, K: c_int, verbose: bool) !void {
+fn runGateUpShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U: c_int, R: c_int, topk: c_int, N: c_int, K: c_int) !void {
     var x = try randBf16(alloc, s, rnd, &[_]c_int{ R, K });
     defer x.deinit(alloc);
     var slab = try randBf16(alloc, s, rnd, &[_]c_int{ U, 2 * N, K });
@@ -678,14 +678,13 @@ fn runGateUpShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, 
 
     const ks = errStats(kvals, truth);
     const gs = errStats(gvals, truth);
-    if (verbose) std.debug.print("gate_up U={d} R={d} k={d} N={d} K={d}: kernel max={e:.3} rms={e:.3} | gather_mm max={e:.3} rms={e:.3}\n", .{ U, R, topk, N, K, ks.max, ks.rms, gs.max, gs.rms });
     try testing.expect(ks.finite);
     try testing.expect(gs.finite);
     try testing.expect(ks.max <= gs.max);
     try testing.expect(ks.rms <= gs.rms);
 }
 
-fn runDownShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U: c_int, R: c_int, topk: c_int, N: c_int, K: c_int, verbose: bool) !void {
+fn runDownShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U: c_int, R: c_int, topk: c_int, N: c_int, K: c_int) !void {
     var h = try randBf16(alloc, s, rnd, &[_]c_int{ R, topk, K });
     defer h.deinit(alloc);
     var slab = try randBf16(alloc, s, rnd, &[_]c_int{ U, N, K });
@@ -715,7 +714,6 @@ fn runDownShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U:
 
     const ks = errStats(kvals, truth);
     const gs = errStats(gvals, truth);
-    if (verbose) std.debug.print("down U={d} R={d} k={d} N={d} K={d}: kernel max={e:.3} rms={e:.3} | gather_mm max={e:.3} rms={e:.3}\n", .{ U, R, topk, N, K, ks.max, ks.rms, gs.max, gs.rms });
     try testing.expect(ks.finite);
     try testing.expect(gs.finite);
     try testing.expect(ks.max <= gs.max);
@@ -730,7 +728,7 @@ test "bf16 slab gate+up+SwiGLU is no worse than the gather_mm reference against 
     const rnd = prng.random();
     for ([_]c_int{ 16, 64, 512 }) |U| {
         for ([_]c_int{ 1, 2, 4, 8, 16 }) |R| {
-            try runGateUpShape(alloc, s, rnd, U, R, 10, 64, 128, benchEnabled());
+            try runGateUpShape(alloc, s, rnd, U, R, 10, 64, 128);
         }
     }
 }
@@ -743,7 +741,7 @@ test "bf16 slab down+reduce is no worse than the gather_mm reference against fp3
     const rnd = prng.random();
     for ([_]c_int{ 16, 64, 512 }) |U| {
         for ([_]c_int{ 1, 2, 4, 8, 16 }) |R| {
-            try runDownShape(alloc, s, rnd, U, R, 10, 128, 64, benchEnabled());
+            try runDownShape(alloc, s, rnd, U, R, 10, 128, 64);
         }
     }
 }
@@ -754,8 +752,8 @@ test "bf16 slab kernels hold parity at the Qwen3.8-Flash-Next expert geometry" {
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x9E77E57);
     const rnd = prng.random();
-    try runGateUpShape(alloc, s, rnd, 8, 1, 10, 640, 2560, benchEnabled());
-    try runDownShape(alloc, s, rnd, 8, 1, 10, 2560, 640, benchEnabled());
+    try runGateUpShape(alloc, s, rnd, 8, 1, 10, 640, 2560);
+    try runDownShape(alloc, s, rnd, 8, 1, 10, 2560, 640);
 }
 
 const PARITY_VARIANTS = [_]struct { lanes: c_int, rpl: c_int, groups: c_int, stage: bool }{
@@ -800,8 +798,8 @@ test "bf16 slab kernels hold parity at every lane split and unroll width" {
         down_rows_per_lane = v.rpl;
         down_slot_groups = v.groups;
         down_stage_activation = v.stage;
-        try runGateUpShape(alloc, s, rnd, 8, 2, 10, 32, 128, false);
-        try runDownShape(alloc, s, rnd, 8, 2, 10, 64, 56, false);
+        try runGateUpShape(alloc, s, rnd, 8, 2, 10, 32, 128);
+        try runDownShape(alloc, s, rnd, 8, 2, 10, 64, 56);
     }
 }
 
@@ -938,285 +936,4 @@ test "bf16 slab kernels decline outside their contract" {
     const neg_slots = mlx.mlx_array_new_data(neg_host.ptr, &[_]c_int{ 1, topk }, 2, .int32);
     defer _ = mlx.mlx_array_free(neg_slots);
     try testing.expectError(error.SlotOutOfRange, gateUpSwiglu(s, x.arr, slab.arr, neg_slots));
-}
-
-const BenchClock = struct {
-    io: std.Io,
-    start: std.Io.Timestamp,
-    mark_ns: u64 = 0,
-
-    fn init() BenchClock {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        return .{ .io = io, .start = std.Io.Timestamp.now(io, .boot) };
-    }
-
-    fn lap(self: *BenchClock) u64 {
-        const cum: u64 = @intCast(self.start.untilNow(self.io, .boot).nanoseconds);
-        const d = cum - self.mark_ns;
-        self.mark_ns = cum;
-        return d;
-    }
-};
-
-fn benchEnabled() bool {
-    const raw = std.c.getenv("EXPERT_BF16_BENCH") orelse return false;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-}
-
-fn medianUs(samples: []u64) f64 {
-    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-    const mid = samples.len / 2;
-    const ns: f64 = if (samples.len % 2 == 1)
-        @floatFromInt(samples[mid])
-    else
-        (@as(f64, @floatFromInt(samples[mid - 1])) + @as(f64, @floatFromInt(samples[mid]))) / 2.0;
-    return ns / 1000.0;
-}
-
-fn distinctSlots(alloc: std.mem.Allocator, R: c_int, topk: c_int, U: c_int) ![]i32 {
-    const n: usize = @intCast(R * topk);
-    const slots = try alloc.alloc(i32, n);
-    const stride: i32 = @divTrunc(U, @as(i32, @intCast(n)));
-    for (slots, 0..) |*v, i| v.* = @as(i32, @intCast(i)) * stride;
-    return slots;
-}
-
-const Variant = struct { lanes: c_int, rpl: c_int, groups: c_int = 0, stage: bool = false };
-const GATEUP_SWEEP = [_]Variant{
-    .{ .lanes = 8, .rpl = 0 },
-    .{ .lanes = 8, .rpl = 2 },
-    .{ .lanes = 16, .rpl = 2 },
-    .{ .lanes = 32, .rpl = 4 },
-};
-const DOWN_SWEEP = [_]Variant{
-    .{ .lanes = 8, .rpl = 0, .groups = 0, .stage = true },
-    .{ .lanes = 8, .rpl = 4, .groups = 10, .stage = false },
-    .{ .lanes = 8, .rpl = 4, .groups = 10, .stage = true },
-    .{ .lanes = 8, .rpl = 8, .groups = 10, .stage = true },
-    .{ .lanes = 8, .rpl = 4, .groups = 5, .stage = true },
-    .{ .lanes = 8, .rpl = 4, .groups = 2, .stage = true },
-    .{ .lanes = 8, .rpl = 4, .groups = 1, .stage = true },
-    .{ .lanes = 16, .rpl = 2, .groups = 10, .stage = true },
-    .{ .lanes = 32, .rpl = 4, .groups = 10, .stage = true },
-};
-const REPS: usize = 8;
-
-fn benchLayer(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U: c_int, R: c_int, roof_gbs: f64) !void {
-    const topk: c_int = 10;
-    const N: c_int = 640;
-    const H: c_int = 2560;
-
-    var x = try randBf16(alloc, s, rnd, &[_]c_int{ R, H });
-    defer x.deinit(alloc);
-    var gu = try randBf16(alloc, s, rnd, &[_]c_int{ U, 2 * N, H });
-    defer gu.deinit(alloc);
-    var dn = try randBf16(alloc, s, rnd, &[_]c_int{ U, H, N });
-    defer dn.deinit(alloc);
-    var hact = try randBf16(alloc, s, rnd, &[_]c_int{ R, topk, N });
-    defer hact.deinit(alloc);
-    const w_host = try alloc.alloc(f32, @intCast(R * topk));
-    defer alloc.free(w_host);
-    for (w_host) |*v| v.* = rnd.float(f32);
-    const w = mlx.mlx_array_new_data(w_host.ptr, &[_]c_int{ R, topk }, 2, .float32);
-    defer _ = mlx.mlx_array_free(w);
-
-    var slot_hosts: [REPS][]i32 = undefined;
-    var slot_arrs: [REPS]mlx.mlx_array = undefined;
-    const per_rep: usize = @intCast(R * topk);
-    for (0..REPS) |rep| {
-        slot_hosts[rep] = try alloc.alloc(i32, per_rep);
-        for (slot_hosts[rep], 0..) |*v, i| v.* = @intCast((rep * per_rep + i) % @as(usize, @intCast(U)));
-        slot_arrs[rep] = mlx.mlx_array_new_data(slot_hosts[rep].ptr, &[_]c_int{ R, topk }, 2, .int32);
-    }
-    defer for (0..REPS) |rep| {
-        _ = mlx.mlx_array_free(slot_arrs[rep]);
-        alloc.free(slot_hosts[rep]);
-    };
-
-    const laps: usize = 50;
-    const warm: usize = 10;
-    const arms = 2 * (2 + GATEUP_SWEEP.len + DOWN_SWEEP.len);
-    const t = try alloc.alloc(u64, arms * laps);
-    defer alloc.free(t);
-
-    const saved_gu = gateup_lpr;
-    const saved_dn = down_lpr;
-    const saved_guu = gateup_rows_per_lane;
-    const saved_dnu = down_rows_per_lane;
-    const saved_grp = down_slot_groups;
-    const saved_stg = down_stage_activation;
-    defer {
-        down_stage_activation = saved_stg;
-        gateup_lpr = saved_gu;
-        down_lpr = saved_dn;
-        gateup_rows_per_lane = saved_guu;
-        down_rows_per_lane = saved_dnu;
-        down_slot_groups = saved_grp;
-    }
-
-    var timer = BenchClock.init();
-    for (0..warm + laps) |i| {
-        var arm: usize = 0;
-        const rec = struct {
-            fn f(buf: []u64, a: usize, lp: usize, wm: usize, idx: usize, v: u64) void {
-                if (idx >= wm) buf[a * lp + (idx - wm)] = v;
-            }
-        }.f;
-        _ = timer.lap();
-        {
-            const a = try gatherMmGateUp(s, x.arr, gu.arr, slot_arrs[0], R, H, N);
-            defer _ = mlx.mlx_array_free(a);
-            try mlx.check(mlx.mlx_array_eval(a));
-        }
-        rec(t, arm, laps, warm, i, timer.lap());
-        arm += 1;
-        for (GATEUP_SWEEP) |v| {
-            gateup_lpr = v.lanes;
-            gateup_rows_per_lane = v.rpl;
-            const a = try gateUpSwiglu(s, x.arr, gu.arr, slot_arrs[0]);
-            try mlx.check(mlx.mlx_array_eval(a));
-            _ = mlx.mlx_array_free(a);
-            rec(t, arm, laps, warm, i, timer.lap());
-            arm += 1;
-        }
-        {
-            const a = try gatherMmDownReduce(s, hact.arr, dn.arr, slot_arrs[0], w, R, topk, N);
-            defer _ = mlx.mlx_array_free(a);
-            try mlx.check(mlx.mlx_array_eval(a));
-        }
-        rec(t, arm, laps, warm, i, timer.lap());
-        arm += 1;
-        for (DOWN_SWEEP) |v| {
-            down_lpr = v.lanes;
-            down_rows_per_lane = v.rpl;
-            down_slot_groups = v.groups;
-            down_stage_activation = v.stage;
-            const a = try downReduce(s, hact.arr, dn.arr, slot_arrs[0], w);
-            try mlx.check(mlx.mlx_array_eval(a));
-            _ = mlx.mlx_array_free(a);
-            rec(t, arm, laps, warm, i, timer.lap());
-            arm += 1;
-        }
-
-        _ = timer.lap();
-        {
-            const v = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(v);
-            for (0..REPS) |rep| {
-                const a = try gatherMmGateUp(s, x.arr, gu.arr, slot_arrs[rep], R, H, N);
-                defer _ = mlx.mlx_array_free(a);
-                _ = mlx.mlx_vector_array_append_value(v, a);
-            }
-            try mlx.check(mlx.mlx_eval(v));
-        }
-        rec(t, arm, laps, warm, i, timer.lap() / REPS);
-        arm += 1;
-        for (GATEUP_SWEEP) |vr| {
-            gateup_lpr = vr.lanes;
-            gateup_rows_per_lane = vr.rpl;
-            const v = mlx.mlx_vector_array_new();
-            for (0..REPS) |rep| {
-                const a = try gateUpSwiglu(s, x.arr, gu.arr, slot_arrs[rep]);
-                _ = mlx.mlx_vector_array_append_value(v, a);
-                _ = mlx.mlx_array_free(a);
-            }
-            try mlx.check(mlx.mlx_eval(v));
-            _ = mlx.mlx_vector_array_free(v);
-            rec(t, arm, laps, warm, i, timer.lap() / REPS);
-            arm += 1;
-        }
-        {
-            const v = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(v);
-            for (0..REPS) |rep| {
-                const a = try gatherMmDownReduce(s, hact.arr, dn.arr, slot_arrs[rep], w, R, topk, N);
-                defer _ = mlx.mlx_array_free(a);
-                _ = mlx.mlx_vector_array_append_value(v, a);
-            }
-            try mlx.check(mlx.mlx_eval(v));
-        }
-        rec(t, arm, laps, warm, i, timer.lap() / REPS);
-        arm += 1;
-        for (DOWN_SWEEP) |vr| {
-            down_lpr = vr.lanes;
-            down_rows_per_lane = vr.rpl;
-            down_slot_groups = vr.groups;
-            down_stage_activation = vr.stage;
-            const v = mlx.mlx_vector_array_new();
-            for (0..REPS) |rep| {
-                const a = try downReduce(s, hact.arr, dn.arr, slot_arrs[rep], w);
-                _ = mlx.mlx_vector_array_append_value(v, a);
-                _ = mlx.mlx_array_free(a);
-            }
-            try mlx.check(mlx.mlx_eval(v));
-            _ = mlx.mlx_vector_array_free(v);
-            rec(t, arm, laps, warm, i, timer.lap() / REPS);
-            arm += 1;
-        }
-    }
-
-    const pairs: f64 = @floatFromInt(R * topk);
-    const gu_bytes: f64 = pairs * @as(f64, @floatFromInt(2 * N)) * @as(f64, @floatFromInt(H)) * 2.0;
-    const dn_bytes: f64 = pairs * @as(f64, @floatFromInt(H)) * @as(f64, @floatFromInt(N)) * 2.0;
-
-    const report = struct {
-        fn f(mode: []const u8, label: []const u8, U_: c_int, R_: c_int, lanes: c_int, rpl: c_int, groups: c_int, stage: bool, kib: f64, us: f64, bytes: f64, roof: f64) void {
-            const gbs = bytes / (us * 1000.0);
-            std.debug.print("U={d:>3} R={d:>2} {s:<10} {s:<18} lanes={d:>2} rpl={d:>1} g={d:>2} staged={d} tgmem={d:>5.2}KiB {d:>8.1} us {d:>6.1} GB/s {d:>5.1}% roof\n", .{ U_, R_, mode, label, lanes, rpl, groups, @intFromBool(stage), kib, us, gbs, 100.0 * gbs / roof });
-        }
-    }.f;
-
-    for ([_][]const u8{ "solo", "pipelined" }, 0..) |mode, m| {
-        const b0 = m * (2 + GATEUP_SWEEP.len + DOWN_SWEEP.len);
-        report(mode, "gate_up gather_mm", U, R, 0, 0, 0, false, 0, medianUs(t[b0 * laps ..][0..laps]), gu_bytes, roof_gbs);
-        for (GATEUP_SWEEP, 0..) |v, j| {
-            report(mode, "gate_up kernel", U, R, v.lanes, v.rpl, 0, false, 0, medianUs(t[(b0 + 1 + j) * laps ..][0..laps]), gu_bytes, roof_gbs);
-        }
-        const b1 = b0 + 1 + GATEUP_SWEEP.len;
-        report(mode, "down gather_mm", U, R, 0, 0, 0, false, 0, medianUs(t[b1 * laps ..][0..laps]), dn_bytes, roof_gbs);
-        for (DOWN_SWEEP, 0..) |v, j| {
-            const kib = if (v.stage) @as(f64, @floatFromInt(v.groups * N)) * 2.0 / 1024.0 else 0;
-            report(mode, "down kernel", U, R, v.lanes, v.rpl, v.groups, v.stage, kib, medianUs(t[(b1 + 1 + j) * laps ..][0..laps]), dn_bytes, roof_gbs);
-        }
-    }
-}
-
-fn measureRoof(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random) !f64 {
-    const elems: c_int = 512 * 1024 * 1024;
-    var big = try randBf16(alloc, s, rnd, &[_]c_int{ 1024, @divExact(elems, 1024) });
-    defer big.deinit(alloc);
-    const laps: usize = 50;
-    var t = try alloc.alloc(u64, laps);
-    defer alloc.free(t);
-    var timer = BenchClock.init();
-    for (0..laps + 10) |i| {
-        _ = timer.lap();
-        var r = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(r);
-        try mlx.check(mlx.mlx_sum(&r, big.arr, false, s));
-        try mlx.check(mlx.mlx_array_eval(r));
-        const d = timer.lap();
-        if (i >= 10) t[i - 10] = d;
-    }
-    const us = medianUs(t);
-    const bytes: f64 = @as(f64, @floatFromInt(elems)) * 2.0;
-    const roof = bytes / (us * 1000.0);
-    std.debug.print("roof: mlx_sum over {d:.2} GB bf16 = {d:.1} us = {d:.1} GB/s\n", .{ bytes / 1.0e9, us, roof });
-    return roof;
-}
-
-test "bf16 slab kernel microbench" {
-    if (!benchEnabled()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const alloc = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0xBE0C4);
-    const rnd = prng.random();
-    const roof = try measureRoof(alloc, s, rnd);
-    for ([_]c_int{ 128, 512 }) |U| {
-        for ([_]c_int{ 1, 4 }) |R| {
-            try benchLayer(alloc, s, rnd, U, R, roof);
-            _ = mlx.mlx_clear_cache();
-        }
-    }
 }

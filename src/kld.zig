@@ -188,8 +188,8 @@ pub const USAGE =
     \\  --json <file>         compare: write the numbers as JSON
     \\  --ctx-size <n>        context length override
     \\  --kv-quant <16|8|4>   KV cache quantization (16 = BF16, also off)
-    \\  --ssd-budget-gb <n>   bf16 expert streaming budget (GiB)
-    \\  --expert-cache-gb <n> bf16 expert cache size (GB), outranks --ssd-budget-gb
+    \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
+    \\  --expert-cache-gb <n> streamed expert cache size (GB), outranks --ssd-budget-gb
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 2..32)
@@ -852,9 +852,9 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     scheduler_mod.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
     self.config.ctx_override = model_settings_mod.contextPick(opts.ctx_size, self.config.ctx_override).value;
 
-    const kld_budget = scheduler_mod.resolveSsdBudget(opts.ssd_budget_bytes, self.config.ssd_budget_gb_override, self.config.streamsExperts());
+    const kld_budget = scheduler_mod.resolveSsdBudget(opts.ssd_budget_bytes, self.config.ssd_budget_gb_override, self.config.supportsExpertStreaming());
     if (expert_stream_mod.expertStreamingEngaged(
-        self.config.streamsExperts(),
+        self.config.supportsExpertStreaming(),
         self.config.expertStreamingRequired(),
         opts.expert_cache_bytes,
         kld_budget.bytes,
@@ -873,29 +873,12 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
             },
             .drop_default, .off => {},
         }
-        const mtp_resident = false;
-        const geometry = scheduler_mod.streamingGeometryOf(&self.config);
-        self.config.expert_layout = expert_stream_mod.quant.layoutOfDirWithFirstMoe(allocator, io, self.config.model_type, opts.model_dir, geometry.layers, geometry.first_moe_layer) orelse
-            return error.ExpertStreamingUnsupportedLayout;
-        const per_expert = try expert_stream_mod.expertBytesFor(allocator, opts.model_dir, geometry, self.config.expert_layout);
-        const split = try model_mod.streamingResidentSplit(io, allocator, opts.model_dir, self.config.expert_layout);
-        const resolved = try scheduler_mod.resolveExpertCache(opts.expert_cache_bytes, budget.bytes, &self.config, split, mtp_resident, per_expert);
-        const plan = try expert_stream_mod.cachePlanBytes(
-            resolved.cache_bytes,
-            @intCast(self.config.expertLayerCount()),
-            geometry.experts,
-            per_expert,
-        );
-        self.config.expert_streaming = true;
+        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, opts.expert_cache_bytes, budget.bytes);
+        scheduler_mod.applyStreamingPlan(&self.config, plan, budget.bytes);
         if (self.config.expert_source_dir == null) self.config.expert_source_dir = try allocator.dupe(u8, opts.model_dir);
-        self.config.expert_cache_bytes = plan.cache_bytes;
-        self.config.expert_ssd_budget_bytes = if (resolved.ledger != null) budget.bytes else 0;
-        self.config.expert_workspace_bytes = plan.workspace_bytes;
-        self.config.expert_bounce_bytes = plan.bounce_bytes;
-        self.config.expert_fill_peak_bytes = plan.prefill_peak_bytes;
         log.info("[kld] expert streaming: cache {d:.2} GB, {d} slots/layer\n", .{
-            @as(f64, @floatFromInt(plan.cache_bytes)) / 1e9,
-            plan.slots_per_layer,
+            @as(f64, @floatFromInt(plan.cache.cache_bytes)) / 1e9,
+            plan.cache.slots_per_layer,
         });
     }
 

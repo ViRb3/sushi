@@ -7,9 +7,10 @@ pub const Geometry = struct {
     experts: u16,
     hidden: u32,
     intermediate: u32,
-    /// Absolute layer at which routed expert banks begin. Qwen4 starts at zero;
-    /// sparse MoE packs such as MiMo keep a dense layer zero.
+    /// Absolute layer at which routed expert banks begin; earlier layers stay
+    /// addressable but get no bank (MiMo and GLM keep a dense prefix).
     first_moe_layer: u16 = 0,
+    /// EXL3 halfwords per packed tile (K = n/16); ignored by every other layout.
     exl3_n: u32 = 64,
 };
 

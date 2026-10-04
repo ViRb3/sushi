@@ -1784,35 +1784,22 @@ pub const Scheduler = struct {
         var victims_buf: [16]*LoadedModel = undefined;
         var n_victims: usize = 0;
 
-        const settings_budget = resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.streamsExperts()).bytes;
+        const settings_budget = resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.supportsExpertStreaming()).bytes;
         const streaming_gate_bytes: ?u64 = if (expert_stream_mod.expertStreamingEngaged(
-            owned.config.streamsExperts(),
+            owned.config.supportsExpertStreaming(),
             owned.config.expertStreamingRequired(),
             self.expert_cache_bytes,
             settings_budget,
         )) blk: {
             if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
-            const geometry = streamingGeometryOf(owned.config);
-            const layout = try expert_stream_mod.quant.streamingLayoutOfDir(self.allocator, self.io, owned.config.model_type, entry.path, geometry.layers, geometry.first_moe_layer);
-            var split = try model_mod.streamingResidentSplit(self.io, self.allocator, entry.path, layout);
-            var layout_config = owned.config.*;
-            layout_config.expert_layout = layout;
-            split.trunk +|= mimoCoarseHeadBytes(&layout_config);
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
             switch (mtpStreamingVerdict(mtp)) {
                 .refuse => return error.ExpertStreamingMtpUnsupported,
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
             }
-            const mtp_resident = false;
-            const per_expert = try expert_stream_mod.expertBytesFor(self.allocator, entry.path, geometry, layout);
-            const resolved = try resolveExpertCache(self.expert_cache_bytes, settings_budget, owned.config, split, mtp_resident, per_expert);
-            const plan = try expert_stream_mod.cachePlanBytesForGeometry(
-                resolved.cache_bytes,
-                geometry,
-                per_expert,
-            );
-            break :blk expertStreamingGateBytes(split.trunk +| split.mtp, plan.cache_bytes, plan.prefill_peak_bytes, plan.bounce_bytes);
+            const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, self.expert_cache_bytes, settings_budget);
+            break :blk expertStreamingGateBytes(plan.split.trunk +| plan.split.mtp, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config.has_vision), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
         else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
@@ -2517,7 +2504,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.preserve_thinking_override = o.preserve_thinking;
     config.think_penalty_override = o.think_penalty;
     config.logit_bias_file_override = o.logit_bias_file;
-    if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.streamsExperts()).setting_ignored)
+    if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
 
@@ -2805,15 +2792,36 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     return .{ .config = config, .tok = tok, .chat_config = cc };
 }
 
-pub fn streamingGeometryOf(config: *const model_mod.ModelConfig) expert_stream_mod.Geometry {
-    return .{
-        .layers = @intCast(config.num_hidden_layers),
-        .experts = @intCast(config.num_experts),
-        .hidden = config.hidden_size,
-        .intermediate = config.moe_intermediate_size,
-        .first_moe_layer = @intCast(config.first_k_dense_replace),
-        .exl3_n = config.expert_quant_rate.n,
-    };
+pub const StreamingPlan = struct {
+    layout: expert_stream_mod.quant.Layout,
+    split: model_mod.ResidentSplit,
+    resolved: ExpertCacheResolution,
+    cache: expert_stream_mod.CachePlan,
+};
+
+/// The ONE streamed-load plan, read by the serving load, its registry gate and `kld`: the
+/// on-disk layout, what stays resident, and the expert cache the budget leaves.
+pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, explicit_cache_bytes: u64, budget_bytes: u64) !StreamingPlan {
+    const geometry = config.expertGeometry();
+    var streamed = config.*;
+    streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
+    var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
+    split.trunk +|= mimoCoarseHeadBytes(&streamed);
+    const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
+    const resolved = try resolveExpertCache(explicit_cache_bytes, budget_bytes, config, split, false, per_expert);
+    const cache = try expert_stream_mod.cachePlanBytesForGeometry(resolved.cache_bytes, geometry, per_expert);
+    return .{ .layout = streamed.expert_layout, .split = split, .resolved = resolved, .cache = cache };
+}
+
+/// Marks the config streamed: the fields every streamed forward and bill reads.
+pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_bytes: u64) void {
+    config.expert_layout = plan.layout;
+    config.expert_streaming = true;
+    config.expert_cache_bytes = plan.cache.cache_bytes;
+    config.expert_ssd_budget_bytes = if (plan.resolved.ledger != null) budget_bytes else 0;
+    config.expert_workspace_bytes = plan.cache.workspace_bytes;
+    config.expert_bounce_bytes = plan.cache.bounce_bytes;
+    config.expert_fill_peak_bytes = plan.cache.prefill_peak_bytes;
 }
 
 pub const ExpertCacheResolution = struct {
@@ -3107,6 +3115,25 @@ fn mimoResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []
     return bytes + mimoCoarseHeadBytes(config);
 }
 
+/// A streamed GLM forward keeps no speculative state: a found assistant stays unloaded,
+/// an asked-for one is refused by name.
+fn glmStreamedDrafterOff(config: *const ModelConfig, drafter_dir: []const u8) !bool {
+    if (!config.isGlm5() or !config.expert_streaming) return false;
+    if (drafter_dir.len > 0) return error.GlmStreamingSpecUnsupported;
+    log.info("[glm-dflash] off: unsupported under expert streaming\n", .{});
+    return true;
+}
+
+test "a streamed GLM load leaves a found assistant unloaded and refuses an asked-for one" {
+    var glm = ModelConfig{ .model_type = "glm5_next" };
+    try testing.expect(!try glmStreamedDrafterOff(&glm, "/assistant"));
+    glm.expert_streaming = true;
+    try testing.expect(try glmStreamedDrafterOff(&glm, ""));
+    try testing.expectError(error.GlmStreamingSpecUnsupported, glmStreamedDrafterOff(&glm, "/assistant"));
+    const qwen = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
+    try testing.expect(!try glmStreamedDrafterOff(&qwen, ""));
+}
+
 /// The drafter a load binds: `--no-drafter` wins, then an explicit dir, then one shipped in the model dir.
 const LoadDrafterDir = struct {
     dir: []const u8,
@@ -3361,11 +3388,11 @@ test "EXL3 streaming CPU settings budget engages the EXL3 loader" {
         .expert_layout = .exl3_k4,
     };
     q4.ssd_budget_gb_override = 60;
-    try t.expect(q4.supportsExpertStreaming() and q4.streamsExperts());
-    const budget = resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.streamsExperts());
+    try t.expect(q4.supportsExpertStreaming());
+    const budget = resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.supportsExpertStreaming());
     try t.expect(!budget.setting_ignored);
     try t.expectEqual(@as(u64, 60 << 30), budget.bytes);
-    try t.expect(expert_stream_mod.expertStreamingEngaged(q4.streamsExperts(), q4.expertStreamingRequired(), 0, budget.bytes));
+    try t.expect(expert_stream_mod.expertStreamingEngaged(q4.supportsExpertStreaming(), q4.expertStreamingRequired(), 0, budget.bytes));
 }
 
 test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
@@ -3729,20 +3756,22 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.free(params.config.expert_source_dir.?);
         params.config.expert_source_dir = null;
     };
-    const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.streamsExperts());
+    if (params.config.isGlm5()) {
+        const kv = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
+        if (kv.config.glmLatentBits() == null) {
+            log.err("[glm] native MLA cache supports --kv-quant 8 or off\n", .{});
+            return error.GlmKvQuantUnsupported;
+        }
+    }
+    const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());
     if (expert_stream_mod.expertStreamingEngaged(
-        params.config.streamsExperts(),
+        params.config.supportsExpertStreaming(),
         params.config.expertStreamingRequired(),
         params.expert_cache_bytes,
         streaming_budget.bytes,
     )) {
         const budget = streaming_budget;
         if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
-        const geometry = streamingGeometryOf(params.config);
-        const layout = try expert_stream_mod.quant.streamingLayoutOfDir(sch.allocator, sch.io, params.config.model_type, params.model_dir, geometry.layers, geometry.first_moe_layer);
-        params.config.expert_layout = layout;
-        var split = try model_mod.streamingResidentSplit(sch.io, sch.allocator, params.model_dir, layout);
-        split.trunk +|= mimoCoarseHeadBytes(params.config);
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
         if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
         switch (mtpStreamingVerdict(mtp)) {
@@ -3756,22 +3785,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             },
             .drop_default, .off => {},
         }
-        const mtp_resident = false;
         if (budget.from_setting)
             log.info("[expert-stream] ssd budget {d} GiB from model-settings.json\n", .{budget.bytes >> 30});
-        const per_expert = try expert_stream_mod.expertBytesFor(sch.allocator, params.model_dir, geometry, layout);
-        const resolved = try resolveExpertCache(params.expert_cache_bytes, budget.bytes, params.config, split, mtp_resident, per_expert);
-        if (resolved.overridden)
+        const plan = try planExpertStreaming(sch.io, sch.allocator, params.config, params.model_dir, params.expert_cache_bytes, budget.bytes);
+        if (plan.resolved.overridden)
             log.info("[expert-stream] --expert-cache-gb overrides --ssd-budget-gb: cache {d:.2} GB\n", .{
-                @as(f64, @floatFromInt(resolved.cache_bytes)) / 1e9,
+                @as(f64, @floatFromInt(plan.resolved.cache_bytes)) / 1e9,
             });
-        const plan = try expert_stream_mod.cachePlanBytes(
-            resolved.cache_bytes,
-            @intCast(params.config.expertLayerCount()),
-            geometry.experts,
-            per_expert,
-        );
-        if (resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
+        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
             led.budget_bytes >> 30,
             @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.mtp_bytes)) / 1e9,
@@ -3779,26 +3800,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             @as(f64, @floatFromInt(led.selected_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.bounce_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.cache_bytes)) / 1e9,
-            plan.slots_per_layer,
+            plan.cache.slots_per_layer,
         });
-        params.config.expert_streaming = true;
+        applyStreamingPlan(params.config, plan, budget.bytes);
         if (params.config.expert_source_dir == null) {
             params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
             expert_source_assigned = true;
         }
-        params.config.expert_cache_bytes = plan.cache_bytes;
-        params.config.expert_ssd_budget_bytes = if (resolved.ledger != null) budget.bytes else 0;
-        params.config.expert_workspace_bytes = plan.workspace_bytes;
-        params.config.expert_bounce_bytes = plan.bounce_bytes;
-        params.config.expert_fill_peak_bytes = plan.prefill_peak_bytes;
-        streaming_resident_bytes = split.trunk +| split.mtp;
+        streaming_resident_bytes = plan.split.trunk +| plan.split.mtp;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
     } else if (params.config.isGlm5()) {
-        const kv = transformer_mod.KvCacheChoice.resolve(params.config.kv_quant_override, params.kv_quant_config, params.kv_quant_explicit);
-        if (kv.config.glmLatentBits() == null) {
-            log.err("[glm] native MLA cache supports --kv-quant 8 or off\n", .{});
-            return error.GlmKvQuantUnsupported;
-        }
         streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, params.load_vision and params.config.glm5_vision);
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
         streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
@@ -3807,7 +3818,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     // Resolve the sidecar before preflight so billing and loading see the same dependency.
-    const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter, params.drafter_dir, params.model_dir);
+    const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter or try glmStreamedDrafterOff(params.config, params.drafter_dir), params.drafter_dir, params.model_dir);
     defer drafter.deinit(sch.allocator);
     var drafter_dir = drafter.dir;
     var prepared_drafter_path: ?[]u8 = null;
@@ -3966,7 +3977,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (kv_quant_config.isQuant()) "kv8" else "BF16", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
-        log.info("[glm] native vision {s}\n", .{if (params.load_vision and params.config.glm5_vision) "enabled (included in resident weight bill)" else "off (--no-vision or absent tower)"});
+        log.info("[glm] native vision {s}\n", .{if (params.config.expert_streaming) "off (expert streaming)" else if (params.load_vision and params.config.glm5_vision) "enabled (included in resident weight bill)" else "off (--no-vision or absent tower)"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0) log.warn("[glm] native recurrent state has no prefix-cache restore yet; RAM/disk prefix reuse off\n", .{});
     }
@@ -10574,24 +10585,27 @@ test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media bo
     try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
 }
 
-test "the ssd budget leaves a positive expert cache on the real quantized pack" {
+test "every real streamed pack and source on this box plans a streamed load" {
     const t = std.testing;
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try @import("test_models.zig").packPath(&path_buf, "Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit");
-    var probe = std.Io.Dir.openDirAbsolute(t.io, path, .{}) catch return error.SkipZigTest;
-    probe.close(t.io);
-    var config = model_mod.parseConfig(t.io, t.allocator, path) catch return error.SkipZigTest;
-    defer config.deinit(t.allocator);
-    const geometry = streamingGeometryOf(&config);
-    const layout = expert_stream_mod.quant.layoutOfDir(t.allocator, t.io, config.model_type, path, geometry.layers) orelse
-        return error.ExpertStreamingUnsupportedLayout;
-    try t.expectEqual(expert_stream_mod.quant.Layout.quantized_split, layout);
-    const per_expert = try expert_stream_mod.expertBytesFor(t.allocator, path, geometry, layout);
-    const split = try model_mod.streamingResidentSplit(t.io, t.allocator, path, layout);
-    const resolved = try resolveExpertCache(0, 50 << 30, &config, split, false, per_expert);
-    const ledger = resolved.ledger orelse return error.MissingLedger;
-    try t.expect(ledger.slots_per_layer > 1);
-    try t.expect(ledger.cache_bytes > 0);
+    const Case = struct { name: []const u8, layout: expert_stream_mod.quant.Layout };
+    for ([_]Case{
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4 },
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-4bpw", .layout = .exl3_k4 },
+        .{ .name = "Qwen/Qwen3.8-Flash-Next", .layout = .bf16_fused },
+        .{ .name = "MiMo-V2.6-Flash-Sushi-2.3bpw", .layout = .exl3_k4 },
+        .{ .name = "GLM-5.3-Flash-Sushi-2.3bpw", .layout = .exl3_k4 },
+        .{ .name = "GLM-5.3-Flash-Sushi-2.5bpw", .layout = .exl3_k4 },
+        .{ .name = "GLM-5.3-Flash-BF16", .layout = .bf16_individual },
+    }) |case| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try @import("test_models.zig").packPath(&path_buf, case.name);
+        var config = model_mod.parseConfig(t.io, t.allocator, path) catch continue;
+        defer config.deinit(t.allocator);
+        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30);
+        try t.expectEqual(case.layout, plan.layout);
+        try t.expect(plan.cache.slots_per_layer > 1);
+        try t.expect(plan.split.trunk > 0 and plan.split.trunk < 40 << 30);
+    }
 }
 
 test "a cleanup allocation failure never frees MLX on the connection thread" {

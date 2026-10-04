@@ -1,12 +1,12 @@
 # Engine: expert streaming (`--ssd-budget-gb` / `--expert-cache-gb` / per-model `ssd_budget_gb`)
 
 How a checkpoint whose routed experts do not fit in memory is served from SSD: the budget ledger, the per-layer LRU,
-the zero-copy slab I/O and the correctness bars. Read this before touching `src/expert_stream.zig` or
-`src/expert_io.zig`.
+the zero-copy slab I/O and the correctness bars. Read this before touching `src/expert_stream.zig`,
+`src/expert_io.zig` or `src/glm5_stream.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-memory-admission](engine-memory-admission.md), [arch-qwen4exp](arch-qwen4exp.md),
-[arch-mimo-v2](arch-mimo-v2.md), [server-lifecycle](server-lifecycle.md#settings).
+[arch-mimo-v2](arch-mimo-v2.md), [arch-glm5-next](arch-glm5-next.md), [server-lifecycle](server-lifecycle.md#settings).
 
 ## Code map
 
@@ -15,32 +15,45 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 | `src/expert_stream.zig` | `ExpertStore` spans, per-layer group-exact LRU + union bridge, zero-copy slabs, `BudgetLedger` (`--ssd-budget-gb`), MTP refusal |
 | `src/expert_io.zig` | SSD→Metal I/O: F_NOCACHE positioned-read `FillPool`, `PageSlab` epoch leases, verified zero-copy `importSlab` |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab |
+| `src/glm5_stream.zig` | GLM's routed experts over the engine (BF16 or EXL3 slabs), the native teacher's capture budget |
 | `src/imatrix.zig` | imatrix capture on the streamed forward |
 | `src/hidden_capture.zig` | block-boundary residual capture under `kld capture` |
 
 ## What streams
 
-Any qwen4_exp checkpoint whose routed experts are leading-index banks streams: the HF fused bf16 layout
-(`mlp.experts.gate_up_proj` `[512,1280,2560]` + `down_proj` `[512,2560,640]`, 335 GB total, `streaming_required`),
-or the MLX split layout (`switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`), or a uniform Sushi EXL3 pack: its
-nine banks per layer (trellis, suh, svh per projection) stream through the same slabs and the resident EXL3 kernels
-run on slab-local ids, output bit-identical to resident; the ledger bills from the stored headers, a slot sized to
-the widest layer rate. A MiMo EXL3 pack streams the same way beside its FP8 trunk. Rate-group (`.gN`) and pruned
-packs are refused by name and serve resident until their streaming lands. MiMo's original MXFP4 checkpoint streams too ([arch-mimo-v2](arch-mimo-v2.md)). Trunk + MTP resident; routed experts come from SSD through
-zero-copy slabs. With no budget a pack loads resident as before.
+One engine (`expert_stream.Engine`) streams every served model, keyed by the checkpoint's routed-expert layout, and
+one plan (`scheduler.planExpertStreaming`) sizes it for `serve`/`run`, the registry's cold-load gate and `sushi kld`.
+Each forward runs its own resident expert kernels on slab-local ids, so a streamed forward is bit-identical to the
+resident one; the ledger bills from the stored headers, a slot sized to the widest layer rate. The trunk (and MiMo's
+coarse lm_head) stays resident; with no budget a pack loads resident.
 
-The GLM-5.3-Flash native forward streams the BF16 source checkpoint's individual experts through the same cache and
-fill pool (`glm5_stream.zig`); `sushi kld capture` uses it for the lossless teacher. Router IDs are remapped to slab
-slots without touching scores, clamps or the FP32 weighted reduction (clamped BF16 GatherMM), and each layer completes
-before its slabs are reused. The total budget covers trunk, request reserve (at least 8 GiB), the full union slab,
-bounce buffers and at least one slot per MoE layer; the lazy trunk must fit before any tensor is evaluated. One
-request at a time, chunks at most 512; CPU GatherMM, DFlash and streamed quantized experts are refused by name
-([arch-glm5-next](arch-glm5-next.md)).
+| Model | Checkpoint | Layout | `serve`, `run`, `kld compare` | `kld capture` |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next | Sushi EXL3 pack | `exl3_k4` | streams | streams |
+| Qwen3.8-Flash-Next | BF16 source (335 GB) | `bf16_fused` | streams; required | streams (the teacher) |
+| MiMo-V2.6-Flash | Sushi EXL3 pack | `exl3_k4` beside the FP8 trunk | streams | streams |
+| MiMo-V2.6-Flash | original checkpoint | `mxfp4_individual` | streams; required | streams (the teacher) |
+| GLM-5.3-Flash | Sushi EXL3 pack | `exl3_k4` | streams | streams (a BF16-latent student reference) |
+| GLM-5.3-Flash | BF16 source (643 GB) | `bf16_individual` | streams; required | native streamed teacher |
+
+- Rate-group (`.gN`) and pruned EXL3 packs are refused by name (`Exl3RateGroupsStreamingUnsupported`,
+  `Exl3RaggedStreamingUnsupported`) and serve resident: an open gap, not the design.
+- Vision is not loaded under streaming: every streamed model serves text only.
+- GLM's routed experts go through `glm5_stream.Stream`: BF16 source experts through the clamped `gather_mm`
+  composite, EXL3 banks through the resident `routedExl3` dispatch; router ids become slot ids, scores, clamps and
+  the FP32 reduction are untouched, and each layer completes before its slabs are reused.
+- A streamed GLM keeps no speculative state: its DFlash2 assistant stays unloaded and an explicit `--drafter` is
+  refused (`GlmStreamingSpecUnsupported`).
+- A streamed GLM serves the kv8 or the BF16 latent; its request bill adds the fill peak, and its planned KV counts the
+  latent at the KV width plus the pooled index.
+- The native BF16 teacher capture (`glm5_kld_capture`) keeps its own budget (`glm5_stream.captureBudget`): trunk,
+  request reserve (at least 8 GiB), the full union slab, bounce buffers and at least one slot per MoE layer, the lazy
+  trunk bounded before any tensor is evaluated, one request, chunks of at most 512.
 
 ## Budget
 
 - `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident
-  target of N GiB = trunk + MTP + the 512-expert union workspace + selected slab + bounce; the remainder is a uniform
+  target of N GiB = trunk + MTP + the all-experts union workspace + selected slab + bounce; the remainder is a uniform
   per-layer LRU. `--expert-cache-gb` overrides (decimal GB of expert cache).
 - Precedence: `--expert-cache-gb` > `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming all three.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
@@ -48,7 +61,8 @@ request at a time, chunks at most 512; CPU GatherMM, DFlash and streamed quantiz
   rung against free memory; a pinned chunk is priced as given; an explicit
   `--prefill-chunk` only lowers the floor the load proves.
 - Admission `budget + planned KV <= wired limit`; the refusal names the `iogpu.wired_limit_mb` that would admit.
-  Under `--no-mtp` the head is not loaded at all.
+  Planned KV is the session bill per token (KV at its width plus Qwen's QSA history or GLM's pooled index) times the
+  planned context. Under `--no-mtp` the head is not loaded at all.
 - An imatrix capture's accumulators live in GPU headroom that admission reads: budgets for capture runs drop
   (MiMo 100 → 94 GB; Flash-Next 96 → 80 GiB no longer admits higher under current bills).
 
@@ -126,6 +140,11 @@ request at a time, chunks at most 512; CPU GatherMM, DFlash and streamed quantiz
 
 - Store-level same-expert byte identity (`real qwen expert store spans and source bytes are exact`); teacher replay
   via `kld compare` (the affine pack is the control); greedy determinism.
+- Streamed logits equal resident logits bit for bit through eviction and the union (`GLM serving streams EXL3
+  experts ...`); `every real streamed pack and source on this box plans a streamed load` plans each pack on the box.
+- Live (main `1e484c10` plus this change): GLM-5.3-Flash-Sushi-2.3bpw `kld compare --limit 1` on the 4x512 BF16
+  teacher scores the same every field streamed at `--ssd-budget-gb 32` (81 slots/layer) and resident, with the BF16
+  latent (KLD 0.044647, top-1 489/512) and with `--kv-quant 8` (KLD 0.042316, top-1 492/512).
 - Cross-day comparisons must match forwards on `hits` + `fill_bytes_per_row` (the SSD's delivered rate drifts).
 - `SUSHI_NGRAM_BF16_DIR=<hf checkpoint>` serves any pack with the ORIGINAL bf16 n-gram table so `kld compare`
   isolates the PLE table's cost.

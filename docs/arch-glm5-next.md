@@ -54,6 +54,8 @@ kept raw (Sushi-2.45bpw). Small BF16/FP32 tensors keep their source precision. T
   expansion beyond it (billed for the widest pending layer: 576 MiB at two pending layers).
 - The BF16 source checkpoint is the KLD teacher, run with SSD-streamed experts
   ([engine-expert-streaming](engine-expert-streaming.md)).
+- `--ssd-budget-gb`/`--expert-cache-gb` stream any pack's EXL3 experts, or the BF16 source's, through the same engine
+  for `serve`, `run` and `kld compare`: text only, DFlash2 off, output identical to the resident load.
 
 ## Serving loop
 

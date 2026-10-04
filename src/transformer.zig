@@ -12315,14 +12315,14 @@ test "a streamed expert engine whose imatrix collector fails is deinit'd, not on
     defer t.allocator.free(raw);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(t.io, &path_buf);
-    const config = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 1, .num_experts = 4, .expert_cache_bytes = 2 * 24576, .expert_source_dir = path_buf[0..path_len] };
+    const config = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 1, .num_experts = 4, .hidden_size = 64, .moe_intermediate_size = 64, .expert_cache_bytes = 2 * 24576, .expert_source_dir = path_buf[0..path_len] };
     // Armed capture: the collector is the allocation that can fail after the engine exists.
     _ = setenv(imatrix_capture.ENV_VAR, "/nonexistent/imatrix.safetensors", 1);
     defer _ = unsetenv(imatrix_capture.ENV_VAR);
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
-        const parts = Transformer.initExpertStream(failing.allocator(), &config, .{ .layers = 1, .experts = 4, .hidden = 64, .intermediate = 64 }, mlx.gpuStream()) catch continue;
+        const parts = Transformer.initExpertStream(failing.allocator(), &config, mlx.gpuStream()) catch continue;
         try t.expect(parts.imatrix != null);
         parts.imatrix.?.deinit();
         parts.engine.deinit();
@@ -17730,26 +17730,13 @@ pub const Transformer = struct {
                 if (qwen4_mtp) |*mtp_head| try evalQwen4MtpResident(mtp_head);
             }
             if (config.expert_streaming) {
-                const parts = try initExpertStream(allocator, &config, .{
-                    .layers = @intCast(config.num_hidden_layers),
-                    .experts = @intCast(config.num_experts),
-                    .hidden = config.hidden_size,
-                    .intermediate = config.moe_intermediate_size,
-                    .exl3_n = config.expert_quant_rate.n,
-                }, s);
+                const parts = try initExpertStream(allocator, &config, s);
                 expert_stream = parts.engine;
                 imatrix = parts.imatrix;
             }
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, {s}), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, if (config.expert_streaming and st.table.bits == 16) "sharded pread" else "mmapped", config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         } else if (std.mem.eql(u8, config.model_type, "mimo_v2") and config.expert_streaming) {
-            const parts = try initExpertStream(allocator, &config, .{
-                .layers = @intCast(config.num_hidden_layers),
-                .experts = @intCast(config.num_experts),
-                .hidden = config.hidden_size,
-                .intermediate = config.moe_intermediate_size,
-                .first_moe_layer = @intCast(config.first_k_dense_replace),
-                .exl3_n = config.expert_quant_rate.n,
-            }, s);
+            const parts = try initExpertStream(allocator, &config, s);
             expert_stream = parts.engine;
             imatrix = parts.imatrix;
         }
@@ -24205,14 +24192,18 @@ pub const Transformer = struct {
 
     const ExpertStreamParts = struct { engine: *expert_stream_mod.Engine, imatrix: ?*imatrix_capture.Collector };
 
+    /// The ONE streamed expert engine of a load, keyed by the config's layout.
+    fn newExpertEngine(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream) !*expert_stream_mod.Engine {
+        const engine = try allocator.create(expert_stream_mod.Engine);
+        errdefer allocator.destroy(engine);
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, config.expert_source_dir orelse return error.MissingExpertSourceDir, config.expertGeometry(), config.expert_cache_bytes, s, .{ .layout = config.expert_layout });
+        return engine;
+    }
+
     /// The streamed expert engine and the imatrix collector that rides it. Once built, the engine
     /// is deinit'd on failure: its I/O workers run until `deinit` joins them.
-    fn initExpertStream(allocator: std.mem.Allocator, config: *const ModelConfig, geometry: expert_stream_mod.Geometry, s: mlx.mlx_stream) !ExpertStreamParts {
-        const engine = try allocator.create(expert_stream_mod.Engine);
-        {
-            errdefer allocator.destroy(engine);
-            engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, config.expert_source_dir orelse return error.MissingExpertSourceDir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout });
-        }
+    fn initExpertStream(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream) !ExpertStreamParts {
+        const engine = try newExpertEngine(allocator, config, s);
         errdefer {
             engine.deinit();
             allocator.destroy(engine);
@@ -44599,9 +44590,14 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
 }
 
 fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
+    const engine = if (config.expert_streaming) try Transformer.newExpertEngine(allocator, &config, s) else null;
+    errdefer if (engine) |e| {
+        e.deinit();
+        allocator.destroy(e);
+    };
     const mdl = try allocator.create(glm5_mod.Model);
     errdefer allocator.destroy(mdl);
-    mdl.* = try glm5_mod.Model.load(allocator, config, weights, s);
+    mdl.* = try glm5_mod.Model.loadStreamed(allocator, config, weights, s, if (engine) |e| @import("glm5_stream.zig").Stream.serving(e, &config) else null);
     errdefer mdl.deinit();
     var request = try glm5_mod.Request.init(allocator, config.num_hidden_layers);
     errdefer request.deinit();
@@ -44610,6 +44606,7 @@ fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
     var shell = try initModuleShell(allocator, config, s);
     shell.glm5 = mdl;
     shell.glm5_request = request;
+    shell.expert_stream = engine;
     return shell;
 }
 
@@ -44644,7 +44641,9 @@ fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array,
             return err;
         };
     }
+    if (self.expert_stream) |engine| engine.beginForward();
     const logits = try mdl.forwardLastWithEmbedding(request, ids, true, embedded);
+    if (self.expert_stream) |engine| engine.finishForward(@intCast(mlx.getShape(ids)[1]));
     ctx.cache.step = request.offset;
     return logits;
 }
@@ -75979,6 +75978,135 @@ test "GLM serving stores the latent its slot cache names and refuses kv4 by name
     defer _ = mlx.mlx_array_free(plain);
     try testing.expectEqual(@as(u8, 0), served.latent_bits);
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(served.layers[3].attention.latent));
+}
+
+fn expectSameBits(expected: mlx.mlx_array, actual: mlx.mlx_array) ![]const u8 {
+    try mlx.check(mlx.mlx_array_eval(expected));
+    try mlx.check(mlx.mlx_array_eval(actual));
+    try testing.expectEqual(mlx.mlx_array_dtype(expected), mlx.mlx_array_dtype(actual));
+    try testing.expectEqualSlices(c_int, mlx.getShape(expected), mlx.getShape(actual));
+    const bytes = mlx.mlx_array_size(expected) * mlx.mlx_array_itemsize(expected);
+    const want = mlx.mlx_array_data_uint8(expected) orelse return error.UnreadableLogits;
+    const got = mlx.mlx_array_data_uint8(actual) orelse return error.UnreadableLogits;
+    try testing.expectEqualSlices(u8, want[0..bytes], got[0..bytes]);
+    return want[0..bytes];
+}
+
+/// The fixture's routed bank as a one-shard EXL3 pack index the expert store opens.
+fn writeGlmExl3Bank(dir: std.Io.Dir, path: []const u8, weights: *const Weights) !void {
+    const a = testing.allocator;
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(a);
+    try index.appendSlice(a, "{\"weight_map\":{");
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
+        for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, ci| {
+            const key = try std.fmt.allocPrintSentinel(a, "{s}.{s}.{s}", .{ glm5_mod.ROUTED_BANK_PREFIX, proj, part }, 0);
+            defer a.free(key);
+            try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, weights.get(key) orelse return error.MissingFixtureTensor));
+            const entry = try std.fmt.allocPrint(a, "{s}\"{s}\":\"experts.safetensors\"", .{ if (pi + ci == 0) "" else ",", key });
+            defer a.free(entry);
+            try index.appendSlice(a, entry);
+        }
+    }
+    try index.appendSlice(a, "}}");
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    const file = try std.fmt.allocPrintSentinel(a, "{s}/experts.safetensors", .{path}, 0);
+    defer a.free(file);
+    try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+    try dir.writeFile(testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+}
+
+test "GLM serving streams EXL3 experts through eviction and the union, bit-identical to resident at BF16 and kv8 latents" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glm5_mod.routedFixture(&weights, 4);
+    var trunk = Weights.init(a);
+    defer trunk.deinit();
+    _ = try glm5_mod.routedFixture(&trunk, 4);
+    try trunk.dropPrefix(glm5_mod.ROUTED_BANK_PREFIX);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    try writeGlmExl3Bank(tmp.dir, path, &weights);
+    var streamed_cfg = cfg;
+    streamed_cfg.expert_streaming = true;
+    streamed_cfg.expert_layout = .exl3_k4;
+    streamed_cfg.expert_source_dir = path;
+    streamed_cfg.expert_cache_bytes = 2 * try expert_stream_mod.expertBytesFor(a, path, cfg.expertGeometry(), .exl3_k4);
+    var resident = try Transformer.init(testing.io, a, cfg, &weights);
+    defer resident.deinit();
+    var streamed = try Transformer.init(testing.io, a, streamed_cfg, &trunk);
+    defer streamed.deinit();
+    const engine = streamed.expert_stream orelse return error.MissingExpertStream;
+    try engine.warmCache();
+    var union_seen = false;
+    for ([_]KVQuantConfig{ .dense, KVQuantConfig.affine(8) }) |kv| {
+        for ([_]*Transformer{ &resident, &streamed }) |xfm| {
+            try xfm.cache.reinit(cfg.num_hidden_layers, kv);
+            try xfm.resetCache();
+        }
+        var first_bytes: ?[8]u8 = null;
+        var logits_moved = false;
+        for ([_][]const u32{ &.{ 0, 1, 2, 3, 1 }, &.{2}, &.{3}, &.{0}, &.{1}, &.{ 2, 0 }, &.{3} }) |chunk| {
+            const ids = mlx.mlx_array_new_data(chunk.ptr, &[_]c_int{ 1, @intCast(chunk.len) }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(ids);
+            const expected = try resident.forward(ids);
+            defer _ = mlx.mlx_array_free(expected);
+            const actual = try streamed.forward(ids);
+            defer _ = mlx.mlx_array_free(actual);
+            const want = try expectSameBits(expected, actual);
+            if (first_bytes) |first| logits_moved = logits_moved or !std.mem.eql(u8, &first, want[0..8]) else first_bytes = want[0..8].*;
+            union_seen = union_seen or engine.breakdown().union_members > 0;
+        }
+        try testing.expect(logits_moved);
+        try testing.expectEqual(@as(u8, if (kv.isQuant()) 8 else 0), streamed.glm5_request.?.latent_bits);
+    }
+    try testing.expect(union_seen);
+    try testing.expect(engine.fill_experts_total > 4);
+}
+
+test "GLM serving streams BF16 source experts through the engine the native capture uses" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var trunk = Weights.init(a);
+    defer trunk.deinit();
+    const cfg = try glm5_mod.routedFixture(&trunk, 4);
+    try trunk.dropPrefix(glm5_mod.ROUTED_BANK_PREFIX);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try @import("glm_stream_fixture.zig").writeSized(a, tmp.dir, .none, 128, 128);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    var streamed_cfg = cfg;
+    streamed_cfg.expert_streaming = true;
+    streamed_cfg.expert_layout = .bf16_individual;
+    streamed_cfg.expert_source_dir = path;
+    streamed_cfg.expert_cache_bytes = 2 * try expert_stream_mod.expertBytesFor(a, path, cfg.expertGeometry(), .bf16_individual);
+    var streamed = try Transformer.init(testing.io, a, streamed_cfg, &trunk);
+    defer streamed.deinit();
+    var engine = try expert_stream_mod.Engine.initWithOptions(a, path, cfg.expertGeometry(), streamed_cfg.expert_cache_bytes, streamed.s, .{ .layout = .bf16_individual });
+    defer engine.deinit();
+    var native = try glm5_mod.Model.loadStreamed(a, cfg, &trunk, streamed.s, .{ .engine = &engine, .max_tokens = 16, .max_chunk = 16 });
+    defer native.deinit();
+    var request = try glm5_mod.Request.init(a, cfg.num_hidden_layers);
+    defer request.deinit();
+    request.dense_prefill = true;
+    for ([_][]const u32{ &.{ 0, 1, 2, 3, 1 }, &.{2}, &.{3}, &.{0} }) |chunk| {
+        const ids = mlx.mlx_array_new_data(chunk.ptr, &[_]c_int{ 1, @intCast(chunk.len) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const expected = try native.forwardLast(&request, ids, true);
+        defer _ = mlx.mlx_array_free(expected);
+        const actual = try streamed.forward(ids);
+        defer _ = mlx.mlx_array_free(actual);
+        _ = try expectSameBits(expected, actual);
+    }
+    try testing.expect(streamed.expert_stream.?.fill_bytes_total > 0);
 }
 
 test "GLM vision native serving splices media before HC expansion and preserves layer capture" {

@@ -1,22 +1,20 @@
-//! Native GLM routed BF16 experts over Sushi's fixed cache and I/O slabs.
+//! Native GLM routed experts over Sushi's shared expert cache: BF16 source experts or EXL3 pack banks.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const stream = @import("expert_stream.zig");
+const exl3 = @import("sushi_exl3");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 
 pub const Budget = struct { total: u64, trunk: u64, reserve: u64, cache: u64, fixed: u64 };
-fn geometryFor(cfg: *const model.ModelConfig) !stream.Geometry {
-    return .{ .layers = std.math.cast(u16, cfg.num_hidden_layers) orelse return error.InvalidGlmStreamBudget, .experts = std.math.cast(u16, cfg.num_experts) orelse return error.InvalidGlmStreamBudget, .hidden = cfg.hidden_size, .intermediate = cfg.moe_intermediate_size, .first_moe_layer = std.math.cast(u16, cfg.first_k_dense_replace) orelse return error.InvalidGlmStreamBudget };
-}
 fn bytesPerExpert(g: stream.Geometry) !u64 {
     return stream.expertBytes(try std.math.mul(u32, 2, g.intermediate), g.hidden, g.intermediate);
 }
 
 /// Retained lazy trunk metadata must fit this bound before tensor evaluation.
 pub fn trunkLimit(cfg: *const model.ModelConfig, total: u64, reserve: u64) !u64 {
-    const g = try geometryFor(cfg);
+    const g = cfg.expertGeometry();
     const bytes = try bytesPerExpert(g);
     const base = try plan(total, 0, reserve, g, bytes);
     const minimum_cache = try std.math.mul(u64, g.layers - g.first_moe_layer, bytes);
@@ -82,43 +80,43 @@ pub fn minimumReserve(cfg: *const model.ModelConfig, tokens: usize, chunk: usize
     return std.math.cast(u64, prepared + recurrent * 2 + caches + activations + attention_scratch + 64 * 1024 * 1024) orelse error.InvalidGlmStreamBudget;
 }
 
-/// The caller owns the trunk and this engine; destroy Model before either owner.
-/// One inference thread may use a stream at a time. Requests own only their caches.
-pub const Bf16 = struct {
-    engine: stream.Engine,
-    budget: Budget,
+/// A lossless teacher capture's BF16 expert budget: one request of `max_tokens`, chunks of at most 512.
+pub fn captureBudget(cfg: *const model.ModelConfig, total: u64, trunk: u64, reserve: u64, max_tokens: usize, max_chunk: usize) !Budget {
+    if (!cfg.isGlm5() or max_tokens == 0 or max_tokens > cfg.max_position_embeddings or max_chunk == 0 or max_chunk > max_tokens or max_chunk > 512) return error.InvalidGlmStreamBudget;
+    if (reserve < try minimumReserve(cfg, max_tokens, max_chunk)) return error.GlmStreamReserveTooSmall;
+    const g = cfg.expertGeometry();
+    return plan(total, trunk, reserve, g, try bytesPerExpert(g));
+}
+
+/// The caller owns the engine. One inference thread may use a stream at a time;
+/// requests own only their caches.
+pub const Stream = struct {
+    engine: *stream.Engine,
     max_tokens: usize,
     max_chunk: usize,
     request_owner: ?*const anyopaque = null,
 
-    pub fn init(a: std.mem.Allocator, directory: []const u8, cfg: *const model.ModelConfig, total: u64, trunk: u64, reserve: u64, max_tokens: usize, max_chunk: usize, s: mlx.mlx_stream) !Bf16 {
-        if (!mlx.streamIsGpu(s)) return error.GlmStreamRequiresGpu;
-        if (!cfg.isGlm5() or max_tokens == 0 or max_tokens > cfg.max_position_embeddings or max_chunk == 0 or max_chunk > max_tokens or max_chunk > 512) return error.InvalidGlmStreamBudget;
-        if (reserve < try minimumReserve(cfg, max_tokens, max_chunk)) return error.GlmStreamReserveTooSmall;
-        const g = try geometryFor(cfg);
-        const expert_bytes = try bytesPerExpert(g);
-        const budget = try plan(total, trunk, reserve, g, expert_bytes);
-        return .{ .engine = try stream.Engine.initWithOptions(a, directory, g, budget.cache, s, .{ .layout = .bf16_individual }), .budget = budget, .max_tokens = max_tokens, .max_chunk = max_chunk };
+    /// Serving admits each request itself; the stream bounds only the model's own context.
+    pub fn serving(engine: *stream.Engine, cfg: *const model.ModelConfig) Stream {
+        return .{ .engine = engine, .max_tokens = cfg.max_position_embeddings, .max_chunk = cfg.max_position_embeddings };
     }
-    pub fn deinit(self: *Bf16) void {
-        self.engine.deinit();
-    }
-    pub fn claim(self: *Bf16, owner: *const anyopaque) !void {
+    pub fn claim(self: *Stream, owner: *const anyopaque) !void {
         if (self.request_owner) |current| if (current != owner) return error.GlmStreamRequestBusy;
         self.request_owner = owner;
     }
-    pub fn release(self: *Bf16, owner: *const anyopaque) void {
+    pub fn release(self: *Stream, owner: *const anyopaque) void {
         if (self.request_owner == owner) self.request_owner = null;
     }
-    pub fn admit(self: *const Bf16, offset: usize, rows: usize) !void {
+    pub fn admit(self: *const Stream, offset: usize, rows: usize) !void {
         if (rows == 0 or rows > self.max_chunk or offset > self.max_tokens or rows > self.max_tokens - offset) return error.GlmStreamRequestBudgetExceeded;
     }
-    pub fn apply(self: *Bf16, layer: u16, ops: *Ops, x: Arr, ids: Arr, scores: Arr, limit: f32) !Arr {
+    /// Router ids reach the slabs as slot ids; scores, clamps and the reduction stay the resident path's.
+    pub fn apply(self: *Stream, layer: u16, ops: *Ops, x: Arr, ids: Arr, scores: Arr, cfg: *const model.ModelConfig) !Arr {
         if (!mlx.streamIsGpu(ops.s)) return error.GlmStreamRequiresGpu;
         const shape = mlx.getShape(x);
         const ish = mlx.getShape(ids);
         if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > self.max_chunk or shape[2] != self.engine.geometry.hidden or mlx.mlx_array_dtype(x) != .bfloat16 or
-            (mlx.mlx_array_dtype(ids) != .uint32 and mlx.mlx_array_dtype(ids) != .int32) or ish.len != 3 or ish[0] != 1 or ish[1] != shape[1] or ish[2] < 1 or ish[2] > self.engine.geometry.experts or !std.mem.eql(c_int, ish, mlx.getShape(scores)) or mlx.mlx_array_dtype(scores) != .float32 or limit != 10) return error.InvalidGlmStreamInput;
+            (mlx.mlx_array_dtype(ids) != .uint32 and mlx.mlx_array_dtype(ids) != .int32) or ish.len != 3 or ish[0] != 1 or ish[1] != shape[1] or ish[2] < 1 or ish[2] > self.engine.geometry.experts or !std.mem.eql(c_int, ish, mlx.getShape(scores)) or mlx.mlx_array_dtype(scores) != .float32 or cfg.glm_swiglu_limit != 10) return error.InvalidGlmStreamInput;
         var scope = Ops{ .s = ops.s };
         defer scope.deinit();
         const raw_ids = try scope.contiguous(try scope.cast(ids, .uint32));
@@ -138,12 +136,26 @@ pub const Bf16 = struct {
         defer self.engine.allocator.free(local);
         for (local, prepared.remapped) |*v, remap| v.* = remap;
         const remapped = try scope.own(mlx.mlx_array_new_data(local.ptr, ish.ptr, @intCast(ish.len), .uint32));
-        const out = try bf16Routed(&scope, x, prepared.gate, prepared.up, prepared.down, remapped, scores, limit);
+        const out = switch (self.engine.store.layout()) {
+            .bf16_individual => try bf16Routed(&scope, x, prepared.gate, prepared.up, prepared.down, remapped, scores, cfg.glm_swiglu_limit),
+            .exl3_k4 => try @import("glm5_forward.zig").routedExl3(&scope, x, exl3Bank(&prepared.quant_raw), remapped, scores, cfg),
+            else => return error.GlmStreamLayoutUnsupported,
+        };
         // Complete every slab reader before another layer can refill the union.
         try mlx.check(mlx.mlx_array_eval(out));
         return ops.own(try scope.result(out));
     }
 };
+
+fn exl3Bank(raw: *const [stream.quant.component_count]Arr) exl3.Bank {
+    const C = stream.quant.Component;
+    const proj = struct {
+        fn of(r: *const [stream.quant.component_count]Arr, w: C, s: C, b: C) exl3.Proj {
+            return .{ .trellis = r[@backingInt(w)], .suh = r[@backingInt(s)], .svh = r[@backingInt(b)] };
+        }
+    }.of;
+    return .{ .gate = proj(raw, .gate_w, .gate_s, .gate_b), .up = proj(raw, .up_w, .up_s, .up_b), .down = proj(raw, .down_w, .down_s, .down_b) };
+}
 
 /// Banks are [experts,input,output] views. Scores remain FP32 until the final cast.
 pub fn bf16Routed(ops: *Ops, x: Arr, gate: Arr, up: Arr, down: Arr, ids: Arr, scores: Arr, limit: f32) !Arr {
@@ -178,8 +190,10 @@ test "GLM stream GPU BF16 routed output matches resident through eviction union 
     const n = try tmp.dir.realPath(t.io, &path);
     const cpu = mlx.gpuStream();
     const geometry = stream.Geometry{ .layers = 4, .experts = 4, .hidden = 32, .intermediate = 16, .first_moe_layer = 3 };
-    var store = Bf16{ .engine = try stream.Engine.initWithOptions(t.allocator, path[0..n], geometry, 2 * 3072, cpu, .{ .layout = .bf16_individual, .bounce_size = 4096, .io_workers = 1 }), .budget = undefined, .max_tokens = 16, .max_chunk = 3 };
-    defer store.deinit();
+    var engine = try stream.Engine.initWithOptions(t.allocator, path[0..n], geometry, 2 * 3072, cpu, .{ .layout = .bf16_individual, .bounce_size = 4096, .io_workers = 1 });
+    defer engine.deinit();
+    var store = Stream{ .engine = &engine, .max_tokens = 16, .max_chunk = 3 };
+    const cfg = model.ModelConfig{ .glm_swiglu_limit = 10 };
     var banks: [3]Arr = undefined;
     for (&banks, 0..) |*bank, pi| {
         var raw: [4 * 512]u16 = undefined;
@@ -207,7 +221,7 @@ test "GLM stream GPU BF16 routed output matches resident through eviction union 
         const x = try ops.cast(try ops.own(mlx.mlx_array_new_data(&values, &.{ 1, 3, 32 }, 3, .float32)), .bfloat16);
         const ids = try ops.own(mlx.mlx_array_new_data(&route_ids, &.{ 1, 3, 2 }, 3, .uint32));
         const scores = try ops.own(mlx.mlx_array_new_data(&[_]f32{ 0.25, 0.75, 0.4, 0.6, 0.7, 0.3 }, &.{ 1, 3, 2 }, 3, .float32));
-        const actual = try store.apply(3, &ops, x, ids, scores, 10);
+        const actual = try store.apply(3, &ops, x, ids, scores, &cfg);
         const expected = try bf16Routed(&ops, x, banks[0], banks[1], banks[2], ids, scores, 10);
         try mlx.check(mlx.mlx_array_eval(expected));
         const bits = mlx.mlx_array_data_bfloat16(actual).?;
@@ -217,10 +231,10 @@ test "GLM stream GPU BF16 routed output matches resident through eviction union 
             old = try ops.result(actual);
             @memcpy(&first, bits[0..96]);
         } else try t.expectEqualSlices(u16, &first, mlx.mlx_array_data_bfloat16(old).?[0..96]);
-        try t.expectError(error.ExpertLayerAbsent, store.apply(0, &ops, x, ids, scores, 10));
+        try t.expectError(error.ExpertLayerAbsent, store.apply(0, &ops, x, ids, scores, &cfg));
         const bad = try ops.own(mlx.mlx_array_new_data(&[_]u32{ 4, 0, 0, 0, 0, 0 }, &.{ 1, 3, 2 }, 3, .uint32));
         const filled = store.engine.fill_bytes_total;
-        try t.expectError(error.ExpertOutOfRange, store.apply(3, &ops, x, bad, scores, 10));
+        try t.expectError(error.ExpertOutOfRange, store.apply(3, &ops, x, bad, scores, &cfg));
         try t.expectEqual(filled, store.engine.fill_bytes_total);
     }
     try t.expect(store.engine.fill_bytes_total > 4 * 3072);
@@ -230,7 +244,7 @@ test "GLM stream GPU BF16 routed output matches resident through eviction union 
 }
 
 test "GLM stream CPU only one request holds the admitted cache reserve" {
-    var store = Bf16{ .engine = undefined, .budget = undefined, .max_tokens = 16, .max_chunk = 4 };
+    var store = Stream{ .engine = undefined, .max_tokens = 16, .max_chunk = 4 };
     var a: u8 = 0;
     var b: u8 = 0;
     try store.claim(&a);
@@ -247,11 +261,11 @@ test "GLM stream CPU only one request holds the admitted cache reserve" {
 test "GLM stream CPU refuses unsupported BF16 gather before reading arrays" {
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    var store = Bf16{ .engine = undefined, .budget = undefined, .max_tokens = 16, .max_chunk = 4 };
+    var store = Stream{ .engine = undefined, .max_tokens = 16, .max_chunk = 4 };
     var ops = Ops{ .s = cpu };
     defer ops.deinit();
     const nil = Arr{ .ctx = null };
-    try std.testing.expectError(error.GlmStreamRequiresGpu, store.apply(0, &ops, nil, nil, nil, 10));
+    try std.testing.expectError(error.GlmStreamRequiresGpu, store.apply(0, &ops, nil, nil, nil, &.{ .glm_swiglu_limit = 10 }));
     try std.testing.expectError(error.GlmStreamRequiresGpu, bf16Routed(&ops, nil, nil, nil, nil, nil, nil, 10));
     try std.testing.expectEqual(@as(usize, 0), ops.count);
 }

@@ -51,10 +51,7 @@ pub fn expertBytes(gate_up_rows: u32, hidden: u32, intermediate: u32) !u64 {
     return std.math.mul(u64, std.math.add(u64, gate_elems, down_elems) catch return error.InvalidExpertGeometry, 2) catch return error.InvalidExpertGeometry;
 }
 
-pub fn moeLayerCount(geometry: Geometry) u16 {
-    if (geometry.first_moe_layer >= geometry.layers) return 0;
-    return geometry.layers - geometry.first_moe_layer;
-}
+pub const moeLayerCount = quant.moeLayerCount;
 
 fn warmSlotCount(slots_per_layer: u16) u16 {
     return @intCast((@as(u32, slots_per_layer) * 4) / 5);
@@ -83,14 +80,7 @@ pub fn expertBytesFor(allocator: std.mem.Allocator, model_dir: []const u8, geome
     switch (layout) {
         .bf16_fused => return expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate),
         .bf16_individual, .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
-            var store = try quant.QuantStore.openForLayout(allocator, model_dir, .{
-                .layers = geometry.layers,
-                .experts = geometry.experts,
-                .hidden = geometry.hidden,
-                .intermediate = geometry.intermediate,
-                .first_moe_layer = geometry.first_moe_layer,
-                .exl3_n = geometry.exl3_n,
-            }, layout);
+            var store = try quant.QuantStore.openForLayout(allocator, model_dir, geometry, layout);
             defer store.deinit();
             return store.expertBytes();
         },
@@ -157,7 +147,7 @@ pub fn mtpRefusal(expert_streaming: bool, mtp_requested: bool) ?[]const u8 {
 
 /// PURE: does this load stream its routed experts? A checkpoint with no resident
 /// arm always does; a capable one only when a cache or an SSD budget was asked for,
-/// so a quantized pack with neither loads exactly as it did before streaming existed.
+/// so a quantized pack with neither loads resident.
 pub fn expertStreamingEngaged(capable: bool, required: bool, explicit_cache_bytes: u64, budget_bytes: u64) bool {
     if (!capable) return false;
     return required or explicit_cache_bytes > 0 or budget_bytes > 0;
@@ -179,7 +169,7 @@ pub fn budgetOverriddenByExplicitCache(explicit_cache_bytes: u64, budget_bytes: 
 }
 
 /// The budget is the TOTAL resident target (GiB, the `--ssd-budget-gb` unit); the expert
-/// cache is what remains after trunk, MTP, the 512-expert union workspace, the selected
+/// cache is what remains after trunk, MTP, the all-experts union workspace, the selected
 /// slab and the bounce buffers. The PLE table is a disk gather and is never billed.
 pub fn budgetLedger(
     budget_bytes: u64,
@@ -551,17 +541,7 @@ pub const GroupCache = struct {
     }
 };
 
-pub const Geometry = struct {
-    layers: u16,
-    experts: u16,
-    hidden: u32,
-    intermediate: u32,
-    /// Absolute first routed-expert layer. Dense-prefix models keep earlier
-    /// indices addressable but do not allocate an expert bank for them.
-    first_moe_layer: u16 = 0,
-    /// EXL3 halfwords per packed tile (K = n/16); ignored by every other layout.
-    exl3_n: u32 = 64,
-};
+pub const Geometry = quant.Geometry;
 
 pub const Component = enum(u1) {
     gate_up,
@@ -691,14 +671,7 @@ pub const ExpertStore = struct {
 
     pub fn openLayout(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, chosen: quant.Layout) !ExpertStore {
         if (chosen == .bf16_fused) return open(allocator, model_dir, geometry);
-        const q = try quant.QuantStore.openForLayout(allocator, model_dir, .{
-            .layers = geometry.layers,
-            .experts = geometry.experts,
-            .hidden = geometry.hidden,
-            .intermediate = geometry.intermediate,
-            .first_moe_layer = geometry.first_moe_layer,
-            .exl3_n = geometry.exl3_n,
-        }, chosen);
+        const q = try quant.QuantStore.openForLayout(allocator, model_dir, geometry, chosen);
         return .{ .allocator = allocator, .geometry = geometry, .files = &.{}, .spans = &.{}, .quantized = q };
     }
 
@@ -1338,10 +1311,6 @@ pub const Engine = struct {
         return false;
     }
 
-    pub fn init(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, requested_bytes: u64, s: mlx.mlx_stream) !Engine {
-        return initWithOptions(allocator, model_dir, geometry, requested_bytes, s, .{});
-    }
-
     pub fn initWithOptions(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, requested_bytes: u64, s: mlx.mlx_stream, opts: Options) !Engine {
         var store = try ExpertStore.openLayout(allocator, model_dir, geometry, opts.layout);
         errdefer store.deinit();
@@ -1588,8 +1557,6 @@ pub const Engine = struct {
         if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
         const layer = &self.layers[layer_index];
         if (!layer.active or layer.slabs.len != self.store.componentCount()) return null;
-        const experts = layer.cache.expert_to_slot.len;
-        _ = experts;
         try layer.refreshSpec(self.allocator);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
@@ -1964,7 +1931,7 @@ test "a capable checkpoint streams only when it must or when a budget was asked 
     try t.expect(!expertStreamingEngaged(false, true, 0, 60 << 30));
     // The dense HF checkpoint cannot load resident: it streams with no budget.
     try t.expect(expertStreamingEngaged(true, true, 0, 0));
-    // A quantized pack with neither flag loads resident, exactly as before.
+    // A quantized pack with neither flag loads resident.
     try t.expect(!expertStreamingEngaged(true, false, 0, 0));
     try t.expect(expertStreamingEngaged(true, false, 0, 50 << 30));
     try t.expect(expertStreamingEngaged(true, false, 60_000_000_000, 0));

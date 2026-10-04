@@ -29,7 +29,7 @@ pub fn tryRun(a: std.mem.Allocator, io: std.Io, opts: kld.Options, out: *kld.Out
     try run(a, io, &cfg, opts, out);
     return true;
 }
-test "GLM native KLD capture dispatch precedes unsupported serving loader" {
+test "GLM native KLD capture takes the lossless teacher before the generic loader" {
     const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .bf16_individual };
     const opts = kld.Options{ .command = .capture, .no_template = true, .tokens = 512, .ssd_budget_bytes = 100 << 30 };
     if (!(try accepts(&cfg, opts))) return error.MissingNativeGlmCapture;
@@ -261,9 +261,10 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
     defer weights.deinit();
     const payload = native.storedBytes(&weights);
     if (payload != headers.trunk_bytes) return error.NativeGlmTeacherStoredBytesChanged;
-    var store = try streaming.Bf16.init(a, opts.model_dir, cfg, opts.ssd_budget_bytes, payload, reserve, max_tokens, chunk, s);
-    defer store.deinit();
-    var net = try forward.Model.loadWithBf16Stream(a, cfg.*, &weights, s, &store);
+    const budget = try streaming.captureBudget(cfg, opts.ssd_budget_bytes, payload, reserve, max_tokens, chunk);
+    var engine = try @import("expert_stream.zig").Engine.initWithOptions(a, opts.model_dir, cfg.expertGeometry(), budget.cache, s, .{ .layout = .bf16_individual });
+    defer engine.deinit();
+    var net = try forward.Model.loadStreamed(a, cfg.*, &weights, s, .{ .engine = &engine, .max_tokens = max_tokens, .max_chunk = chunk });
     defer net.deinit();
     const loaded_active = try activeBound(limit, reserve);
     var request = try forward.Request.init(a, cfg.num_hidden_layers);
@@ -338,7 +339,7 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
     if (!std.mem.eql(u8, &headers.shard_stat_sha256, &final_shards.shard_stat_sha256)) return error.NativeGlmTeacherSourceChanged;
     try completeBaseline(a, io, staging, records.items.len, opts.tokens);
     if (cached != 0 or peak > limit) return error.GlmResidentBudgetExceeded;
-    try json(a, io, staging, "identity.json", .{ .schema = "sushi-native-glm-capture-v1", .complete = true, .engine = "sushi-native-glm", .model = opts.model_dir, .source_storage = "indexed BF16/F32 trunk; individual BF16 experts, as stored", .config_sha256 = &config_sha, .index_sha256 = &index_sha, .tokenizer_sha256 = &tokenizer_sha, .kda_unary_modes = try @import("glm5_kda_fused.zig").unaryModes(s), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .kda_post_dispatches = @import("glm5_kda_fused.zig").postDispatchCount(), .kda_prework_dispatches = @import("glm5_kda_prework.zig").dispatchCount(), .trunk_header_audit = headers, .shard_stat_sha256 = &headers.shard_stat_sha256, .logits_dtype = @tagName(logits_dtype.?), .logits_export = "exact full-vocabulary little-endian float32", .vocab_size = cfg.vocab_size, .tokens_per_prompt = opts.tokens, .prompt_count = records.items.len, .prefix_chunk = chunk, .final_request_offset = final_offset, .kv_cache_format = "bf16", .kda_state_format = "float32", .dense_prefill = true, .synchronous_layers = true, .mtp = false, .dflash = false, .tf32 = false, .template = false, .prefix_reuse = false, .stream_budget = store.budget, .stream_cache_slots = store.engine.plan.slots_per_layer, .stream_fill_bytes = store.engine.fill_bytes_total, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = limit, .wired_limit_bytes = limit, .allocator_cache_bytes = cached, .elapsed_seconds = elapsed });
+    try json(a, io, staging, "identity.json", .{ .schema = "sushi-native-glm-capture-v1", .complete = true, .engine = "sushi-native-glm", .model = opts.model_dir, .source_storage = "indexed BF16/F32 trunk; individual BF16 experts, as stored", .config_sha256 = &config_sha, .index_sha256 = &index_sha, .tokenizer_sha256 = &tokenizer_sha, .kda_unary_modes = try @import("glm5_kda_fused.zig").unaryModes(s), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .kda_post_dispatches = @import("glm5_kda_fused.zig").postDispatchCount(), .kda_prework_dispatches = @import("glm5_kda_prework.zig").dispatchCount(), .trunk_header_audit = headers, .shard_stat_sha256 = &headers.shard_stat_sha256, .logits_dtype = @tagName(logits_dtype.?), .logits_export = "exact full-vocabulary little-endian float32", .vocab_size = cfg.vocab_size, .tokens_per_prompt = opts.tokens, .prompt_count = records.items.len, .prefix_chunk = chunk, .final_request_offset = final_offset, .kv_cache_format = "bf16", .kda_state_format = "float32", .dense_prefill = true, .synchronous_layers = true, .mtp = false, .dflash = false, .tf32 = false, .template = false, .prefix_reuse = false, .stream_budget = budget, .stream_cache_slots = engine.plan.slots_per_layer, .stream_fill_bytes = engine.fill_bytes_total, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = limit, .wired_limit_bytes = limit, .allocator_cache_bytes = cached, .elapsed_seconds = elapsed });
     try json(a, io, staging, "progress.json", .{ .complete = true, .phase = "complete", .completed_prompts = records.items.len, .completed_rows = records.items.len * opts.tokens });
     try cwd.renamePreserve(staging, cwd, opts.out_dir, io);
     out.print("[kld] native GLM captured {d} prompts x {d} full-vocabulary rows into {s}\n", .{ records.items.len, opts.tokens, opts.out_dir });

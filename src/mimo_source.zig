@@ -2220,7 +2220,7 @@ fn checkMimoExl3StreamTrunk(runtime: bool) !void {
     cfg.expert_streaming = true;
     const streamed_bill = try residentBytesWithConfig(t.io, a, path, &cfg);
     try t.expectEqual(@as(u64, 3 * (2 * 8 * 8 * 36 * 2 + 2 * 2 * 128 * 2)), resident_bill - streamed_bill);
-    try t.expectEqual(streamed_bill, (try model.streamingResidentSplit(t.io, a, path, .exl3_k4)).trunk);
+    try t.expectEqual(streamed_bill, (try model.streamingResidentSplit(t.io, a, path, &cfg)).trunk);
     if (!runtime) return;
     cfg.expert_streaming = false;
     var resident = try model.loadWeightsForConfig(t.io, a, path, &cfg, false);

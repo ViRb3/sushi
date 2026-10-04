@@ -10,6 +10,12 @@ earlier history is mlx-serve's, in that project's changelog.
   instead of failing to compile mlx-c after a plain `git pull`.
 - **GLM-5.3 now stores its MLA latent at 8 bits by default**, like every model: 6,688 instead of 11,968 bytes per
   token. `--kv-quant 16` (or a request's `kv_quant: 16`) keeps it BF16; `16` is accepted for every model.
+- **GLM-5.3-Flash streams its experts from SSD** under `--ssd-budget-gb`/`--expert-cache-gb`, for Sushi packs and the
+  BF16 source checkpoint alike, in `serve`, `run` and `kld compare`; streamed output is identical to resident, text
+  only, without the DFlash2 assistant.
+- **`sushi kld` plans a streamed load exactly as `serve` does**: rate-group packs are refused by name and a streamed
+  MiMo bills its coarse lm_head.
+- **A streamed Qwen's load admission counts its QSA history** beside the KV cache, as the context sizer already did.
 - **GLM's first load prepares its DFlash2 assistant as A4/group-64** (was A6/group-128), 0.24 GB smaller with identical
   output; an existing A6 cache is rebuilt once.
 - **`--wired-margin-gib` defaults to 4 GiB (was 8)**, so a raised `iogpu.wired_limit_mb` admits 4 GiB more weights
