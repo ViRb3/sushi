@@ -1338,3 +1338,18 @@ Quiet bench, binary `b8267038` (carries the four wins), llmprobe 0.6.13 `--bench
 kv8 and BF16 latents decode within noise on one pack; the 32K ladder gap is acceptance (2.74 against 2.06 tokens
 per step). Four concurrent requests decode 44 tok/s in aggregate against ~34 alone. The 2.3bpw row matches or beats
 the `4fcb541e` table in [arch-glm5-next](arch-glm5-next.md#recorded-performance).
+
+<a id="mtp-depth-policy"></a>
+## MTP depth policy (acceptance EMAs below 8k KV)
+
+Commit 81c36bb5, Sushi-2.6bpw, kv8, ctx 32768, solo greedy 256 tokens, 5 reps per prompt, `taskpolicy -a`, lock
+`qport-mtp`, shared box. A = accept policy, B = the previous planner (a pre-removal env switch, `SUSHI_MTP_DEPTH_POLICY=legacy`), boots A B B A, median tok/s:
+
+| prompt | A1 | B1 | B2 | A2 |
+|---|---|---|---|---|
+| code | 83.4 | 78.2 | 75.6 | 76.5 |
+| prose | 62.0 | 62.9 | 61.0 | 61.6 |
+| echo | 93.6 | 96.2 | 90.6 | 92.5 |
+| mixed | 71.8 | 66.6 | 66.7 | 68.6 |
+
+Output hashes are identical in all four boots. A logs `ext_rounds=0`, B extends. About +2% average, code +4%, mixed +5%, prose/echo flat, within ~5% boot drift.
