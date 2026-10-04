@@ -2147,7 +2147,14 @@ pub const HotPrefixCache = struct {
             }
         }
 
-        var new_snap = try source_cache.snapshotRetained(mlx.gpuStream());
+        // Ownership of `ssm_cps` is ours from entry; no cleanup is armed until here.
+        var new_snap = source_cache.snapshotRetained(mlx.gpuStream()) catch |err| {
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
+            return err;
+        };
         // The speculative-side payloads are best-effort: a snapshot failure
         // must not cost the trunk KV entry they ride on.
         var new_dflash: ?DflashSnap = null;
@@ -11795,4 +11802,33 @@ test "a GLM commit copies only the rows its destination tier keeps, chosen befor
     try t.expectEqual(@as(?usize, 262144), HotPrefixCache.glmCommitLenFor(policy, 2 * gib, true, 1_040_000, row, 0, &positions, &bytes));
     try t.expectEqual(@as(?usize, null), HotPrefixCache.glmCommitLenFor(policy, 0, true, 1_040_000, row, 0, &positions, &bytes));
     try t.expectEqual(@as(?usize, null), HotPrefixCache.glmCommitLenFor(policy, gib, false, 0, row, 0, &.{}, &.{}));
+}
+
+test "a GLM commit whose retention snapshot fails still destroys every transferred checkpoint once" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
+    for (cps, 0..) |*cp, i| {
+        const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 2);
+        for (layers) |*l| l.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        cp.* = .{ .pos = (i + 1) * 8, .layers = layers };
+    }
+    const rows: glm5_prefix.MlaRows = .{
+        .allocator = testing.allocator,
+        .layers = try testing.allocator.alloc(glm5_prefix.MlaRows.Layer, 2),
+        .len = 8,
+        .latent_bits = 8,
+    };
+    @memset(rows.layers, .{});
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    var source = try KVCache.initWithConfig(failing.allocator(), 2, glmKvConfig(8));
+    // The next allocation is the retention snapshot's.
+    failing.fail_index = failing.alloc_index;
+    defer source.deinit();
+
+    var hc = HotPrefixCache.init(testing.allocator, 2);
+    defer hc.deinit();
+    const tokens: [24]u32 = @splat(1);
+    try testing.expectError(error.OutOfMemory, hc.commitGlm(&source, &tokens, false, 0, 0, null, cps, rows, null, tokens.len));
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
 }

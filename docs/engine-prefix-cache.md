@@ -236,7 +236,9 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
     after the response. There is no prefill write-through; a flush is bounded by the 2 GB readback, and a later
     turn's commit extends a partial entry.
 - **A decode-phase cancel commits in `cullDecoding`**, before `releaseNativeState` resets the request that the
-  cleanup drain's commit would otherwise read.
+  cleanup drain's commit would otherwise read. The drop decision is taken once per slot under `queue_mu`; the commit
+  and the release run outside it on the dropped slots, so a late cancel waits for the next tick.
+- **`commitImpl` owns the transferred checkpoints on every outcome**, including a failure of the retention snapshot.
 - **One schedule drives the capture and its bill** (`generate.glmCaptureSchedule`: the grid points in the tail, the
   prompt-end checkpoint, pool alignment, cold/warm backoff, the cap). The configured stride never enters, and
   `glmChunkEnd` keeps the tail merge from absorbing a grid point, so the billed count is the captured count.
