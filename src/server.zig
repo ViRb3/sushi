@@ -2021,6 +2021,8 @@ pub fn serve(
     // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
     scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
     defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
+    scheduler_mod.vision_encode_available = &visionEncodeAvailable;
+    defer scheduler_mod.vision_encode_available = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -14211,6 +14213,13 @@ fn towerFitFault(config: *const model_mod.ModelConfig, images: []const chat_mod.
     return MediaFault.init(false, "encoding the media needs ~{d} MB of GPU memory (its largest block has {d} patches), ~{d} MB is available", .{ needed / mb, worst, available / mb });
 }
 
+/// What `scheduler_mod.vision_encode_available` reads on the inference thread, right before an encode.
+fn visionEncodeAvailable(config: *const model_mod.ModelConfig) u64 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    return currentGpuMemoryCeiling(config, active_mem) -| active_mem;
+}
+
 /// One media block of the expanded prompt, in prompt order.
 const PlacedMedia = struct { kind: chat_mod.MediaPart.Kind, start: usize, rows: usize };
 
@@ -14390,10 +14399,7 @@ fn prepareRequestMedia(
     if (placed.ids.len > ctx_limit) {
         return .{ .refused = MediaFault.init(false, "prompt ({d} tokens, {d} of them from {d} images and {d} videos) exceeds the {d}-token context", .{ placed.ids.len, placed.rows, flat.images.len, flat.videos.len, ctx_limit }) };
     }
-    var active_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
-    const ceiling = currentGpuMemoryCeiling(config, active_mem);
-    if (towerFitFault(config, flat.images, flat.videos, placed.rows, ceiling -| active_mem)) |fault| return .{ .refused = fault };
+    if (towerFitFault(config, flat.images, flat.videos, placed.rows, visionEncodeAvailable(config))) |fault| return .{ .refused = fault };
 
     const chain = try mediaChain(allocator, placed.items, flat.images, flat.videos);
     var ready: PreparedMedia = .{ .chain = chain };
@@ -14421,11 +14427,15 @@ fn prepareRequestMedia(
         .images = pix,
         .videos = vids,
         .order = order,
+        .bill_bytes = if (config.qv_heads == 0) 0 else visionEncodeBill(config, flat.images, flat.videos, placed.rows).bytes,
         .allocator = allocator,
     };
     const arr = global_scheduler.?.encodeVision(&req) catch |err| {
         const name = req.error_name orelse @errorName(err);
-        const fault = MediaFault.init(true, "vision encoding failed: {s}", .{name});
+        const fault = if (std.mem.eql(u8, name, scheduler_mod.vision_headroom_error))
+            towerFitFault(config, flat.images, flat.videos, placed.rows, req.available_bytes) orelse MediaFault.init(true, "vision encoding failed: {s}", .{name})
+        else
+            MediaFault.init(true, "vision encoding failed: {s}", .{name});
         if (req.error_name) |e| allocator.free(e);
         ready.deinit(allocator);
         return .{ .refused = fault };

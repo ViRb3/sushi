@@ -364,6 +364,15 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 /// Logs the numbers the estimator compared on a refusal.
 pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) ?model_registry_mod.MemoryContextRefusal = null;
 
+/// GPU bytes a vision encode may still take, read live (`server.visionEncodeAvailable`). Null skips the recheck.
+pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 = null;
+
+/// The `VisionEncodeRequest.error_name` of an encode whose bill no longer fits when its turn comes.
+pub const vision_headroom_error = "VisionHeadroomExceeded";
+
+/// Tests only: stands in for the tower on one image block.
+var vision_block_test_hook: ?*const fn (VisionImagePixels) anyerror!mlx.mlx_array = null;
+
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
 
@@ -1087,6 +1096,11 @@ pub const VisionEncodeRequest = struct {
     n_vision_tokens: usize = 0,
     n_video_tokens: usize = 0,
     n_audio_tokens: usize = 0,
+    /// `server.visionEncodeBill` of this request; the inference thread refuses the encode when
+    /// the GPU has less left when its turn comes. 0 = unbilled.
+    bill_bytes: u64 = 0,
+    /// Output: what the GPU had left when `vision_headroom_error` refused the encode.
+    available_bytes: u64 = 0,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
@@ -5670,6 +5684,7 @@ fn flushImatrixCaptures(sch: *Scheduler) void {
 /// One image through the tower: a patch-grid ViT takes pixel_values [N, feat]
 /// and yields [1, N/merge², hidden]; a fixed-square tower takes CHW.
 fn encodeImageBlock(vision_enc: *VisionEncoder, img: VisionImagePixels) !mlx.mlx_array {
+    if (@import("builtin").is_test) if (vision_block_test_hook) |hook| return hook(img);
     if (img.grid_h > 0) {
         const n: usize = @as(usize, img.grid_h) * img.grid_w;
         const feat: usize = (img.pixels.len / 4) / n;
@@ -5709,6 +5724,16 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
+    // The connection thread's fit check ran before the queue: a prefill's cache growth, or the
+    // output of an encode ahead of this one, may have taken the headroom since.
+    if (req.bill_bytes > 0) if (vision_encode_available) |available_fn| if (req.model.config) |cfg| {
+        const available = available_fn(cfg);
+        if (req.bill_bytes > available) {
+            req.available_bytes = available;
+            finishVisionRequest(sch, req, vision_headroom_error);
+            return;
+        }
+    };
 
     // Encode all soft tokens into `emb_parts`: images and videos in prompt
     // `order`, then audio, so the single splice channel scatters them in the
@@ -12475,4 +12500,74 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     const row = &sch.live_sessions[0];
     try testing.expectEqual(cp_bytes, row.state_bytes);
     try testing.expectEqual(@as(u64, 7), row.entry_id);
+}
+
+test "a queued vision encode is refused when its bill no longer fits, and an earlier output counts as spent" {
+    const Probe = struct {
+        var capacity: u64 = 0;
+        var resident: u64 = 0;
+        var tower_runs: usize = 0;
+        fn available(_: *const ModelConfig) u64 {
+            return capacity -| resident;
+        }
+        fn tower(_: VisionImagePixels) anyerror!mlx.mlx_array {
+            tower_runs += 1;
+            resident += 100;
+            const rows = [_]f32{ 0, 0, 0, 0 };
+            return mlx.mlx_array_new_data(&rows, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+        }
+        fn run(sch: *Scheduler, model: *LoadedModel, bill: u64) !VisionEncodeRequest {
+            const pixels = [_]VisionImagePixels{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+            var req = VisionEncodeRequest{ .model = model, .images = &pixels, .bill_bytes = bill, .allocator = testing.allocator };
+            runVisionEncode(sch, &req);
+            return req;
+        }
+    };
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.vision_encoder = @ptrFromInt(@alignOf(VisionEncoder));
+    vision_block_test_hook = Probe.tower;
+    vision_encode_available = Probe.available;
+    defer {
+        vision_block_test_hook = null;
+        vision_encode_available = null;
+    }
+
+    // Headroom shrank after the connection thread's check: the tower never runs.
+    Probe.capacity = 50;
+    Probe.resident = 0;
+    Probe.tower_runs = 0;
+    const refused = try Probe.run(&sch, &model, 100);
+    defer if (refused.error_name) |e| testing.allocator.free(e);
+    try testing.expectEqualStrings(vision_headroom_error, refused.error_name orelse return error.TestExpectedRefusal);
+    try testing.expectEqual(@as(u64, 50), refused.available_bytes);
+    try testing.expect(refused.done);
+    try testing.expect(refused.result == null);
+    try testing.expectEqual(@as(usize, 0), Probe.tower_runs);
+
+    // Two encodes queued together: the first fits, and its output (held by its connection thread)
+    // leaves the second without room.
+    Probe.capacity = 150;
+    Probe.resident = 0;
+    const first = try Probe.run(&sch, &model, 100);
+    defer if (first.result) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    try testing.expect(first.error_name == null);
+    try testing.expectEqual(@as(usize, 1), Probe.tower_runs);
+    const second = try Probe.run(&sch, &model, 100);
+    defer if (second.error_name) |e| testing.allocator.free(e);
+    try testing.expectEqualStrings(vision_headroom_error, second.error_name orelse return error.TestExpectedRefusal);
+    try testing.expectEqual(@as(u64, 50), second.available_bytes);
+    try testing.expectEqual(@as(usize, 1), Probe.tower_runs);
+
+    // An unbilled request (a tower with no bill) is never refused here.
+    const unbilled = try Probe.run(&sch, &model, 0);
+    defer if (unbilled.result) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    try testing.expect(unbilled.error_name == null);
 }
