@@ -17147,6 +17147,7 @@ pub const Transformer = struct {
             qsaScoreFusedArm();
             qsaNaxArm();
         }
+        fp8_block.tile_nax = verifyQmmNaxAvailable();
         const prefix = config.weight_prefix;
 
         var name_buf: [256]u8 = undefined;
@@ -18750,7 +18751,7 @@ pub const Transformer = struct {
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
         // u8 codes + f32 tile scales = an FP8 source linear (`mimo_source`).
-        if (mlx.mlx_array_dtype(w) == .uint8) return fp8_block.linear(self.s, x, w, sc);
+        if (mlx.mlx_array_dtype(w) == .uint8) return fp8_block.linearServing(self.s, x, w, sc);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the
         // global config; per-weight overrides (mixed-precision checkpoints, e.g.
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
@@ -28593,7 +28594,7 @@ pub const Transformer = struct {
             // The source FP8 QKV: q_w holds all three, rank-local; V leaves it already scaled.
             var split = try fp8_block.RowSplit.qkv(@intCast(h_count * hd), @intCast(kv_h * hd), @intCast(kv_h * vhd), @intCast(mlx.getShape(fa.q_s)[0]));
             split.v_scale = cfg.attention_value_scale;
-            try fp8_block.project(self.s, x, fa.q_w, fa.q_s, split, &proj);
+            try fp8_block.projectServing(self.s, x, fa.q_w, fa.q_s, split, &proj);
         } else {
             proj[0] = try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
             proj[1] = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);

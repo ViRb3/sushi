@@ -841,6 +841,52 @@ tok/s over the four runs per arm:
   already land ~3.9 tokens per round on a verbatim copy, and a three-draft lookup round (47-51 ms) costs what an MTP
   round does.
 
+<a id="mimo-fp8-tile"></a>
+### MiMo-V2.6-Flash-Sushi-2.3bpw: the FP8 trunk audit and the 9-128-row tile (this change, measured at 01319267)
+
+Audit, `SUSHI_FP8_UBENCH=1` at MiMo's trunk shapes, six weight copies, arms interleaved in one process, medians of 5-30
+laps, `taskpolicy -a`, GPU lock, fans at max, 180 s idle, 2026-10-04:
+
+- 1-4 rows (direct GEMV): 443-477 GB/s against ~538 delivered, 1.7x MLX's bf16 GEMV and 4-12% ahead of its affine-8
+  qmv; the geometry was already swept. 5-8 rows (NR 2, SGS 8): 147-202 us, as recorded at [8 rows](#mimo-verify-8).
+- 2048 rows: the dequant pass costs 6-8% over the bare MLX GEMM per call, ~1% of a 2k chunk.
+- The weak band was 9-256 rows: the staged arm ran 2-3x slower than MLX's affine-8 kernel at 16 rows, and the dequant
+  pass costs a flat 300-400 us per call (182 MB at ~575 GB/s) on top of the GEMM.
+
+The tile against the arm it replaces (staged at 9-16, dequant + MLX GEMM from 17), us per call:
+
+| shape | 9 | 16 | 32 | 64 | 128 | 256 (not served) |
+|---|---|---|---|---|---|---|
+| qkv global | 146 / 233 | 158 / 494 | 196 / 720 | 329 / 752 | 647 / 824 | 1310 / 966 |
+| qkv sliding | 150 / 243 | 177 / 524 | 217 / 754 | 370 / 785 | 798 / 863 | 1533 / 1038 |
+| L0 gate/up | 160 / 265 | 189 / 565 | 242 / 800 | 417 / 807 | 887 / 954 | 1789 / 1062 |
+| L0 down | 208 / 328 | 196 / 653 | 212 / 804 | 317 / 807 | 904 / 868 | 1309 / 1164 |
+
+In-process prefill meter (`SUSHI_PREFILL_UBENCH=6`, real text, one cold forward, `--kv-quant 8`, arms off / on / on /
+off in one boot, `taskpolicy -a`, lock, 2026-10-05), ms per forward:
+
+| rows | tile off | tile on | prefill tok/s |
+|---|---|---|---|
+| 32 | 155.1 / 155.8 | 120.8 / 120.8 | 206 -> 265 (x1.29) |
+| 64 | 185.1 / 195.4 | 156.9 / 165.1 | 337 -> 398 (x1.18) |
+| 128 | 226.5 / 232.0 | 208.0 / 208.9 | 559 -> 614 (x1.10) |
+
+Serving, A B B A boots (A = tile off), 17-25-token chat prompts, greedy, thinking off, `--kv-quant 8
+--max-concurrent 12`:
+
+- MTP on, 32 prompts, 256 tokens each: 2.414 / 2.406 / 2.461 / 2.480 tokens per round (A 2.447, B 2.434 mean: B
+  sits inside A's boot-to-boot spread). Each arm's greedy text repeats across its boots; the arms answer 27 of 32
+  prompts differently (prompt-prefill rounding). On the 5 answered identically (277 tokens): 115 / 120 / 118 / 109
+  rounds, B more on 3 and equal on 2; a prompt moves up to 4 rounds between boots of one arm.
+- 12 concurrent plain requests: 64.0 / 64.3 / 55.6 / 55.6 tok/s aggregate, unchanged. MiMo's batched decode groups
+  at most 4 rows (`batchGroupCap`), so the tile never runs in decode; it runs each request's 11-row prefill after a
+  prefix hit.
+
+Ruled out:
+- The staged arm's geometry at 16 rows (13 geometries): the shipped NR 4 / SGS 8 / S 1 is best or tied on QKV; NR 2
+  wins only on the layer-0 MLP (513 vs 557, 543 vs 682 us), and the tile now takes 9-16 rows.
+- The tile past 128 rows: issue-bound at ~22 TFLOPS against MLX GEMM's 58 (table above).
+
 <a id="mimo-ttft-idle"></a>
 ### MiMo-V2.6-Flash-Sushi-2.3bpw: where the time to first token goes, and the GPU wake after idle (e2d5be76 base)
 

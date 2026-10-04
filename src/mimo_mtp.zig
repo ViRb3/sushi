@@ -50,7 +50,7 @@ const Linear = union(enum) {
 
     fn apply(self: Linear, s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
         return switch (self) {
-            .fp8 => |f| fp8_block.linear(s, x, f.w, f.s),
+            .fp8 => |f| fp8_block.linearServing(s, x, f.w, f.s),
             .dense => |w| blk: {
                 var wt = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(wt);
@@ -520,7 +520,7 @@ pub const Head = struct {
         const k_w = self.n_kv * self.head_dim;
         const v_w = self.n_kv * self.v_dim;
         switch (lw.qkv) {
-            .fp8 => |f| try fp8_block.project(s, x, f.w, f.s, f.split, &proj),
+            .fp8 => |f| try fp8_block.projectServing(s, x, f.w, f.s, f.split, &proj),
             .dense => {
                 const qkv = try lw.qkv.apply(s, x);
                 defer _ = mlx.mlx_array_free(qkv);

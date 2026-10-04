@@ -104,6 +104,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - On NAX the stock sdpa is the hd-256 kernel (`naxSdpaPreferred`, `SUSHI_NAX_SDPA=0|1`).
 - MLX sdpa has a WIDTH WALL at hd 256 (dense causal q 6..9 ride `splitCausalSdpa`); `use_fallback` has NO fused arm
   for an hd-256 ARRAY mask (`splitMaskedSdpa256`).
+- MiMo's FP8 trunk at 9-128 rows (`fp8_block` tile, serving forwards only, NAX only): 8 simdgroups split K over
+  32 stored rows; each step a simdgroup writes the dequant route's own `bf16(code x block scale)` into a 16x32
+  threadgroup tile and runs 16x32x16 matmul2d against up to 8 sixteen-row tiles of x (wider inputs split rows over
+  grid z). Same operands as the dequant route, f32 sums in another order: KLD-gated, never byte-identical
+  ([quality-kld](quality-kld.md#mimo)). Past ~128 rows it is issue-bound (~22 TFLOPS against MLX GEMM's 58) and
+  the dequant + MLX GEMM route serves. `kld capture` keeps that route at every width (`fp8_block.reference_route`),
+  so teacher fixtures reproduce; GLM's raw-FP8 trunk keeps `fp8_block.linear`.
+  [perf-baselines](perf-baselines.md#mimo-fp8-tile) has the audit.
 - Qwen4 HC + GDN prefill fusions take the chunk WIDTH as a scalar INPUT (`SUSHI_HC_PREFILL=0` /
   `SUSHI_GDN_PREFILL_FUSED=0`).
 - GDN prefill (S >= 64) takes one of three recurrences (`GdnRoute`): stock, blocked-seq, or oMLX's software-pipelined

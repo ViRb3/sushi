@@ -10,6 +10,7 @@ const scheduler_mod = @import("scheduler.zig");
 const model_settings_mod = @import("model_settings.zig");
 const server_mod = @import("server.zig");
 const hidden_capture = @import("hidden_capture.zig");
+const fp8_block = @import("fp8_block.zig");
 const testing = std.testing;
 
 pub const SCHEMA = "mlx-serve-kld-baseline-v1";
@@ -1059,6 +1060,8 @@ pub fn capturedSsdBudgetGb(config: *const model_mod.ModelConfig, flag_bytes: u64
 }
 
 pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Options, out: *Out) !void {
+    fp8_block.reference_route = true;
+    defer fp8_block.reference_route = false;
     var prompts = try loadPrompts(allocator, io, opts.prompts, opts.limit);
     defer prompts.deinit();
     if (prompts.items.len == 0) return error.NoPromptsFound;

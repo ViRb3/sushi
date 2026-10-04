@@ -10,6 +10,8 @@ earlier history is mlx-serve's, in that project's changelog.
   beside the others.
 - **A streamed answer that ends in the middle of a character delivers it** like the non-streaming answer does, on chat,
   Anthropic, Responses and completions.
+- **Faster MiMo short prefills**: on M5-class GPUs the FP8 trunk runs forwards of 9-128 rows on the matrix units, so a
+  follow-up turn after a prefix hit prefills faster; `kld capture` keeps the reference arithmetic.
 - **Unloading a model waits for every finished request to be torn down**, a submission that fails after its slot is
   built frees its media on the inference thread, and an error whose name cannot be copied still ends its request.
 - **GLM-5.3 DFlash2 no longer fails a request that ends within a few positions of the context limit**, and a request

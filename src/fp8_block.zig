@@ -2,7 +2,8 @@
 //! one f32 scale per 128x128 tile, the weight being `code * scale` in f32 as
 //! the checkpoint defines it. Decode rows take a GEMV that multiplies in f32;
 //! wider inputs dequantize one weight to bf16 scratch for MLX's matmul, which
-//! is the bf16-dequant route's exact arithmetic.
+//! is the bf16-dequant route's exact arithmetic. A serving forward's middle
+//! widths sum those same bf16 weights on the matrix units (`projectServing`).
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -19,6 +20,13 @@ pub var gemv_direct_max_rows: c_int = 8;
 pub var gemv_rows_per_sg: c_int = 0;
 pub var gemv_sgs: c_int = 0;
 pub var gemv_stage_tiles: c_int = 0;
+/// The serving projection's matrix-unit tile covers these widths; 0 disables it.
+pub var tile_min_rows: c_int = 9;
+pub var tile_max_rows: c_int = 128;
+/// Set where the M5-class matrix units exist: the tile kernel must never be built elsewhere.
+pub var tile_nax: bool = false;
+/// `kld capture` sets it: the teacher keeps the dequant route at every width past the GEMV.
+pub var reference_route: bool = false;
 
 /// How a stored weight's rows map onto its outputs. MiMo's QKV stacks `tp`
 /// rank-local slabs of `[q | k | v]` rows and tiles each slab's scales on its
@@ -235,14 +243,132 @@ const DEQUANT_TAIL =
     \\}
 ;
 
-const Kind = enum { gemv, staged, dequant };
+const TILE_HEADER = "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n" ++ E4M3_HEADER;
+
+const TILE_ROW_TILES = 8;
+
+/// 8 simdgroups split K over 32 stored rows; each step one writes the dequant route's own `bf16(code * scale)`
+/// into a 16x32 tile and runs it on the matrix units against its z block's MT 16-row tiles of x (zero-padded),
+/// summing in f32. `$` text repeats once per row tile.
+const TILE_BODY = GEOMETRY ++
+    \\using namespace mpp::tensor_ops;
+    \\constexpr uint NSG = 8u;
+    \\constexpr uint BN = 32u;
+    \\constexpr uint KCH = uint(K) / NSG;
+    \\uint tid = thread_position_in_threadgroup.x;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint n0 = threadgroup_position_in_grid.y * BN;
+    \\threadgroup T b_tile[NSG][16 * BN];
+    \\threadgroup float partial[NSG][16 * BN];
+    \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<desc, metal::execution_simdgroup> op;
+    \\uint mb = threadgroup_position_in_grid.z * uint(MT) * 16u;
+    \\tensor<device T, dextents<int, 2>, tensor_inline> A((device T*)x + (size_t)mb * (size_t)K, dextents<int, 2>{K, MT * 16}, array<int, 2>{1, K});
+    \\tensor<threadgroup T, dextents<int, 2>, tensor_inline> B(b_tile[sg], dextents<int, 2>{int(BN), 16}, array<int, 2>{1, int(BN)});
+    \\tensor<threadgroup float, dextents<int, 2>, tensor_inline> C(partial[sg], dextents<int, 2>{int(BN), 16}, array<int, 2>{1, int(BN)});
+    \\#define SUSHI_FP8_CT op.template get_destination_cooperative_tensor<tensor<device T, extents<int, 16, 16>, tensor_inline>, tensor<threadgroup T, extents<int, 32, 16>, tensor_inline>, float>()
+    \\
+++ tileRepeat(
+    \\auto c$ = SUSHI_FP8_CT;
+    \\if constexpr (MT > $) { for (uint16_t i = 0; i < c$.get_capacity(); ++i) c$[i] = 0.0f; }
+    \\
+) ++
+    \\uint o_read = metal::min(n0 + lane, NROWS - 1u);
+    \\uint rank_read = o_read / RPR;
+    \\const device uint4* wrow = (const device uint4*)(w + (size_t)o_read * (size_t)K);
+    \\const device float* srow = scales + (rank_read * uint(BPR) + (o_read - rank_read * RPR) / 128u) * KB;
+    \\for (uint k0 = sg * KCH; k0 < (sg + 1u) * KCH; k0 += 16u) {
+    \\  uint4 wr = wrow[k0 >> 4];
+    \\  float sc = srow[k0 >> 7];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int i = 0; i < 4; ++i) {
+    \\    float4 v = sushi_e4m3_decode4(wr[i]) * sc;
+    \\    b_tile[sg][(i * 4 + 0) * BN + lane] = T(v.x);
+    \\    b_tile[sg][(i * 4 + 1) * BN + lane] = T(v.y);
+    \\    b_tile[sg][(i * 4 + 2) * BN + lane] = T(v.z);
+    \\    b_tile[sg][(i * 4 + 3) * BN + lane] = T(v.w);
+    \\  }
+    \\  simdgroup_barrier(mem_flags::mem_threadgroup);
+    \\  auto tb = B.template slice<32, 16>(0, 0);
+    \\
+++ tileRepeat(
+    \\  if constexpr (MT > $) { auto ta = A.template slice<16, 16>(int(k0), $ * 16); op.run(ta, tb, c$); }
+    \\
+) ++
+    \\  simdgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\
+;
+
+/// One 16-row tile's partials, reduced across the simdgroups in a fixed order, stored for
+/// input row `row` and stored row `o`.
+const TILE_REDUCE_HEAD =
+    \\if constexpr (MT > $) {
+    \\  c$.store(C.template slice<32, 16>(0, 0));
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (uint off = tid; off < 16u * BN; off += 32u * NSG) {
+    \\    float acc = ((partial[0][off] + partial[1][off]) + (partial[2][off] + partial[3][off])) +
+    \\        ((partial[4][off] + partial[5][off]) + (partial[6][off] + partial[7][off]));
+    \\    uint row = mb + $u * 16u + off / BN;
+    \\    uint o = n0 + off % BN;
+    \\    if (row < uint(M) && o < NROWS) {
+    \\      uint rank = o / RPR;
+    \\      uint local = o - rank * RPR;
+    \\
+;
+
+const TILE_STORE_1 =
+    \\      y[(size_t)row * NROWS + o] = T(acc);
+    \\
+;
+
+const TILE_STORE_3 =
+    \\      if (local < uint(P0)) yq[(size_t)row * (TP * P0) + rank * P0 + local] = T(acc);
+    \\      else if (local < uint(P0 + P1)) yk[(size_t)row * (TP * P1) + rank * P1 + (local - P0)] = T(acc);
+    \\      else yv[(size_t)row * (TP * P2) + rank * P2 + (local - P0 - P1)] = T(float(T(acc)) * as_type<float>(uint(VSB)));
+    \\
+;
+
+const TILE_REDUCE_TAIL =
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\
+;
+
+/// `text` once per row tile, each `$` replaced by the tile's index.
+fn tileRepeat(comptime text: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: []const u8 = "";
+        for (0..TILE_ROW_TILES) |t| {
+            for (text) |ch| out = out ++ (if (ch == '$') &[_]u8{'0' + t} else &[_]u8{ch});
+        }
+        return out;
+    }
+}
+
+fn tileSource(comptime three: bool) [:0]const u8 {
+    comptime {
+        const store = if (three) TILE_STORE_3 else TILE_STORE_1;
+        const text = TILE_BODY ++ tileRepeat(TILE_REDUCE_HEAD ++ store ++ TILE_REDUCE_TAIL);
+        var buf: [text.len:0]u8 = undefined;
+        @memcpy(buf[0..text.len], text);
+        const final = buf;
+        return &final;
+    }
+}
+
+const Kind = enum { gemv, staged, dequant, tile };
 
 const KernelSlot = struct {
     kernel: ?mlx.mlx_fast_metal_kernel = null,
     engaged: bool = false,
 };
 
-var kernels: [3][2]KernelSlot = @splat(@splat(.{}));
+var kernels: [4][2]KernelSlot = @splat(@splat(.{}));
 
 fn getKernel(kind: Kind, three: bool) !mlx.mlx_fast_metal_kernel {
     const slot = &kernels[@intFromEnum(kind)][@intFromBool(three)];
@@ -256,17 +382,20 @@ fn getKernel(kind: Kind, three: bool) !mlx.mlx_fast_metal_kernel {
         .gemv => if (three) GEMV_HEAD ++ GEMV_DIRECT ++ GEMV_TAIL ++ GEMV_STORE_3 else GEMV_HEAD ++ GEMV_DIRECT ++ GEMV_TAIL ++ GEMV_STORE_1,
         .staged => if (three) GEMV_HEAD ++ GEMV_STAGED ++ GEMV_TAIL ++ GEMV_STORE_3 else GEMV_HEAD ++ GEMV_STAGED ++ GEMV_TAIL ++ GEMV_STORE_1,
         .dequant => if (three) DEQUANT_BODY ++ DEQUANT_DST_3 ++ DEQUANT_TAIL else DEQUANT_BODY ++ DEQUANT_DST_1 ++ DEQUANT_TAIL,
+        .tile => if (three) comptime tileSource(true) else comptime tileSource(false),
     };
     const name: [*:0]const u8 = switch (kind) {
         .gemv => if (three) "sushi_fp8_block_gemv3" else "sushi_fp8_block_gemv",
         .staged => if (three) "sushi_fp8_block_gemv_staged3" else "sushi_fp8_block_gemv_staged",
         .dequant => if (three) "sushi_fp8_block_dequant3" else "sushi_fp8_block_dequant",
+        .tile => if (three) "sushi_fp8_block_tile3" else "sushi_fp8_block_tile",
     };
     const in_vec = mlx.mlx_vector_string_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(outputs.ptr, outputs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, E4M3_HEADER, true, false);
+    const header: [*:0]const u8 = if (kind == .tile) TILE_HEADER else E4M3_HEADER;
+    const kernel = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     slot.kernel = kernel;
     return kernel;
@@ -329,6 +458,13 @@ fn buildConfig(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
             const kc = @divExact(key.k, 16);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, kc, nrows, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(kc, 256), 1, 1));
+        },
+        .tile => {
+            // `nr` carries the tiles per threadgroup, `sgs` the z blocks.
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, @divTrunc(nrows + 31, 32), key.sgs));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", key.m));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "MT", key.nr));
         },
     }
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", key.dtype));
@@ -424,6 +560,43 @@ pub fn project(
     split: RowSplit,
     out: []mlx.mlx_array,
 ) !void {
+    return projectRoute(s, x, w, scales, split, out, false);
+}
+
+/// `project` for a serving forward: the matrix-unit tile takes the bf16 widths it covers.
+pub fn projectServing(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    split: RowSplit,
+    out: []mlx.mlx_array,
+) !void {
+    return projectRoute(s, x, w, scales, split, out, tile_nax and !reference_route);
+}
+
+/// Row tiles per threadgroup at most; the microbench sweeps it.
+pub var tile_block_tiles: c_int = TILE_ROW_TILES;
+
+/// `mt` 16-row tiles per threadgroup over `blocks` z blocks, as even as whole tiles allow.
+const TilePlan = struct { mt: c_int, blocks: c_int };
+
+fn tilePlan(m: c_int) TilePlan {
+    const tiles = @divTrunc(m + 15, 16);
+    const cap = std.math.clamp(tile_block_tiles, 1, TILE_ROW_TILES);
+    const blocks = @divTrunc(tiles + cap - 1, cap);
+    return .{ .mt = @divTrunc(tiles + blocks - 1, blocks), .blocks = blocks };
+}
+
+fn projectRoute(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    split: RowSplit,
+    out: []mlx.mlx_array,
+    tile: bool,
+) !void {
     const k = try checkWeight(s, w, scales, split, out.len);
     @memset(out[0..split.outputs()], .{});
     errdefer freeOutputs(out[0..split.outputs()]);
@@ -440,6 +613,35 @@ pub fn project(
         m *= d;
     }
     if (m <= 0) return error.Fp8ShapeMismatch;
+
+    if (tile and x_dtype == .bfloat16 and tile_min_rows > 0 and m >= tile_min_rows and m <= tile_max_rows) {
+        const plan = tilePlan(m);
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_reshape(&rows, x, &[_]c_int{ m, k }, 2, s));
+        var padded = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(padded);
+        const pad = plan.blocks * plan.mt * 16 - m;
+        if (pad > 0) {
+            var zero = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(zero);
+            try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{}, 0, x_dtype, s));
+            try mlx.check(mlx.mlx_pad(&padded, rows, &[_]c_int{0}, 1, &[_]c_int{0}, 1, &[_]c_int{pad}, 1, zero, "constant", s));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&padded, rows));
+        }
+        const key = CfgKey{ .kind = .tile, .dtype = x_dtype, .m = m, .k = k, .tp = split.tp, .parts = split.parts, .nr = plan.mt, .sgs = plan.blocks, .tiles = 0, .vsb = @bitCast(roundedTo(x_dtype, split.v_scale)) };
+        var flat: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+        defer for (&flat) |*a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a.*);
+        };
+        try apply(s, .tile, &.{ padded, w, scales }, key, split, &flat);
+        for (0..split.outputs()) |p| {
+            lead[xsh.len - 1] = @intCast(split.partRows(p));
+            try mlx.check(mlx.mlx_reshape(&out[p], flat[p], &lead, xsh.len, s));
+        }
+        return;
+    }
 
     if (m <= gemv_max_rows) {
         const key = gemvKey(x_dtype, m, k, split);
@@ -493,6 +695,15 @@ pub fn linear(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, scales: mlx
     if (wsh.len != 2 or wsh[0] <= 0) return error.Fp8ShapeMismatch;
     var out: [1]mlx.mlx_array = .{.{}};
     try project(s, x, w, scales, RowSplit.dense(@intCast(wsh[0])), &out);
+    return out[0];
+}
+
+/// `linear` for a serving forward (`projectServing`).
+pub fn linearServing(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, scales: mlx.mlx_array) !mlx.mlx_array {
+    const wsh = mlx.getShape(w);
+    if (wsh.len != 2 or wsh[0] <= 0) return error.Fp8ShapeMismatch;
+    var out: [1]mlx.mlx_array = .{.{}};
+    try projectServing(s, x, w, scales, RowSplit.dense(@intCast(wsh[0])), &out);
     return out[0];
 }
 
@@ -733,6 +944,165 @@ test "fp8 block GEMV in f32 errs by no more than an f32 accumulation over the su
                 try testing.expect(st.finite);
                 try testing.expect(st.max_rel_summands <= ceiling);
             }
+        }
+    }
+}
+
+/// bf16 activations at a MiMo trunk input's spread: a normed body with a few outlier channels.
+fn mimoX(alloc: std.mem.Allocator, rnd: std.Random, m: usize, k: usize) ![]f32 {
+    const x = try randomX(alloc, rnd, m, k);
+    for (x, 0..) |*v, i| {
+        if ((i % k) % 97 == 5) v.* = bfToF32(bf16Rne(v.* * 48.0));
+    }
+    return x;
+}
+
+/// Every output of `got` within bf16 output rounding plus an f32 sum's error of the fp64 sum
+/// over the dequant route's own weights, `bf16(code * scale)`, each relative to its summands.
+fn expectTileWithinBar(tw: *const TestWeight, x: []const f32, m: usize, part: usize, got: []const f32) !void {
+    const rows = tw.split.partRows(part);
+    const f32_sum = @as(f64, @floatFromInt(tw.k + 2)) * std.math.pow(f64, 2, -24);
+    for (0..tw.n) |row| {
+        const d = tw.destOf(row);
+        if (d.part != part) continue;
+        for (0..m) |mi| {
+            var truth: f64 = 0;
+            var summands: f64 = 0;
+            for (0..tw.k) |j| {
+                const term = @as(f64, x[mi * tw.k + j]) * @as(f64, bfToF32(bf16Rne(tw.value(row, j))));
+                truth += term;
+                summands += @abs(term);
+            }
+            const g: f64 = got[mi * rows + d.row];
+            try testing.expect(std.math.isFinite(g));
+            try testing.expect(@abs(g - truth) <= std.math.pow(f64, 2, -8) * @abs(truth) + f32_sum * summands);
+        }
+    }
+}
+
+fn naxForTest() bool {
+    return mlx.streamIsGpu(mlx.gpuStream()) and @import("transformer.zig").verifyQmmNaxAvailable();
+}
+
+test "fp8 block serving tile stays within bf16 rounding plus an f32 sum over the dequant route's weights" {
+    if (!naxForTest()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const armed = tile_nax;
+    defer tile_nax = armed;
+    tile_nax = true;
+    const armed_max = tile_max_rows;
+    defer tile_max_rows = armed_max;
+    tile_max_rows = 1 << 20;
+    const alloc = testing.allocator;
+    for (PARITY_SEEDS) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rnd = prng.random();
+        for (PARITY_SPLITS) |split| {
+            var tw = try TestWeight.init(alloc, rnd, split, 1024);
+            defer tw.deinit(alloc);
+            // A partial tile, one full row block, and three blocks of seven tiles.
+            for ([_]usize{ 17, 40, 128, 300 }) |m| {
+                const x = try mimoX(alloc, rnd, m, tw.k);
+                defer alloc.free(x);
+                const xb = try uploadX(s, x, m, tw.k, .bfloat16);
+                defer _ = mlx.mlx_array_free(xb);
+                const slot = &kernels[@intFromEnum(Kind.tile)][@intFromBool(split.outputs() == 3)];
+                slot.engaged = false;
+                var out: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+                try projectServing(s, xb, tw.w, tw.sc, split, &out);
+                defer for (out[0..split.outputs()]) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
+                try testing.expect(slot.engaged);
+                for (0..split.outputs()) |p| {
+                    try testing.expectEqualSlices(c_int, &[_]c_int{ 1, @intCast(m), @intCast(split.partRows(p)) }, mlx.getShape(out[p]));
+                    const got = try readAs32(alloc, s, out[p]);
+                    defer alloc.free(got);
+                    try expectTileWithinBar(&tw, x, m, p, got);
+                }
+            }
+        }
+    }
+}
+
+test "fp8 block serving tile scales V as the composed multiply rounds it" {
+    if (!naxForTest()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const armed = tile_nax;
+    defer tile_nax = armed;
+    tile_nax = true;
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7A11E);
+    const rnd = prng.random();
+    var tw = try TestWeight.init(alloc, rnd, PARITY_SPLITS[1], 512);
+    defer tw.deinit(alloc);
+    const x = try mimoX(alloc, rnd, 33, tw.k);
+    defer alloc.free(x);
+    const xb = try uploadX(s, x, 33, tw.k, .bfloat16);
+    defer _ = mlx.mlx_array_free(xb);
+    var plain: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+    try projectServing(s, xb, tw.w, tw.sc, tw.split, &plain);
+    defer for (plain) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var split = tw.split;
+    split.v_scale = 0.0883883;
+    var scaled: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+    try projectServing(s, xb, tw.w, tw.sc, split, &scaled);
+    defer for (scaled) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const factor = roundedTo(.bfloat16, split.v_scale);
+    for (0..3) |p| {
+        try mlx.check(mlx.mlx_array_eval(plain[p]));
+        try mlx.check(mlx.mlx_array_eval(scaled[p]));
+        const n = mlx.mlx_array_size(plain[p]);
+        const a = (mlx.mlx_array_data_bfloat16(plain[p]) orelse return error.TestUnreadable)[0..n];
+        const b = (mlx.mlx_array_data_bfloat16(scaled[p]) orelse return error.TestUnreadable)[0..n];
+        for (a, b) |u, v| try testing.expectEqual(if (p == 2) bf16Rne(bfToF32(u) * factor) else u, v);
+    }
+}
+
+test "fp8 block serving widths outside the tile, and every width under the reference route, keep project's bytes" {
+    if (!naxForTest()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const armed = tile_nax;
+    defer tile_nax = armed;
+    tile_nax = true;
+    defer reference_route = false;
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x0EF);
+    const rnd = prng.random();
+    var tw = try TestWeight.init(alloc, rnd, PARITY_SPLITS[2], 512);
+    defer tw.deinit(alloc);
+    const cases = [_]struct { m: usize, reference: bool }{
+        .{ .m = @intCast(tile_min_rows - 1), .reference = false },
+        .{ .m = @intCast(tile_max_rows + 1), .reference = false },
+        .{ .m = @intCast(tile_min_rows), .reference = true },
+        .{ .m = 64, .reference = true },
+        .{ .m = @intCast(tile_max_rows), .reference = true },
+    };
+    for (cases) |c| {
+        reference_route = c.reference;
+        const x = try mimoX(alloc, rnd, c.m, tw.k);
+        defer alloc.free(x);
+        const xb = try uploadX(s, x, c.m, tw.k, .bfloat16);
+        defer _ = mlx.mlx_array_free(xb);
+        var served: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+        try projectServing(s, xb, tw.w, tw.sc, tw.split, &served);
+        defer for (served) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        var plain: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
+        try project(s, xb, tw.w, tw.sc, tw.split, &plain);
+        defer for (plain) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (0..3) |p| {
+            try mlx.check(mlx.mlx_array_eval(served[p]));
+            try mlx.check(mlx.mlx_array_eval(plain[p]));
+            const n = mlx.mlx_array_size(plain[p]);
+            try testing.expectEqualSlices(u16, (mlx.mlx_array_data_bfloat16(plain[p]) orelse return error.TestUnreadable)[0..n], (mlx.mlx_array_data_bfloat16(served[p]) orelse return error.TestUnreadable)[0..n]);
         }
     }
 }
@@ -1026,7 +1396,7 @@ const BENCH_SHAPES = [_]BenchShape{
 const BENCH_COPIES = 6;
 
 /// `fp8_staged` stages x at every width, against the arm `fp8` takes there.
-const BenchArm = enum { bf16, fp8, fp8_staged, affine8 };
+const BenchArm = enum { bf16, fp8, fp8_staged, fp8_tile, affine8 };
 
 const BenchWeights = struct {
     fp8_w: [BENCH_COPIES]mlx.mlx_array = @splat(.{}),
@@ -1097,6 +1467,7 @@ fn benchOp(s: mlx.mlx_stream, arm: BenchArm, shape: BenchShape, bw: *const Bench
     };
     switch (arm) {
         .fp8 => try project(s, x, bw.fp8_w[c], bw.fp8_s[c], shape.split, &outs),
+        .fp8_tile => try projectServing(s, x, bw.fp8_w[c], bw.fp8_s[c], shape.split, &outs),
         .fp8_staged => {
             const armed = gemv_direct_max_rows;
             defer gemv_direct_max_rows = armed;
@@ -1120,7 +1491,7 @@ fn armBytes(arm: BenchArm, shape: BenchShape) f64 {
     const nk: f64 = @as(f64, @floatFromInt(shape.split.tp * shape.split.rowsPerRank())) * @as(f64, @floatFromInt(shape.k));
     return switch (arm) {
         .bf16 => 2 * nk,
-        .fp8, .fp8_staged => nk + @as(f64, @floatFromInt(shape.split.tp * shape.split.blocksPerRank())) * @as(f64, @floatFromInt(shape.k)) / 128.0 * 4.0,
+        .fp8, .fp8_staged, .fp8_tile => nk + @as(f64, @floatFromInt(shape.split.tp * shape.split.blocksPerRank())) * @as(f64, @floatFromInt(shape.k)) / 128.0 * 4.0,
         .affine8 => nk + nk / 64.0 * 4.0,
     };
 }
@@ -1168,17 +1539,40 @@ test "fp8 block microbench vs bf16 and affine-8 at MiMo's trunk shapes (SUSHI_FP
     if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) return error.SkipZigTest;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    const sweep = std.c.getenv("SUSHI_FP8_UBENCH_SWEEP") != null;
+    const armed_tile = tile_nax;
+    defer tile_nax = armed_tile;
+    tile_nax = naxForTest();
+    // The tile arm at every width, to find where it stops winning.
+    const armed_max = tile_max_rows;
+    defer tile_max_rows = armed_max;
+    tile_max_rows = 1 << 20;
+    const armed_block = tile_block_tiles;
+    defer tile_block_tiles = armed_block;
+    const sweep_raw: []const u8 = if (std.c.getenv("SUSHI_FP8_UBENCH_SWEEP")) |r| std.mem.sliceTo(r, 0) else "";
+    const tile_sweep = std.mem.eql(u8, sweep_raw, "tile");
+    const sweep = sweep_raw.len > 0 and !tile_sweep;
     const only = std.c.getenv("SUSHI_FP8_UBENCH_SHAPE");
     for (BENCH_SHAPES, 0..) |shape, si| {
         if (only) |name| if (!std.mem.eql(u8, std.mem.sliceTo(name, 0), shape.name)) continue;
         var bw = try benchWeights(s, shape, 0xF8 + si * 16);
         defer bw.deinit();
-        const arms: []const BenchArm = if (shape.fp8) &.{ .bf16, .fp8, .affine8 } else &.{ .bf16, .affine8 };
-        for ([_]c_int{ 1, 2, 4, 8, 16, 512, 2048 }) |m| {
+        const arms: []const BenchArm = if (shape.fp8) &.{ .bf16, .fp8, .fp8_tile, .affine8 } else &.{ .bf16, .affine8 };
+        for ([_]c_int{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 2048 }) |m| {
             try benchCell(s, shape, &bw, m, arms, if (m > 16) 5 else 30);
         }
         if (shape.fp8) for ([_]c_int{ 4, 5, 6, 7, 8 }) |m| try benchCell(s, shape, &bw, m, &.{ .fp8, .fp8_staged }, 60);
+        if (shape.fp8 and tile_nax) {
+            const armed_min = tile_min_rows;
+            defer tile_min_rows = armed_min;
+            tile_min_rows = 9;
+            for ([_]c_int{ 9, 12, 16 }) |m| try benchCell(s, shape, &bw, m, &.{ .fp8, .fp8_tile }, 30);
+            if (tile_sweep) for ([_]c_int{ 2, 4, 8 }) |tiles| {
+                tile_block_tiles = tiles;
+                std.debug.print("[fp8-ubench] tile block {d} tiles\n", .{tiles});
+                for ([_]c_int{ 32, 128, 256, 512 }) |m| try benchCell(s, shape, &bw, m, &.{.fp8_tile}, 10);
+            };
+            tile_block_tiles = armed_block;
+        }
         if (sweep and shape.fp8) {
             const armed = gemv_direct_max_rows;
             defer {

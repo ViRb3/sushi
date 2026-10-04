@@ -42,8 +42,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   tile scales, served by `fp8_block.zig` (f32 decode GEMV for 1-8 rows, staged x for 9-16, one linear dequantized to
   billed bf16 scratch + MLX matmul for wider forwards). That is the checkpoint's exact math, so the KLD teacher
   carries no quantization of its own ([quality-kld](quality-kld.md#teacher-path)); sources are read-only, MTP/media
-  excluded, residency billed as stored plus `server.fp8DequantScratchBytes` at prefill. All three kernels are plain
-  SIMD Metal (no NAX/matmul2d), so M4 runs the same code.
+  excluded, residency billed as stored plus `server.fp8DequantScratchBytes` at prefill. Those kernels are plain
+  SIMD Metal (no NAX/matmul2d), so M4 runs the same code. On NAX a serving forward of 9-128 rows takes the
+  matrix-unit tile instead ([engine-kernels](engine-kernels.md#prefill-kernels)); `kld capture` never does.
 - **Converted MXFP4 pack**: the private MiMo pack converter optionally restacks the same
   MXFP4 bytes into `model.layers.N.mlp.switch_mlp` U32 weights + U8 e8m0/32 scales, without biases, and prepares
   the trunk ahead of time. Both source layouts use the same streaming kernels.
@@ -170,7 +171,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `attention_value_scale` (`RowSplit.v_scale`, rounded to the output dtype first, as the composed multiply did).
 - The GEMV's three width arms REASSOCIATE the f32 sum, so a row is byte-identical to a decode tick only at or below
   `MIMO_VERIFY_ROWS_MAX`: direct (<=8 rows) strides each row in 16-byte chunks per lane, staged x (9-16) gives each
-  lane one 4-column group per 128-column tile, and the wide arm (>=17) dequantizes the weights to bf16. Past four
+  lane one 4-column group per 128-column tile, and the wide arm (>=17) dequantizes the weights to bf16; the serving
+  tile (9-128 on NAX) sums the wide arm's bf16 weights in its own order. Past four
   rows the direct arm runs two stored rows per simdgroup (8 per group), which moves no row's sum and beat the staged
   arm by 23-36% at 8 rows on every FP8 trunk shape ([perf-baselines](perf-baselines.md#mimo-verify-8)).
 - Every residual add runs in one kernel with the norm that reads its sum (`fusedAddRmsNormUngated`): the
