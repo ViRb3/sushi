@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3-Flash prompts tokenize exactly like Hugging Face**: the plain Llama-3 pre-tokenizer no longer takes Muse's
+  case-splitting grammar (`iPhone`, `McDonald`, `//!`, `½`), and the BPE `ignore_merges` flag is honoured.
 - **A GLM-5.3 prompt served without prefix checkpoints no longer hangs its prefill** (prefix cache off, or admission
   shedding every checkpoint at long context).
 - **GLM-5.3-Flash tool results render in GLM's own chat format**: the chat-template engine now reads `x.0` as `x[0]`,

@@ -148,7 +148,7 @@ Existing tools:
 
 - `INTERLEAVE_SHARE_ONLY=1 INTERLEAVE_PREFILL_CHUNK=8192 tests/test_prefill_interleave.sh` checks #568 in two boots: share zero versus 0.5, two probes each, effective `/props`, increased hosted-decode fraction and identical decoder output. Set `INTERLEAVE_TEST_OUTPUT_DIR` to retain logs; the default run also retains the original interleave on/off checks.
 
-- `test_tokenizer_reference.sh`: CPU-only, both served packs' tokenizer JSONs vs HF `tokenizers`, including
-  Unicode marks, Thai/Arabic/Hebrew/Indic, Unicode numbers/whitespace and optional `TOKENIZER_CASES_JSON` prompts.
+- `test_tokenizer_reference.sh`: CPU-only, the three served packs' (GLM, Qwen, MiMo) tokenizer JSONs vs HF `tokenizers`, including
+  code, camelCase, tool-call history, Unicode marks, Thai/Arabic/Hebrew/Indic, Unicode numbers/whitespace and optional `TOKENIZER_CASES_JSON` prompts.
   Requires Python `tokenizers` and `SUSHI_MODELS_DIR`; normalizes synthetic inputs to isolate Split/BPE parity.
   Hermetic class guard: `format corpus: tokenizer rules are model-local across Unicode scripts`.
