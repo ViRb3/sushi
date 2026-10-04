@@ -11673,7 +11673,8 @@ test "every real streamed pack and source on this box plans a streamed load" {
         try t.expectEqual(case.tower, seen.split.vision);
         try t.expectEqual(plan.split.trunk, seen.split.trunk);
         try t.expectEqual(seen.vision.slots_with.?, seen.cache.slots_per_layer);
-        try t.expect(seen.cache.slots_per_layer < plan.cache.slots_per_layer);
+        // Slots are whole per layer: a tower smaller than one slot across the layers, or a pack that fits in full, costs none.
+        try t.expect(seen.cache.slots_per_layer <= plan.cache.slots_per_layer);
     }
 }
 
