@@ -2,10 +2,9 @@
 
 A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwen4_exp`),
 MiMo-V2.6-Flash (`mimo_v2`) and GLM-5.3-Flash (`glm5_next`). Qwen and MiMo use
-native MTP and affine8 KV by default. GLM serves one request at a time with an affine8
-compressed MLA latent (`--kv-quant 16` = BF16), FP32 KDA state, optional DFlash2, native image/video input and
-prefix reuse; its MTP remains off. OpenAI/Anthropic-compatible HTTP, no Python
-at serve time. Fork of ddalcu's mlx-serve.
+native MTP and affine8 KV by default. GLM batches up to four requests over an affine8 MLA latent
+(`--kv-quant 16` = BF16) and FP32 KDA state, with DFlash2, image/video input and prefix reuse; its MTP
+stays off. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of ddalcu's mlx-serve.
 
 - **sushi** is this engine's new name (runtime, to be opened to the public): a scripted rename changes the binary
   name, the env prefix and the home dir everywhere; until it lands, write today's names. Treat every change as future
