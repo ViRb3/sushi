@@ -32,7 +32,8 @@ fi
 
 # The run step is cached on success, so a second invocation would prove nothing.
 # Drop the manifests that name a test binary; every other step stays cached.
-grep -l -E "o/[0-9a-f]+/test$" .zig-cache/h/*.txt 2>/dev/null | xargs rm -f 2>/dev/null
+# Zig 0.17 manifests are binary files with NUL-terminated paths and no extension.
+LC_ALL=C grep -l -a -E 'o/[0-9a-f]+/(exl3-)?test' .zig-cache/h/* 2>/dev/null | xargs rm -f 2>/dev/null
 
 if [ -n "$FILTER" ]; then
   WHAT="zig build test -Dtest-filter=$FILTER"
