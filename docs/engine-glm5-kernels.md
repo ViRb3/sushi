@@ -116,8 +116,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   the temporary 8-row block attends a read-only slice of the last 2047 context rows (assistant forward 11.4 → 4.6 ms at
   32K; assistant rounding changes, target exact); the next context is cropped to 2047 rows before accepted captures
   append (50 MiB bound at any length; commit 4.27 → 0.73 ms at 32K; exact).
-- After prefill, latent and pooled capacity for input + max output + 3 is reserved once, so verification never grows
-  a buffer. Every array a replay needs is an async dispatch output.
+- At the end of prefill, latent and pooled capacity for input + max output + 3 is reserved once, so verification never
+  grows a buffer. Every array a replay needs is an async dispatch output.
+- The reserve's ledger is the sequential peak (grown buffers keep their growth; the one in flight holds old rows, new
+  buffer and padding), checked against the request's admission bill less what it holds, never live headroom.
 
 ## Ruled out
 

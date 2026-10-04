@@ -1,6 +1,7 @@
 const std = @import("std");
 const dsv4_mod = @import("deepseek_v4.zig");
 const glm5_mod = @import("glm5_forward.zig");
+const GlmRequest = glm5_mod.Request;
 const qwen4_mod = @import("qwen4_exp.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_bf16 = @import("expert_bf16_kernels.zig");
@@ -14793,6 +14794,9 @@ pub const ForwardCtx = struct {
     moe_seq_offset: *usize,
     ssm_entries: ?[]SSMCacheEntry,
     ssm_member_gen: u64 = 0,
+    /// glm5_next: the request's native KDA/MLA state, owned by the slot (the default
+    /// context names the shell's own). A GLM forward without one is refused by name.
+    glm5_request: ?*GlmRequest = null,
     capture_hidden: ?*mlx.mlx_array,
     /// Like `capture_hidden` but receives the FULL post-final-norm hidden
     /// `[B, L, H]` (all positions, refcount-shared) instead of the last
@@ -20188,6 +20192,7 @@ pub const Transformer = struct {
             .ssm_entries = self.ssm_entries,
             .capture_hidden = self.capture_hidden,
             .vision_embeddings = self.vision_embeddings,
+            .glm5_request = if (self.glm5_request) |*request| request else null,
         };
     }
 
@@ -20199,7 +20204,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "glm5" };
+    pub const module_owned_state_fields = [_][]const u8{"dsv4"};
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20207,12 +20212,15 @@ pub const Transformer = struct {
     /// pooled blocks), so slots interleave AND batch freely. The one
     /// module-owned piece on this arch is the MTP head's cache, and the
     /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
-    pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "expert_stream" };
+    /// glm5: weights only; each slot's `glm5_forward.Request` rides `ForwardCtx.glm5_request`.
+    pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "expert_stream", "glm5" };
 
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         inline for (module_owned_state_fields) |f| {
             if (@field(self, f) != null) return true;
         }
+        // A streamed GLM load (the KLD teacher) admits one claimant per expert stream.
+        if (self.glm5) |m| if (m.expert_stream != null) return true;
         return false;
     }
 
@@ -44599,10 +44607,8 @@ fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
     errdefer allocator.destroy(mdl);
     mdl.* = try glm5_mod.Model.loadStreamed(allocator, config, weights, s, if (engine) |e| @import("glm5_stream.zig").Stream.serving(e, &config) else null);
     errdefer mdl.deinit();
-    var request = try glm5_mod.Request.init(allocator, config.num_hidden_layers);
+    var request = try glm5_mod.Request.initServing(allocator, config.num_hidden_layers);
     errdefer request.deinit();
-    request.dense_prefill = true;
-    request.prefill_async = true;
     var shell = try initModuleShell(allocator, config, s);
     shell.glm5 = mdl;
     shell.glm5_request = request;
@@ -44611,7 +44617,7 @@ fn initGlm5(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
 }
 
 fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array, mdl: *glm5_mod.Model) !mlx.mlx_array {
-    const request = &self.glm5_request.?;
+    const request = ctx.glm5_request orelse return error.GlmRequestMissing;
     if (ctx.cache.step == 0) {
         request.reset();
         try request.setLatentBits(ctx.cache.config.glmLatentBits() orelse return error.GlmKvQuantUnsupported);
@@ -75888,7 +75894,7 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
     const cfg = try glm5_mod.completeFixture(&weights);
     var xfm = try Transformer.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.ownsModuleDecodeState());
+    try testing.expect(!xfm.ownsModuleDecodeState());
     try testing.expect(!xfm.usesStandardForward());
     try testing.expect(xfm.supportsLayerCapture());
     var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
@@ -75932,6 +75938,74 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
     const captured = try xfm.forwardWith(&ctx, ids);
     defer _ = mlx.mlx_array_free(captured);
     try testing.expectEqualSlices(c_int, &.{ 1, 1, 128 }, mlx.getShape(out[0]));
+}
+
+test "GLM forward contexts carry their own request: interleaved streams equal each stream alone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glm5_mod.completeFixture(&weights);
+    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer xfm.deinit();
+    try testing.expect(!xfm.ownsModuleDecodeState());
+    try testing.expect(xfm.moduleSpecWiring());
+    var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
+    defer reference.deinit();
+    var caches: [2]KVCache = undefined;
+    var offsets: [2]usize = .{ 0, 0 };
+    var served: [2]glm5_mod.Request = undefined;
+    var solo: [2]glm5_mod.Request = undefined;
+    var ctxs: [2]ForwardCtx = undefined;
+    for (0..2) |i| {
+        caches[i] = try KVCache.init(a, cfg.num_hidden_layers);
+        served[i] = try glm5_mod.Request.initServing(a, cfg.num_hidden_layers);
+        solo[i] = try glm5_mod.Request.initServing(a, cfg.num_hidden_layers);
+        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .glm5_request = &served[i] };
+    }
+    defer for (0..2) |i| {
+        caches[i].deinit();
+        served[i].deinit();
+        solo[i].deinit();
+    };
+    const Step = struct { slot: usize, ids: []const u32 };
+    const steps = [_]Step{ .{ .slot = 0, .ids = &.{ 0, 1, 2 } }, .{ .slot = 1, .ids = &.{ 2, 1 } }, .{ .slot = 0, .ids = &.{1} }, .{ .slot = 1, .ids = &.{0} }, .{ .slot = 1, .ids = &.{2} }, .{ .slot = 0, .ids = &.{2} } };
+    for (steps) |step| {
+        const ids = mlx.mlx_array_new_data(step.ids.ptr, &[_]c_int{ 1, @intCast(step.ids.len) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const actual = try xfm.forwardWith(&ctxs[step.slot], ids);
+        defer _ = mlx.mlx_array_free(actual);
+        const expected = try reference.forwardLast(&solo[step.slot], ids, true);
+        defer _ = mlx.mlx_array_free(expected);
+        var equal = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(equal);
+        try mlx.check(mlx.mlx_array_equal(&equal, actual, expected, true, xfm.s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, equal));
+        try testing.expect(same);
+        try testing.expectEqual(solo[step.slot].offset, caches[step.slot].step);
+    }
+    // The shell's own request belongs to the default context only.
+    try testing.expectEqual(@as(usize, 0), xfm.glm5_request.?.offset);
+    var orphan = ctxs[0];
+    orphan.glm5_request = null;
+    const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    try testing.expectError(error.GlmRequestMissing, xfm.forwardWith(&orphan, ids));
+}
+
+test "a streamed GLM load keeps its one teacher stream exclusive" {
+    var t: Transformer = undefined;
+    t.dsv4 = null;
+    t.qwen4 = null;
+    t.expert_stream = null;
+    var glm: glm5_mod.Model = undefined;
+    glm.expert_stream = null;
+    t.glm5 = &glm;
+    try testing.expect(!t.ownsModuleDecodeState());
+    try testing.expect(t.moduleSpecWiring());
+    glm.expert_stream = @ptrFromInt(@alignOf(@import("glm5_stream.zig").Stream));
+    try testing.expect(t.ownsModuleDecodeState());
 }
 
 test "GLM serving stores the latent its slot cache names and refuses kv4 by name" {

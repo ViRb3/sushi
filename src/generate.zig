@@ -1227,6 +1227,17 @@ pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
         !sampling.think_penalty.active();
 }
 
+/// Takes the verifier's MLA capacity right after prefill, inside the request's admission bill: no
+/// round grows a buffer, and a later admission already sees the capacity as live memory.
+fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assistant: *const dflash_mod.DflashCtx, max_tokens: u32, s: mlx.mlx_stream) !void {
+    const request = ctx.glm5_request orelse return error.GlmRequestMissing;
+    const kv = ctx.cache.config;
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    const held = request.residentBytes() +| assistant.cache.residentBytes();
+    const budget = @import("server.zig").glmDflashReserveBudget(config, request.offset, max_tokens, kv_bits, held);
+    _ = try @import("glm5_dflash_reserve.zig").reserve(request, request.offset + max_tokens + 3, budget, s);
+}
+
 /// Only the synchronous serial sampler (`sampleToken`) applies these penalties. A repeat
 /// penalty of 0 or below is off: it would divide by zero or flip signs.
 pub fn penaltyActive(sampling: SamplingParams) bool {
@@ -1715,7 +1726,6 @@ pub const Generator = struct {
     dflash: ?*DflashModel = null,
     dflash_ctx: ?dflash_mod.DflashCtx = null,
     glm_dflash_native: bool = false,
-    glm_dflash_reserved: bool = false,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, clamped by --draft-block-size).
@@ -3498,6 +3508,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
 
+            if (glm_dflash_native) try reserveGlmDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
             const mtp_cost_profile: mtp_mod.MtpCostProfile = if (mtp_active)
                 options.mtp.?.costProfile(xfm, ctx.cache.config)
             else
@@ -5383,16 +5394,11 @@ pub const Generator = struct {
         if (self.done or try self.checkStop()) return null;
         if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         const target = self.xfm.glm5.?;
-        const request = &self.xfm.glm5_request.?;
+        const request = self.ctx.glm5_request orelse return error.GlmRequestMissing;
         const assistant = self.dflash.?;
         target.s = self.xfm.s;
         assistant.s = self.xfm.s;
         target.suppress_mask = self.xfm.suppress_mask;
-        if (!self.glm_dflash_reserved) {
-            const total = request.offset + @as(usize, self.max_tokens) + 3;
-            _ = try @import("glm5_dflash_reserve.zig").reserve(request, total, @intCast(@import("server.zig").prefillHeadroomNow(&self.xfm.config, 0)), self.xfm.s);
-            self.glm_dflash_reserved = true;
-        }
         const schedule = try @import("glm5_dflash_model.zig").bindSchedule(4);
         defer schedule.restore();
         const budget = self.max_tokens - self.completion_tokens;

@@ -5,7 +5,9 @@ const attention = @import("glm5_attention.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 
-pub const Plan = struct { latent_capacity: usize, pool_capacity: usize, additional_peak_bytes: usize };
+/// `growth_bytes`: what the state holds more once grown. `peak_bytes`: the most it holds above its start
+/// while growing, when the buffer in flight keeps its old rows beside the new buffer and its padding.
+pub const Plan = struct { latent_capacity: usize, pool_capacity: usize, growth_bytes: usize, peak_bytes: usize };
 fn add(a: usize, b: usize) !usize {
     return std.math.add(usize, a, b) catch error.GlmReserveOverflow;
 }
@@ -17,7 +19,7 @@ pub fn capacity(rows: usize) !usize {
     if (value > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
     return value;
 }
-fn growthBill(old: usize, target: usize, row_bytes: usize) !usize {
+fn inFlight(old: usize, target: usize, row_bytes: usize) !usize {
     if (target == old) return 0;
     return mul(try add(target, target - old), row_bytes);
 }
@@ -28,7 +30,20 @@ pub fn plan(processed: usize, lc: usize, pc: usize, latent_row_bytes: usize, iw:
     if (lc > std.math.maxInt(c_int) or pc > std.math.maxInt(c_int) or iw > std.math.maxInt(c_int)) return error.GlmReserveOverflow;
     const latent = @max(lc, try capacity(total));
     const pool = @max(pc, try capacity(total / 4));
-    return .{ .latent_capacity = latent, .pool_capacity = pool, .additional_peak_bytes = try add(try growthBill(lc, latent, latent_row_bytes), try growthBill(pc, pool, try mul(iw, ib))) };
+    const pool_row_bytes = try mul(iw, ib);
+    const latent_growth = try mul(latent - lc, latent_row_bytes);
+    return .{
+        .latent_capacity = latent,
+        .pool_capacity = pool,
+        .growth_bytes = try add(latent_growth, try mul(pool - pc, pool_row_bytes)),
+        .peak_bytes = @max(try inFlight(lc, latent, latent_row_bytes), try add(latent_growth, try inFlight(pc, pool, pool_row_bytes))),
+    };
+}
+
+/// Peak above the live state when `reserve` grows `count` states with this plan one after another.
+pub fn statesPeak(count: usize, p: Plan) !usize {
+    if (count == 0) return 0;
+    return add(try mul(count - 1, p.growth_bytes), p.peak_bytes);
 }
 fn supported(a: Arr) bool {
     return a.ctx != null and (mlx.mlx_array_dtype(a) == .bfloat16 or mlx.mlx_array_dtype(a) == .float32);
@@ -92,15 +107,18 @@ fn growLatent(st: *attention.State, rows: usize, stream: mlx.mlx_stream) !void {
         next += 1;
     };
 }
-/// Call on the inference owner after prefill, before taking any request clone.
-/// Available bytes are additional peak headroom above the currently live state.
+/// Call on the inference owner after prefill, before taking any request clone. `available_peak_bytes`
+/// is what the request may still hold above its live state; returns the peak the growth reaches.
 pub fn reserve(request: anytype, total_tokens: usize, available_peak_bytes: usize, stream: mlx.mlx_stream) !usize {
     if (request.failed) return error.InvalidGlmReserveShape;
+    var held: usize = 0;
     var bill: usize = 0;
     for (request.layers) |*layer| {
         if (layer.attention.processed == 0) continue;
         if (layer.attention.processed != request.offset) return error.InvalidGlmReserveShape;
-        bill = try add(bill, (try statePlan(&layer.attention, total_tokens)).additional_peak_bytes);
+        const p = try statePlan(&layer.attention, total_tokens);
+        bill = @max(bill, try add(held, p.peak_bytes));
+        held = try add(held, p.growth_bytes);
     }
     if (bill > available_peak_bytes) return error.GlmReserveMemoryLimit;
     for (request.layers) |*layer| {
@@ -121,7 +139,9 @@ test "GLM reserve ledger admits the 128K verifier" {
     const p = try plan(131072, 131072, 32768, 1024, 128, 2, 131072 + 256 + 3);
     try std.testing.expectEqual(@as(usize, 131584), p.latent_capacity);
     try std.testing.expectEqual(@as(usize, 33024), p.pool_capacity);
-    try std.testing.expectEqual(@as(usize, 143785984), p.additional_peak_bytes);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 + 256 * 256), p.growth_bytes);
+    try std.testing.expectEqual(@as(usize, (131584 + 512) * 1024), p.peak_bytes);
+    try std.testing.expectEqual(@as(usize, 10 * (512 * 1024 + 256 * 256) + (131584 + 512) * 1024), try statesPeak(11, p));
     const admitted = try scratch.plan(131328, p.latent_capacity, p.pool_capacity, 512, 128, 64, 3, 2);
     try std.testing.expectEqual(@as(usize, 3), admitted.branches);
     try std.testing.expect(admitted.live_bytes <= scratch.limit_bytes);
@@ -184,7 +204,7 @@ test "GLM reserve preserves cache bits and subsequent append and attention on BF
         _ = try baseline.append(latent, keys, gates, ape, stream);
         try baseline.evaluate();
         const p = try statePlan(&layers[0].attention, total);
-        const bill = p.additional_peak_bytes * 2;
+        const bill = try statesPeak(2, p);
         const old = layers[0].attention.latent.ctx;
         const tail = layers[0].attention.tail_keys.ctx;
         try std.testing.expectError(error.GlmReserveMemoryLimit, reserve(&request, total, bill - 1, stream));
@@ -244,8 +264,10 @@ test "GLM reserve grows kv8 codes scales and biases together and bills 544-byte 
     const total = n + 33;
     const p = try statePlan(&layers[0].attention, total);
     try std.testing.expectEqual(@as(usize, 1280), p.latent_capacity);
-    try std.testing.expectEqual((1280 + 256) * 544 + (512 + 256) * 4 * 2, p.additional_peak_bytes);
-    try std.testing.expectEqual(p.additional_peak_bytes, try reserve(&request, total, p.additional_peak_bytes, stream));
+    try std.testing.expectEqual(256 * 544 + 256 * 4 * 2, p.growth_bytes);
+    try std.testing.expectEqual((1280 + 256) * 544, p.peak_bytes);
+    try std.testing.expectError(error.GlmReserveMemoryLimit, reserve(&request, total, p.peak_bytes - 1, stream));
+    try std.testing.expectEqual(p.peak_bytes, try reserve(&request, total, p.peak_bytes, stream));
     const view = layers[0].attention.latentView();
     try std.testing.expect(view.rowMajor() and view.rows() == 1280);
     for ([_]Arr{ view.data, view.scales, view.biases }, [_]Arr{ baseline.latent, baseline.latent_scales, baseline.latent_biases }) |grown_part, kept| try attention.expectSameBits(try ops.slice(grown_part, 0, 0, n), try ops.slice(kept, 0, 0, n));

@@ -309,6 +309,13 @@ pub const Request = struct {
         for (layers) |*layer| layer.* = .init();
         return .{ .allocator = allocator, .layers = layers };
     }
+    /// The schedule every served request runs: dense cold MLA prefill and two prefill layers in flight.
+    pub fn initServing(allocator: std.mem.Allocator, count: usize) !Request {
+        var request = try init(allocator, count);
+        request.dense_prefill = true;
+        request.prefill_async = true;
+        return request;
+    }
     pub fn deinit(self: *Request) void {
         if (self.stream_owner) |store| store.release(self);
         for (self.layers) |*layer| layer.deinit();

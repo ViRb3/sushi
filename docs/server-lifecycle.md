@@ -157,6 +157,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:
   `tests/test_batched_equivalence.sh` runs a real two-stream arm.
+- **A GLM slot owns its `glm5_forward.Request`** (`Slot.glm5_request`, handed to the forward as
+  `ForwardCtx.glm5_request`; a GLM forward without one is `GlmRequestMissing`), so GLM requests interleave; only a
+  streamed GLM load stays exclusive. The boot line and `/props batching.reason` (`arch` vs `exclusive`) say which.
+- **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel,
+  failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
 - `src/generate.zig`: generation, sampling, MTP orchestration, `StallClock`, prefill chunking, loop-stop tiers,
   `commitForcedTokens`. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts.
 

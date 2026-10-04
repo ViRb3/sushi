@@ -2106,12 +2106,10 @@ pub fn serve(
     // `--max-concurrent` sizes the submit queue; requests decode together at
     // any value. Whether they share ONE forward is the model's answer, printed
     // at every value so a default-1 boot does not read as "one at a time".
-    if (scheduler_mod.configBatchesDecode(config)) {
-        log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
-        if (prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
-    } else {
-        log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
-    }
+    const startup_entry = scheduler.registry.resolveEntry("") catch null;
+    const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
+    log.info("Concurrency: --max-concurrent={d}, {s} (arch: {s})\n", .{ max_concurrent, concurrencyClause(verdict), config.model_type });
+    if (verdict == .ok and prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
     // Install signal handlers for graceful shutdown
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -6245,6 +6243,12 @@ pub fn glmDflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u
         @import("glm5_dflash_memory.zig").limit_bytes +| 64 * 1024 * 1024;
 }
 
+/// What a GLM DFlash2 request may still allocate when it reserves its verifier capacity right after
+/// prefill: its admission bill at the narrowest width (no width bills less) less what it holds.
+pub fn glmDflashReserveBudget(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, held: u64) u64 {
+    return prefillNeededAtChunk(config, seq, max_tokens, kv_bits, 1, .{}) -| held;
+}
+
 /// The per-request terms of the admission bill, in one place.
 pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
     // Arch gate for every term (all new, all measured on qwen4_exp alone; the reservation's
@@ -7874,8 +7878,23 @@ fn renderPropsBody(
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
 fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
-    const cfg = entry.config orelse return .arch;
-    return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
+    const exclusive = if (entry.transformer) |t| t.ownsModuleDecodeState() else false;
+    return batchVerdictOf(entry.config, exclusive);
+}
+
+pub fn batchVerdictOf(cfg: ?*const model_mod.ModelConfig, exclusive: bool) scheduler_mod.BatchVerdict {
+    if (exclusive) return .exclusive;
+    const c = cfg orelse return .arch;
+    return if (scheduler_mod.configBatchesDecode(c)) .ok else .arch;
+}
+
+/// The boot line's account of concurrent requests, from the verdict `/props` reports.
+pub fn concurrencyClause(verdict: scheduler_mod.BatchVerdict) []const u8 {
+    return switch (verdict) {
+        .ok => "batched decode on",
+        .exclusive => "batched decode off; concurrent requests queue, one at a time",
+        else => "batched decode off; concurrent requests interleave serially",
+    };
 }
 
 /// The /props "batching" object: whether the loaded model rides the batched
@@ -26081,6 +26100,40 @@ test "GLM serving DFlash2 bill includes the bounded window captures replay and s
     try std.testing.expect(needed >= cfg.ssmCheckpointBytes() * 3);
     try std.testing.expect(needed < 2 * 1024 * 1024 * 1024);
     try std.testing.expect(glmDflashRequestBytes(&cfg, 1024) < needed);
+}
+
+test "the concurrency verdict says GLM interleaves, an exclusive model queues, qwen4 batches" {
+    const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .full_attention_interval = 4, .num_experts = 8, .num_experts_per_tok = 2 };
+    try std.testing.expectEqual(scheduler_mod.BatchVerdict.arch, batchVerdictOf(&glm, false));
+    try std.testing.expectEqual(scheduler_mod.BatchVerdict.exclusive, batchVerdictOf(&glm, true));
+    try std.testing.expectEqual(scheduler_mod.BatchVerdict.ok, batchVerdictOf(&qwen4, false));
+    try std.testing.expectEqual(scheduler_mod.BatchVerdict.arch, batchVerdictOf(null, false));
+    try std.testing.expectEqualStrings("batched decode off; concurrent requests interleave serially", concurrencyClause(.arch));
+    try std.testing.expectEqualStrings("batched decode off; concurrent requests queue, one at a time", concurrencyClause(.exclusive));
+    try std.testing.expectEqualStrings("batched decode on", concurrencyClause(.ok));
+}
+
+test "GLM DFlash2 reserve at prefill end fits the admission bill at every request shape" {
+    const reserve = @import("glm5_dflash_reserve.zig");
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.glm_dflash_loaded = true;
+    const ctx: u64 = getEffectiveContextLength(&cfg);
+    const mla_layers: usize = cfg.num_hidden_layers / cfg.full_attention_interval;
+    const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
+    const shapes = [_][2]u64{ .{ 18, 32 }, .{ 100, 920 }, .{ 1000, 24 }, .{ 1022, 2 }, .{ 2008, 2400 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 2008, std.math.maxInt(u32) }, .{ 500000, std.math.maxInt(u32) } };
+    for ([_]u64{ 16, 8 }) |kv_bits| {
+        const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
+        for (shapes) |shape| {
+            const seq: usize = @intCast(shape[0]);
+            const max_tokens: u32 = @intCast(@min(shape[1], ctx - seq));
+            const lc = try reserve.capacity(seq);
+            const pc = try reserve.capacity(seq / 4);
+            const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+            const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
+            try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= glmDflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
+        }
+    }
 }
 
 test "GLM vision serving processor carries image and video token budgets without M-RoPE" {

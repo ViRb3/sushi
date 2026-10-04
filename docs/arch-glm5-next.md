@@ -10,8 +10,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
 
 ## Scope
 
-- One request at a time. MTP and RAM/disk prefix reuse are off: native KDA state has no prefix-cache restore and the
-  checkpoint's MTP layer is not integrated.
+- Concurrent requests interleave; they do not batch yet ([concurrency](#concurrency)). MTP and RAM/disk prefix reuse
+  are off: native KDA state has no prefix-cache restore and the checkpoint's MTP layer is not integrated.
 - Cache: kv8 compressed MLA latent plus FP32 KDA state, the engine default; it passed its KLD gate
   ([quality-kld](quality-kld.md)). `--kv-quant 16` (or `kv_quant: 16` per request or in model-settings) keeps the
   latent BF16. The pooled index and KDA state stay lossless. kv4 is refused (`GlmKvQuantUnsupported`), and the KLD teacher capture refuses any kv-quant.
@@ -102,6 +102,25 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 
 Wider trees lost: N3 with every four-row kernel optimized measured 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`,
 inside 1.46% drift) because verification per round grew 20.6%.
+
+- **N2 saturates on copies, breaks even on prose** (no runtime yield gate): a ~2K-token verbatim copy and a rename
+  edit accepted 2.00 of 2 drafts every round (41.4/40.8 vs 25.2 tok/s serial), low-effort prose 0.88 (26.1 vs 25.6);
+  greedy bytes equal serial (`144f63db`, BF16 latent, Sushi-2.3bpw + A4 g64, `taskpolicy -a`, busy box, 2026-10-04).
+- **No lookup drafting**: PLD never runs on GLM (`specInitWiring`'s module branch, cleared again in `Generator.init`),
+  so `--no-drafter` decodes plain serial; the request log's `pld=enabled` then `drafter takes priority` is cosmetic
+  and the 0.010 n-gram gate is inert (DFlash2 is exempt from it).
+
+<a id="concurrency"></a>
+## Concurrency
+
+- Each slot owns its target state ([server-lifecycle](server-lifecycle.md#scheduler-and-batching)), so concurrent
+  requests interleave one forward or round at a time and a prefill yields to the others' decode ticks; aggregate
+  throughput stays one stream's until rows batch. A streamed GLM load (the teacher) still queues.
+- **Rows are the currency**: a row costs ~10–12 ms over a ~20–27 ms fixed forward; draft rows pay only while their ms
+  per accepted token (~19 ordinary, ~37 prose) beats the batch's own (fixed/B + row: ~26 at two requests, ~19 at four).
+  Interleaving alone adds no throughput; batched plain rows do, and a B×3 verify crosses the four-row tile cliff.
+- A multi-request forward can reuse the verifier's row-exact projections, router, HC and EXL3 FFN (1–16 rows); only
+  the KDA recurrence and MLA attention hold per-request state.
 
 ## Memory
 

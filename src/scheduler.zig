@@ -71,6 +71,7 @@ const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
+const glm5_forward_mod = @import("glm5_forward.zig");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 const expert_stream_mod = @import("expert_stream.zig");
@@ -405,6 +406,8 @@ pub const Slot = struct {
     cache: KVCache,
     moe_seq_offset: usize,
     ssm_entries: ?[]SSMCacheEntry,
+    /// glm5_next: this request's native KDA/MLA state (`ctx.glm5_request`).
+    glm5_request: ?glm5_forward_mod.Request = null,
     /// SSM stride checkpoints salvaged from a prefill the client cancelled:
     /// `Generator.initWithOptions` moves its captured checkpoints into this
     /// sink before returning `error.Cancelled` (they die with the failed
@@ -612,6 +615,8 @@ pub const Slot = struct {
             }
             allocator.free(entries);
         };
+        var glm5_request: ?glm5_forward_mod.Request = if (config.isGlm5()) try glm5_forward_mod.Request.initServing(allocator, config.num_hidden_layers) else null;
+        errdefer if (glm5_request) |*request| request.deinit();
 
         // Dup owned slices.
         const prompt_owned = try allocator.dupe(u32, params.prompt_ids);
@@ -638,6 +643,7 @@ pub const Slot = struct {
             .cache = cache,
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
+            .glm5_request = glm5_request,
             .vision_embeddings = params.vision_embeddings,
             .vision_key = params.vision_key,
             .cache_key = params.cache_key,
@@ -717,6 +723,7 @@ pub const Slot = struct {
             .moe_seq_offset = &slot.moe_seq_offset,
             .ssm_entries = slot.ssm_entries,
             .ssm_member_gen = transformer_mod.nextSsmMemberGen(),
+            .glm5_request = if (slot.glm5_request) |*request| request else null,
             .vision_embeddings = slot.vision_embeddings,
             .mrope_pos = slot.mrope_pos,
             .mrope_total = slot.mrope_total,
@@ -746,6 +753,7 @@ pub const Slot = struct {
         self.cancelled_prefill.deinit();
         self.ring_cps.deinit();
         self.cache.deinit();
+        if (self.glm5_request) |*request| request.deinit();
         if (self.ssm_entries) |entries| {
             if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
             for (entries) |*e| {
@@ -2198,6 +2206,8 @@ pub const BatchVerdict = enum {
     arch,
     pad_waste,
     row_cap,
+    /// The model owns its decode state (`slotExclusiveDecode`): requests queue, never co-decode.
+    exclusive,
 };
 
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
@@ -5174,6 +5184,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                         }
                         log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
                         slot.markError(@errorName(err));
+                        releaseNativeState(slot);
                         break :prefill;
                     };
                     break :prefill;
@@ -5192,6 +5203,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 sch.decoding.append(sch.allocator, slot) catch |err| {
                     sch.queue_mu.unlock(sch.io);
                     slot.markError(@errorName(err));
+                    releaseNativeState(slot);
                     continue;
                 };
                 sch.queue_mu.unlock(sch.io);
@@ -5229,26 +5241,36 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
         worked = n_prefill > 0 or active.items.len > 0;
 
-        // 5. Cull finished / errored / cancelled from `decoding`. The slot
-        //    still belongs to its connection thread until that thread calls
-        //    `complete`; we just stop touching it.
-        {
-            sch.queue_mu.lockUncancelable(sch.io);
-            defer sch.queue_mu.unlock(sch.io);
-            var i: usize = 0;
-            while (i < sch.decoding.items.len) {
-                const s = sch.decoding.items[i];
-                const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
-                if (drop) {
-                    _ = sch.decoding.orderedRemove(i);
-                } else i += 1;
-            }
-            // Republish the snapshot with this tick's survivors, under the same
-            // lock the conn-thread reader copies under.
-            publishLiveKvResidency(sch, null);
-        }
+        // 5. Cull finished / errored / cancelled from `decoding`.
+        cullDecoding(sch);
     }
     flushImatrixCaptures(sch);
+}
+
+/// The slot still belongs to its connection thread until that thread calls `complete`; the
+/// inference thread just stops touching it.
+fn cullDecoding(sch: *Scheduler) void {
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    var i: usize = 0;
+    while (i < sch.decoding.items.len) {
+        const s = sch.decoding.items[i];
+        const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
+        if (drop) {
+            releaseNativeState(s);
+            _ = sch.decoding.orderedRemove(i);
+        } else i += 1;
+    }
+    // Republish the snapshot with this tick's survivors, under the same
+    // lock the conn-thread reader copies under.
+    publishLiveKvResidency(sch, null);
+}
+
+/// Native GLM has no reusable prefix snapshot: a slot the inference thread stops touching
+/// (finished, errored or cancelled) releases its reserved target state before the next
+/// admission read, not when its connection thread completes it.
+fn releaseNativeState(slot: *Slot) void {
+    if (slot.glm5_request) |*request| request.reset();
 }
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
@@ -5293,9 +5315,7 @@ fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session
 /// to that entry (`shared_view`), not here.
 fn slotStateBytes(s: *const Slot) u64 {
     var bytes = s.cache.residentBytes();
-    if (s.model.transformer) |xfm| {
-        if (xfm.glm5_request) |*request| bytes += request.residentBytes();
-    }
+    if (s.glm5_request) |*request| bytes += request.residentBytes();
     if (s.legacy_gen) |*gen| {
         if (gen.dflash_ctx) |*ctx| bytes += ctx.cache.residentBytes();
     }
@@ -6034,9 +6054,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
     if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
-    // Native GLM has no reusable prefix snapshot. Release its reserved target
-    // state on the inference owner before the next request's admission read.
-    if (slot.model.transformer) |xfm| if (xfm.glm5_request) |*request| request.reset();
+    releaseNativeState(slot);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
@@ -10678,6 +10696,45 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
 }
 
+test "every GLM slot owns its native request and hands it to its forward context" {
+    const allocator = testing.allocator;
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    defer sch.pending.deinit(allocator);
+    defer sch.decoding.deinit(allocator);
+    defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
+    var cfg = try model_mod.parseConfigFromJson(allocator, @embedFile("fixtures/glm5_config.json"));
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    model.prefix_cache = null;
+    var slots: [2]*Slot = undefined;
+    for (&slots) |*slot| slot.* = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
+    for (slots) |slot| {
+        const request = &slot.glm5_request.?;
+        try testing.expectEqual(request, slot.ctx.glm5_request.?);
+        try testing.expectEqual(@as(usize, cfg.num_hidden_layers), request.layers.len);
+        try testing.expect(request.dense_prefill and request.prefill_async);
+    }
+    try testing.expect(slots[0].ctx.glm5_request.? != slots[1].ctx.glm5_request.?);
+    for (slots) |slot| sch.complete(slot);
+    while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
+}
+
 test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
@@ -11005,6 +11062,53 @@ test "MTP handover: the first block's echo of the streamed t1 is swallowed once,
     try testing.expectEqual(@as(?u32, null), slot.handover_token);
 }
 
+test "culling an errored or cancelled GLM slot releases its native state, a live one keeps it" {
+    var mm = metrics_mod.Metrics.init();
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.metrics = &mm;
+    sch.live_sessions = undefined;
+    sch.live_session_count = 0;
+    sch.decoding = .empty;
+    defer sch.decoding.deinit(testing.allocator);
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/glm-cull";
+    model.prefix_cache = null;
+    var slots: [3]Slot = undefined;
+    for (&slots, 0..) |*slot, i| {
+        slot.model = &model;
+        slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+        slot.ssm_entries = null;
+        slot.ring_cps = .{};
+        slot.restored_entry = 0;
+        slot.full_prompt = &.{};
+        slot.prompt_tokens = 4;
+        slot.completion_tokens = 0;
+        slot.cached_tokens = 0;
+        slot.request_id = i;
+        slot.max_tokens = 8;
+        slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
+        slot.legacy_gen = null;
+        slot.finished = false;
+        slot.error_code = null;
+        slot.cancelled = .init(false);
+        slot.glm5_request = try glm5_forward_mod.Request.init(testing.allocator, 2);
+        slot.glm5_request.?.offset = 4;
+        try sch.decoding.append(testing.allocator, slot);
+    }
+    defer for (&slots) |*slot| slot.glm5_request.?.deinit();
+    slots[0].error_code = "GlmReserveMemoryLimit";
+    slots[1].cancelled.store(true, .release);
+    cullDecoding(&sch);
+    try testing.expectEqual(@as(usize, 1), sch.decoding.items.len);
+    try testing.expectEqual(&slots[2], sch.decoding.items[0]);
+    try testing.expectEqual(@as(usize, 0), slots[0].glm5_request.?.offset);
+    try testing.expectEqual(@as(usize, 0), slots[1].glm5_request.?.offset);
+    try testing.expectEqual(@as(usize, 4), slots[2].glm5_request.?.offset);
+}
+
 test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" {
     var mm = metrics_mod.Metrics.init();
     var sch: Scheduler = undefined;
@@ -11023,6 +11127,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     slot.legacy_gen = null;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
+    slot.glm5_request = null;
     slot.ring_cps = .{};
     slot.restored_entry = 0;
     slot.full_prompt = &.{};
@@ -11118,6 +11223,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     slot.legacy_gen = null;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
+    slot.glm5_request = null;
     slot.ring_cps = .{ .fork = .{ .entries = &cp_entries, .step = 8, .allocator = testing.allocator, .config = .dense } };
     slot.full_prompt = &.{};
     slot.prompt_tokens = 8;
