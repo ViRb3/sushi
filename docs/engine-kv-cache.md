@@ -30,7 +30,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   it packed or gets the dense rebuild; nothing else touches the storage.
 - Schemes extend via enum + two switch arms; a prefix-cache entry records its scheme (`Entry.quant_config`), so a
   slot running `kv_quant=4` never restores from an entry committed at another width
-  (`tests/test_kv_quant_per_request.sh`).
+  (`tests/test_kv_quant_per_request.sh`). Every generation endpoint, `/v1/completions` included, reads the per-request
+  `kv_quant` through `parseKvQuantOverride` and logs the override it applied.
 - Packed reads are kernel-or-DENSE per WIDTH (`kvAttnFusedEligible` t_q==1, `kvAttnVerifyEligible` t_q 2..8; verify
   kernel OFF on G17, `SUSHI_KV_ATTN_VERIFY=1|0`; floor 2048). Guard: `tests/test_kv_quant_fused_equivalence.sh`.
 - Arch-specific packed readers: QSA on qwen4_exp ([engine-qsa-long-context](engine-qsa-long-context.md)); the

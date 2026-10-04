@@ -13139,10 +13139,29 @@ pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array
     defer _ = mlx.mlx_array_free(zero);
     const scalar_shape = [_]c_int{1};
     try mlx.check(mlx.mlx_zeros(&zero, &scalar_shape, 0, mlx.mlx_array_dtype(x), s));
+    var neg_zero = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg_zero);
+    try mlx.check(mlx.mlx_negative(&neg_zero, zero, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_add(&out, x, zero, s));
+    try mlx.check(mlx.mlx_add(&out, x, neg_zero, s));
     return out;
+}
+
+test "materializedOwnedCopy: -0.0 survives bit-for-bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const data = [_]f32{ -0.0, 0.0, 1.5, -2.5 };
+    const x = mlx.mlx_array_new_data(@ptrCast(&data), &[_]c_int{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const out = try materializedOwnedCopy(s, x);
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    const got = mlx.mlx_array_data_float32(out) orelse return error.NoData;
+    try testing.expect(std.math.signbit(got[0]));
+    try testing.expect(!std.math.signbit(got[1]));
+    try testing.expectEqual(@as(f32, 1.5), got[2]);
+    try testing.expectEqual(@as(f32, -2.5), got[3]);
 }
 
 /// `settle` evaluates the copy so it lets go of a prefill chunk; a verify's few rows stay

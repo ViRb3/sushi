@@ -6868,7 +6868,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     );
     const use_mtp = wiring.use_mtp;
     const use_drafter = wiring.use_drafter;
-    const use_dflash = wiring.use_dflash or (slot.model.config.?.isGlm5() and slot.enable_drafter and slot.dflash != null and generate_mod.glmDflashEligible(slot.sampling, slot.logprobs_n));
+    const use_dflash = wiring.use_dflash or glmNativeDflashArmed(slot.model.config.?.isGlm5(), slot.enable_drafter, slot.dflash != null, slot.sampling, slot.logprobs_n);
     const use_pld = wiring.use_pld;
     const dsv4_spec_intent = wiring.native_intent;
     log.debug("[spec-wiring] mtp={} dflash={} drafter={} pld={} (slot: drafter_flag={} dflash_handle={} drafter_handle={})\n", .{
@@ -7565,6 +7565,16 @@ pub fn specInitWiring(
         .use_pld = !use_mtp and !use_dflash and !use_drafter and enable_pld,
         .native_intent = false,
     };
+}
+
+pub fn glmNativeDflashArmed(
+    is_glm5: bool,
+    enable_drafter: bool,
+    has_dflash: bool,
+    sampling: SamplingParams,
+    logprobs_n: u32,
+) bool {
+    return is_glm5 and enable_drafter and has_dflash and generate_mod.glmDflashEligible(sampling, logprobs_n);
 }
 
 /// Resolve the request-level switch shared by the classic external drafter
@@ -10410,8 +10420,6 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
     inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
     }
-    try testing.expect(std.mem.indexOf(u8, src, "const use_dflash = wiring.use_dflash or (") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "generate_mod.glmDflashEligible(slot.sampling, slot.logprobs_n)") != null);
     // The exclusion must come from the shared predicate, not a new arch list.
     const from_predicate = "transformer.?.moduleSpec" ++ "Wiring()";
     try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);
@@ -10419,6 +10427,23 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
     // a second module-owned arch gets missed.
     const old_pld = "and !is_dsv4 and slot." ++ "enable_pld";
     try testing.expect(std.mem.indexOf(u8, src, old_pld) == null);
+}
+
+test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained/penalised/logprobs/budgeted-thinking/disabled ones do not" {
+    const t = testing;
+    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 0));
+    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 1 }, 0));
+
+    try t.expect(!glmNativeDflashArmed(false, true, true, .{ .temperature = 0 }, 0));
+    try t.expect(!glmNativeDflashArmed(true, false, true, .{ .temperature = 0 }, 0));
+    try t.expect(!glmNativeDflashArmed(true, true, false, .{ .temperature = 0 }, 0));
+
+    var constraint: generate_mod.Constraint = undefined;
+    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .constraint = &constraint }, 0));
+    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .presence_penalty = 1 }, 0));
+    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 1));
+    var think_bound: generate_mod.ThinkBound = undefined;
+    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_bound = &think_bound }, 0));
 }
 
 test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
@@ -11193,6 +11218,78 @@ test "every GLM slot owns its native request and hands it to its forward context
     try testing.expect(slots[0].ctx.glm5_request.? != slots[1].ctx.glm5_request.?);
     for (slots) |slot| sch.complete(slot);
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
+}
+
+test "a per-request kv_quant override (16, \"16\", 8, 4) reaches the submitted slot's cache as that scheme" {
+    const allocator = testing.allocator;
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    defer sch.pending.deinit(allocator);
+    defer sch.decoding.deinit(allocator);
+    defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
+    var plain = ModelConfig{ .model_type = "qwen3", .num_hidden_layers = 1 };
+    var model: LoadedModel = undefined;
+    model.config = &plain;
+    model.transformer = null;
+    model.prefix_cache = null;
+
+    const Case = struct { body: std.json.Value, want: transformer_mod.KVQuantConfig };
+    for ([_]Case{
+        .{ .body = .{ .integer = 16 }, .want = transformer_mod.KVQuantConfig.dense },
+        .{ .body = .{ .string = "16" }, .want = transformer_mod.KVQuantConfig.dense },
+        .{ .body = .{ .integer = 8 }, .want = transformer_mod.KVQuantConfig.affine(8) },
+        .{ .body = .{ .integer = 4 }, .want = transformer_mod.KVQuantConfig.affine(4) },
+    }) |c| {
+        const override = transformer_mod.KVQuantConfig.fromJsonValue(c.body).?;
+        const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = override });
+        try testing.expectEqual(c.want, slot.ctx.cache.config);
+        sch.complete(slot);
+        while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
+    }
+}
+
+test "a GLM slot submitted with a kv4 override is refused by the same name admission uses elsewhere" {
+    const allocator = testing.allocator;
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    defer sch.pending.deinit(allocator);
+    defer sch.decoding.deinit(allocator);
+    defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
+    var cfg = try model_mod.parseConfigFromJson(allocator, @embedFile("fixtures/glm5_config.json"));
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    model.prefix_cache = null;
+    const result = sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = transformer_mod.KVQuantConfig.affine(4) });
+    try testing.expectError(error.GlmKvQuantUnsupported, result);
 }
 
 test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {

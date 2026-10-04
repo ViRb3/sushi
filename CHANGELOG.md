@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`/v1/completions` honours a per-request `kv_quant`** instead of always running at the process default, and a hybrid
+  model's prefix checkpoint keeps the sign of negative zero.
 - **Source builds use the Zig 0.17.0 release** instead of a 0.17 nightly; `scripts/fetch-zig.sh` checks its sha256.
 - **Concurrent GLM-5.3 requests no longer over-admit or publish EOS**: a later request now waits while earlier ones
   still owe cache growth, and a DFlash2 request that sampled EOS first finishes without emitting it beside others.

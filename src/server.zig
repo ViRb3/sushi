@@ -9237,12 +9237,6 @@ fn handleChatCompletions(
     // hot-prefix-cache hits never happen — entries record their scheme and
     // findBestMatch filters on it.
     const kv_quant_override = parseKvQuantOverride(root);
-    if (kv_quant_override) |kq| {
-        switch (kq.scheme) {
-            .off => log.info("  kv-quant override: off (per-request)\n", .{}),
-            .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),
-        }
-    }
     const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Parse enable_pld: per-request override of the --pld default.
@@ -9575,6 +9569,7 @@ fn handleCompletions(
     }
     const root = parsed.value.object;
     const cache_key = requestCacheKey(root);
+    const kv_quant_override = parseKvQuantOverride(root);
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/completions -> 400 (unsupported n)\n", .{});
@@ -9709,7 +9704,7 @@ fn handleCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, null, false, enable_mtp)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, enable_mtp)) return;
 
     // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
     // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.
@@ -9754,12 +9749,12 @@ fn handleCompletions(
     sampling.think_penalty.biases = request_bias;
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9784,6 +9779,7 @@ fn handleNonStreamingCompletion(
     allow_batch_mtp: bool,
     logprobs_n: u32,
     cache_key: u64,
+    kv_quant_override: ?transformer_mod.KVQuantConfig,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
@@ -9796,7 +9792,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, null, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -9874,6 +9870,7 @@ fn handleStreamingCompletion(
     allow_batch_mtp: bool,
     logprobs_n: u32,
     cache_key: u64,
+    kv_quant_override: ?transformer_mod.KVQuantConfig,
 ) !void {
     const cmpl_id = nowMs(stream.io);
     const created_ts = nowSecs(stream.io);
@@ -9910,9 +9907,10 @@ fn handleStreamingCompletion(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
+        .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
+        .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
@@ -13732,7 +13730,12 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
 /// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
 fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
     const v = root.get("kv_quant") orelse return null;
-    return transformer_mod.KVQuantConfig.fromJsonValue(v);
+    const kq = transformer_mod.KVQuantConfig.fromJsonValue(v) orelse return null;
+    switch (kq.scheme) {
+        .off => log.info("  kv-quant override: off (per-request)\n", .{}),
+        .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),
+    }
+    return kq;
 }
 
 // ── Vision Processing ──

@@ -136,4 +136,20 @@ else
     echo -e "${GREEN}PASS${NC} per-request 'off' override observed in server log"
 fi
 
+# /v1/completions once ignored the field: the override line must appear for it too.
+echo
+echo "== /v1/completions per-request kv_quant =="
+before=$(grep -c "kv-quant override: affine 4-bit" "$LOGFILE" || true)
+curl -s -X POST -H "Content-Type: application/json" \
+    -d '{"model":"sushi","prompt":"Say hello.","max_tokens":8,"temperature":0.0,"kv_quant":4}' \
+    "$BASE/v1/completions" > /dev/null
+sleep 1
+after=$(grep -c "kv-quant override: affine 4-bit" "$LOGFILE" || true)
+if [ "$after" -gt "$before" ]; then
+    echo -e "${GREEN}PASS${NC} /v1/completions honoured the per-request 4-bit override"
+else
+    echo -e "${RED}FAIL${NC} /v1/completions ignored kv_quant: 4"
+    FAIL=1
+fi
+
 exit $FAIL

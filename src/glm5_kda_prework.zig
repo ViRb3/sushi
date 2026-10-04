@@ -263,7 +263,8 @@ pub fn apply(s: mlx.mlx_stream, in: Inputs) !?Result {
     inline for (.{ "SIG_B", "SIG_F", "EXP_F", "RSQ_F" }, .{ mode.sig_b, mode.sig_f, mode.exp_f, mode.rsq_f }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, name, @intFromBool(value)));
     const length = mlx.mlx_array_new_int(rows);
     defer _ = mlx.mlx_array_free(length);
-    const constants = mlx.mlx_array_new_data(&[_]f32{ 1 / @sqrt(@as(f32, 128)), 1e-6, in.lower, 0 }, &[_]c_int{4}, 1, .float32);
+    // constants[3] is added to a copied tail row, and -0.0 keeps the sign of a zero as `materializedOwnedCopy` does.
+    const constants = mlx.mlx_array_new_data(&[_]f32{ 1 / @sqrt(@as(f32, 128)), 1e-6, in.lower, -0.0 }, &[_]c_int{4}, 1, .float32);
     defer _ = mlx.mlx_array_free(constants);
     const iv = mlx.mlx_vector_array_new_data(&.{ in.qkv, in.a, in.beta, in.conv_weight, in.exp_a, in.dt_bias, in.conv_state orelse in.qkv, length, constants }, 9);
     defer _ = mlx.mlx_vector_array_free(iv);
