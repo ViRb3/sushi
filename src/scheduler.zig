@@ -5581,25 +5581,32 @@ fn postPrefillTerminal(slot: *Slot) bool {
 /// The slot still belongs to its connection thread until that thread calls `complete`; the
 /// inference thread just stops touching it.
 fn cullDecoding(sch: *Scheduler) void {
-    // A GLM decode-phase cancel commits before its native state is released below; the cleanup
-    // drain's commit would read a reset request. The drain then finds no checkpoints and adds nothing.
-    for (sch.decoding.items) |s| {
-        if (s.glm5_request != null and s.cancelled.load(.acquire) and !s.finished and s.error_code == null) commitSlotIfApplicable(sch, s);
-    }
+    cullDecodingWith(sch, commitSlotIfApplicable);
+}
+
+fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) void) void {
+    // One drop decision per slot, under the lock `complete()` removes under. A slot dropped here is
+    // out of `decoding`, and its memory lives until this thread's cleanup drain.
+    var dropped: std.ArrayList(*Slot) = .empty;
+    defer dropped.deinit(sch.allocator);
     sch.queue_mu.lockUncancelable(sch.io);
-    defer sch.queue_mu.unlock(sch.io);
     var i: usize = 0;
     while (i < sch.decoding.items.len) {
         const s = sch.decoding.items[i];
         const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
-        if (drop) {
-            releaseNativeState(s);
+        // An allocation failure keeps the slot for the next tick; every pass skips it meanwhile.
+        if (drop and if (dropped.append(sch.allocator, s)) true else |_| false) {
             _ = sch.decoding.orderedRemove(i);
         } else i += 1;
     }
-    // Republish the snapshot with this tick's survivors, under the same
-    // lock the conn-thread reader copies under.
     publishLiveKvResidency(sch, null);
+    sch.queue_mu.unlock(sch.io);
+    // A GLM decode-phase cancel commits before its native state is released; the cleanup drain's
+    // commit would read a reset request and add nothing.
+    for (dropped.items) |s| {
+        if (s.glm5_request != null and s.cancelled.load(.acquire) and !s.finished and s.error_code == null) commit(sch, s);
+        releaseNativeState(s);
+    }
 }
 
 /// Native GLM has no reusable prefix snapshot: a slot the inference thread stops touching
@@ -12277,6 +12284,66 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     try testing.expectEqual(@as(usize, 0), slots[0].glm5_request.?.offset);
     try testing.expectEqual(@as(usize, 0), slots[1].glm5_request.?.offset);
     try testing.expectEqual(@as(usize, 4), slots[2].glm5_request.?.offset);
+}
+
+test "a GLM cancel landing between the cull passes is committed once before its native reset" {
+    const Hook = struct {
+        var commits: [2]usize = .{ 0, 0 };
+        var offset_at_commit: [2]usize = .{ 0, 0 };
+        var slots: [2]*Slot = undefined;
+        fn commit(_: *Scheduler, s: *Slot) void {
+            const i: usize = if (s == slots[0]) 0 else 1;
+            commits[i] += 1;
+            offset_at_commit[i] = s.glm5_request.?.offset;
+            slots[1].cancelled.store(true, .release);
+        }
+    };
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.metrics = null;
+    sch.live_session_count = 0;
+    sch.decoding = .empty;
+    defer sch.decoding.deinit(testing.allocator);
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/glm-cull-race";
+    model.prefix_cache = null;
+    var slots: [2]Slot = undefined;
+    for (&slots, 0..) |*slot, i| {
+        slot.model = &model;
+        slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+        slot.ssm_entries = null;
+        slot.ring_cps = .{};
+        slot.restored_entry = 0;
+        slot.full_prompt = &.{};
+        slot.prompt_tokens = 4;
+        slot.completion_tokens = 0;
+        slot.cached_tokens = 0;
+        slot.request_id = i;
+        slot.max_tokens = 8;
+        slot.legacy_gen = null;
+        slot.finished = false;
+        slot.error_code = null;
+        slot.cancelled = .init(false);
+        slot.glm5_request = try glm5_forward_mod.Request.init(testing.allocator, 2);
+        slot.glm5_request.?.offset = 4;
+        Hook.slots[i] = slot;
+        try sch.decoding.append(testing.allocator, slot);
+    }
+    defer for (&slots) |*slot| slot.glm5_request.?.deinit();
+    Hook.commits = .{ 0, 0 };
+    slots[0].cancelled.store(true, .release);
+
+    cullDecodingWith(&sch, Hook.commit);
+    // The late cancel stays in `decoding` with its state, and the next cull commits it.
+    try testing.expectEqual(@as(usize, 1), sch.decoding.items.len);
+    try testing.expectEqual(@as(usize, 4), slots[1].glm5_request.?.offset);
+    cullDecodingWith(&sch, Hook.commit);
+    try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
+    try testing.expectEqual([2]usize{ 1, 1 }, Hook.commits);
+    try testing.expectEqual([2]usize{ 4, 4 }, Hook.offset_at_commit);
+    try testing.expectEqual(@as(usize, 0), slots[1].glm5_request.?.offset);
 }
 
 test "an error whose name cannot be copied still ends the consumer and leaves scheduling" {
