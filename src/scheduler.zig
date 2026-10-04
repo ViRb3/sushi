@@ -8052,6 +8052,36 @@ fn slotMimoMtpCrowdable(slot: *const Slot) bool {
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
 }
 
+/// Step costs of a grouped GLM forward in ms (rows ubench, arch-glm5-next#concurrency): fixed, per
+/// row, and one assistant draft.
+pub const GlmRowCost = struct { fixed: f32 = 25, row: f32 = 14.5, draft: f32 = 5 };
+
+/// Rows one grouped GLM tick carries: the verify kernels' four-row tile.
+const glm_tick_rows = 4;
+
+/// Draft nodes (0, 1 or 2) for the best drafter among `slots` single rows under the four-row cap:
+/// a tree pays while its expected accepted tokens, priced at the group's ms per token, beat its
+/// rows and draft. `rate` is that request's accepted share of drafts (`Generator.glm_draft_rate`).
+pub fn glmTreeNodes(slots: usize, rate: f32, cost: GlmRowCost) usize {
+    if (slots == 0) return 0;
+    const n: f32 = @floatFromInt(slots);
+    const per_token = (cost.fixed + n * cost.row) / n;
+    var best: usize = 0;
+    var best_gain: f32 = 0;
+    var accepted: f32 = 0;
+    var power: f32 = 1;
+    for (1..@min(2, glm_tick_rows -| slots) + 1) |k| {
+        power *= rate;
+        accepted += power;
+        const gain = accepted * per_token - (@as(f32, @floatFromInt(k)) * cost.row + cost.draft);
+        if (gain > best_gain) {
+            best = k;
+            best_gain = gain;
+        }
+    }
+    return best;
+}
+
 /// Does another slot of this one's model decode this tick (a drafting GLM slot or a plain batchable one)?
 fn glmRowsInCompany(slot: *const Slot, drafting: []const *Slot, plain: []const *Slot) bool {
     var company: usize = 0;
@@ -9006,40 +9036,89 @@ fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
 
 var glm_rows_logged = false;
 
-/// A plain batched GLM tick: one single-row group per slot through `verifyGroups`, each row
-/// committed by its own generator. Returns the rows' logits in `batch` order.
-fn glmRowsForward(allocator: std.mem.Allocator, xfm: *Transformer, batch: []const *Slot, tokens: []const u32) ![]mlx.mlx_array {
+var glm_tree_logged = false;
+
+/// A batched GLM tick: one group per slot through `verifyGroups`, at most four rows. Every slot
+/// decodes one plain row, committed by its own generator, unless `glmTreeNodes` hands the spare
+/// rows to the best drafter's DFlash2 tree: that slot's round is published here and it leaves
+/// `batch`. Returns the plain rows' logits in the order of the shortened `batch`.
+fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transformer, batch: *[]*Slot, tokens: []const u32) ![]mlx.mlx_array {
     const verifier = @import("glm5_dflash_model.zig");
     const target = xfm.glm5.?;
     target.s = xfm.s;
     target.suppress_mask = xfm.suppress_mask;
+    const schedule = try verifier.bindSchedule(4);
+    defer schedule.restore();
+    var timer = io_util.Stopwatch.init(sch.io);
+    // The drafter with the best landing rate; its tree takes the rows the plain slots leave.
+    var tree_at: ?usize = null;
+    var proposal: @import("glm5_dflash.zig").Proposal = undefined;
+    for (batch.*, 0..) |slot, i| {
+        const gen = &slot.legacy_gen.?;
+        if (!gen.glm_dflash_native or gen.dflash_ctx == null) continue;
+        if (tree_at) |best| if (batch.*[best].legacy_gen.?.glm_draft_rate >= gen.glm_draft_rate) continue;
+        tree_at = i;
+    }
+    if (tree_at) |at| tree: {
+        const gen = &batch.*[at].legacy_gen.?;
+        const nodes = glmTreeNodes(batch.len, gen.glm_draft_rate, .{});
+        if (nodes == 0 or gen.done or gen.completion_tokens + 2 > gen.max_tokens) {
+            tree_at = null;
+            break :tree;
+        }
+        gen.dflash.?.s = xfm.s;
+        proposal = try gen.glmPropose(nodes);
+    }
+    const draft_ns = timer.read();
+    timer.reset();
     var groups: [verifier.max_rows]verifier.Group = undefined;
     // A DFlash2 row keeps its assistant context; every row then carries the assistant's taps.
     var taps: []const u32 = &.{};
-    for (batch, 0..) |slot, i| {
+    for (batch.*, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
         if (gen.glm_dflash_native) taps = gen.dflash.?.config.target_layer_ids;
-        groups[i] = .{ .request = gen.ctx.glm5_request orelse return error.GlmRequestMissing, .tokens = tokens[i .. i + 1], .parents = &.{-1} };
+        const request = gen.ctx.glm5_request orelse return error.GlmRequestMissing;
+        groups[i] = if (tree_at == i)
+            .{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count] }
+        else
+            .{ .request = request, .tokens = tokens[i .. i + 1], .parents = &.{-1} };
     }
-    const schedule = try verifier.bindSchedule(4);
-    defer schedule.restore();
     if (!glm_rows_logged) {
         glm_rows_logged = true;
         log.info("[glm-rows] grouped plain tick engaged: {d} rows\n", .{batch.len});
     }
+    if (tree_at != null and !glm_tree_logged) {
+        glm_tree_logged = true;
+        log.info("[glm-rows] a {d}-row draft tree joined {d} plain rows\n", .{ proposal.count, batch.len - 1 });
+    }
     var out: [verifier.max_rows]verifier.Verified = undefined;
     try verifier.verifyGroups(target, groups[0..batch.len], taps, .affine_rows_ffn, out[0..batch.len]);
     defer for (out[0..batch.len]) |*v| v.deinit();
-    const logits = try allocator.alloc(mlx.mlx_array, batch.len);
+    const verify_ns = timer.read();
+    const logits = try allocator.alloc(mlx.mlx_array, batch.len - @intFromBool(tree_at != null));
     var made: usize = 0;
     errdefer {
         for (logits[0..made]) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits);
     }
-    for (batch, out[0..batch.len]) |slot, *v| {
-        logits[made] = try slot.legacy_gen.?.glmRowCommit(v);
+    var kept: usize = 0;
+    for (batch.*, out[0..batch.len], 0..) |slot, *v, i| {
+        const gen = &slot.legacy_gen.?;
+        if (tree_at == i) {
+            const result = gen.glmRoundEnd(slot.allocator, &proposal, v, draft_ns, verify_ns) catch |err| {
+                slot.markError(@errorName(err));
+                continue;
+            };
+            defer slot.allocator.free(result.tokens);
+            publishSpeculativeBlock(sch, slot, gen, result.tokens);
+            continue;
+        }
+        logits[made] = try gen.glmRowCommit(v);
         made += 1;
+        batch.*[kept] = slot;
+        kept += 1;
     }
+    batch.* = batch.*[0..kept];
     return logits;
 }
 
@@ -9090,7 +9169,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     defer allocator.free(live);
     const live_n = try batchedTickRows(sch, active, live);
     if (live_n == 0) return;
-    const batch = live[0..live_n];
+    var batch = live[0..live_n];
 
     // Build inputs.
     const next_tokens = try allocator.alloc(u32, live_n);
@@ -9142,7 +9221,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         allocator.free(rows);
     };
     const logits_arr = if (use_glm)
-        try glmRowsForward(allocator, xfm_ptr, batch, next_tokens)
+        try glmRowsForward(sch, allocator, xfm_ptr, &batch, next_tokens)
     else if (use_gdn)
         try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else if (use_mimo)
@@ -9178,8 +9257,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     var sample_params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
     var sample_rows: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
     var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
-    std.debug.assert(live_n == logits_arr.len);
-    std.debug.assert(live_n <= sample_params.len);
+    std.debug.assert(batch.len == logits_arr.len);
+    std.debug.assert(batch.len <= sample_params.len);
     var shifted_n: usize = 0;
     defer for (sample_rows[0..shifted_n], logits_arr[0..shifted_n]) |row, raw| {
         if (row.ctx != raw.ctx) _ = mlx.mlx_array_free(row);
@@ -9190,8 +9269,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         shifted_n = i + 1;
         sample_params[i] = gen.sampling;
     }
-    if (live_n > 0) {
-        try generate_mod.sampleRows(sample_ids[0..live_n], sample_rows[0..live_n], sample_params[0..live_n], xfm_ptr.s);
+    if (batch.len > 0) {
+        try generate_mod.sampleRows(sample_ids[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], xfm_ptr.s);
         for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
     }
 
@@ -10877,6 +10956,15 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
     try testing.expectEqual(@as(usize, 24), Probe.frees);
     try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
+}
+
+test "the four-row planner gives spare rows to drafts only while they beat the group's rows" {
+    const cost = GlmRowCost{};
+    try testing.expectEqual(@as(usize, 2), glmTreeNodes(2, 0.98, cost));
+    try testing.expectEqual(@as(usize, 0), glmTreeNodes(2, 0.5, cost));
+    try testing.expectEqual(@as(usize, 1), glmTreeNodes(3, 0.95, cost));
+    try testing.expectEqual(@as(usize, 0), glmTreeNodes(3, 0.7, cost));
+    try testing.expectEqual(@as(usize, 0), glmTreeNodes(4, 1.0, cost));
 }
 
 test "a drafting GLM slot rides plain rows only in company of its own model" {

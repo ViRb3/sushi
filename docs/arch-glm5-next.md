@@ -127,6 +127,9 @@ inside 1.46% drift) because verification per round grew 20.6%.
 - **Rows are the currency** (rows ubench `02d2ee4d`, Sushi-2.3bpw kv8, 1K/6K context): a grouped forward costs ~25 ms
   plus ~14.5 ms per row; two requests 54 ms (1.39× serial), four 82 ms (1.84×); one row is within 2% of serial decode.
   A draft row pays only while its ms per accepted token (~19 copy, ~35 prose) beats the batch's (27 at two, 21 at four).
+- **Four-row planner** (`glmTreeNodes`, `GlmRowCost` from those costs): a grouped tick carries at most four rows; the
+  drafter with the best landing rate (`Generator.glm_draft_rate`, accepted share of a tree's depth) takes the spare
+  rows as its DFlash2 tree (two requests: N2, three: one draft, four: none) while its expected tokens pay for them.
 
 ## Memory
 

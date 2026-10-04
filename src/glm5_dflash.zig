@@ -614,24 +614,41 @@ pub const DecisionHook = struct {
 };
 
 pub fn roundTreeLayerwiseWithDecisions(io: std.Io, assistant: *draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, mode: @import("glm5_dflash_kda.zig").ProjectionMode, children: usize, decisions: ?DecisionHook) !RoundResult {
-    if (children == 0 or children > 16) return error.InvalidGlmDraftTree;
-    try validatePair(assistant, target);
-    if (budget == 0) return error.InvalidGlmDraftBudget;
-    if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
     var timer = @import("io_util.zig").Stopwatch.init(io);
-    const proposal = if (budget == 1 or std.mem.indexOfScalar(u32, eos, pending) != null) blk: {
-        var one = Proposal{ .count = 1 };
-        one.tokens[0] = pending;
-        one.parents[0] = -1;
-        break :blk one;
-    } else try proposeTreeWithChildren(assistant, context, target, pending, max_nodes, children);
+    const proposal = try proposeRound(assistant, context, target, request, pending, max_nodes, budget, eos, children);
     const draft_ns = timer.read();
     timer.reset();
     var layerwise = try @import("glm5_dflash_model.zig").verify(target, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], assistant.config.target_layer_ids, mode);
     defer layerwise.deinit();
     if (decisions) |hook| try hook.apply(hook.ctx, &layerwise, budget, eos);
     const verify_ns = timer.read();
-    timer.reset();
+    var result = try finishRound(io, assistant, context, target, request, &proposal, &layerwise, budget, eos);
+    result.draft_ns = draft_ns;
+    result.verify_ns = verify_ns;
+    result.verifier = if (mode == .affine_rows_ffn) "layerwise_tree_affine_ffn_tiles" else if (mode == .affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections";
+    return result;
+}
+
+/// A round's draft: the assistant's tree, or the pending token alone at the last budgeted
+/// token or an EOS.
+pub fn proposeRound(assistant: *draft.DflashModel, context: *const draft.DflashCtx, target: *const forward.Model, request: *const forward.Request, pending: u32, max_nodes: usize, budget: usize, eos: []const u32, children: usize) !Proposal {
+    if (children == 0 or children > 16) return error.InvalidGlmDraftTree;
+    try validatePair(assistant, target);
+    if (budget == 0) return error.InvalidGlmDraftBudget;
+    if (request.offset != context.absLen()) return error.InvalidGlmDraftOffset;
+    if (max_nodes == 0 or budget == 1 or std.mem.indexOfScalar(u32, eos, pending) != null) {
+        var one = Proposal{ .count = 1 };
+        one.tokens[0] = pending;
+        one.parents[0] = -1;
+        return one;
+    }
+    return proposeTreeWithChildren(assistant, context, target, pending, max_nodes, children);
+}
+
+/// Commits a verified round (decisions already applied): target state and assistant context
+/// together, or neither.
+pub fn finishRound(io: std.Io, assistant: *const draft.DflashModel, context: *draft.DflashCtx, target: *const forward.Model, request: *forward.Request, proposal: *const Proposal, layerwise: *const @import("glm5_dflash_model.zig").Verified, budget: usize, eos: []const u32) !RoundResult {
+    var timer = @import("io_util.zig").Stopwatch.init(io);
     var verified = try layerwise.prepareCommitConsuming(request, budget, eos, target.s);
     defer verified.deinit();
     const replay_ns = timer.read();
@@ -640,7 +657,7 @@ pub fn roundTreeLayerwiseWithDecisions(io: std.Io, assistant: *draft.DflashModel
         request.failed = true;
         return err;
     };
-    var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = if (mode == .affine_rows_ffn) "layerwise_tree_affine_ffn_tiles" else if (mode == .affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections" };
+    var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = 0, .verify_ns = 0, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = "layerwise_tree_grouped" };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
     return result;
 }

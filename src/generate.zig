@@ -1726,6 +1726,8 @@ pub const Generator = struct {
     dflash: ?*DflashModel = null,
     dflash_ctx: ?dflash_mod.DflashCtx = null,
     glm_dflash_native: bool = false,
+    /// Accepted share of a DFlash2 round's drafts, smoothed; the grouped tick prices draft rows with it.
+    glm_draft_rate: f32 = 0.8,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, clamped by --draft-block-size).
@@ -5412,21 +5414,59 @@ pub const Generator = struct {
     }
 
     fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        if (self.done or try self.checkStop()) return null;
-        if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
-        const target = self.xfm.glm5.?;
-        const request = self.ctx.glm5_request orelse return error.GlmRequestMissing;
-        const assistant = self.dflash.?;
-        target.s = self.xfm.s;
-        assistant.s = self.xfm.s;
-        target.suppress_mask = self.xfm.suppress_mask;
+        if (!try self.glmRoundReady()) return null;
         const schedule = try @import("glm5_dflash_model.zig").bindSchedule(4);
         defer schedule.restore();
+        var timer = io_util.Stopwatch.init(self.timer.io);
+        const proposal = try self.glmPropose(@min(@max(self.dflash_block_size, 2) - 1, 2));
+        const draft_ns = timer.read();
+        timer.reset();
+        const request = self.ctx.glm5_request.?;
+        // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
+        var layerwise = try @import("glm5_dflash_model.zig").verify(self.xfm.glm5.?, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], self.dflash.?.config.target_layer_ids, .affine_rows_ffn);
+        defer layerwise.deinit();
+        const verify_ns = timer.read();
+        return try self.glmRoundEnd(allocator, &proposal, &layerwise, draft_ns, verify_ns);
+    }
+
+    /// A DFlash2 GLM round may run: not done, no stop due.
+    pub fn glmRoundReady(self: *Generator) !bool {
+        if (self.done or try self.checkStop()) return false;
+        if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        if (self.ctx.glm5_request == null) return error.GlmRequestMissing;
+        const target = self.xfm.glm5.?;
+        target.s = self.xfm.s;
+        target.suppress_mask = self.xfm.suppress_mask;
+        self.dflash.?.s = self.xfm.s;
+        return true;
+    }
+
+    /// This request's round draft of at most `max_nodes` nodes.
+    pub fn glmPropose(self: *Generator, max_nodes: usize) !@import("glm5_dflash.zig").Proposal {
+        return @import("glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
+    }
+
+    /// Decides (sampled requests draw along the visited path), commits and books a verified
+    /// round, alone or as one group of a grouped tick.
+    pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *const @import("glm5_dflash.zig").Proposal, layerwise: *@import("glm5_dflash_model.zig").Verified, draft_ns: u64, verify_ns: u64) !DrafterStepResult {
         const budget = self.max_tokens - self.completion_tokens;
         const sampled = !isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
-        const decisions: ?@import("glm5_dflash.zig").DecisionHook = if (sampled) .{ .ctx = self, .apply = sampledGlmDecisions } else null;
-        // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
-        const round = try @import("glm5_dflash.zig").roundTreeLayerwiseWithDecisions(self.timer.io, assistant, &self.dflash_ctx.?, target, request, self.next_token_id, @min(@max(self.dflash_block_size, 2) - 1, 2), budget, self.eos_token_ids, .affine_rows_ffn, 4, decisions);
+        if (sampled) try sampledGlmDecisions(self, layerwise, budget, self.eos_token_ids);
+        const request = self.ctx.glm5_request.?;
+        var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, budget, self.eos_token_ids);
+        round.draft_ns = draft_ns;
+        round.verify_ns = verify_ns;
+        // Accepted share of the tree's depth: a fork can land one draft, a chain two.
+        var depth: [16]u32 = @splat(0);
+        var deepest: u32 = 0;
+        for (proposal.parents[1..proposal.count], 1..) |parent, row| {
+            depth[row] = depth[@intCast(parent)] + 1;
+            deepest = @max(deepest, depth[row]);
+        }
+        if (deepest > 0) {
+            const rate: f32 = @as(f32, @floatFromInt(round.accepted_drafts)) / @as(f32, @floatFromInt(deepest));
+            self.glm_draft_rate = 0.7 * self.glm_draft_rate + 0.3 * rate;
+        }
         var emitted = round.count;
         for (round.tokens[1..round.count], 1..) |token, i| {
             if (tokenStops(token, self.eos_token_ids, &self.consecutive_pad)) {
