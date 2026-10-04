@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
+  instead of failing to compile mlx-c after a plain `git pull`.
 - **`sushi launch omp` lets local buffered tool calls finish without the default five-minute retry**; the generated
   Sushi provider disables its model-progress deadline while preserving explicit user timeout overrides.
 

@@ -17,7 +17,7 @@
 # bundling them) require macOS >= 26.2 at runtime.
 #
 # This is the single source of truth for the pinned mlx/mlx-c versions: the
-# submodule SHAs. Bump by checking out a new tag in the submodule; CI and
+# submodule SHAs. Bump by checking out a new tag in the submodule and staging it; CI and
 # local builds rebuild automatically (stamp mismatch). Guard test:
 # tests/test_mlx_staged_nax.sh.
 set -euo pipefail
@@ -36,6 +36,16 @@ die() { echo "[build-mlx] ERROR: $*" >&2; exit 1; }
 
 [ -f "$MLX_SRC/CMakeLists.txt" ] && [ -f "$MLXC_SRC/CMakeLists.txt" ] \
   || die "submodules missing — run: git submodule update --init lib/mlx-src lib/mlxc-src"
+
+# The pin is the superproject's index entry, so a staged bump builds and a pull that left a
+# submodule behind (git pull without --recurse-submodules) is refused instead of mis-building.
+for src in "$MLX_SRC" "$MLXC_SRC"; do
+  rel="${src#"$REPO_ROOT"/}"
+  pin="$(git -C "$REPO_ROOT" ls-files -s -- "$rel" | awk '$1 == "160000" {print $2}')"
+  have="$(git -C "$src" rev-parse HEAD)"
+  [ -z "$pin" ] || [ "$pin" = "$have" ] \
+    || die "$rel is at ${have:0:12} but this checkout pins ${pin:0:12} — run: git submodule update --init lib/mlx-src lib/mlxc-src"
+done
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"

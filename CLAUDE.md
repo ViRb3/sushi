@@ -121,7 +121,7 @@ lists the rest.
   `rm -rf .zig-cache` (configure-time output is cached).
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
   `zig build test` does NOT refresh `zig-out/bin/sushi` — rebuild before any live A/B.
-- mlx + mlx-c: `scripts/build-mlx.sh`. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs against
+- mlx + mlx-c: `scripts/build-mlx.sh`. Bump = checkout tag → `git add` the submodule → rerun → re-diff `src/mlx.zig` externs against
   `lib/mlxc-src/mlx/c/*.h`.
 - Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into
   `obj/`, `ar rcs libjinja.a obj/*.o`.

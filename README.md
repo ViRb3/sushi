@@ -39,6 +39,9 @@ brew bundle
 mkdir -p ~/.local/bin && ln -s "$PWD/zig-out/bin/sushi" ~/.local/bin/sushi   # or any directory on your PATH
 ```
 
+To update a source checkout, pull with `git pull --recurse-submodules` (or run `git submodule update --init` after a
+plain pull) before `./scripts/build-mlx.sh`: the script refuses a submodule left at an older pin.
+
 The server listens on `127.0.0.1:12345`, the model's own MTP draft head and the 8-bit KV cache are on by default.
 
 GLM-5.3 uses a BF16 compressed MLA cache by default. Its 11 attention layers store
