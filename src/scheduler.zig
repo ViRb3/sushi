@@ -356,6 +356,9 @@ pub var hot_cache_budget_invalidate: ?*const fn () void = null;
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
+/// The error name latched when the real one cannot be copied; `Slot.deinit` must not free it.
+const static_error_name: []const u8 = "OutOfMemory";
+
 /// Result of `Slot.waitNext`. Driven by the inference thread; consumed by
 /// the connection thread.
 pub const NextResult = union(enum) {
@@ -536,6 +539,7 @@ pub const Slot = struct {
     /// row the same row across polls (the wire `chatcmpl` id is minted later,
     /// at response time, and does not map to this).
     request_id: u64 = 0,
+    abandoned_next: ?*Slot = null,
     /// Monotonic timestamp captured in `Slot.init`, BEFORE the queue wait.
     /// Anchors the exact time-to-first-token measurement.
     request_start_ts: std.Io.Timestamp,
@@ -778,7 +782,9 @@ pub const Slot = struct {
         self.allocator.free(self.full_prompt);
         self.allocator.free(self.media_chain);
         self.allocator.free(self.eos_token_ids);
-        if (self.error_code) |code| self.allocator.free(code);
+        if (self.error_code) |code| {
+            if (code.ptr != static_error_name.ptr) self.allocator.free(code);
+        }
         if (self.generated_ids) |g| self.allocator.free(g);
         // Free any logprobs the conn thread didn't claim. After
         // `nonStreamingViaScheduler` calls `toOwnedSlice`, items.len becomes
@@ -839,16 +845,9 @@ pub const Slot = struct {
             // Degrade to error like the token append below — and do NOT return:
             // the broadcast at the bottom is what wakes a reader blocked on the
             // condvar, so an early exit here trades an OOM for a hang.
-            self.logprobs_buf.append(self.allocator, entry) catch |err| {
-                self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
-                self.state = .errored;
-            };
+            self.logprobs_buf.append(self.allocator, entry) catch |err| self.latchErrorLocked(@errorName(err));
         }
-        self.out_buf.append(self.allocator, t) catch |err| {
-            // Allocation failure: degrade to error.
-            self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
-            self.state = .errored;
-        };
+        self.out_buf.append(self.allocator, t) catch |err| self.latchErrorLocked(@errorName(err));
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
     }
@@ -912,12 +911,18 @@ pub const Slot = struct {
         return errorNameIsMemory(name);
     }
 
+    /// Caller holds `out_mu`. `error_code != null` is what the consumers and the cull read as
+    /// terminal, so an uncopyable name falls back to a static one instead of leaving it null.
+    fn latchErrorLocked(self: *Slot, name: []const u8) void {
+        if (self.error_code == null) self.error_code = self.allocator.dupe(u8, name) catch static_error_name;
+        self.state = .errored;
+    }
+
     fn markError(self: *Slot, name: []const u8) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         if (self.error_code != null or self.finished) return;
-        self.error_code = self.allocator.dupe(u8, name) catch null;
-        self.state = .errored;
+        self.latchErrorLocked(name);
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
     }
@@ -1362,6 +1367,9 @@ pub const Scheduler = struct {
     /// inference thread drains this queue between ticks where it owns the
     /// stream binding, so all mlx ops stay on one thread.
     cleanup_queue: std.ArrayList(*Slot),
+    /// Slots whose `submit` failed after they were built, linked through `Slot.abandoned_next`
+    /// (queue_mu). An intrusive list, so handing one over cannot fail for want of memory.
+    abandoned: ?*Slot,
     /// Slots out of `pending` whose prefill pass is running: neither pending nor decoding, so
     /// a shutdown reaches them only here (queue_mu).
     prefilling: std.ArrayList(*Slot),
@@ -1484,6 +1492,7 @@ pub const Scheduler = struct {
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
+            .abandoned = null,
             .prefilling = std.ArrayList(*Slot).empty,
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
@@ -1550,6 +1559,7 @@ pub const Scheduler = struct {
         self.decoding.deinit(self.allocator);
         for (self.cleanup_queue.items) |slot| slot.deinit();
         self.cleanup_queue.deinit(self.allocator);
+        destroyAbandoned(self.abandoned);
         self.prefilling.deinit(self.allocator);
         // Vision/embed queues should be empty (encodeVision/computeEmbedding
         // block until done) but guard against shutdown-mid-encode by signaling
@@ -1644,7 +1654,8 @@ pub const Scheduler = struct {
             transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
         if (slot_config.isGlm5() and eff_kv_quant.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
-        errdefer slot.deinit();
+        // The slot may own GPU arrays that only the inference thread frees.
+        errdefer self.abandon(slot);
 
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
@@ -1665,6 +1676,14 @@ pub const Scheduler = struct {
         self.in_flight += 1;
         self.queue_cond.broadcast(self.io);
         return slot;
+    }
+
+    fn abandon(self: *Scheduler, slot: *Slot) void {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        slot.abandoned_next = self.abandoned;
+        self.abandoned = slot;
+        self.queue_cond.broadcast(self.io);
     }
 
     /// Hand the slot off to the inference thread for cleanup, and notify any
@@ -5057,6 +5076,42 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
     );
 }
 
+/// What one inference pass takes under `queue_mu` for teardown and model jobs.
+const TeardownTake = struct {
+    cleanup_n: usize,
+    abandoned: ?*Slot,
+    load: ?*LoadRequest,
+    unload: ?*UnloadRequest,
+};
+
+/// Caller holds `queue_mu`.
+fn takeTeardownLocked(sch: *Scheduler, batch: []*Slot) TeardownTake {
+    var n: usize = 0;
+    while (n < batch.len and sch.cleanup_queue.items.len > 0) {
+        batch[n] = sch.cleanup_queue.orderedRemove(0);
+        n += 1;
+    }
+    const abandoned = sch.abandoned;
+    sch.abandoned = null;
+    // A queued slot's generator points into its model's transformer, and its connection released
+    // the model before the job was queued: the job waits until the whole queue is destroyed.
+    const settled = sch.cleanup_queue.items.len == 0;
+    return .{
+        .cleanup_n = n,
+        .abandoned = abandoned,
+        .load = if (settled and sch.load_queue.items.len > 0) sch.load_queue.orderedRemove(0) else null,
+        .unload = if (settled and sch.unload_queue.items.len > 0) sch.unload_queue.orderedRemove(0) else null,
+    };
+}
+
+fn destroyAbandoned(head: ?*Slot) void {
+    var next = head;
+    while (next) |slot| {
+        next = slot.abandoned_next;
+        slot.deinit();
+    }
+}
+
 /// Caller holds `queue_mu`. Shared with the wait condition below.
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
@@ -5064,6 +5119,7 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.vision_queue.items.len > 0 or
         sch.embed_queue.items.len > 0 or
         sch.cleanup_queue.items.len > 0 or
+        sch.abandoned != null or
         sch.load_queue.items.len > 0 or
         sch.unload_queue.items.len > 0;
 }
@@ -5168,6 +5224,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         //     real GPU memory release on refcount-zero.
         var cleanup_batch: [16]*Slot = undefined;
         var cleanup_n: usize = 0;
+        var abandoned: ?*Slot = null;
         // 0b. Drain any pending vision/embed work. These run synchronously on
         //     behalf of conn threads waiting in `encodeVision` /
         //     `computeEmbedding`. Processed here (not concurrently with decode
@@ -5187,10 +5244,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (cleanup_n < cleanup_batch.len and sch.cleanup_queue.items.len > 0) {
-                cleanup_batch[cleanup_n] = sch.cleanup_queue.orderedRemove(0);
-                cleanup_n += 1;
-            }
+            const teardown = takeTeardownLocked(sch, &cleanup_batch);
+            cleanup_n = teardown.cleanup_n;
+            abandoned = teardown.abandoned;
             while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
                 vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
                 vision_n += 1;
@@ -5199,12 +5255,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
                 embed_n += 1;
             }
-            if (sch.load_queue.items.len > 0) {
-                load_req = sch.load_queue.orderedRemove(0);
-            }
-            if (sch.unload_queue.items.len > 0) {
-                unload_req = sch.unload_queue.orderedRemove(0);
-            }
+            load_req = teardown.load;
+            unload_req = teardown.unload;
         }
         for (cleanup_batch[0..cleanup_n]) |s| {
             // Decode-phase cancel: `complete()` pulled this slot straight
@@ -5230,6 +5282,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
         }
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
+        destroyAbandoned(abandoned);
         if (vision_n > 0 or embed_n > 0) {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
@@ -11160,6 +11213,138 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
 }
 
+fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Scheduler {
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = queue_cap;
+    sch.in_flight = 0;
+    sch.req_seq = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    sch.load_queue = .empty;
+    sch.unload_queue = .empty;
+    sch.abandoned = null;
+    return sch;
+}
+
+test "a submit that fails once its slot is built hands the slot to the inference thread" {
+    const Probe = struct {
+        var inference_id: std.Thread.Id = undefined;
+        var frees: usize = 0;
+        var off_thread_frees: usize = 0;
+        fn free(_: mlx.mlx_array) void {
+            frees += 1;
+            if (std.Thread.getCurrentId() != inference_id) off_thread_frees += 1;
+        }
+        fn submit(sch: *Scheduler, model: *LoadedModel, slot: *?*Slot, err: *?anyerror) void {
+            slot.* = sch.submit(.{
+                .model = model,
+                .prompt_ids = &.{1},
+                .sampling = .{},
+                .eos_token_ids = &.{},
+                .max_tokens = 1,
+                .vision_embeddings = .{ .ctx = @ptrFromInt(1) },
+            }) catch |e| {
+                err.* = e;
+                return;
+            };
+        }
+    };
+    Probe.inference_id = std.Thread.getCurrentId();
+    slot_vision_free_test_hook = Probe.free;
+    defer slot_vision_free_test_hook = null;
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    var handed_over: usize = 0;
+    var fail_at: usize = 0;
+    while (fail_at < 32) : (fail_at += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_at });
+        const allocator = failing.allocator();
+        var sch = submitTestScheduler(allocator, 2);
+        defer sch.pending.deinit(allocator);
+        defer sch.cleanup_queue.deinit(allocator);
+        defer sch.prefilling.deinit(allocator);
+        Probe.frees = 0;
+        Probe.off_thread_frees = 0;
+        var slot: ?*Slot = null;
+        var err: ?anyerror = null;
+        const conn = try std.Thread.spawn(.{}, Probe.submit, .{ &sch, &model, &slot, &err });
+        conn.join();
+        try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
+        if (slot) |s| sch.complete(s);
+        // The inference thread's pass over what the connection left behind.
+        var batch: [16]*Slot = undefined;
+        const take = takeTeardownLocked(&sch, &batch);
+        for (batch[0..take.cleanup_n]) |s| s.deinit();
+        const built = slot != null or take.abandoned != null;
+        if (take.abandoned != null) handed_over += 1;
+        destroyAbandoned(take.abandoned);
+        try testing.expectEqual(@as(usize, if (built) 1 else 0), Probe.frees);
+        try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
+    }
+    // cleanup_queue, prefilling and pending each grow once after the slot is built.
+    try testing.expect(handed_over >= 3);
+
+    var shut = submitTestScheduler(testing.allocator, 2);
+    shut.shutdown.store(true, .release);
+    Probe.frees = 0;
+    var shut_slot: ?*Slot = null;
+    var shut_err: ?anyerror = null;
+    const shut_conn = try std.Thread.spawn(.{}, Probe.submit, .{ &shut, &model, &shut_slot, &shut_err });
+    shut_conn.join();
+    try testing.expect(shut_err.? == error.Shutdown);
+    try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
+    destroyAbandoned(shut.abandoned);
+    try testing.expectEqual(@as(usize, 1), Probe.frees);
+}
+
+test "a model load or unload waits for every queued slot to be destroyed" {
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    const allocator = testing.allocator;
+    for ([_]bool{ false, true }) |evicting| {
+        var sch = submitTestScheduler(allocator, 32);
+        defer sch.pending.deinit(allocator);
+        defer sch.cleanup_queue.deinit(allocator);
+        defer sch.prefilling.deinit(allocator);
+        defer sch.load_queue.deinit(allocator);
+        defer sch.unload_queue.deinit(allocator);
+        var load: LoadRequest = undefined;
+        var unload = UnloadRequest{ .entry = &model };
+        for (0..17) |_| {
+            const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
+            sch.complete(slot);
+        }
+        if (evicting) try sch.load_queue.append(allocator, &load) else try sch.unload_queue.append(allocator, &unload);
+        var destroyed: usize = 0;
+        var model_job_after: ?usize = null;
+        var batch: [16]*Slot = undefined;
+        for (0..4) |_| {
+            const take = takeTeardownLocked(&sch, &batch);
+            for (batch[0..take.cleanup_n]) |s| s.deinit();
+            destroyed += take.cleanup_n;
+            if (take.load != null or take.unload != null) {
+                model_job_after = destroyed;
+                break;
+            }
+        }
+        try testing.expectEqual(@as(?usize, 17), model_job_after);
+    }
+}
+
 test "the four-row planner gives spare rows to drafts only while they beat the group's rows" {
     const cost = GlmRowCost{};
     try testing.expectEqual(@as(usize, 2), glmTreeNodes(2, 0.98, cost));
@@ -11753,6 +11938,56 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     try testing.expectEqual(@as(usize, 0), slots[0].glm5_request.?.offset);
     try testing.expectEqual(@as(usize, 0), slots[1].glm5_request.?.offset);
     try testing.expectEqual(@as(usize, 4), slots[2].glm5_request.?.offset);
+}
+
+test "an error whose name cannot be copied still ends the consumer and leaves scheduling" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var mm = metrics_mod.Metrics.init();
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.metrics = &mm;
+    sch.live_sessions = undefined;
+    sch.live_session_count = 0;
+    sch.decoding = .empty;
+    defer sch.decoding.deinit(testing.allocator);
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/err-alloc";
+    model.prefix_cache = null;
+    var slot: Slot = undefined;
+    slot.io = testing.io;
+    slot.allocator = failing.allocator();
+    slot.model = &model;
+    slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+    slot.ssm_entries = null;
+    slot.ring_cps = .{};
+    slot.restored_entry = 0;
+    slot.full_prompt = &.{};
+    slot.prompt_tokens = 4;
+    slot.completion_tokens = 0;
+    slot.cached_tokens = 0;
+    slot.request_id = 0;
+    slot.max_tokens = 8;
+    slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
+    slot.legacy_gen = null;
+    slot.glm5_request = null;
+    slot.state = .decoding;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.cancelled = .init(false);
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.out_buf = .empty;
+    slot.out_idx = 0;
+    try sch.decoding.append(testing.allocator, &slot);
+    slot.markError("MlxFailure");
+    try testing.expect(slot.waitNextTimeout(0).? == .err);
+    try testing.expect(slot.waitNext() == .err);
+    try testing.expectEqual(@as(usize, 0), liveDecodingCount(&sch));
+    cullDecoding(&sch);
+    try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
 }
 
 test "postPrefillTerminal releases native GLM state for a cancelled slot but not a live one" {

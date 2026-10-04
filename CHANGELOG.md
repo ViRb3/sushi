@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Unloading a model waits for every finished request to be torn down**, a submission that fails after its slot is
+  built frees its media on the inference thread, and an error whose name cannot be copied still ends its request.
 - **GLM-5.3 DFlash2 no longer fails a request that ends within a few positions of the context limit**, and a request
   cancelled just after its prefill releases its GLM state at once.
 - **`/v1/completions` honours a per-request `kv_quant`** instead of always running at the process default, and a hybrid

@@ -180,6 +180,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   last prefill or decode tick, the parked inference thread runs one synced element-op every 500 ms (`gpuWarmTick`),
   never while work is queued; an unload closes the window. Output is unchanged.
 - `Slot.deinit` runs on conn threads: it stores marks, the inference thread frees.
+- **A `submit` that fails after its slot is built hands the slot to the inference thread** (`Scheduler.abandoned`, an
+  intrusive list, so the handoff cannot fail for memory): its vision array is freed there, never on the conn thread.
+- **A model load or unload runs only once `cleanup_queue` is empty**: a queued slot's generator points into its
+  model's transformer, and the inference thread drains 16 entries per pass.
+- **A slot's error is latched with a static name when the name cannot be copied** (`Slot.latchErrorLocked`):
+  `error_code != null` is the terminal predicate for the consumers and the cull, so it must never be lost.
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.
