@@ -1393,6 +1393,8 @@ pub fn nextChunkEnd(
 /// `nextChunkEnd` for a GLM prefill, whose checkpoint grid must be hit exactly: the tail merge never
 /// absorbs a grid point.
 pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
+    // Grid 0 = no checkpoints for this request (prefix cache off, or admission shed them all).
+    if (grid == 0) return nextChunkEnd(pos, prefix_len, default_chunk, false, 0, offset, adaptive_width);
     const next_grid = ((pos + offset) / grid + 1) * grid - offset;
     return @min(nextChunkEnd(pos, prefix_len, default_chunk, true, grid, offset, adaptive_width), next_grid);
 }
@@ -22488,6 +22490,13 @@ test "the GLM capture schedule is what the prefill loop captures: peak, newest a
     // A grid point at a chunk's end is not absorbed by the tail merge that follows it.
     try testing.expectEqual(@as(usize, 2058), nextChunkEnd(0, 2058, 2048, true, 2048, 0, true));
     try testing.expectEqual(@as(usize, 2048), glmChunkEnd(0, 2058, 2048, 2048, 0, true));
+}
+
+test "a GLM prefill without checkpoints chunks like any other prefill" {
+    for ([_]usize{ 0, 4096 }) |pos| for ([_]usize{ 2, 2058, 9000 }) |len| {
+        const end = pos + len;
+        try testing.expectEqual(nextChunkEnd(pos, end, 2048, false, 0, 0, true), glmChunkEnd(pos, end, 2048, 0, 0, true));
+    };
 }
 
 test "the GLM prefill holds as many checkpoints as its schedule says, and ends on the newest" {

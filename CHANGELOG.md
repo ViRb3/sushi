@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A GLM-5.3 prompt served without prefix checkpoints no longer hangs its prefill** (prefix cache off, or admission
+  shedding every checkpoint at long context).
 - **GLM-5.3-Flash tool results render in GLM's own chat format**: the chat-template engine now reads `x.0` as `x[0]`,
   so every request with a tool message no longer falls back to the generic format; `/props.template_fallbacks`
   counts any render that still does.
