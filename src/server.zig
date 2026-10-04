@@ -1980,6 +1980,8 @@ pub fn serve(
     defer configured_mtp = null;
     scheduler_mod.load_context_bytes = &loadContextBytes;
     defer scheduler_mod.load_context_bytes = null;
+    scheduler_mod.load_serving_bill = &loadServingBill;
+    defer scheduler_mod.load_serving_bill = null;
 
     scheduler_mod.prefill_ubench_chunk = &requestPrefillChunkNow;
     defer scheduler_mod.prefill_ubench_chunk = null;
@@ -2682,10 +2684,7 @@ fn handleConnection(
         // registry preserves by name answers 503 under that name; anything
         // else is a 500 with the error name, never a hung connection.
         else => {
-            if (loadRefusalFor(err)) |refusal| {
-                try sendErrorResponse(allocator, stream, "503 Service Unavailable", refusal.type, refusal.message, 503);
-                return;
-            }
+            if (try sendNamedLoadRefusal(allocator, stream, scheduler, requested_model_id, err)) return;
             log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
@@ -3582,6 +3581,179 @@ pub fn loadContextBytes(config: *const model_mod.ModelConfig) ?u64 {
     if (!measured or config.expert_layout != .exl3_k4 or config.expert_streaming) return null;
     if (manualContext(config) == 0) return null;
     return sizerCtxKvBytes(config, defaultKvBits(config));
+}
+
+/// The full-context admission bill at the width a requested launch can run.
+/// An explicit prefill width is priced as requested; auto picks the per-request floor.
+fn sushiContextBytesAt(config: *const model_mod.ModelConfig, context: u32, kv_bits: u64) struct { bytes: u64, chunk: u64 } {
+    const explicit = explicitPrefillChunk();
+    const rung: u32 = if (explicit > 0) explicit else perRequestFloorWidth(config) orelse
+        (if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else 8192);
+    const chunk = rungWidth(config, context, rung, config.longCtxGated());
+    return .{
+        .bytes = prefillNeededAtChunk(config, context, 0, kv_bits, chunk, .{ .mtp_on = mtpHeadDefaultOn(config) }),
+        .chunk = chunk,
+    };
+}
+
+/// PURE with respect to memory: solve the same admission bill used to check the requested context.
+pub fn maxSushiContextForBudget(config: *const model_mod.ModelConfig, kv_bits: u64, budget: u64) u32 {
+    return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
+}
+
+fn maxSushiContextAtWidth(config: *const model_mod.ModelConfig, kv_bits: u64, budget: u64, fixed_chunk: ?u64, warm: WarmPrefix) u32 {
+    var low: u32 = 0;
+    var high: u32 = if (config.contextCap() > 0) config.contextCap() else std.math.maxInt(u32);
+    while (low < high) {
+        const mid = low + @as(u32, @intCast((@as(u64, high) - low + 1) / 2));
+        const chunk = fixed_chunk orelse sushiContextBytesAt(config, mid, kv_bits).chunk;
+        if (prefillNeededAtChunk(config, mid, 0, kv_bits, chunk, warm) <= budget)
+            low = mid
+        else
+            high = mid - 1;
+    }
+    return low;
+}
+
+fn requestContextRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv: transformer_mod.KVQuantConfig, bill: AdmissionBill, warm: WarmPrefix) ?model_registry_mod.MemoryContextRefusal {
+    if (!model_mod.usesSushiQuantMemoryBill(config)) return null;
+    const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    const budget = bill.available +| bill.evictionCredit();
+    return .{
+        .requested = @as(u64, @intCast(prompt_len)) +| @min(max_tokens, getEffectiveContextLength(config) -| @as(u64, @intCast(prompt_len))),
+        .maximum = maxSushiContextAtWidth(config, bits, budget, bill.chunk, warm),
+        .needed = bill.needed,
+        .available = budget,
+        .kv_bits = bits,
+        .chunk = bill.chunk,
+    };
+}
+
+fn memoryContextRefusalMessage(buf: []u8, refusal: model_registry_mod.MemoryContextRefusal) []const u8 {
+    return std.fmt.bufPrint(buf, "Context {d} does not fit available GPU memory at KV{d}, prefill chunk {d}. Maximum context: {d} tokens. Reduce context or free memory.", .{
+        refusal.requested, refusal.kv_bits, refusal.chunk, refusal.maximum,
+    }) catch "The requested context does not fit in available GPU memory.";
+}
+
+pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?scheduler_mod.LoadServingBill {
+    if (!model_mod.usesSushiQuantMemoryBill(config)) return null;
+    const context = manualContext(config);
+    if (context == 0) return null;
+    const bits = defaultKvBits(config);
+    const full = sushiContextBytesAt(config, context, bits);
+    return .{
+        .requested_context = context,
+        .needed = full.bytes,
+        .max_context = maxSushiContextForBudget(config, bits, budget),
+        .kv_bits = bits,
+        .chunk = full.chunk,
+    };
+}
+
+test "Sushi quant memory production context CPU audit" {
+    const raw = std.c.getenv("SUSHI_MEMORY_AUDIT_MODEL") orelse return error.SkipZigTest;
+    const path = std.mem.span(raw);
+    var cfg = try model_mod.parseConfig(std.testing.io, std.testing.allocator, path);
+    defer cfg.deinit(std.testing.allocator);
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    const saved_width = generate_mod.prefill_chunk_override;
+    defer generate_mod.prefill_chunk_override = saved_width;
+    const saved_explicit = generate_mod.prefill_chunk_explicit;
+    defer generate_mod.prefill_chunk_explicit = saved_explicit;
+    server_config.max_context_size = 500000;
+    generate_mod.prefill_chunk_override = 2048;
+    generate_mod.prefill_chunk_explicit = true;
+    const budget: u64 = 16 << 30;
+    const bill = loadServingBill(&cfg, budget).?;
+    try std.testing.expectEqual(@as(u64, 8), bill.kv_bits);
+    try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context, 8).bytes <= budget);
+    if (bill.max_context < cfg.contextCap()) try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context + 1, 8).bytes > budget);
+    std.debug.print("Sushi context audit {s}: 500000 tokens={d} bytes, max_context={d} for 16 GiB, chunk={d}, KV{d}\n", .{ path, bill.needed, bill.max_context, bill.chunk, bill.kv_bits });
+}
+
+test "Sushi quant memory request refusal carries the actual KV width MTP and maximum to the wire" {
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    const saved_mtp = configured_mtp;
+    defer configured_mtp = saved_mtp;
+    server_config.max_context_size = 500000;
+    configured_mtp = null;
+    var cfg = qwen4RequestTestConfig();
+    cfg.expert_layout = .exl3_k4;
+    const chunk: u64 = 1024;
+    const budget = prefillNeededAtChunk(&cfg, 64000, 0, 4, chunk, .{});
+    const bill = AdmissionBill{ .needed = prefillNeededAtChunk(&cfg, 128000, 32000, 4, chunk, .{}), .available = budget, .chunk = chunk };
+    const refusal = requestContextRefusal(&cfg, 128000, 32000, transformer_mod.KVQuantConfig.affine(4), bill, .{}).?;
+    try std.testing.expectEqual(@as(u64, 4), refusal.kv_bits);
+    try std.testing.expectEqual(@as(u32, 64000), refusal.maximum);
+    try std.testing.expectEqual(@as(u64, 160000), refusal.requested);
+    const mtp = requestContextRefusal(&cfg, 128000, 32000, transformer_mod.KVQuantConfig.affine(4), bill, .{ .mtp_on = true }).?;
+    try std.testing.expect(mtp.maximum < refusal.maximum);
+    var buf: [256]u8 = undefined;
+    const message = memoryContextRefusalMessage(&buf, refusal);
+    try std.testing.expect(std.mem.indexOf(u8, message, "Maximum context: 64000 tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "KV4") != null);
+    slot_memory_context_refusal = refusal;
+    const wire = mapGenerationError(error.PrefillDoesNotFit, &buf);
+    try std.testing.expectEqual(@as(u32, 400), wire.code);
+    try std.testing.expect(std.mem.indexOf(u8, wire.message, "Maximum context: 64000 tokens") != null);
+    try std.testing.expectEqual(@as(?model_registry_mod.MemoryContextRefusal, null), slot_memory_context_refusal);
+    try std.testing.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
+}
+
+test "Sushi quant memory rejects an oversized context with an exact maximum at KV8" {
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    const saved_mtp = configured_mtp;
+    defer configured_mtp = saved_mtp;
+    const saved_kv = configured_kv_quant;
+    defer configured_kv_quant = saved_kv;
+    const saved_width = generate_mod.prefill_chunk_override;
+    defer generate_mod.prefill_chunk_override = saved_width;
+    const saved_explicit = generate_mod.prefill_chunk_explicit;
+    defer generate_mod.prefill_chunk_explicit = saved_explicit;
+    server_config.max_context_size = 500000;
+    configured_kv_quant = null;
+    configured_mtp = false;
+    generate_mod.prefill_chunk_override = 2048;
+    generate_mod.prefill_chunk_explicit = true;
+    var cfg = qwen4RequestTestConfig();
+    cfg.expert_layout = .exl3_k4;
+    const budget = sushiContextBytesAt(&cfg, 128000, 8).bytes;
+    const bill = loadServingBill(&cfg, budget).?;
+    try std.testing.expectEqual(@as(u64, 8), bill.kv_bits);
+    try std.testing.expectEqual(@as(u32, 500000), bill.requested_context);
+    try std.testing.expect(bill.needed > budget);
+    try std.testing.expectEqual(@as(u32, 128000), bill.max_context);
+    try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context, 8).bytes <= budget);
+    try std.testing.expect(sushiContextBytesAt(&cfg, bill.max_context + 1, 8).bytes > budget);
+    try std.testing.expectEqual(@as(u64, 2048), sushiContextBytesAt(&cfg, 128000, 8).chunk);
+    try std.testing.expect(maxSushiContextForBudget(&cfg, 4, budget) > bill.max_context);
+    try std.testing.expectEqual(@as(u32, 0), maxSushiContextForBudget(&cfg, 8, 0));
+    configured_mtp = true;
+    try std.testing.expect(loadServingBill(&cfg, budget).?.max_context < bill.max_context);
+    var mimo = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/model-configs/mimo_v2.json"));
+    defer mimo.deinit(std.testing.allocator);
+    mimo.expert_layout = .exl3_k4;
+    const mimo_budget = sushiContextBytesAt(&mimo, 64000, 8).bytes;
+    const mimo_bill = loadServingBill(&mimo, mimo_budget).?;
+    try std.testing.expectEqual(@as(u32, 64000), mimo_bill.max_context);
+    server_config.max_context_size = 0;
+    cfg.ctx_override = 4096;
+    cfg.kv_quant_override = transformer_mod.KVQuantConfig.affine(4);
+    const settings = loadServingBill(&cfg, budget).?;
+    try std.testing.expectEqual(@as(u32, 4096), settings.requested_context);
+    try std.testing.expectEqual(@as(u64, 4), settings.kv_bits);
+    server_config.max_context_size = 8192;
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    try std.testing.expectEqual(@as(u32, 8192), loadServingBill(&cfg, budget).?.requested_context);
+    try std.testing.expectEqual(@as(u64, 8), loadServingBill(&cfg, budget).?.kv_bits);
+    cfg.expert_layout = .mxfp4_individual;
+    try std.testing.expectEqual(@as(?scheduler_mod.LoadServingBill, null), loadServingBill(&cfg, budget));
+    cfg.expert_layout = .exl3_k4;
+    cfg.expert_streaming = true;
+    try std.testing.expectEqual(@as(?scheduler_mod.LoadServingBill, null), loadServingBill(&cfg, budget));
 }
 
 test "loadContextBytes reuses the sizer with launch and model settings precedence" {
@@ -6093,9 +6265,13 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     };
 }
 
+// Numeric slot diagnostics cross to error mapping only on this connection's thread.
+threadlocal var slot_memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
+
 /// A slot that errored reports why: the MLX error latch's `error.OutOfMemory` is a memory
 /// failure the operator can act on. One helper for the three slot-drain sites.
 fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
+    slot_memory_context_refusal = slot.memory_context_refusal;
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
     if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
@@ -6140,6 +6316,8 @@ pub const GenErrorWire = struct {
 /// non-streaming arms; streaming arms wrote a bare `server_error` into an SSE frame, so agents
 /// never saw the actionable 400/503. The unknown arm keeps the error name at a mapped 500.
 pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+    const context_refusal = slot_memory_context_refusal;
+    slot_memory_context_refusal = null;
     return switch (err) {
         // The MLX working-set latch (#353): a memory 503.
         error.GenerationOutOfMemory, error.OutOfMemory => .{
@@ -6155,7 +6333,7 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .code = 400,
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
-            .message = PREFILL_NOFIT_MSG,
+            .message = if (context_refusal) |r| memoryContextRefusalMessage(buf, r) else PREFILL_NOFIT_MSG,
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -6753,7 +6931,7 @@ pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: u
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) void {
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) ?model_registry_mod.MemoryContextRefusal {
     // The same warm inputs the probe was refused on, the checkout decision included.
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
         .matched_tokens = warm_matched,
@@ -6776,6 +6954,12 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         bill.evictable / mb,
         pinnedResidentBytes(bill) / mb,
     });
+    const context = requestContextRefusal(config, prompt_len, max_tokens, kv_cfg, bill, .{
+        .matched_tokens = warm_matched, .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate, .mtp_on = enable_mtp,
+    });
+    if (context) |r| log.warn("  maximum context at KV{d}, prefill chunk {d}: {d} tokens\n", .{ r.kv_bits, r.chunk, r.maximum });
+    return context;
 }
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
@@ -6819,7 +7003,14 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm). The cache
         // clause is only true where the bill carries the cache; `memoryRefusalMessage` is the one formatter.
-        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.admissionEvictsHotCache());
+        const base = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.admissionEvictsHotCache());
+        defer allocator.free(base);
+        const kv = kv_override orelse configuredKvQuantFor(config);
+        const refusal = requestContextRefusal(config, prompt_len, max_tokens, kv, bill, .{ .mtp_on = enable_mtp });
+        const msg = if (refusal) |r|
+            try std.fmt.allocPrint(allocator, "{s} Maximum context at KV{d} and prefill chunk {d}: {d} tokens.", .{ base, r.kv_bits, r.chunk, r.maximum })
+        else
+            try allocator.dupe(u8, base);
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -7460,10 +7651,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             return;
         },
         else => {
-            if (loadRefusalFor(err)) |refusal| {
-                try sendErrorResponse(allocator, stream, "503 Service Unavailable", refusal.type, refusal.message, 503);
-                return;
-            }
+            if (try sendNamedLoadRefusal(allocator, stream, scheduler, requested_id, err)) return;
             log.warn("  -> 500 ({s}) on /v1/load-model\n", .{@errorName(err)});
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
@@ -12843,6 +13031,17 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
         else => null,
     };
+}
+
+fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, err: anyerror) !bool {
+    const refusal = loadRefusalFor(err) orelse return false;
+    var buf: [256]u8 = undefined;
+    const message = if (err == error.InsufficientMemory) blk: {
+        const context = scheduler.takeLoadContextRefusal(id) orelse break :blk refusal.message;
+        break :blk memoryContextRefusalMessage(&buf, context);
+    } else refusal.message;
+    try sendErrorResponse(allocator, stream, "503 Service Unavailable", refusal.type, message, 503);
+    return true;
 }
 
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for

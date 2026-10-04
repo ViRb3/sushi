@@ -295,6 +295,28 @@ test "flat EXL3 resident split drops co-located routed banks and isolates MTP" {
     try std.testing.expectEqual(@as(u64, 1024), split.mtp);
 }
 
+test "Sushi quant memory bills resident routed banks and enabled vision and MTP exactly" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try createFixture(io, a, &tmp);
+    defer a.free(path);
+    // Text trunk (3136) plus all three resident expert projections (1152).
+    const text = try model.qwenResidentWeightBytes(io, a, path, false, false);
+    try std.testing.expectEqual(@as(u64, 4288), text.trunk);
+    try std.testing.expectEqual(@as(u64, 0), text.mtp);
+    const all = try model.qwenResidentWeightBytes(io, a, path, true, true);
+    try std.testing.expectEqual(text.trunk + 4, all.trunk);
+    try std.testing.expectEqual(@as(u64, 1408), all.mtp);
+    // A duplicate of an indexed tensor in another indexed shard must not double its bill.
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+    defer dir.close(io);
+    try writeSafetensors(io, a, dir, "model-vision.safetensors", &.{ VISION_SPEC, TRUNK_SPEC });
+    const duplicate = try model.qwenResidentWeightBytes(io, a, path, true, true);
+    try std.testing.expectEqual(all, duplicate);
+}
+
 test "flat EXL3 routed-key filtering is independent of shard filename" {
     var key_buf: [256]u8 = undefined;
     for (EXL3_SPECS) |spec| {

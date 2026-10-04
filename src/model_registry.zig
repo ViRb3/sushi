@@ -125,6 +125,16 @@ pub const ReasoningMarker = struct {
     }
 };
 
+/// Numeric context diagnostics shared by load refusals and per-request admission.
+pub const MemoryContextRefusal = struct {
+    requested: u64,
+    maximum: u32,
+    needed: u64,
+    available: u64,
+    kv_bits: u64,
+    chunk: u64,
+};
+
 pub const LoadedModel = struct {
     allocator: std.mem.Allocator,
 
@@ -241,6 +251,8 @@ pub const LoadedModel = struct {
     /// the `/v1/models` snapshot so clients can see why a load failed
     /// (e.g. "LoadFailed", "MissingVisionWeights"). Null otherwise.
     error_name: ?[]const u8,
+    /// Kept through a transient memory refusal's unloaded reset; cleared on retry or success.
+    memory_context_refusal: ?MemoryContextRefusal = null,
 
     /// Token → bytes table backing the JSON grammar mask, built lazily on this
     /// entry's first schema-constrained request. Its lifetime matches
@@ -918,6 +930,7 @@ pub const ModelRegistry = struct {
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
+        entry.memory_context_refusal = null;
         self.state_cond.broadcast(self.io);
         return true;
     }
@@ -1083,6 +1096,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;
+        entry.memory_context_refusal = null;
         entry.error_name = null;
         self.lru_clock += 1;
         entry.last_used_ns = self.lru_clock;
@@ -1300,6 +1314,15 @@ pub const ModelRegistry = struct {
         if (entry.state != .error_state) return null;
         const name = entry.error_name orelse return null;
         return alloc.dupe(u8, name) catch null;
+    }
+
+    /// Read the most recent numeric refusal, including a transient unloaded entry.
+    pub fn loadContextRefusal(self: *ModelRegistry, id_or_empty: []const u8) ?MemoryContextRefusal {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "sushi")) self.default_id else id_or_empty;
+        const entry = self.entries.get(id) orelse return null;
+        return entry.memory_context_refusal;
     }
 
     /// Snapshot of every entry for `/v1/models`. Sort: default first
@@ -2158,4 +2181,24 @@ test "upstream bugfix: ModelRegistry: rescan clears a failed load so the complet
     try testing.expectEqual(LoadState.loading, fine.state);
     try testing.expectEqual(LoadState.error_state, moved.state);
     try testing.expectEqual(@as(?u64, 4), fine.bytes_on_disk);
+}
+
+
+test "Sushi quant memory load diagnostics survive refusal and clear on retry and success" {
+    var reg = try ModelRegistry.init(testing.allocator, std.testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("quant", "/path/to/quant", 1024);
+    reg.mutex.lockUncancelable(reg.io);
+    try testing.expect(reg.tryBeginLoadLocked(stub));
+    stub.memory_context_refusal = .{ .requested = 500000, .maximum = 128000, .needed = 100, .available = 90, .kv_bits = 8, .chunk = 2048 };
+    reg.markUnloadedLocked(stub);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqual(@as(u32, 128000), reg.loadContextRefusal("quant").?.maximum);
+    reg.mutex.lockUncancelable(reg.io);
+    try testing.expect(reg.tryBeginLoadLocked(stub));
+    try testing.expectEqual(@as(?MemoryContextRefusal, null), stub.memory_context_refusal);
+    stub.memory_context_refusal = .{ .requested = 500000, .maximum = 128000, .needed = 100, .available = 90, .kv_bits = 8, .chunk = 2048 };
+    reg.markReadyLocked(stub, 1024);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqual(@as(?MemoryContextRefusal, null), reg.loadContextRefusal("quant"));
 }

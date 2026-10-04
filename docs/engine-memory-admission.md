@@ -25,9 +25,22 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`).
-- Resident Flash-Next or MiMo EXL3 with an explicit context bills weights plus min(flat headroom, 2 GiB load/warmup
-  scratch + `sizerCtxKvBytes`); auto context, other layouts/architectures, streamed loads, sidecars and ANE keep flat
-  headroom (min(weights/8, 6 GiB) + 1 GiB). This is a load gate, not the request admission bill.
+- Resident Sushi Flash-Next and MiMo EXL3 packs bill the exact enabled text, vision and MTP tensors, including
+  draft rerank copies. Qwen drops disabled native MTP tensors before the transformer binds them. Their load bill
+  is weights + max(2 GiB measured load/warmup allowance, the requested context's full admission bill). Auto context
+  reserves the warmup allowance and retains the post-load context sizer. Their default KV remains affine 8-bit.
+- An explicit launch or model-settings context is checked before loading those packs. `loadServingBill` uses
+  `prefillNeededAtChunk`, including KV, rings, recurrent/history state, MTP and prefill scratch. It prices an explicit
+  prefill width at that width after the architecture's cap; otherwise it proves the per-request floor. A refusal
+  reports the largest context that fits the same bill and available memory, capped at the model's context limit.
+  Existing active MLX buffers are subtracted from the GPU working-set limit before this check. Cold-load HTTP 503
+  responses retain the numeric maximum through the transient unloaded reset; retry and successful load clear it.
+- Request-time memory refusals for these packs also report a maximum context using the request's actual KV width,
+  effective chunk, MTP choice and warm-prefix credits. The connection-thread 400 and a later scheduler refusal
+  carry the same numeric diagnostic; generation error mapping consumes the slot's diagnostic on its connection
+  thread so it cannot leak into another request.
+- Other layouts and architectures retain the legacy flat headroom (min(weights/8, 6 GiB) + 1 GiB), with the existing
+  explicit-context reduction where applicable. Native GLM has its separate BF16 load and serving bill.
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
 - Load-time bills run INSIDE `Scheduler.init` ([engine-qsa-long-context](engine-qsa-long-context.md)).
@@ -36,9 +49,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   them as taken (45 GB free where 95 GB was a moment later).
 - A ready entry's `bytes_resident` (the registry's resident-memory gate, `/v1/models`) is the weights the preflight
   billed (`residentWeightBytes`): a boot `--model` entry has no discovery `bytes_on_disk`, so it measures the shards.
-- **A resident MiMo cold load reserves its load preflight's own requirement** (`mimoColdLoadBillBytes`: the shared
-  `mimoResidentLoadBytes` plus `preflightCtxBytes`), never the 1.1x disk-size guess (105.9 GB against a 96.65 GB bill
-  for the 2.3bpw pack). The auto resident cap bounds co-residence only ([server-lifecycle](server-lifecycle.md)).
+- **A resident Sushi Qwen or MiMo cold load reserves its load preflight's own requirement** (`residentColdLoadBillBytes`:
+  exact enabled weights and the same full-context admission callback), rather than the 1.1x disk-size guess. The auto resident cap bounds co-residence only ([server-lifecycle](server-lifecycle.md)).
 
 ### Explicit-context warmup envelope
 
@@ -65,8 +77,9 @@ heads), `taskpolicy -a`, GPU lock, one boot per row, 2026-10-01:
 
 Both peaks were unchanged after a short chat. The 2 GiB allowance leaves ~1.9 GiB unused, so MiMo takes the same term.
 
-The 2 GiB allowance covers load/warmup scratch and fixed state outside the context bill, not arbitrary prompt
-activations. Separate MTP sidecar files, assistant drafters and ANE retain flat headroom; other expert layouts and
+These historical measurements establish the 2 GiB load/warmup allowance for resident Sushi Qwen and MiMo EXL3.
+The current bill compares that allowance with the full requested-context admission bill instead of capping context
+at legacy headroom. Assistant checkpoint payloads are additional resident weights. Other expert layouts and
 architectures need their own measured envelope. These runs do not simulate a 64 GB host or establish a timing result.
 
 ## Context and chunk

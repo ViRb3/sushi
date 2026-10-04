@@ -348,7 +348,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) void = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) ?model_registry_mod.MemoryContextRefusal = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -495,6 +495,7 @@ pub const Slot = struct {
     out_idx: usize,
     finished: bool,
     error_code: ?[]const u8,
+    memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null,
     finish_reason: []const u8,
     /// Set ONLY by the degenerate-tail guard. The wire reason is "stop" so a
     /// client does not mistake the guard for output/context exhaustion; this
@@ -1171,6 +1172,7 @@ pub const LoadRequest = struct {
     /// Output: error name on failure (owned by `allocator`; conn thread
     /// frees). Null on success.
     error_name: ?[]const u8 = null,
+    memory_context_refusal: ?model_registry_mod.MemoryContextRefusal = null,
 
     /// Conn-thread synchronization. Inference thread broadcasts when done.
     done: bool = false,
@@ -1190,6 +1192,9 @@ pub const UnloadRequest = struct {
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
 };
+
+// Connection-local transport preserves a load diagnostic across a concurrent retry.
+threadlocal var last_load_context_refusal: ?model_registry_mod.MemoryContextRefusal = null;
 
 /// Continuous-batching scheduler. One per server. Owns the inference
 /// thread, the queue of in-flight slots, AND (post-A1) the loaded model
@@ -1738,6 +1743,7 @@ pub const Scheduler = struct {
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
+        last_load_context_refusal = null;
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
         const fast_result = self.registry.ensureLoaded(id_or_empty);
@@ -1809,8 +1815,8 @@ pub const Scheduler = struct {
             break :blk expertStreamingGateBytes(split.trunk +| split.mtp, plan.cache_bytes, plan.prefill_peak_bytes, plan.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
-        else if (owned.config.usesMimoSourceTrunk())
-            try mimoColdLoadBillBytes(
+        else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
+            try residentColdLoadBillBytes(
                 self.io,
                 self.allocator,
                 owned.config,
@@ -1949,6 +1955,7 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
 
         if (req.error_name) |name| {
+            last_load_context_refusal = req.memory_context_refusal;
             // The failure crosses the thread boundary by NAME — map it back
             // to a typed error so a memory-preflight refusal surfaces as a
             // named 503, not the generic "Model load failed" 500 (#144).
@@ -1987,6 +1994,12 @@ pub const Scheduler = struct {
     /// message (#144). Caller frees.
     pub fn loadErrorName(self: *Scheduler, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
         return self.registry.loadErrorNameDupe(alloc, id_or_empty);
+    }
+
+    pub fn takeLoadContextRefusal(self: *Scheduler, id: []const u8) ?model_registry_mod.MemoryContextRefusal {
+        const context = last_load_context_refusal;
+        last_load_context_refusal = null;
+        return context orelse self.registry.loadContextRefusal(id);
     }
 
     /// Free a model's resident GPU state, returning its registry stub to
@@ -3059,6 +3072,33 @@ pub var skip_mem_preflight: bool = false;
 /// Explicit context's cache bill at the resolved KV width; null preserves flat headroom.
 pub var load_context_bytes: ?*const fn (*const model_mod.ModelConfig) ?u64 = null;
 
+/// The full requested-context bill and the largest context fitting the same budget.
+pub const LoadServingBill = struct {
+    requested_context: u32,
+    needed: u64,
+    max_context: u32,
+    kv_bits: u64,
+    chunk: u64,
+};
+pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?LoadServingBill = null;
+
+fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !u64 {
+    if (directory.len == 0) return 0;
+    if (std.c.getenv("SUSHI_DFLASH")) |v| if (v[0] == '0' and dflash_mod.probeIsDflash(io, allocator, directory)) return 0;
+    return @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
+}
+
+fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
+    if (config.isMimo()) return mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
+    const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
+    const coarse_bits = mtp_mod.rerankCoarseBits();
+    const coarse = if (mtp_on and split.mtp > 0 and coarse_bits > 0 and mtp_mod.MtpModel.draftRerankMode() != .off)
+        mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits)
+    else
+        0;
+    return split.trunk +| split.mtp +| coarse;
+}
+
 /// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads
 /// when MTP is on, and the coarse lm_head copy the heads and the greedy readout share.
 fn mimoResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
@@ -3094,12 +3134,20 @@ fn preflightCtxBytes(io: std.Io, allocator: std.mem.Allocator, config: *const Mo
     return loadContextBill(config, drafter_dir, ane_prefill, mtp_sidecar);
 }
 
-/// What a resident MiMo cold load reserves in the registry: the requirement its load preflight
+/// What a resident cold load reserves in the registry: the requirement its load preflight
 /// compares with free memory, so the gate and the preflight read one bill.
-fn mimoColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, load_vision: bool, mtp_on: bool, no_drafter: bool, drafter_dir: []const u8, ane_prefill: bool) !u64 {
-    const weights = try mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
+fn residentColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, load_vision: bool, mtp_on: bool, no_drafter: bool, drafter_dir: []const u8, ane_prefill: bool) !u64 {
+    var weights = if (model_mod.usesSushiQuantMemoryBill(config))
+        try sushiResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on)
+    else
+        try mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const drafter = LoadDrafterDir.resolve(io, allocator, no_drafter, drafter_dir, model_dir);
     defer drafter.deinit(allocator);
+    if (model_mod.usesSushiQuantMemoryBill(config)) {
+        weights +|= try sushiAssistantLoadBytes(io, allocator, drafter.dir);
+        const serving = if (load_serving_bill) |bill| bill(config, std.math.maxInt(u64)) else null;
+        return weights +| @max(LOAD_WARMUP_BYTES, if (serving) |b| b.needed else 0);
+    }
     return loadRequirementBytes(weights, preflightCtxBytes(io, allocator, config, model_dir, drafter.dir, ane_prefill, mtp_on));
 }
 
@@ -3119,7 +3167,7 @@ test "a resident MiMo cold load reserves its load preflight's requirement" {
     fixture.config.expert_layout = .mxfp4_individual;
     const weights = try mimoResidentLoadBytes(io, a, fixture.path, &fixture.config, false, false);
     const preflight = loadRequirementBytes(weights, preflightCtxBytes(io, a, &fixture.config, fixture.path, "", false, false));
-    try testing.expectEqual(preflight, try mimoColdLoadBillBytes(io, a, &fixture.config, fixture.path, false, false, false, "", false));
+    try testing.expectEqual(preflight, try residentColdLoadBillBytes(io, a, &fixture.config, fixture.path, false, false, false, "", false));
     try testing.expect(weights > 0);
 }
 
@@ -3398,6 +3446,20 @@ fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64
     return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
 }
 
+/// A resident Sushi load shares the working-set cap with already active model buffers.
+fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64) u64 {
+    const available = effectiveAvailableBytes(host_avail, proc_avail, gpu_limit);
+    return if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
+}
+
+test "Sushi quant memory subtracts existing resident buffers from the GPU limit" {
+    const gib: u64 = 1 << 30;
+    try testing.expectEqual(@as(u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib));
+    try testing.expectEqual(@as(u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib));
+    try testing.expectEqual(@as(u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib));
+    try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib));
+}
+
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {
     const GB: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(36 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB));
@@ -3444,6 +3506,7 @@ pub fn loadRequirementBytes(weights_bytes: u64, ctx_bytes: ?u64) u64 {
 const LOAD_WARMUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 fn loadRequirementForConfig(config: *const ModelConfig, weights: u64, ctx_bytes: ?u64) u64 {
+    if (model_mod.usesSushiQuantMemoryBill(config)) return weights +| LOAD_WARMUP_BYTES;
     if (!config.isGlm5()) return loadRequirementBytes(weights, ctx_bytes);
     // Native serving warms T=1 and T=8, then resets. The requested context
     // allocates later; billing a percentage of the expert banks at startup
@@ -3478,6 +3541,39 @@ fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *Model
     return loadRequirementForConfig(config, weights +| try glmDflashLoadBytes(io, allocator, config, drafter.dir), null);
 }
 
+test "Sushi quant memory production pack CPU header audit" {
+    const raw = std.c.getenv("SUSHI_MEMORY_AUDIT_MODEL") orelse return error.SkipZigTest;
+    const path = std.mem.span(raw);
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var cfg = try model_mod.parseConfig(io, a, path);
+    defer cfg.deinit(a);
+    try testing.expect(model_mod.usesSushiQuantMemoryBill(&cfg));
+    const text = try sushiResidentLoadBytes(io, a, path, &cfg, false, false);
+    const vision = try sushiResidentLoadBytes(io, a, path, &cfg, true, false);
+    const all = try sushiResidentLoadBytes(io, a, path, &cfg, true, true);
+    try testing.expect(all > vision);
+    try testing.expect(vision > text);
+    try testing.expectEqual(all + LOAD_WARMUP_BYTES, try residentColdLoadBillBytes(io, a, &cfg, path, true, true, true, "", false));
+    std.debug.print("Sushi memory audit {s}: text={d}, vision={d}, mtp={d}, all={d} bytes\n", .{ path, text, vision - text, all - vision, all });
+}
+
+test "Sushi quant memory retires legacy headroom only for resident EXL3 Qwen and MiMo" {
+    const gib: u64 = 1 << 30;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4 };
+    try testing.expectEqual(@as(u64, 52 * gib), loadRequirementForConfig(&cfg, 50 * gib, null));
+    cfg.model_type = "mimo_v2";
+    try testing.expectEqual(@as(u64, 92 * gib), loadRequirementForConfig(&cfg, 90 * gib, 30 * gib));
+    cfg.expert_streaming = true;
+    try testing.expectEqual(loadRequirementBytes(90 * gib, null), loadRequirementForConfig(&cfg, 90 * gib, null));
+    cfg.expert_streaming = false;
+    cfg.expert_layout = .mxfp4_individual;
+    try testing.expectEqual(loadRequirementBytes(90 * gib, null), loadRequirementForConfig(&cfg, 90 * gib, null));
+    cfg.model_type = "llama";
+    cfg.expert_layout = .exl3_k4;
+    try testing.expectEqual(loadRequirementBytes(90 * gib, null), loadRequirementForConfig(&cfg, 90 * gib, null));
+}
+
 test "GLM serving load bills text weights and warmup instead of an unallocated context" {
     var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const weights: u64 = 93295638776;
@@ -3486,6 +3582,7 @@ test "GLM serving load bills text weights and warmup instead of an unallocated c
     try testing.expectEqual(wanted, loadRequirementForConfig(&cfg, weights, 500000 * 11968));
     try testing.expect(wanted < 90 * 1024 * 1024 * 1024);
     cfg.model_type = "mimo_v2";
+    cfg.expert_layout = .bf16_individual;
     try testing.expectEqual(loadRequirementBytes(weights, null), loadRequirementForConfig(&cfg, weights, null));
 }
 
@@ -3663,6 +3760,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             return error.GlmKvQuantUnsupported;
         }
         streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytes(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers);
+    } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
+        streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     } else if (params.config.usesMimoSourceTrunk()) {
         streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     }
@@ -3671,6 +3770,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter, params.drafter_dir, params.model_dir);
     defer drafter.deinit(sch.allocator);
     const drafter_dir = drafter.dir;
+    if (model_mod.usesSushiQuantMemoryBill(params.config) and drafter_dir.len > 0)
+        streaming_resident_bytes = streaming_resident_bytes.? +| try sushiAssistantLoadBytes(sch.io, sch.allocator, drafter_dir);
     if (params.config.isGlm5()) {
         const assistant_bytes = try glmDflashLoadBytes(sch.io, sch.allocator, params.config, drafter_dir);
         streaming_resident_bytes = streaming_resident_bytes.? +| assistant_bytes;
@@ -3685,16 +3786,37 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!skip_mem_preflight) {
         const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
-        const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
+        const gpu_limit = mlx.maxRecommendedWorkingSet();
+        var active: usize = 0;
+        if (model_mod.usesSushiQuantMemoryBill(params.config)) _ = mlx.mlx_get_active_memory(&active);
+        const avail_bytes = if (model_mod.usesSushiQuantMemoryBill(params.config))
+            effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), gpu_limit, active)
+        else
+            effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), gpu_limit);
         const ctx_bytes = preflightCtxBytes(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.ane_prefill, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
-        const needed = loadRequirementForConfig(params.config, weights_bytes, ctx_bytes);
+        const serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
+        const needed = @max(loadRequirementForConfig(params.config, weights_bytes, ctx_bytes), weights_bytes +| (if (serving) |b| b.needed else 0));
         log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
         });
-        if (weights_bytes > 0 and avail_bytes > 0 and avail_bytes < needed) {
+        const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
+        if (weights_bytes > 0 and ((avail_bytes > 0 and avail_bytes < needed) or gpu_exhausted)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
+            if (serving) |b| {
+                const maximum: u32 = if (avail_bytes < weights_bytes +| LOAD_WARMUP_BYTES) 0 else b.max_context;
+                sch.registry.mutex.lockUncancelable(sch.io);
+                const refusal = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail_bytes, .kv_bits = b.kv_bits, .chunk = b.chunk };
+                params.entry.memory_context_refusal = refusal;
+                if (@TypeOf(params) == *LoadRequest) params.memory_context_refusal = refusal;
+                sch.registry.mutex.unlock(sch.io);
+                log.err("Insufficient memory for requested context: {d} tokens at KV{d} and prefill chunk {d} need ~{d:.2} GiB including {d:.2} GiB of enabled model/vision/MTP weights, but only {d:.2} GiB is available. Maximum context with this memory budget: {d} tokens. Lower --ctx-size or free memory; --skip-mem-preflight overrides this check.\n", .{
+                    b.requested_context,                         b.kv_bits,                                 b.chunk,                                                                              @as(f64, @floatFromInt(needed)) / gb,
+                    @as(f64, @floatFromInt(weights_bytes)) / gb, @as(f64, @floatFromInt(avail_bytes)) / gb, maximum,
+                });
+                return error.InsufficientMemory;
+            }
             log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available (free RAM, capped at the GPU working-set limit that iogpu.wired_limit_mb sets). Close other models/apps (or wait for a prior sushi to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
                 @as(f64, @floatFromInt(needed)) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
@@ -3717,7 +3839,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Weights — first mlx call. Binds the stream on this thread.
     const weights_ptr = try sch.allocator.create(Weights);
     errdefer sch.allocator.destroy(weights_ptr);
-    weights_ptr.* = try model_mod.loadWeightsForConfig(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision);
+    var load_config = params.config.*;
+    // The resolved launch choice gates lazy native-head tensors before Transformer.init binds them.
+    load_config.mtp_override = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
+    weights_ptr.* = try model_mod.loadWeightsForConfig(sch.io, sch.allocator, params.model_dir, &load_config, params.load_vision);
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
 
@@ -6616,7 +6741,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (!report.admitted) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
-                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                        slot.memory_context_refusal = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.

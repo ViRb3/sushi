@@ -4158,6 +4158,21 @@ pub const Weights = struct {
         return self.map.get(name);
     }
 
+    /// Remove lazy tensors before the transformer binds or evaluates them.
+    pub fn dropPrefix(self: *Weights, prefix: []const u8) !void {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(self.allocator);
+        var it = self.map.keyIterator();
+        while (it.next()) |key| if (std.mem.startsWith(u8, key.*, prefix)) {
+            try keys.append(self.allocator, key.*);
+        };
+        for (keys.items) |key| {
+            const removed = self.map.fetchRemove(key).?;
+            _ = mlx.mlx_array_free(removed.value);
+            self.allocator.free(removed.key);
+        }
+    }
+
     pub fn count(self: *const Weights) u32 {
         return @intCast(self.map.count());
     }
@@ -4238,6 +4253,17 @@ pub fn qwen4StreamingWeightKey(layout: expert_quant.Layout, buf: []u8, key: []co
 
 pub const ResidentSplit = struct { trunk: u64, mtp: u64 };
 
+/// Resident Sushi EXL3 packs have a measured load envelope and exact component bills.
+pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
+    return config.expert_layout == .exl3_k4 and !config.expert_streaming and
+        (std.mem.eql(u8, config.model_type, "qwen4_exp") or config.isMimo());
+}
+
+/// Flash-Next's resident tensor payloads, with the loader's vision filter and optional native head.
+pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool, mtp_on: bool) !ResidentSplit {
+    return indexedResidentSplit(io, allocator, model_dir, null, vision, mtp_on);
+}
+
 pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !ResidentSplit {
     if (layout == .mxfp4_individual)
         return .{ .trunk = try @import("mimo_source.zig").residentBytes(io, allocator, model_dir), .mtp = 0 };
@@ -4254,10 +4280,16 @@ pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_di
             return .{ .trunk = try @import("mimo_source.zig").residentBytesWithConfig(io, allocator, model_dir, &config), .mtp = 0 };
         }
     }
+    return indexedResidentSplit(io, allocator, model_dir, layout, false, true);
+}
+
+fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, streaming: ?expert_quant.Layout, vision: bool, mtp_on: bool) !ResidentSplit {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     var referenced = model_discovery.indexShardSet(io, dir) orelse return error.InvalidSafetensorsIndex;
     defer model_discovery.freeShardSet(&referenced);
+    var owners = indexWeightMap(io, allocator, dir);
+    defer if (owners) |*o| o.deinit();
     var total: u64 = 0;
     var mtp: u64 = 0;
     var found: usize = 0;
@@ -4267,10 +4299,11 @@ pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_di
         if (!std.mem.endsWith(u8, entry.name, ".safetensors") or !referenced.contains(entry.name)) continue;
         const file = try dir.openFile(io, entry.name, .{});
         defer file.close(io);
+        const stat = try file.stat(io);
         var read_buffer: [8192]u8 = undefined;
         var reader = file.reader(io, &read_buffer);
         const header_len = try reader.interface.takeInt(u64, .little);
-        if (header_len == 0 or header_len > 128 * 1024 * 1024) return error.InvalidSafetensorsHeader;
+        if (header_len == 0 or header_len > 128 * 1024 * 1024 or header_len > stat.size -| 8) return error.InvalidSafetensorsHeader;
         const header = try allocator.alloc(u8, @intCast(header_len));
         defer allocator.free(header);
         try reader.interface.readSliceAll(header);
@@ -4281,16 +4314,24 @@ pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_di
         while (tensor_iterator.next()) |tensor| {
             if (std.mem.eql(u8, tensor.key_ptr.*, "__metadata__")) continue;
             var key_buf: [512]u8 = undefined;
-            const canonical = qwen4StreamingWeightKey(layout, &key_buf, tensor.key_ptr.*) orelse continue;
-            if (!shouldKeepWeightKey(canonical, false)) continue;
+            if (owners) |o| if (o.value.object.get("weight_map").?.object.get(tensor.key_ptr.*)) |owner| {
+                if (owner == .string and !std.mem.eql(u8, owner.string, entry.name) and referenced.contains(owner.string)) continue;
+            };
+            const canonical = if (streaming) |layout|
+                qwen4StreamingWeightKey(layout, &key_buf, tensor.key_ptr.*) orelse continue
+            else
+                tensor.key_ptr.*;
+            if (!shouldKeepWeightKey(canonical, vision)) continue;
+            const is_mtp = std.mem.startsWith(u8, canonical, "language_model.mtp.");
+            if (is_mtp and !mtp_on) continue;
             if (tensor.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
             const offsets = tensor.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader;
             if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[0] != .integer or offsets.array.items[1] != .integer) return error.InvalidSafetensorsHeader;
             const start = offsets.array.items[0].integer;
             const end = offsets.array.items[1].integer;
-            if (start < 0 or end < start) return error.InvalidSafetensorsHeader;
+            if (start < 0 or end < start or @as(u64, @intCast(end)) > stat.size -| header_len -| 8) return error.InvalidSafetensorsHeader;
             const size: u64 = @intCast(end - start);
-            if (std.mem.startsWith(u8, canonical, "language_model.mtp.")) {
+            if (is_mtp) {
                 mtp = std.math.add(u64, mtp, size) catch return error.InvalidSafetensorsHeader;
             } else {
                 total = std.math.add(u64, total, size) catch return error.InvalidSafetensorsHeader;
@@ -4440,8 +4481,14 @@ pub fn loadWeightsForConfig(
     }
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
-    if (load_vision) return loadWeightsWithVision(io, allocator, model_dir);
-    return loadWeights(io, allocator, model_dir);
+    var weights = if (load_vision)
+        try loadWeightsWithVision(io, allocator, model_dir)
+    else
+        try loadWeights(io, allocator, model_dir);
+    errdefer weights.deinit();
+    if (std.mem.eql(u8, config.model_type, "qwen4_exp") and config.mtp_override == false)
+        try weights.dropPrefix("language_model.mtp.");
+    return weights;
 }
 
 pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !Weights {
