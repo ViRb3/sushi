@@ -19,6 +19,7 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const mimo_vision = @import("mimo_vision.zig");
+const glm5_vision = @import("glm5_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -13725,13 +13726,21 @@ fn readContentParts(
             // URLs: frame extraction is the client's job.
             var frame_urls = std.ArrayList([]const u8).empty;
             defer frame_urls.deinit(allocator);
+            var fps: f64 = 24;
             if (part.object.get("video_url")) |vid_obj| if (vid_obj == .object) {
+                if (vid_obj.object.get("fps")) |v| {
+                    const rate: f64 = if (v == .float) v.float else if (v == .integer) @floatFromInt(v.integer) else 0;
+                    if (std.math.isFinite(rate) and rate > 0) fps = rate;
+                }
                 if (vid_obj.object.get("frames")) |frames| if (frames == .array) {
                     for (frames.array.items) |f| if (f == .string) try frame_urls.append(allocator, f.string);
                 };
             };
-            if (media.addVideo(vid_slot, frame_urls.items, vp, pos))
+            if (media.addVideo(vid_slot, frame_urls.items, vp, pos)) {
+                const videos = media.videos(vid_slot);
+                videos.items[videos.items.len - 1].fps = fps;
                 try placed.append(allocator, .{ .at = joined_len, .kind = .video });
+            }
         } else if (vocab == .openai and std.mem.eql(u8, ptype, "input_audio")) {
             const data: ?[]const u8 = if (part.object.get("input_audio")) |a| (if (a == .object) (if (a.object.get("data")) |d| (if (d == .string) d.string else null) else null) else null) else null;
             media.addAudio(aud_slot, data, pos);
@@ -14058,6 +14067,7 @@ fn mediaKindRefusal(messages: []const chat_mod.Message, flat: FlatMedia, has_tow
 /// Peak GPU scratch of one ViT call over `patches` rows, from each tower's measured bill.
 fn visionScratchBytes(config: *const model_mod.ModelConfig, patches: u64) u64 {
     if (config.mimo_vision) return mimo_vision.encodeScratchBytes(config, patches);
+    if (config.glm5_vision) return glm5_vision.encodeScratchBytes(config, patches);
     return qwen_vision.encodeScratchBytes(config, patches);
 }
 
@@ -14135,6 +14145,7 @@ fn placeMedia(
     config: *const model_mod.ModelConfig,
     images: []const chat_mod.ImageData,
     videos: []const chat_mod.VideoData,
+    tokenizer: ?*const Tokenizer,
 ) !MediaPlacement {
     const merge = visionPreprocFromConfig(config).merge;
     var out = std.ArrayList(u32).empty;
@@ -14163,7 +14174,22 @@ fn placeMedia(
             break :blk mediaRows(vd.grid_t, vd.grid_h, vd.grid_w, merge);
         };
         try items.append(allocator, .{ .kind = if (is_image) .image else .video, .start = out.items.len, .rows = rows });
-        try out.appendNTimes(allocator, t, rows);
+        if (is_video and config.glm5_vision) {
+            const tok = tokenizer orelse return error.MediaLayoutUnsupported;
+            const video = videos[next_video - 1];
+            const per_group = rows / video.grid_t;
+            for (0..video.grid_t) |group| {
+                try out.append(allocator, config.vision_start_token_id);
+                try out.appendNTimes(allocator, config.image_token_id, per_group);
+                try out.append(allocator, config.vision_end_token_id);
+                var stamp: [64]u8 = undefined;
+                const seconds = @as(f64, @floatFromInt(group * config.qv_temporal_patch)) / video.fps;
+                const text = try std.fmt.bufPrint(&stamp, "{d:.1} seconds", .{seconds});
+                const stamp_ids = try tok.encode(allocator, text);
+                defer allocator.free(stamp_ids);
+                try out.appendSlice(allocator, stamp_ids);
+            }
+        } else try out.appendNTimes(allocator, t, rows);
         rows_total += rows;
     }
     const owned_ids = try out.toOwnedSlice(allocator);
@@ -14202,6 +14228,7 @@ fn mediaChain(
                 h.update(std.mem.asBytes(&vd.grid_t));
                 h.update(std.mem.asBytes(&vd.grid_h));
                 h.update(std.mem.asBytes(&vd.grid_w));
+                h.update(std.mem.asBytes(&vd.fps));
                 h.update(vd.pixels);
             },
         }
@@ -14248,7 +14275,7 @@ fn prepareRequestMedia(
     if (found.images != flat.images.len or found.videos != flat.videos.len) {
         return .{ .refused = MediaFault.init(false, "the rendered prompt holds {d} image and {d} video placeholders for {d} images and {d} videos (media in a system message, or placeholder text in the content)", .{ found.images, found.videos, flat.images.len, flat.videos.len }) };
     }
-    var placed = placeMedia(allocator, ids.*, config, flat.images, flat.videos) catch |err| switch (err) {
+    var placed = placeMedia(allocator, ids.*, config, flat.images, flat.videos, lm.tokenizer.?) catch |err| switch (err) {
         error.MediaLayoutUnsupported => return .{ .refused = MediaFault.init(false, "this model's vision tower cannot place images inside a conversation", .{}) },
         else => return err,
     };
@@ -14403,6 +14430,15 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
         .merge = config.qv_merge,
         .min_pixels = config.qv_min_pixels,
         .max_pixels = config.qv_max_pixels,
+    };
+    if (config.glm5_vision) return .{
+        .mode = .glm5,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_tokens = config.glmv_min_image_tokens,
+        .max_tokens = config.glmv_max_image_tokens,
+        .max_video_tokens = config.glmv_max_video_tokens,
     };
     if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
@@ -14971,6 +15007,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
             .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
             .mimo => mimo_vision.smartResize(src_h, src_w, factor, min_pixels, max_pixels),
+            .glm5 => glm5_vision.smartResize(vp.tps, src_h, src_w, vp.tps, factor, vp.min_tokens, vp.max_tokens),
             else => qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels),
         };
         const rh = rs.h;
@@ -14987,6 +15024,8 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const source_len: usize = @as(usize, src_h) * src_w * C;
         if (vp.mode == .mimo) {
             mimo_vision.resizeNormalizedChw(chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
+        } else if (vp.mode == .glm5) {
+            glm5_vision.resizeNormalizedChw(allocator, chw, px[0..source_len], src_h, src_w, rh, rw, vp.tps, vp.tps, factor, vp.min_tokens) catch return null;
         } else qwen_vision.resizeRgbNormalizedChw(
             allocator,
             chw,
@@ -15048,7 +15087,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
 /// patch groups — the last group pads by repeating its final frame, matching
 /// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
-    if (vp.mode != .qwen or frame_urls.len == 0) return null;
+    if ((vp.mode != .qwen and vp.mode != .glm5) or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
 
@@ -15076,9 +15115,13 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
     const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
     const min_pixels = bounds.min;
     const max_pixels = bounds.max;
-    if (bounds.clamped) logVisionPixelClamp(vp.max_pixels);
+    if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
     const first = decoded.items[0];
-    const rs = qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
+    if (vp.mode == .glm5 and @as(u64, (frame_urls.len + vp.tps - 1) / vp.tps) > vp.max_video_tokens) return null;
+    const rs = if (vp.mode == .glm5)
+        glm5_vision.smartResize(@intCast(frame_urls.len), first.h, first.w, vp.tps, factor, vp.min_tokens, vp.max_video_tokens)
+    else
+        qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
     const rh = rs.h;
     const rw = rs.w;
     const C: u32 = 3;
@@ -15096,7 +15139,11 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
     for (decoded.items) |d| {
         const source_len: usize = @as(usize, d.h) * d.w * C;
         const chw = allocator.alloc(f32, @as(usize, C) * rh * rw) catch return null;
-        qwen_vision.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp)) catch {
+        const resize = if (vp.mode == .glm5)
+            glm5_vision.resizeNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, @intCast(frame_urls.len), vp.tps, factor, vp.min_tokens)
+        else
+            qwen_vision.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp));
+        resize catch {
             allocator.free(chw);
             return null;
         };
@@ -15124,8 +15171,8 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         qwen_vision.buildPixelValuesVideo(out_slice, group_frames[0..vp.tps], C, rh, rw, vp.patch, vp.merge);
     }
 
-    log.info("  Decoded {d} frames → qwen video grid_t={d} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
-        frame_urls.len, grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
+    log.info("  Decoded {d} frames → {s} video grid_t={d} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
+        frame_urls.len, @tagName(vp.mode), grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
     });
     return .{ .pixels = pv_bytes, .grid_t = @intCast(grid_t), .grid_h = gh, .grid_w = gw };
 }
@@ -15431,7 +15478,7 @@ test "placeMedia expands each placeholder to its block's rows, in prompt order" 
     const found = countMediaPlaceholders(&ids, &config);
     try std.testing.expectEqual(@as(usize, 2), found.images);
     try std.testing.expectEqual(@as(usize, 1), found.videos);
-    var placed = try placeMedia(std.testing.allocator, &ids, &config, &images, &videos);
+    var placed = try placeMedia(std.testing.allocator, &ids, &config, &images, &videos, null);
     defer placed.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u32, &.{ 1, 7, 9, 9, 9, 9, 6, 2, 7, 8, 8, 6, 3, 7, 9, 9, 9, 6 }, placed.ids);
     try std.testing.expectEqual(@as(usize, 9), placed.rows);
@@ -25914,4 +25961,37 @@ test "GLM serving DFlash2 bill includes the bounded window captures replay and s
     try std.testing.expect(needed >= cfg.ssmCheckpointBytes() * 3);
     try std.testing.expect(needed < 2 * 1024 * 1024 * 1024);
     try std.testing.expect(glmDflashRequestBytes(&cfg, 1024) < needed);
+}
+
+test "GLM vision serving processor carries image and video token budgets without M-RoPE" {
+    const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const processor = visionPreprocFromConfig(&cfg);
+    try std.testing.expectEqual(.glm5, processor.mode);
+    try std.testing.expectEqual(@as(u32, 14), processor.patch);
+    try std.testing.expectEqual(@as(u32, 2), processor.tps);
+    try std.testing.expectEqual(@as(u32, 16), processor.min_tokens);
+    try std.testing.expectEqual(@as(u32, 8000), processor.max_tokens);
+    try std.testing.expectEqual(@as(u32, 240000), processor.max_video_tokens);
+    try std.testing.expect(!cfg.qwen_vision);
+    const images = [_]chat_mod.ImageData{ .{ .pixels = &.{}, .width = 56, .height = 56, .grid_h = 4, .grid_w = 4 } };
+    const videos = [_]chat_mod.VideoData{ .{ .pixels = &.{}, .grid_t = 2, .grid_h = 4, .grid_w = 4, .fps = 2 } };
+    const ids = [_]u32{ 154830, 154854, 154831, 154832, 154855, 154833 };
+    const counts = countMediaPlaceholders(&ids, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), counts.images);
+    try std.testing.expectEqual(@as(usize, 1), counts.videos);
+    var tok = Tokenizer.initEmptyForTests(std.testing.allocator, .byte_level_bpe);
+    defer tok.deinit();
+    try tok.special_tokens.put(try std.testing.allocator.dupe(u8, "0.0 seconds"), 1000);
+    try tok.special_tokens.put(try std.testing.allocator.dupe(u8, "1.0 seconds"), 1001);
+    var placed = try placeMedia(std.testing.allocator, &ids, &cfg, &images, &videos, &tok);
+    defer placed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 12), placed.rows);
+    try std.testing.expectEqualSlices(u32, &.{ 154830, 154854, 154854, 154854, 154854, 154831,
+        154832, 154830, 154854, 154854, 154854, 154854, 154831, 1000,
+        154830, 154854, 154854, 154854, 154854, 154831, 1001, 154833 }, placed.ids);
+    const bill = visionEncodeBill(&cfg, &images, &videos, placed.rows);
+    try std.testing.expectEqual(@as(u64, 16), bill.largest_group_patches);
+    const input_bytes: u64 = 3 * 16 * 3 * 2 * 14 * 14 * 4;
+    const output_bytes: u64 = 12 * 4096 * 2;
+    try std.testing.expectEqual(glm5_vision.encodeScratchBytes(&cfg, 16) + input_bytes + 3 * output_bytes, bill.bytes);
 }

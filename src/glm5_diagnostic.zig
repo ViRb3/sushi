@@ -53,13 +53,19 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     return loadWeightsBounded(io, allocator, model_dir, s, false, std.math.maxInt(u64));
 }
 
-fn keepLoadKey(name: []const u8, layers: usize, trunk_only: bool) bool {
+fn keepLoadKey(name: []const u8, layers: usize, trunk_only: bool, vision: bool) bool {
+    if (vision and std.mem.startsWith(u8, name, "model.visual.")) return true;
     return keepTextKey(name, layers) and (!trunk_only or (std.mem.indexOf(u8, name, ".mlp.experts.") == null and std.mem.indexOf(u8, name, ".mlp.switch_mlp.") == null));
 }
 
 /// The same indexed text tensors the native loader retains, before allocating MLX arrays.
 /// Counts payloads, excluding vision, extra prediction layers and unindexed shard contents.
 pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize) !u64 {
+    return residentBytesWithVision(io, allocator, model_dir, layers, false);
+}
+
+/// Counts exactly the enabled trunk and vision tensors retained by the loader.
+pub fn residentBytesWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize, vision: bool) !u64 {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer dir.close(io);
     const raw = try dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(16 * 1024 * 1024));
@@ -74,7 +80,7 @@ pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     var it = wm.object.iterator();
     var expected: usize = 0;
     while (it.next()) |entry| {
-        if (!keepLoadKey(entry.key_ptr.*, layers, false)) continue;
+        if (!keepLoadKey(entry.key_ptr.*, layers, false, vision)) continue;
         const value = entry.value_ptr.*;
         if (value != .string or value.string.len == 0 or std.mem.indexOfAny(u8, value.string, "/\\") != null or std.mem.eql(u8, value.string, "..")) return error.InvalidGlmShardName;
         try files.put(value.string, {});
@@ -103,7 +109,7 @@ pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
         var tensors = header.value.object.iterator();
         while (tensors.next()) |entry| {
             const name = entry.key_ptr.*;
-            if (!keepLoadKey(name, layers, false)) continue;
+            if (!keepLoadKey(name, layers, false, vision)) continue;
             const owner = wm.object.get(name) orelse continue;
             if (owner != .string or !std.mem.eql(u8, owner.string, file.*)) continue;
             if (entry.value_ptr.* != .object) return error.InvalidSafetensorsTensor;
@@ -122,7 +128,15 @@ pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
 
 /// The budget is checked on lazy metadata before any retained tensor is evaluated.
 /// Expert-only shards are never opened; mixed shards materialize only trunk tensors.
+pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream, vision: bool) !model.Weights {
+    return loadWeightsBoundedWithVision(io, allocator, model_dir, s, false, std.math.maxInt(u64), vision);
+}
+
 pub fn loadWeightsBounded(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream, trunk_only: bool, max_bytes: u64) !model.Weights {
+    return loadWeightsBoundedWithVision(io, allocator, model_dir, s, trunk_only, max_bytes, false);
+}
+
+pub fn loadWeightsBoundedWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream, trunk_only: bool, max_bytes: u64, vision: bool) !model.Weights {
     _ = s; // Safetensors Load has a CPU implementation; unified storage is consumed by GPU ops.
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
@@ -150,7 +164,7 @@ pub fn loadWeightsBounded(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     var owners = wm.object.iterator();
     var expected: usize = 0;
     while (owners.next()) |entry| {
-        if (!keepLoadKey(entry.key_ptr.*, layers, trunk_only)) continue;
+        if (!keepLoadKey(entry.key_ptr.*, layers, trunk_only, vision)) continue;
         const value = entry.value_ptr.*;
         if (value != .string or value.string.len == 0 or std.mem.indexOfAny(u8, value.string, "/\\") != null or std.mem.eql(u8, value.string, "..")) return error.InvalidGlmShardName;
         try files.put(value.string, {});
@@ -182,7 +196,7 @@ pub fn loadWeightsBounded(io: std.Io, allocator: std.mem.Allocator, model_dir: [
             }
             const name = std.mem.span(key.?);
             const owner = wm.object.get(name);
-            if (!keepLoadKey(name, layers, trunk_only) or owner == null or owner.? != .string or !std.mem.eql(u8, owner.?.string, file.*)) {
+            if (!keepLoadKey(name, layers, trunk_only, vision) or owner == null or owner.? != .string or !std.mem.eql(u8, owner.?.string, file.*)) {
                 _ = mlx.mlx_array_free(value);
                 continue;
             }
@@ -592,4 +606,36 @@ test "GLM stream CPU trunk loader never opens expert shards and refuses a reside
     defer weights.deinit();
     try std.testing.expectEqual(@as(u32, 1), weights.count());
     try std.testing.expectEqual(@as(u16, 0x3f80), mlx.mlx_array_data_bfloat16(weights.get("lm_head.weight").?).?[0]);
+}
+
+test "GLM vision enabled payload bill and CPU loader retain exactly the same indexed tensors" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fixture(tmp.dir, "text.safetensors", "{\"lm_head.weight\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}", &.{ 0, 0, 128, 63 });
+    try fixture(tmp.dir, "vision.safetensors", "{\"model.visual.weight\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[0,4]},\"unindexed\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[4,8]}}", &.{ 128, 63, 0, 64, 0, 0, 0, 64 });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"lm_head.weight\":\"text.safetensors\",\"model.visual.weight\":\"vision.safetensors\",\"model.language_model.mtp.weight\":\"missing.safetensors\",\"model.language_model.layers.1.x\":\"missing.safetensors\"}}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"text_config\":{\"num_hidden_layers\":1}}" });
+    const path = try tmpPath(tmp);
+    defer a.free(path);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    for ([_]bool{ false, true }) |enabled| {
+        var w = try loadWeightsWithVision(std.testing.io, a, path, cpu, enabled);
+        defer w.deinit();
+        try std.testing.expectEqual(enabled, w.get("model.visual.weight") != null);
+        try std.testing.expect(w.get("unindexed") == null);
+        try std.testing.expectEqual(@as(u64, if (enabled) 8 else 4), storedBytes(&w));
+        try std.testing.expectEqual(storedBytes(&w), try residentBytesWithVision(std.testing.io, a, path, 1, enabled));
+    }
+}
+
+test "GLM vision local packed checkpoint header bill adds only enabled tower bytes" {
+    const model_dir = std.c.getenv("GLM_VISION_TEST_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const cfg = try model.parseConfig(std.testing.io, a, std.mem.span(model_dir));
+    const text = try residentBytesWithVision(std.testing.io, a, std.mem.span(model_dir), cfg.num_hidden_layers, false);
+    const vision = try residentBytesWithVision(std.testing.io, a, std.mem.span(model_dir), cfg.num_hidden_layers, true);
+    try std.testing.expectEqual(@as(u64, 493389824), vision - text);
+    try std.testing.expectEqual(@as(u64, 93295638776), text);
 }

@@ -1814,7 +1814,7 @@ pub const Scheduler = struct {
             );
             break :blk expertStreamingGateBytes(split.trunk +| split.mtp, plan.cache_bytes, plan.prefill_peak_bytes, plan.bounce_bytes);
         } else if (owned.config.isGlm5())
-            try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
+            try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config.has_vision), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
         else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
             try residentColdLoadBillBytes(
                 self.io,
@@ -3534,10 +3534,10 @@ fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelCo
     return (try @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory)) +| mini;
 }
 
-fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, no_drafter: bool, drafter_dir: []const u8) !u64 {
+fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, load_vision: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
     const drafter = LoadDrafterDir.resolve(io, allocator, no_drafter, drafter_dir, model_dir);
     defer drafter.deinit(allocator);
-    const weights = try @import("glm5_diagnostic.zig").residentBytes(io, allocator, model_dir, config.num_hidden_layers);
+    const weights = try @import("glm5_diagnostic.zig").residentBytesWithVision(io, allocator, model_dir, config.num_hidden_layers, load_vision and config.glm5_vision);
     return loadRequirementForConfig(config, weights +| try glmDflashLoadBytes(io, allocator, config, drafter.dir), null);
 }
 
@@ -3759,7 +3759,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             log.err("[glm] native MLA cache requires BF16; use --kv-quant off\n", .{});
             return error.GlmKvQuantUnsupported;
         }
-        streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytes(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers);
+        streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, params.load_vision and params.config.glm5_vision);
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
         streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     } else if (params.config.usesMimoSourceTrunk()) {
@@ -3883,7 +3883,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_enabled = mtp.on and !mtp_streaming_off and !params.config.isGlm5();
     if (params.config.isGlm5()) {
         log.info("[glm] native BF16 MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ params.config.kvBytesPerToken(), params.config.qsaHistoryBytesPerToken() });
-        log.info("[glm] vision tower unavailable in native serving; text only\n", .{});
+        log.info("[glm] native vision {s}\n", .{if (params.load_vision and params.config.glm5_vision) "enabled (included in resident weight bill)" else "off (--no-vision or absent tower)"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0) log.warn("[glm] native recurrent state has no prefix-cache restore yet; RAM/disk prefix reuse off\n", .{});
     }

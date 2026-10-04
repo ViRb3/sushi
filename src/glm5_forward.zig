@@ -556,6 +556,11 @@ pub const Model = struct {
     }
 
     pub fn forwardLast(self: *const Model, request: *Request, ids: Arr, last_only: bool) !Arr {
+        return self.forwardLastWithEmbedding(request, ids, last_only, null);
+    }
+
+    /// Server media rows replace token embeddings before expansion into the four HC streams.
+    pub fn forwardLastWithEmbedding(self: *const Model, request: *Request, ids: Arr, last_only: bool, embedded: ?Arr) !Arr {
         const ish = mlx.getShape(ids);
         if (ish.len != 2 or ish[0] != 1 or ish[1] < 1 or request.layers.len != self.layers.len) return error.InvalidGlmInput;
         if (self.expert_stream) |store| try store.admit(request.offset, @intCast(ish[1]));
@@ -584,9 +589,14 @@ pub const Model = struct {
         {
             var ops = Ops{ .s = self.s };
             defer ops.deinit();
-            const e = self.embedding;
-            const code = try ops.take(e.w, ids, 0);
-            const hidden = if (e.scales.ctx != null) try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0)) else code;
+            const hidden = if (embedded) |input| blk: {
+                if (!std.mem.eql(c_int, mlx.getShape(input), &.{ 1, ish[1], @intCast(self.cfg.hidden_size) })) return error.InvalidGlmInput;
+                break :blk try ops.cast(input, .bfloat16);
+            } else blk: {
+                const e = self.embedding;
+                const code = try ops.take(e.w, ids, 0);
+                break :blk if (e.scales.ctx != null) try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0)) else code;
+            };
             h = try ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(hidden, &.{ 1, ish[1], 1, @intCast(self.cfg.hidden_size) }), &.{ 1, ish[1], 4, @intCast(self.cfg.hidden_size) })));
         }
         defer _ = mlx.mlx_array_free(h);

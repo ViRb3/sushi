@@ -44657,7 +44657,18 @@ fn forwardGlm5WithImpl(self: *Transformer, ctx: *ForwardCtx, ids: mlx.mlx_array,
         request.capture = &capture;
     }
     defer request.capture = null;
-    const logits = try mdl.forwardLast(request, ids, true);
+    var embedded: ?mlx.mlx_array = null;
+    defer if (embedded) |h| {
+        _ = mlx.mlx_array_free(h);
+    };
+    if (ctx.vision_embeddings) |media| {
+        const h = try mdl.rawEmbedding(ids);
+        embedded = self.spliceVisionEmbeddings(h, ids, media, self.config.image_token_id, self.config.audio_token_id, self.config.video_token_id, ctx.vision_splice_offset) catch |err| {
+            _ = mlx.mlx_array_free(h);
+            return err;
+        };
+    }
+    const logits = try mdl.forwardLastWithEmbedding(request, ids, true, embedded);
     ctx.cache.step = request.offset;
     return logits;
 }
@@ -76024,4 +76035,52 @@ test "GLM serving dispatch matches native forward across prefill decode and rese
     const captured = try xfm.forwardWith(&ctx, ids);
     defer _ = mlx.mlx_array_free(captured);
     try testing.expectEqualSlices(c_int, &.{ 1, 1, 128 }, mlx.getShape(out[0]));
+}
+
+test "GLM vision native serving splices media before HC expansion and preserves layer capture" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    var cfg = try glm5_mod.completeFixture(&weights);
+    cfg.image_token_id = 1;
+    cfg.video_token_id = 2;
+    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer xfm.deinit();
+    var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
+    defer reference.deinit();
+    var request = try glm5_mod.Request.init(a, cfg.num_hidden_layers);
+    defer request.deinit();
+    request.dense_prefill = true;
+    request.prefill_async = true;
+    var values: [2 * 128]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 13)) * 0.017;
+    const media = mlx.mlx_array_new_data(&values, &[_]c_int{ 1, 2, 128 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(media);
+    var capture_out = [_]mlx.mlx_array{mlx.mlx_array_new()};
+    defer _ = mlx.mlx_array_free(capture_out[0]);
+    const capture_ids = [_]u32{0};
+    var capture = CaptureLayers{ .ids = &capture_ids, .out = &capture_out };
+    for ([_]u32{ 1, 2 }, 0..) |token, offset| {
+        const ids = mlx.mlx_array_new_data(&token, &[_]c_int{ 1, 1 }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        var ctx = xfm.defaultCtx();
+        ctx.vision_embeddings = media;
+        ctx.vision_splice_offset = offset;
+        ctx.capture_layers = &capture;
+        const out = try xfm.forwardWith(&ctx, ids);
+        defer _ = mlx.mlx_array_free(out);
+        const embedded = try Transformer.spliceVisionRows(try reference.rawEmbedding(ids), ids, media, cfg.image_token_id, 0, cfg.video_token_id, offset, xfm.s);
+        defer _ = mlx.mlx_array_free(embedded);
+        const want = try reference.forwardLastWithEmbedding(&request, ids, true, embedded);
+        defer _ = mlx.mlx_array_free(want);
+        var equal = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(equal);
+        try mlx.check(mlx.mlx_array_equal(&equal, out, want, true, xfm.s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, equal));
+        try testing.expect(same);
+        try testing.expectEqualSlices(c_int, &.{ 1, 1, 128 }, mlx.getShape(capture_out[0]));
+        try testing.expectEqual(request.offset, ctx.cache.step);
+    }
 }

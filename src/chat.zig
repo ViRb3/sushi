@@ -38,7 +38,7 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, mimo } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, mimo, glm5 } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -46,6 +46,7 @@ pub const VisionPreproc = struct {
     max_pixels: u32 = 0,
     /// muse/lfm2: the resize cap is on MERGED tokens, not pixels.
     max_tokens: u32 = 0,
+    max_video_tokens: u32 = 0,
     /// lfm2: the budget has a FLOOR too — a small image is upscaled to it.
     min_tokens: u32 = 0,
     /// lfm2 tiling. A source past `max_tokens * pixels_tolerance` is split into
@@ -76,6 +77,8 @@ pub const VideoData = struct {
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
+    /// Rate of the pre-sampled input frames. GLM uses it for frame timestamps.
+    fps: f64 = 24,
 };
 
 /// OpenAI spells the system turn `developer` for reasoning models (pi does

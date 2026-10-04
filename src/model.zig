@@ -577,6 +577,15 @@ pub const ModelConfig = struct {
     // 0 means absent: the Qwen processor defaults remain the fallback.
     qv_min_pixels: u32 = 0,
     qv_max_pixels: u32 = 0,
+    // GLM-5.3 shares patch-grid geometry, with a separate RMSNorm ViT and padded CLIP processor.
+    glm5_vision: bool = false,
+    glmv_projection_intermediate: u32 = 10240,
+    glmv_eps: f32 = 1e-5,
+    glmv_swiglu_limit: f32 = 10,
+    glmv_rope_theta: f32 = 10000,
+    glmv_min_image_tokens: u32 = 16,
+    glmv_max_image_tokens: u32 = 8000,
+    glmv_max_video_tokens: u32 = 240000,
     // Muse-Glimmer vision (src/muse_vision.zig). Shares the qv_* geometry but
     // NOT the Qwen ViT: split qkv, learned pos table resampled per image,
     // window/full attention per layer, and plain 1D text positions (no M-RoPE).
@@ -1617,7 +1626,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // Qwen image sizing is processor metadata rather than an architecture
     // constant. Prefer processor_config.json and fill any missing field from
     // the older preprocessor_config.json layout.
-    if (config.qwen_vision or config.muse_vision) {
+    if (config.qwen_vision or config.muse_vision or config.glm5_vision) {
         var vision_defaults = VisionProcessorDefaults{};
         const processor_files = [_][]const u8{
             "processor_config.json",
@@ -1637,6 +1646,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                         vision_defaults.min_pixels = parsed_defaults.min_pixels;
                     if (vision_defaults.max_pixels == null)
                         vision_defaults.max_pixels = parsed_defaults.max_pixels;
+                    if (vision_defaults.min_image_tokens == null)
+                        vision_defaults.min_image_tokens = parsed_defaults.min_image_tokens;
+                    if (vision_defaults.max_video_tokens == null)
+                        vision_defaults.max_video_tokens = parsed_defaults.max_video_tokens;
                     if (vision_defaults.max_image_tokens == null)
                         vision_defaults.max_image_tokens = parsed_defaults.max_image_tokens;
                 } else |_| {}
@@ -1651,6 +1664,12 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
         config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
         config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
+        if (config.glm5_vision) {
+            config.glmv_min_image_tokens = vision_defaults.min_image_tokens orelse 16;
+            config.glmv_max_image_tokens = vision_defaults.max_image_tokens orelse 8000;
+            config.glmv_max_video_tokens = vision_defaults.max_video_tokens orelse 240000;
+            if (config.glmv_min_image_tokens > config.glmv_max_image_tokens) return error.InvalidGlmVisionConfig;
+        }
     }
 
     return config;
@@ -1677,6 +1696,8 @@ pub const VisionProcessorDefaults = struct {
     max_pixels: ?u32 = null,
     /// Muse: the cap is on MERGED tokens, not pixels.
     max_image_tokens: ?u32 = null,
+    min_image_tokens: ?u32 = null,
+    max_video_tokens: ?u32 = null,
 };
 
 fn positiveJsonU32(value: ?std.json.Value) ?u32 {
@@ -1707,6 +1728,8 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
         .min_pixels = positiveJsonU32(processor.get("min_pixels")),
         .max_pixels = positiveJsonU32(processor.get("max_pixels")),
         .max_image_tokens = positiveJsonU32(processor.get("max_image_tokens")),
+        .min_image_tokens = positiveJsonU32(processor.get("min_image_tokens")),
+        .max_video_tokens = if (root.get("video_processor")) |v| if (v == .object) positiveJsonU32(v.object.get("max_image_tokens")) else null else null,
     };
     if (processor.get("size")) |value| {
         if (value == .object) {
@@ -2073,6 +2096,47 @@ fn glmLayerList(obj: std.json.ObjectMap, key: []const u8, layers: u32, linear: b
         item += 1;
     }
     if (item != value.array.items.len) return error.UnsupportedGlmConfig;
+}
+
+fn parseGlm5VisionFields(c: *ModelConfig, root: std.json.ObjectMap) !void {
+    const value = root.get("vision_config") orelse return;
+    if (value != .object) return error.InvalidGlmVisionConfig;
+    const v = value.object;
+    try glmRequireString(v, "model_type", "glm5_next_vision");
+    try glmRequireString(v, "hidden_act", "silu");
+    try glmRequireBool(v, "attention_bias", true);
+    c.qv_depth = try glmU32(v, "depth");
+    c.qv_hidden = try glmU32(v, "hidden_size");
+    c.qv_heads = try glmU32(v, "num_heads");
+    c.qv_intermediate = try glmU32(v, "intermediate_size");
+    c.qv_patch = try glmU32(v, "patch_size");
+    c.qv_temporal_patch = try glmU32(v, "temporal_patch_size");
+    c.qv_merge = try glmU32(v, "spatial_merge_size");
+    c.qv_out_hidden = try glmU32(v, "out_hidden_size");
+    c.glmv_projection_intermediate = try glmU32(v, "projection_intermediate_size");
+    c.glmv_eps = try glmF32(v, "rms_norm_eps");
+    c.glmv_swiglu_limit = try glmF32(v, "swiglu_limit");
+    if (c.qv_heads == 0 or c.qv_hidden % c.qv_heads != 0 or c.qv_out_hidden != c.hidden_size or
+        c.qv_depth == 0 or c.qv_hidden == 0 or c.qv_intermediate == 0 or c.qv_patch == 0 or c.qv_patch > 64 or
+        c.qv_temporal_patch == 0 or c.qv_temporal_patch > 8 or c.qv_merge != 2 or
+        c.glmv_projection_intermediate == 0 or !std.math.isFinite(c.glmv_eps) or c.glmv_eps <= 0 or
+        !std.math.isFinite(c.glmv_swiglu_limit) or c.glmv_swiglu_limit <= 0) return error.InvalidGlmVisionConfig;
+    c.qv_head_dim = c.qv_hidden / c.qv_heads;
+    if (c.qv_head_dim % 4 != 0) return error.InvalidGlmVisionConfig;
+    if (v.get("rope_parameters")) |rp| {
+        if (rp == .object) {
+            try glmRequireString(rp.object, "rope_type", "axial");
+            c.glmv_rope_theta = try glmF32(rp.object, "rope_theta");
+            if (!std.math.isFinite(c.glmv_rope_theta) or c.glmv_rope_theta <= 0) return error.InvalidGlmVisionConfig;
+        }
+    }
+    c.image_token_id = try glmU32(root, "image_token_id");
+    c.video_token_id = try glmU32(root, "video_token_id");
+    c.vision_start_token_id = try glmU32(root, "image_start_token_id");
+    c.vision_end_token_id = try glmU32(root, "image_end_token_id");
+    for ([_]u32{ c.image_token_id, c.video_token_id, c.vision_start_token_id, c.vision_end_token_id }) |id| if (id >= c.vocab_size) return error.InvalidGlmVisionConfig;
+    c.glm5_vision = true;
+    c.has_vision = true;
 }
 
 fn parseGlm5Fields(c: *ModelConfig, obj: std.json.ObjectMap) !void {
@@ -2824,6 +2888,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         try parseQwenVisionFields(&config, root, cfg_obj);
     } else if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5_next_text")) {
         try parseGlm5Fields(&config, cfg_obj);
+        try parseGlm5VisionFields(&config, root);
     } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
     {
@@ -4473,7 +4538,7 @@ pub fn loadWeightsForConfig(
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
         if (config.expert_streaming) return error.ExpertStreamingUnsupportedLayout;
-        return @import("glm5_diagnostic.zig").loadWeights(io, allocator, model_dir, mlx.gpuStream());
+        return @import("glm5_diagnostic.zig").loadWeightsWithVision(io, allocator, model_dir, mlx.gpuStream(), load_vision and config.glm5_vision);
     }
     if (config.expert_streaming and config.usesMimoSourceTrunk()) {
         logMimoSourceLoad(config, false);
@@ -9329,7 +9394,9 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
 test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assumptions" {
     const c = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
     try testing.expect(c.isGlm5());
-    try testing.expect(!c.has_vision);
+    try testing.expect(c.has_vision and c.glm5_vision);
+    try testing.expectEqual(@as(u32, 14), c.qv_patch);
+    try testing.expectEqual(@as(u32, 154854), c.image_token_id);
     try testing.expectEqual(@as(f32, 0.0625), c.attnScale());
     try testing.expectEqualStrings("model.language_model", c.weight_prefix);
     try testing.expectEqual(@as(u32, 45), c.num_hidden_layers);
@@ -9431,4 +9498,31 @@ test "thinking policy launch defaults are model-specific and preserve GLM high" 
     try testing.expect(!qwen.defaultEnableThinking(false));
     try testing.expect(!mimo.defaultEnableThinking(false));
     try testing.expect(glm.defaultEnableThinking(false));
+}
+
+test "GLM vision config rejects unsupported tower geometry and accepts a text-only checkpoint" {
+    const a = testing.allocator;
+    const source = @embedFile("fixtures/glm5_config.json");
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, source, .{});
+    defer parsed.deinit();
+    var root = parsed.value.object;
+    const vision = root.get("vision_config").?.object;
+    var cfg = try parseConfigFromJson(a, source);
+    try testing.expect(cfg.has_vision and cfg.glm5_vision and !cfg.qwen_vision);
+    try testing.expectEqual(@as(u32, 64), cfg.qv_head_dim);
+    try testing.expectEqual(@as(f32, 10000), cfg.glmv_rope_theta);
+    try testing.expectEqual(@as(u32, 10240), cfg.glmv_projection_intermediate);
+    var invalid = vision;
+    invalid.getPtr("num_heads").?.* = .{ .integer = 15 };
+    cfg.glm5_vision = false;
+    try testing.expectError(error.InvalidGlmVisionConfig, parseGlm5VisionFields(&cfg, root));
+    _ = root.swapRemove("vision_config");
+    cfg.glm5_vision = false;
+    cfg.has_vision = false;
+    try parseGlm5VisionFields(&cfg, root);
+    try testing.expect(!cfg.has_vision and !cfg.glm5_vision);
+    const processor = parseVisionProcessorDefaultsFromJson("{\"image_processor\":{\"min_image_tokens\":16,\"max_image_tokens\":8000},\"video_processor\":{\"max_image_tokens\":240000}}");
+    try testing.expectEqual(@as(?u32, 16), processor.min_image_tokens);
+    try testing.expectEqual(@as(?u32, 8000), processor.max_image_tokens);
+    try testing.expectEqual(@as(?u32, 240000), processor.max_video_tokens);
 }

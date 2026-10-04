@@ -11,7 +11,7 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
-* GLM-5.3-Flash (`glm5_next`), text input with native affine/EXL3 weights.
+* GLM-5.3-Flash (`glm5_next`), text, image, and video input with native affine/EXL3 weights. Vision loads by default when present; `--no-vision` excludes its weights and buffers.
 
 ## Install
 
@@ -52,9 +52,10 @@ sampled, constrained or penalized requests decode serially. Original BF16 and st
 A4/A6/A8 assistants keep their precision. The assistant weights join the load bill;
 its BF16 sliding window, target reservation, captures and verification scratch join
 the request bill.
-Startup bills only text weights and the small warmup; request admission checks context
-storage, capacity growth and native kernel scratch. Vision and extra prediction-layer
-tensors remain on disk.
+Startup bills text weights, enabled vision and the selected assistant plus warmup.
+Native GLM vision is enabled unless `--no-vision` is given; its preprocessing and tower
+scratch are checked before image/video encoding. Request admission checks context
+storage, capacity growth and native kernel scratch. Unused MTP prediction layers stay on disk.
 
 ## Memory
 
