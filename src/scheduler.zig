@@ -3220,6 +3220,95 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+/// Bytes of the MTP head sidecar `mtp.loadMtp` reads beside the trunk shards: 0 when MTP is off, the
+/// head rides the checkpoint (its shards are billed already), none ships, or the arch loads its head
+/// elsewhere (MiMo and GLM never call `loadMtp`).
+fn mtpSidecarBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, mtp_on: bool) u64 {
+    if (!mtp_on or config.isMimo() or config.isGlm5()) return 0;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return 0;
+    defer dir.close(io);
+    const rel = switch (mtp_mod.resolveMtpSource(io, allocator, dir) orelse return 0) {
+        .sidecar_file => |r| r,
+        .in_checkpoint => return 0,
+    };
+    const st = dir.statFile(io, rel, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
+/// The resident weight bill of a load no component-exact bill covers: the shards the index names plus the sidecar head.
+fn plainWeightBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, mtp_on: bool) u64 {
+    return modelDiskBytes(io, model_dir) +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
+}
+
+/// A one-tensor safetensors file: 8-byte LE header length, JSON header, `payload` zero bytes.
+fn writeTestSafetensors(io: std.Io, dir: std.Io.Dir, rel: []const u8, key: []const u8, payload: usize) !u64 {
+    var header_buf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "{{\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[{d}],\"data_offsets\":[0,{d}]}}}}", .{ key, payload / 2, payload });
+    var file: [512]u8 = undefined;
+    std.mem.writeInt(u64, file[0..8], header.len, .little);
+    @memcpy(file[8 .. 8 + header.len], header);
+    const total = 8 + header.len + payload;
+    @memset(file[8 + header.len .. total], 0);
+    if (std.fs.path.dirname(rel)) |d| try dir.createDirPath(io, d);
+    try dir.writeFile(io, .{ .sub_path = rel, .data = file[0..total] });
+    return total;
+}
+
+fn testTmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    return std.fmt.bufPrint(buf, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+}
+
+test "the preflight bills a separately loaded MTP sidecar once, never an in-checkpoint head twice" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try testTmpDirPath(&tmp, &path_buf);
+
+    const shard = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "model.embed_tokens.weight", 8);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.embed_tokens.weight\":\"model.safetensors\"}}" });
+    const plain = ModelConfig{ .model_type = "qwen4_exp" };
+    try testing.expectEqual(shard, plainWeightBytes(io, a, &plain, dir, true));
+
+    const sidecar = try writeTestSafetensors(io, tmp.dir, "mtp/weights.safetensors", "mtp.fc.weight", 16);
+    try testing.expectEqual(shard + sidecar, plainWeightBytes(io, a, &plain, dir, true));
+    // The head is billed only when it will load, and only where `loadMtp` loads it.
+    try testing.expectEqual(shard, plainWeightBytes(io, a, &plain, dir, false));
+    const mimo = ModelConfig{ .model_type = "mimo_v2" };
+    const glm = ModelConfig{ .model_type = "glm5_next" };
+    try testing.expectEqual(@as(u64, 0), mtpSidecarBytes(io, a, &mimo, dir, true));
+    try testing.expectEqual(@as(u64, 0), mtpSidecarBytes(io, a, &glm, dir, true));
+
+    // A head inside the shards is already in the shard sum.
+    try tmp.dir.deleteFile(io, "mtp/weights.safetensors");
+    const with_head = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "mtp.fc.weight", 8);
+    try testing.expectEqual(with_head, plainWeightBytes(io, a, &plain, dir, true));
+}
+
+test "the Sushi resident bill carries a separately loaded MTP sidecar and its coarse rerank copy" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try testTmpDirPath(&tmp, &path_buf);
+
+    _ = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "model.embed_tokens.weight", 8);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.embed_tokens.weight\":\"model.safetensors\"}}" });
+    var config = ModelConfig{ .model_type = "qwen4_exp" };
+    config.vocab_size = 128;
+    config.hidden_size = 64;
+    const without = try sushiResidentLoadBytes(io, a, dir, &config, false, true);
+    const sidecar = try writeTestSafetensors(io, tmp.dir, "mtp/weights.safetensors", "mtp.fc.weight", 16);
+    const with = try sushiResidentLoadBytes(io, a, dir, &config, false, true);
+    try testing.expect(with >= without + sidecar);
+    try testing.expectEqual(without, try sushiResidentLoadBytes(io, a, dir, &config, false, false));
+}
+
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -3305,12 +3394,13 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
     if (config.isMimo()) return mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
+    const head_bytes = split.mtp +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
     const coarse_bits = mtp_mod.rerankCoarseBits();
-    const coarse = if (mtp_on and split.mtp > 0 and coarse_bits > 0 and mtp_mod.MtpModel.draftRerankMode() != .off)
+    const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0 and mtp_mod.MtpModel.draftRerankMode() != .off)
         mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits)
     else
         0;
-    return split.trunk +| split.mtp +| coarse;
+    return split.trunk +| head_bytes +| coarse;
 }
 
 /// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads
@@ -4141,7 +4231,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!skip_mem_preflight) {
-        const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
+        const weights_bytes = streaming_resident_bytes orelse plainWeightBytes(sch.io, sch.allocator, params.config, params.model_dir, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
         const gpu_limit = mlx.maxRecommendedWorkingSet();
         const Reader = struct {
             io: std.Io,
@@ -5043,7 +5133,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.expert_bounce_bytes,
         )
     else
-        residentWeightBytes(streaming_resident_bytes, entry.bytes_on_disk, modelDiskBytes(sch.io, params.model_dir), params.config.num_hidden_layers, params.config.hidden_size);
+        residentWeightBytes(streaming_resident_bytes, entry.bytes_on_disk, plainWeightBytes(sch.io, sch.allocator, params.config, params.model_dir, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on), params.config.num_hidden_layers, params.config.hidden_size);
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);
