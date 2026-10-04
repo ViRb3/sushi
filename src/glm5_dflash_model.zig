@@ -108,7 +108,7 @@ fn forkAttention(source: *const attention.State) !attention.State {
 
 fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, mode: kda.ProjectionMode) !struct { output: Arr, tape: MlaTape } {
     const native = @import("glm5_attention_decode_batch.zig");
-    const native_mode = native.enabled();
+    const native_mode = native.enabled() and (native.explicitlyRequested() or native.supportedConfig(cfg, mlx.mlx_array_dtype(x), ops.s));
     if (native_mode) {
         try native.admit(cfg, .bfloat16, ops.s);
         if (parents.len > 3) return error.GlmDecodeNativeTreeUnsupported;

@@ -15,14 +15,33 @@ thread owns all MLX calls, including frees, and services requests sequentially.
 The public serving gates and cache precision remain unchanged: BF16 compressed
 MLA caches and FP32 KDA state.
 
+## Current qualified defaults
+
+The qualified GLM flags now default on when absent. Set a named switch to `0`
+to opt out; `SUSHI_GLM_KDA_VALUE_ROWS` defaults to 4 and `0`
+selects the original recurrence. Existing dtype, shape and memory guards still
+apply. `/props` and final diagnostics report the effective selected policies;
+actual counters establish whether a path engaged.
+
+| Area | Default-enabled switches (all with `SUSHI_GLM_` prefix) |
+| --- | --- |
+| Experts/drafting | `LANE_PAIR`, `DOWN_LANE`, `DFLASH_GROUP2`, `DFLASH_DENSE_ROWS` |
+| Prefill trunk | `HC_PREFILL`, `A6_DENSE_PREFILL`, `MLA_PREFILL_BATCH`, `KDA_PREFILL_CLUSTER` |
+| Attention/index | `ATTENTION_PACKED`, `INDEX_SCORE_NAX`, `VERIFY_MLA_BATCH`, `DECODE_BATCH`, `PREFILL_PACKED32`, `PREFILL_CADENCE` |
+| Verifier/assistant | `DFLASH_READOUT_HORIZON`, `KDA_KEEP_LEAF`, `DFLASH_BLOCK_TAIL`, `DFLASH_A6_HOIST`, `DFLASH_COMMIT_WINDOW` |
+| Layout/HC | `PREFILL_GRID_TRANSPOSE`, `HC_COLLAPSE_SIMD32` |
+
+Recipe-zero controls stay off: `HC_FUSED`, `PREFILL_DIRECT`, `DFLASH_MINI_HEAD`,
+`HC_EXPAND_PREFILL`, profiling/capture controls and unknown switches. Rejected
+long-pool scoring and unproved expert pairing are excluded. MLX's TF32 default 1
+is unchanged. Native reference capture explicitly selects its zero profile and
+TF32=0, so these defaults do not change the teacher contract or generic capture options.
+
+The later measurement sections describe opt-ins at their historical commits.
+This default promotion selects the already qualified recipe; it adds no new
+benchmark claim and does not attain the 1500/60 throughput goals.
+
 ```sh
-SUSHI_GLM_KDA_VALUE_ROWS=4 \
-SUSHI_GLM_A6_DENSE_PREFILL=1 \
-SUSHI_GLM_DFLASH_GROUP2=1 \
-SUSHI_GLM_LANE_PAIR=1 \
-SUSHI_GLM_DOWN_LANE=1 \
-SUSHI_GLM_DFLASH_DENSE_ROWS=1 \
-SUSHI_GLM_DFLASH_MINI_HEAD=0 \
 taskpolicy -a zig-out/bin/sushi glm-bench "$GLM_MODEL_DIR" \
   --assistant "$GLM_ASSISTANT_DIR" --port 8094 \
   --ctx-size 132096 --prefill-chunk 2048 --memory-gib 110 \
@@ -32,9 +51,8 @@ taskpolicy -a zig-out/bin/sushi glm-bench "$GLM_MODEL_DIR" \
 An explicit `--assistant` selects the existing layerwise DFlash2 verifier,
 N2/C4, affine-row/FFN mode and async4. Omitting it selects native greedy serial
 output with async4 layer scheduling. Props and final usage metadata identify the
-actual backend, assistant, MLX runtime version, chunk width and experimental
-flags. The environment selects the existing qualified row/layout arms; the
-bridge does not silently override them.
+actual backend, assistant, MLX runtime version, chunk width and effective
+flags. Explicit environment values override the qualified defaults.
 
 Sampling is greedy. Completion budgets honor `max_completion_tokens` or the
 legacy `max_tokens`, and usage counts actual generated IDs, including the first

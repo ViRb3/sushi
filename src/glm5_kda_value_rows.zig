@@ -1,5 +1,5 @@
-//! Isolated prefill experiment: one SIMD group carries independent value rows.
-//! No production caller; FP32 state and each member's original 32-lane reductions remain.
+//! Qualified prefill schedule: one SIMD group carries independent value rows.
+//! FP32 state and each member's original 32-lane reductions remain.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const primitive = @import("glm5_next.zig");
@@ -53,13 +53,13 @@ const SOURCE =
     \\GLM_VALUE_UNROLL for(uint r=0;r<uint(R);++r) GLM_VALUE_UNROLL for(uint i=0;i<4u;++i)
     \\ state_out[(size_t(n)*128u+dv0+r)*128u+4u*lane+i]=state[r][i];
 ;
-// Diagnostic policy; production default stays on the existing recurrence.
+// Zero selects the original recurrence; valid explicit schedules remain available.
 var selected_rows: ?u32 = null;
 var dispatches: usize = 0;
 pub fn configuredRows() !?u32 {
     if (selected_rows == null) {
         const raw = std.c.getenv("SUSHI_GLM_KDA_VALUE_ROWS");
-        const rows = if (raw) |value| std.fmt.parseInt(u32, std.mem.span(value), 10) catch return error.InvalidKdaValueRows else 0;
+        const rows = if (raw) |value| std.fmt.parseInt(u32, std.mem.span(value), 10) catch return error.InvalidKdaValueRows else 4;
         if (rows != 0 and rows != 1 and rows != 2 and rows != 4) return error.InvalidKdaValueRows;
         selected_rows = rows;
     }
@@ -286,4 +286,36 @@ test "GLM KDA value-row isolated timing" {
     }, .{ .whitespace = .indent_2 });
     defer std.testing.allocator.free(result);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(path), .data = result });
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "GLM fast opt-out KDA value rows defaults four and preserves valid overrides" {
+    const a = std.testing.allocator;
+    const name = "SUSHI_GLM_KDA_VALUE_ROWS";
+    const previous_cache = selected_rows;
+    defer selected_rows = previous_cache;
+    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    selected_rows = null;
+    try std.testing.expectEqual(@as(?u32, 4), try configuredRows());
+    const values = [_][:0]const u8{ "0", "1", "2", "4" };
+    const expected = [_]?u32{ null, 1, 2, 4 };
+    for (values, expected) |value, rows| {
+        try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+        selected_rows = null;
+        try std.testing.expectEqual(rows, try configuredRows());
+    }
+    for ([_][:0]const u8{ "3", "-1", "invalid" }) |value| {
+        try std.testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+        selected_rows = null;
+        try std.testing.expectError(error.InvalidKdaValueRows, configuredRows());
+    }
 }

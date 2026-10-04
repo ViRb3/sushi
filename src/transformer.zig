@@ -36748,10 +36748,37 @@ test "speculative expert compute runs at decode widths without an imatrix captur
     try testing.expect(!expertSpecApplies(true, &.{ 1, 1, 10 }));
 }
 
+const glm_qualified_default_flags = [_][]const u8{
+    "SUSHI_GLM_LANE_PAIR",
+    "SUSHI_GLM_DOWN_LANE",
+    "SUSHI_GLM_KDA_VALUE_ROWS",
+    "SUSHI_GLM_HC_PREFILL",
+    "SUSHI_GLM_DFLASH_GROUP2",
+    "SUSHI_GLM_DFLASH_DENSE_ROWS",
+    "SUSHI_GLM_A6_DENSE_PREFILL",
+    "SUSHI_GLM_MLA_PREFILL_BATCH",
+    "SUSHI_GLM_ATTENTION_PACKED",
+    "SUSHI_GLM_INDEX_SCORE_NAX",
+    "SUSHI_GLM_VERIFY_MLA_BATCH",
+    "SUSHI_GLM_DFLASH_READOUT_HORIZON",
+    "SUSHI_GLM_KDA_KEEP_LEAF",
+    "SUSHI_GLM_DFLASH_BLOCK_TAIL",
+    "SUSHI_GLM_DFLASH_A6_HOIST",
+    "SUSHI_GLM_KDA_PREFILL_CLUSTER",
+    "SUSHI_GLM_DFLASH_COMMIT_WINDOW",
+    "SUSHI_GLM_PREFILL_CADENCE",
+    "SUSHI_GLM_PREFILL_GRID_TRANSPOSE",
+    "SUSHI_GLM_DECODE_BATCH",
+    "SUSHI_GLM_PREFILL_PACKED32",
+    "SUSHI_GLM_HC_COLLAPSE_SIMD32",
+};
+
 pub fn diagEnvOn(name: [*:0]const u8) bool {
-    return diagEnvValueOn(std.c.getenv(name));
+    if (std.c.getenv(name)) |raw| return diagEnvValueOn(raw);
+    for (glm_qualified_default_flags) |flag| if (std.mem.eql(u8, std.mem.span(name), flag)) return true;
+    return false;
 }
-/// `diagEnvOn` for a hot path: same semantics (absent or `0` = off), asked once.
+/// Cache the effective switch once, including qualified GLM defaults and explicit opt-outs.
 fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
     if (cache.*) |v| return v;
     const v = diagEnvOn(name);
@@ -75804,4 +75831,82 @@ test "the GPU expert pick declines a shape its threadgroup cannot hold" {
     const a_starved = mlx.mlx_array_new_data(&starved, &[_]c_int{2048}, 1, .uint8);
     defer _ = mlx.mlx_array_free(a_starved);
     try testing.expectError(error.UnsupportedShape, expertPickGpu(a_ids, a_logits, a_map, a_starved, 0.2, s));
+}
+
+test "GLM qualified opt-out defaults preserve explicit zero and teacher reference" {
+    const flags = [_][*:0]const u8{
+        "SUSHI_GLM_LANE_PAIR",
+        "SUSHI_GLM_DOWN_LANE",
+        "SUSHI_GLM_KDA_VALUE_ROWS",
+        "SUSHI_GLM_HC_PREFILL",
+        "SUSHI_GLM_DFLASH_GROUP2",
+        "SUSHI_GLM_DFLASH_DENSE_ROWS",
+        "SUSHI_GLM_A6_DENSE_PREFILL",
+        "SUSHI_GLM_MLA_PREFILL_BATCH",
+        "SUSHI_GLM_ATTENTION_PACKED",
+        "SUSHI_GLM_INDEX_SCORE_NAX",
+        "SUSHI_GLM_VERIFY_MLA_BATCH",
+        "SUSHI_GLM_DFLASH_READOUT_HORIZON",
+        "SUSHI_GLM_KDA_KEEP_LEAF",
+        "SUSHI_GLM_DFLASH_BLOCK_TAIL",
+        "SUSHI_GLM_DFLASH_A6_HOIST",
+        "SUSHI_GLM_KDA_PREFILL_CLUSTER",
+        "SUSHI_GLM_DFLASH_COMMIT_WINDOW",
+        "SUSHI_GLM_PREFILL_CADENCE",
+        "SUSHI_GLM_PREFILL_GRID_TRANSPOSE",
+        "SUSHI_GLM_DECODE_BATCH",
+        "SUSHI_GLM_PREFILL_PACKED32",
+        "SUSHI_GLM_HC_COLLAPSE_SIMD32",
+    };
+    var previous: [flags.len]?[:0]u8 = @splat(null);
+    for (flags, &previous) |name, *saved| if (std.c.getenv(name)) |value| {
+        saved.* = try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0);
+    };
+    defer for (flags, previous) |name, saved| {
+        if (saved) |value| {
+            _ = setenv(name, value, 1);
+            testing.allocator.free(value);
+        } else _ = unsetenv(name);
+    };
+    for (flags) |name| {
+        _ = unsetenv(name);
+        try testing.expect(diagEnvOn(name));
+        _ = setenv(name, "0", 1);
+        try testing.expect(!diagEnvOn(name));
+        _ = setenv(name, "", 1);
+        try testing.expect(!diagEnvOn(name));
+        _ = setenv(name, "1", 1);
+        try testing.expect(diagEnvOn(name));
+    }
+}
+
+test "GLM qualified opt-out keeps experiments and generic diagnostics default off" {
+    const flags = [_][*:0]const u8{
+        "SUSHI_GLM_HC_FUSED",
+        "SUSHI_GLM_DFLASH_MINI_HEAD",
+        "SUSHI_GLM_PREFILL_DIRECT",
+        "SUSHI_GLM_DFLASH_PROFILE",
+        "SUSHI_GLM_DFLASH_CAPTURE_ROUTES",
+        "SUSHI_GLM_HC_EXPAND_PREFILL",
+        "SUSHI_GLM_INDEX_SCORE_NAX_LONG",
+        "SUSHI_GLM_PREFILL_EXPERT_PAIR",
+        "SUSHI_GLM_KDA_TREE_CORE",
+        "SUSHI_GLM_UNKNOWN_FAST_SWITCH",
+        "SUSHI_MIMO_ROWS_UBENCH",
+        "QWEN4_PROFILE_FWD",
+    };
+    var previous: [flags.len]?[:0]u8 = @splat(null);
+    for (flags, &previous) |name, *saved| if (std.c.getenv(name)) |value| {
+        saved.* = try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0);
+    };
+    defer for (flags, previous) |name, saved| {
+        if (saved) |value| {
+            _ = setenv(name, value, 1);
+            testing.allocator.free(value);
+        } else _ = unsetenv(name);
+    };
+    for (flags) |name| {
+        _ = unsetenv(name);
+        try testing.expect(!diagEnvOn(name));
+    }
 }

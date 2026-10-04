@@ -577,7 +577,9 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
             !std.mem.eql(c_int, is[0..2], mlx.getShape(w)) or mlx.mlx_array_dtype(iq) != mlx.mlx_array_dtype(state.pooled) or
             mlx.mlx_array_dtype(w) != mlx.mlx_array_dtype(iq)) return error.InvalidGlmAttentionShape;
     }
-    if (@import("glm5_attention_decode_batch.zig").enabled() and sh[0] <= 8)
+    const native = @import("glm5_attention_decode_batch.zig");
+    if (native.enabled() and sh[0] <= 8 and
+        (native.explicitlyRequested() or native.supportedQuery(sh, mlx.mlx_array_dtype(q), s)))
         return attendNativeDecode(state, q, index_q, weights, offset, scale, overlay, s);
     const splits: c_int = if (sh[0] <= 8) 8 else 1;
     const headpack = overlay == null and sparse and splits == 1 and sh[1] == 64 and sh[2] == 512 and
@@ -920,3 +922,48 @@ test "GLM attention rejects invalid append without advancing request state" {
     defer other.deinit();
     try std.testing.expectEqual(@as(usize, 0), other.processed);
 }
+
+test "GLM native decode default fallback preserves unsupported tiny attention bits" {
+    const a = std.testing.allocator;
+    const name = "SUSHI_GLM_DECODE_BATCH";
+    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
+    }
+    _ = unsetenv(name);
+    const native = @import("glm5_attention_decode_batch.zig");
+    const s = mlx.gpuStream();
+    const latent = array(&.{ 0.25, -0.5, 1, 2 }, &.{ 2, 2 });
+    defer _ = mlx.mlx_array_free(latent);
+    const keys = array(&.{ 0, 0, 0, 0 }, &.{ 2, 2 });
+    defer _ = mlx.mlx_array_free(keys);
+    const ape = array(&.{ 0, 0, 0, 0, 0, 0, 0, 0 }, &.{ 4, 2 });
+    defer _ = mlx.mlx_array_free(ape);
+    const q = array(&.{ 0.5, 1, -0.25, 0.75 }, &.{ 1, 2, 2 });
+    defer _ = mlx.mlx_array_free(q);
+    var state = State.init();
+    defer state.deinit();
+    _ = try state.append(latent, keys, keys, ape, s);
+    const reference = blk: {
+        const off = native.bind(false);
+        defer off.restore();
+        break :blk try attend(&state, q, null, null, 1, 0.5, s);
+    };
+    defer _ = mlx.mlx_array_free(reference);
+    native.resetCalls();
+    const actual = try attend(&state, q, null, null, 1, 0.5, s);
+    defer _ = mlx.mlx_array_free(actual);
+    const evals = mlx.mlx_vector_array_new_data(&.{ reference, actual }, 2);
+    defer _ = mlx.mlx_vector_array_free(evals);
+    try mlx.check(mlx.mlx_eval(evals));
+    const count = mlx.mlx_array_size(actual);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(reference).?[0..count]), std.mem.sliceAsBytes(mlx.mlx_array_data_float32(actual).?[0..count]));
+    try std.testing.expectEqual(@as(usize, 0), native.b1Calls());
+    try std.testing.expectEqual(@as(usize, 0), native.b3Calls());
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;

@@ -76,6 +76,8 @@ test "GLM prefill cadence scoped control restores serial fallback" {
 }
 
 test "GLM prefill cadence extra budget covers only a second packed tile" {
+    const legacy16 = @import("glm5_attention_nax_packed.zig").bind32(false);
+    defer legacy16.restore();
     const pack = packed_attention.bind(true);
     defer pack.restore();
     const off = attention.bindPackedCadence(false);

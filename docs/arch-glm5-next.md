@@ -40,6 +40,7 @@ Related documents: [execution plan](plan-glm5-native.md), [DFlash2 study](plan-g
 [actual tail inputs](glm5-tail-actual-input-capture.md),
 [long-tail component](glm5-indexpool-tail-component.md),
 [round 2K–32K bench table](glm5-round35666-bench-table.md),
+[final bounded round closure](glm5-final-round-result.md),
 [current decode system trace](glm5-current-gpu-profile-result.md),
 [bounded draft readouts](glm5-dflash-readout-horizon.md),
 [verification latent overlays](glm5-dflash-latent-overlay.md),

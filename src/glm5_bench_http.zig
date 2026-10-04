@@ -312,6 +312,8 @@ test "GLM benchmark HTTP admission includes head-batched MLA permutation buffers
 }
 
 test "GLM benchmark HTTP admission includes bounded packed attention banks" {
+    const legacy16 = @import("glm5_attention_nax_packed.zig").bind32(false);
+    defer legacy16.restore();
     const cadence = @import("glm5_attention.zig").bindPackedCadence(false);
     defer cadence.restore();
     const headpack = @import("glm5_attention_nax_packed.zig");
@@ -918,6 +920,8 @@ test "GLM benchmark HTTP reserve forecast bills every MLA full replacement" {
 
 // The second packed tile is additional to the original per-layer packed bill.
 test "GLM benchmark HTTP admission includes second packed attention tile" {
+    const legacy16 = @import("glm5_attention_nax_packed.zig").bind32(false);
+    defer legacy16.restore();
     const attention = @import("glm5_attention.zig");
     const headpack_binding = @import("glm5_attention_nax_packed.zig").bind(true);
     defer headpack_binding.restore();

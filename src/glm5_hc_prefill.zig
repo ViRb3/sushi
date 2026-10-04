@@ -440,3 +440,29 @@ test "GLM HC prefill integrated collapse preserves mixed post and comb bits" {
         try expectBits(expected.comb, actual.comb);
     }
 }
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "GLM fast opt-out HC prefill defaults on and preserves explicit controls" {
+    const a = std.testing.allocator;
+    const name = "SUSHI_GLM_HC_PREFILL";
+    const previous_cache = enabled_cache;
+    defer enabled_cache = previous_cache;
+    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    enabled_cache = null;
+    try std.testing.expect(enabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
+    enabled_cache = null;
+    try std.testing.expect(!enabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    enabled_cache = null;
+    try std.testing.expect(enabled());
+}

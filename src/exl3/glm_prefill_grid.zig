@@ -1,4 +1,4 @@
-//! Opt-in exact physical grid transpose for qualified GLM routed prefill.
+//! Exact physical grid transpose for qualified GLM routed prefill.
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const base = @import("expert_exl3_kernels.zig");
@@ -20,7 +20,7 @@ pub fn bind(on: bool) Binding {
 }
 pub fn enabled() bool {
     return enabled_override orelse blk: {
-        const value = std.c.getenv("SUSHI_GLM_PREFILL_GRID_TRANSPOSE") orelse break :blk false;
+        const value = std.c.getenv("SUSHI_GLM_PREFILL_GRID_TRANSPOSE") orelse break :blk true;
         break :blk std.mem.eql(u8, std.mem.span(value), "1");
     };
 }
@@ -140,7 +140,7 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr)
     return shaped;
 }
 
-test "GLM prefill grid opt in restores binding and declines guards before dispatch" {
+test "GLM prefill grid opt out restores binding and declines guards before dispatch" {
     const off = bind(false);
     defer off.restore();
     try std.testing.expect(!enabled());
@@ -158,4 +158,30 @@ test "GLM prefill grid opt in restores binding and declines guards before dispat
     }
     try std.testing.expect(!enabled());
     try std.testing.expectEqual(count, dispatchCount());
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "GLM fast opt-out grid transpose defaults on and preserves explicit controls" {
+    const a = std.testing.allocator;
+    const name = "SUSHI_GLM_PREFILL_GRID_TRANSPOSE";
+    const previous_cache = enabled_override;
+    defer enabled_override = previous_cache;
+    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    enabled_override = null;
+    try std.testing.expect(enabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
+    enabled_override = null;
+    try std.testing.expect(!enabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    enabled_override = null;
+    try std.testing.expect(enabled());
 }

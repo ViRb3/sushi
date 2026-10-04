@@ -8,7 +8,7 @@ var calls: usize = 0;
 pub fn enabled() bool {
     if (enabled_cache) |value| return value;
     const raw = std.c.getenv("SUSHI_GLM_DFLASH_DENSE_ROWS");
-    const value = if (raw) |text| std.mem.eql(u8, std.mem.span(text), "1") else false;
+    const value = if (raw) |text| std.mem.eql(u8, std.mem.span(text), "1") else true;
     enabled_cache = value;
     return value;
 }
@@ -68,4 +68,30 @@ test "GLM DFlash dense column batch rejects unsupported inputs" {
     var cpu = native.Ops{ .s = cpu_stream };
     defer cpu.deinit();
     try std.testing.expect((try project(&cpu, linear, x)) == null);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "GLM fast opt-out dense rows defaults on and preserves explicit controls" {
+    const a = std.testing.allocator;
+    const name = "SUSHI_GLM_DFLASH_DENSE_ROWS";
+    const previous_cache = enabled_cache;
+    defer enabled_cache = previous_cache;
+    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    enabled_cache = null;
+    try std.testing.expect(enabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
+    enabled_cache = null;
+    try std.testing.expect(!enabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    enabled_cache = null;
+    try std.testing.expect(enabled());
 }

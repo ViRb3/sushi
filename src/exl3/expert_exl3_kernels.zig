@@ -9517,6 +9517,14 @@ test "exl3 clamped routing preserves staged bytes at every 2 to 4 bpw rate" {
 }
 
 test "exl3 clamped routing preserves GLM production width bytes" {
+    const previous_lane = lane_pair_enabled;
+    const previous_down = down_lane_enabled;
+    lane_pair_enabled = false;
+    down_lane_enabled = false;
+    defer {
+        lane_pair_enabled = previous_lane;
+        down_lane_enabled = previous_down;
+    }
     const previous_mode = clamped_middle_enabled;
     clamped_middle_enabled = .on;
     defer clamped_middle_enabled = previous_mode;
@@ -10231,7 +10239,10 @@ pub fn resetLanePairChainCalls() void {
     lane_chain_calls = 0;
 }
 fn lanePairEnabled() bool {
-    if (lane_pair_enabled == null) lane_pair_enabled = diagEnvValueOn(std.c.getenv("SUSHI_GLM_LANE_PAIR"));
+    if (lane_pair_enabled == null) {
+        const value = std.c.getenv("SUSHI_GLM_LANE_PAIR");
+        lane_pair_enabled = if (value == null) true else diagEnvValueOn(value);
+    }
     return lane_pair_enabled.?;
 }
 fn laneClampedPair(s: mlx.mlx_stream, x: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, sg: mlx.mlx_array, su: mlx.mlx_array, slots: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int) !?[2]mlx.mlx_array {
@@ -10476,7 +10487,10 @@ pub fn resetDownLaneCalls() void {
     down_lane_calls = 0;
 }
 fn downLaneEnabled() bool {
-    if (down_lane_enabled == null) down_lane_enabled = diagEnvValueOn(std.c.getenv("SUSHI_GLM_DOWN_LANE"));
+    if (down_lane_enabled == null) {
+        const value = std.c.getenv("SUSHI_GLM_DOWN_LANE");
+        down_lane_enabled = if (value == null) true else diagEnvValueOn(value);
+    }
     return down_lane_enabled.?;
 }
 test "exl3 GLM down lane full clamped chain bytes" {
@@ -10512,4 +10526,50 @@ test "exl3 GLM down lane full clamped chain bytes" {
         const size = mlx.mlx_array_size(expected);
         try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..size], mlx.mlx_array_data_bfloat16(actual).?[0..size]);
     }
+}
+
+test "GLM fast opt-out lane pair defaults on and preserves explicit controls" {
+    const a = std.testing.allocator;
+    const name = "SUSHI_GLM_LANE_PAIR";
+    const previous_cache = lane_pair_enabled;
+    defer lane_pair_enabled = previous_cache;
+    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    lane_pair_enabled = null;
+    try std.testing.expect(lanePairEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
+    lane_pair_enabled = null;
+    try std.testing.expect(!lanePairEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    lane_pair_enabled = null;
+    try std.testing.expect(lanePairEnabled());
+}
+
+test "GLM fast opt-out down lane defaults on and preserves explicit controls" {
+    const a = std.testing.allocator;
+    const name = "SUSHI_GLM_DOWN_LANE";
+    const previous_cache = down_lane_enabled;
+    defer down_lane_enabled = previous_cache;
+    const previous = if (std.c.getenv(name)) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    defer {
+        if (previous) |value| {
+            _ = setenv(name, value, 1);
+            a.free(value);
+        } else _ = unsetenv(name);
+    }
+    try std.testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    down_lane_enabled = null;
+    try std.testing.expect(downLaneEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "0", 1));
+    down_lane_enabled = null;
+    try std.testing.expect(!downLaneEnabled());
+    try std.testing.expectEqual(@as(c_int, 0), setenv(name, "1", 1));
+    down_lane_enabled = null;
+    try std.testing.expect(downLaneEnabled());
 }

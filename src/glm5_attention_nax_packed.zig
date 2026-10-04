@@ -165,6 +165,8 @@ test "GLM packed NAX geometry and fixed scratch bound" {
     try std.testing.expect(try temporaryBytes(16) <= scratch_limit);
 }
 test "GLM packed NAX scoped controls bill every pending layer" {
+    const legacy16 = @import("glm5_attention_nax_packed.zig").bind32(false);
+    defer legacy16.restore();
     const off = bind(false);
     defer off.restore();
     try std.testing.expect(!enabled());
