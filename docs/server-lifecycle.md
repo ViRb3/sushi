@@ -142,7 +142,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A
   batched group is capped by PADDING WASTE (`batchedKvKeepCount`, `MAX_PAD_WASTE` 1.5 < 2.0), not slot count.
   Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
-  ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)).
+  ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)); resident GLM does the same through `verifyGroups`, and a
+  drafting GLM slot joins as a plain row when its model has company ([arch-glm5-next](arch-glm5-next.md#concurrency)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
 - `--prefill-decode-share S` (flag > `SUSHI_PREFILL_DECODE_SHARE` > 0) targets the fraction of wall time given
@@ -160,8 +161,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:
   `tests/test_batched_equivalence.sh` runs a real two-stream arm.
 - **A GLM slot owns its `glm5_forward.Request`** (`Slot.glm5_request`, handed to the forward as
-  `ForwardCtx.glm5_request`; a GLM forward without one is `GlmRequestMissing`), so GLM requests interleave; only a
-  streamed GLM load stays exclusive. The boot line and `/props batching.reason` (`arch` vs `exclusive`) say which.
+  `ForwardCtx.glm5_request`; a GLM forward without one is `GlmRequestMissing`), so GLM requests share a model; only a
+  streamed GLM load stays exclusive. The boot line and `/props batching.reason` (`ok` vs `exclusive`) say which.
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel,
   failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
 - `src/generate.zig`: generation, sampling, MTP orchestration, `StallClock`, prefill chunking, loop-stop tiers,

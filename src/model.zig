@@ -1230,6 +1230,12 @@ pub const ModelConfig = struct {
         return self.isMimo() and !self.expert_streaming;
     }
 
+    /// GLM decodes concurrent slots as single-row groups of one verifier forward
+    /// (`glm5_dflash_model.verifyGroups`); a streamed load stays serial.
+    pub fn supportsBatchedGlmRows(self: *const ModelConfig) bool {
+        return self.isGlm5() and !self.expert_streaming;
+    }
+
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h

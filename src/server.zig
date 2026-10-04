@@ -26115,10 +26115,12 @@ test "GLM serving DFlash2 bill includes the bounded window captures replay and s
     try std.testing.expect(glmDflashRequestBytes(&cfg, 1024) < needed);
 }
 
-test "the concurrency verdict says GLM interleaves, an exclusive model queues, qwen4 batches" {
+test "the concurrency verdict: a resident GLM and qwen4 batch, an exclusive model queues, another MoE interleaves" {
     const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .full_attention_interval = 4, .num_experts = 8, .num_experts_per_tok = 2 };
-    try std.testing.expectEqual(scheduler_mod.BatchVerdict.arch, batchVerdictOf(&glm, false));
+    const moe = model_mod.ModelConfig{ .model_type = "qwen3_moe", .num_experts = 8, .num_experts_per_tok = 2 };
+    try std.testing.expectEqual(scheduler_mod.BatchVerdict.ok, batchVerdictOf(&glm, false));
+    try std.testing.expectEqual(scheduler_mod.BatchVerdict.arch, batchVerdictOf(&moe, false));
     try std.testing.expectEqual(scheduler_mod.BatchVerdict.exclusive, batchVerdictOf(&glm, true));
     try std.testing.expectEqual(scheduler_mod.BatchVerdict.ok, batchVerdictOf(&qwen4, false));
     try std.testing.expectEqual(scheduler_mod.BatchVerdict.arch, batchVerdictOf(null, false));

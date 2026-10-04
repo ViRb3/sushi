@@ -22473,6 +22473,11 @@ pub const Transformer = struct {
     /// gemma4 MoE) are NOT covered and must keep the serial path. Asked by
     /// the scheduler's batching gate, so a new arch on this forward defaults
     /// to serial instead of silently riding a path that never modelled it.
+    pub fn supportsBatchedGlmRows(self: *const Transformer) bool {
+        const glm = self.glm5 orelse return false;
+        return self.config.supportsBatchedGlmRows() and glm.expert_stream == null;
+    }
+
     pub fn supportsBatchedMimoDecode(self: *const Transformer) bool {
         // Without the packed global arms every row rebuilds its whole cache: the bill would be the context.
         return self.config.supportsBatchedMimoDecode() and self.moe_layers != null and self.expert_stream == null and

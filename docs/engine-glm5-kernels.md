@@ -97,6 +97,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 
 ## DFlash2 verification
 
+- **Groups**: `verifyGroups` runs several requests' trees (≤ 16 rows) in one layer loop. KDA `project`/`finish` and
+  MLA `mlaProject`/`mlaFinish` take every row; `recur` and `mlaAttend` take one request's rows and state. Each group
+  equals its solo `verify` bit for bit; `SUSHI_GLM_ROWS_UBENCH=N` (`_CTX`, `_TEXT`) times grouped against serial rows.
 - **KDA**: parent-indexed prework over 1–16 nodes, then a tree recurrence holding FP32 parent states locally; the tape
   keeps projected prework and replays only the accepted path. The first-child leaf (chain row 2, fork row 1) is kept and
   aliased on a hit (4 MiB per layer; −25%; 59% hits at 8K, break-even 21%).

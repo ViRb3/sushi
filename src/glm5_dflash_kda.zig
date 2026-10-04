@@ -241,27 +241,53 @@ pub fn forceStagedForTest(on: bool) void {
     if (@import("builtin").is_test) force_staged_for_tests = on;
 }
 
+const KdaLayer = @import("glm5_model.zig").KdaLayer;
+const SSMCacheEntry = @import("transformer.zig").SSMCacheEntry;
+
 /// `.serial_rows` keeps one-row projection geometry; the affine modes batch rows exactly.
-pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const @import("transformer.zig").SSMCacheEntry, parents: []const i32, mode: ProjectionMode) !LayerResult {
+pub fn applyLayer(layer: KdaLayer, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const SSMCacheEntry, parents: []const i32, mode: ProjectionMode) !LayerResult {
     const sh = mlx.getShape(x);
-    if (sh.len != 3 or sh[0] != 1 or sh[1] < 1 or sh[1] > 16 or sh[1] != parents.len or cfg.linear_conv_kernel_dim != 4) return error.InvalidGlmDraftShape;
+    if (sh.len != 3 or sh[0] != 1 or sh[1] < 1 or sh[1] > 16 or sh[1] != parents.len) return error.InvalidGlmDraftShape;
+    const p = try project(layer, ops, x, mode);
+    var r = try recur(layer, ops, p, 0, cfg, state, parents);
+    errdefer r.tape.deinit();
+    return .{ .output = try finish(layer, ops, r.y, p.gate, cfg, mode), .tape = r.tape };
+}
+
+pub const Projected = struct { raw: Arr, a: Arr, beta: Arr, gate: Arr };
+
+/// Every projection of the layer over all rows: rows of several requests read each weight once.
+pub fn project(layer: KdaLayer, ops: *Ops, x: Arr, mode: ProjectionMode) !Projected {
+    const raw = try ops.concat(&.{ try linearRows(ops, layer.q, x, mode), try linearRows(ops, layer.k, x, mode), try linearRows(ops, layer.v, x, mode) }, -1);
+    return .{
+        .raw = raw,
+        .a = try linearRows(ops, layer.fb, try linearRows(ops, layer.fa, x, mode), mode),
+        .beta = try linearRows(ops, layer.beta, x, mode),
+        .gate = try linearRows(ops, layer.gb, try linearRows(ops, layer.ga, x, mode), mode),
+    };
+}
+
+pub const Recurred = struct { y: Arr, tape: Tape };
+
+/// One request's tree, rows `from ..` of `p`: conv prework and recurrence from that request's state.
+pub fn recur(layer: KdaLayer, ops: *Ops, p: Projected, from: usize, cfg: *const @import("model.zig").ModelConfig, state: *const SSMCacheEntry, parents: []const i32) !Recurred {
+    if (parents.len < 1 or parents.len > 16 or cfg.linear_conv_kernel_dim != 4) return error.InvalidGlmDraftShape;
     if (parents[0] != -1) return error.InvalidGlmDraftTree;
     for (parents[1..], 1..) |parent, i| if (parent < 0 or parent >= i) return error.InvalidGlmDraftTree;
     const heads: c_int = @intCast(cfg.linear_num_value_heads);
     const dim: c_int = @intCast(cfg.linear_key_head_dim);
     const width = heads * dim;
-    const dtype = mlx.mlx_array_dtype(x);
-    const qraw = try linearRows(ops, layer.q, x, mode);
-    const kraw = try linearRows(ops, layer.k, x, mode);
-    const vraw = try linearRows(ops, layer.v, x, mode);
-    const raw = try ops.concat(&.{ qraw, kraw, vraw }, -1);
+    const n: c_int = @intCast(parents.len);
+    const begin: c_int = @intCast(from);
+    const raw = try ops.slice(p.raw, 1, begin, begin + n);
+    const a_raw = try ops.slice(p.a, 1, begin, begin + n);
+    const beta_raw = try ops.slice(p.beta, 1, begin, begin + n);
+    const dtype = mlx.mlx_array_dtype(raw);
     const old = if (state.initialized) state.conv_state else try ops.zeros(&.{ 1, 3, width * 3 }, dtype);
     const conv_input = try ops.concat(&.{ old, raw }, 1);
     const conv_w = if (layer.prepared_conv.ctx != null) layer.prepared_conv else try ops.contiguous(try ops.transpose(try ops.concat(&.{ layer.conv_q, layer.conv_k, layer.conv_v }, 0), &.{ 0, 2, 1 }));
     const exp_decay = if (layer.prepared_decay.ctx != null) layer.prepared_decay else try ops.unary(.exp, layer.a_log);
-    const dims = [_]c_int{ 1, sh[1], heads, dim };
-    const a_raw = try linearRows(ops, layer.fb, try linearRows(ops, layer.fa, x, mode), mode);
-    const beta_raw = try linearRows(ops, layer.beta, x, mode);
+    const dims = [_]c_int{ 1, n, heads, dim };
     const fused = if (!force_staged_for_tests and dim == 128) try @import("glm5_kda_prework.zig").applyTree(ops.s, .{
         .qkv = raw,
         .a = a_raw,
@@ -286,8 +312,8 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
             window[row * 4 + j] = if (at >= 0) 3 + at else 2 - @as(i32, @intCast(back));
         };
         const indices = try ops.own(mlx.mlx_array_new_data(&window, &[_]c_int{@intCast(parents.len * 4)}, 1, .int32));
-        const conv_x = try ops.reshape(try ops.take(conv_input, indices, 1), &.{ sh[1], 4, width * 3 });
-        const convolved = try ops.reshape(try ops.silu(try ops.conv(conv_x, conv_w, width * 3)), &.{ 1, sh[1], width * 3 });
+        const conv_x = try ops.reshape(try ops.take(conv_input, indices, 1), &.{ n, 4, width * 3 });
+        const convolved = try ops.reshape(try ops.silu(try ops.conv(conv_x, conv_w, width * 3)), &.{ 1, n, width * 3 });
         const rq = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, 0, width), &dims), .float32);
         const rk = try ops.cast(try ops.reshape(try ops.slice(convolved, 2, width, 2 * width), &dims), .float32);
         const values = try ops.reshape(try ops.slice(convolved, 2, 2 * width, 3 * width), &dims);
@@ -308,17 +334,6 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     const retained: ?LeafResult = if (parents.len <= 3) try recurrentLeaf(inputs, parents, ops.s) else null;
     defer if (retained) |value| value.deinit();
     const y_bf = try ops.own(if (retained) |value| try ops.result(value.y) else try recurrent(inputs, parents, ops.s));
-    const gate_bf = try ops.reshape(try linearRows(ops, layer.gb, try linearRows(ops, layer.ga, x, mode), mode), &dims);
-    const post = if (!force_staged_for_tests and sh[1] > 1) try @import("glm5_kda_fused.zig").post(ops.s, y_bf, gate_bf, layer.out_norm, cfg.rms_norm_eps) else null;
-    const gated = if (post) |value| try ops.own(value) else blk: {
-        const y = try ops.cast(y_bf, .float32);
-        const variance = try ops.reduce(try ops.binary(.mul, y, y), -1, true, true);
-        const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(cfg.rms_norm_eps, .float32)));
-        const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(layer.out_norm, .float32));
-        const gate = try ops.cast(gate_bf, .float32);
-        break :blk try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, gate)), dtype);
-    };
-    const output = try linearRows(ops, layer.out, try ops.reshape(gated, &.{ 1, sh[1], width }), mode);
     var tape = Tape{ .inputs = .{ .q = .{ .ctx = null }, .k = .{ .ctx = null }, .v = .{ .ctx = null }, .decay = .{ .ctx = null }, .beta = .{ .ctx = null }, .state = .{ .ctx = null } }, .conv_input = .{ .ctx = null } };
     errdefer tape.deinit();
     inline for (.{ "q", "k", "v", "decay", "beta", "state" }) |name| @field(tape.inputs, name) = try ops.result(@field(inputs, name));
@@ -329,7 +344,24 @@ pub fn applyLayer(layer: @import("glm5_model.zig").KdaLayer, ops: *Ops, x: Arr, 
     }
     tape.count = parents.len;
     @memcpy(tape.parents[0..parents.len], parents);
-    return .{ .output = output, .tape = tape };
+    return .{ .y = y_bf, .tape = tape };
+}
+
+/// Gated output norm and output projection over all rows (`y` and `gate` row-aligned).
+pub fn finish(layer: KdaLayer, ops: *Ops, y_bf: Arr, gate: Arr, cfg: *const @import("model.zig").ModelConfig, mode: ProjectionMode) !Arr {
+    const heads: c_int = @intCast(cfg.linear_num_value_heads);
+    const dim: c_int = @intCast(cfg.linear_key_head_dim);
+    const rows = mlx.getShape(y_bf)[1];
+    const gate_bf = try ops.reshape(gate, &.{ 1, rows, heads, dim });
+    const post = if (!force_staged_for_tests and rows > 1) try @import("glm5_kda_fused.zig").post(ops.s, y_bf, gate_bf, layer.out_norm, cfg.rms_norm_eps) else null;
+    const gated = if (post) |value| try ops.own(value) else blk: {
+        const y = try ops.cast(y_bf, .float32);
+        const variance = try ops.reduce(try ops.binary(.mul, y, y), -1, true, true);
+        const normalization = try ops.unary(.rsqrt, try ops.binary(.add, variance, try ops.scalar(cfg.rms_norm_eps, .float32)));
+        const normalized = try ops.binary(.mul, try ops.binary(.mul, y, normalization), try ops.cast(layer.out_norm, .float32));
+        break :blk try ops.cast(try ops.binary(.mul, normalized, try ops.unary(.sigmoid, try ops.cast(gate_bf, .float32))), mlx.mlx_array_dtype(gate));
+    };
+    return linearRows(ops, layer.out, try ops.reshape(gated, &.{ 1, rows, heads * dim }), mode);
 }
 
 test "GLM DFlash KDA layer tree and replay equal serial ancestor forwards" {

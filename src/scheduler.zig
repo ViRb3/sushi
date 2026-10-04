@@ -2188,7 +2188,7 @@ pub const Scheduler = struct {
         // a hybrid), but has its own batched kernel. Ask the transformer, never
         // name the arch here — same rule as `modelExclusiveDecode`.
         const t = slot.model.transformer orelse return .arch;
-        return if (t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode()) .ok else .arch;
+        return if (t.supportsBatchedGdnDecode() or t.supportsBatchedMimoDecode() or t.supportsBatchedGlmRows()) .ok else .arch;
     }
 };
 
@@ -2213,12 +2213,12 @@ pub const BatchVerdict = enum {
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
 pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
-    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode() or cfg.supportsBatchedMimoDecode();
+    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode() or cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows();
 }
 
-/// MiMo batching is certified for up to four independent slots.
+/// MiMo and GLM batching are certified (and GLM measured) for up to four independent slots.
 pub fn batchGroupCap(cfg: *const model_mod.ModelConfig) usize {
-    return if (cfg.supportsBatchedMimoDecode()) 4 else MAX_BATCH_GROUP;
+    return if (cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows()) 4 else MAX_BATCH_GROUP;
 }
 
 /// One line per slot the first time it decodes serial beside live company;
@@ -4060,6 +4060,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     if (transformer_mod.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
+    if (transformer_mod.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (xfm_ptr.glm5) |target| glmRowsUbench(sch.allocator, target, kv_quant_config.glmLatentBits() orelse 0, params.tok);
 
     // DIAGNOSTIC (SUSHI_DECODE_FWD_UBENCH=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
@@ -6119,6 +6120,26 @@ fn deinitSlotsReturningPool(slots: []const *Slot) void {
     if (returns_pool) _ = mlx.mlx_clear_cache();
 }
 
+/// DIAGNOSTIC (SUSHI_GLM_ROWS_UBENCH=N): `glm5_rows_ubench.run` per `_CTX=<tokens>[,<tokens>...]`
+/// (default 1024) over `_TEXT=<abs path>`.
+fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, latent_bits: u8, tok: *Tokenizer) void {
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const rounds = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_GLM_ROWS_UBENCH").?, 0), 10) catch 8);
+    const ctxs: []const u8 = if (std.c.getenv("SUSHI_GLM_ROWS_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "1024";
+    var ids: []u32 = &.{};
+    defer alloc.free(ids);
+    if (std.c.getenv("SUSHI_GLM_ROWS_UBENCH_TEXT")) |path| blk: {
+        const text = std.Io.Dir.cwd().readFileAlloc(tio, std.mem.sliceTo(path, 0), alloc, .limited(64 << 20)) catch break :blk;
+        defer alloc.free(text);
+        ids = tok.encode(alloc, text) catch break :blk;
+    }
+    var it = std.mem.tokenizeScalar(u8, ctxs, ',');
+    while (it.next()) |field| {
+        const ctx = std.fmt.parseInt(usize, field, 10) catch continue;
+        @import("glm5_rows_ubench.zig").run(alloc, target, latent_bits, ids, ctx, rounds) catch |err| log.warn("[glm-rows-ubench] failed: {s}\n", .{@errorName(err)});
+    }
+}
+
 /// DIAGNOSTIC (SUSHI_PREFILL_UBENCH=N): N cold one-chunk prefills per arm at load, each from an
 /// empty cache, logits never projected (the chunk loop never reads them). `_ROWS` (default 2025)
 /// is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
@@ -7134,6 +7155,8 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var batchable_n: usize = 0;
     var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
+    var glm_buf: [MAX_BATCH_GROUP]*Slot = undefined;
+    var glm_n: usize = 0;
     for (active) |s| {
         const why = sch.batchVerdict(s);
         if (why == .ok and batchable_n < batchable_buf.len) {
@@ -7142,6 +7165,9 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         } else if (why == .spec_active and (slotMtpGroupable(s) or slotMimoMtpCrowdable(s)) and mtp_n < mtp_buf.len) {
             mtp_buf[mtp_n] = s;
             mtp_n += 1;
+        } else if (why == .spec_active and slotGlmRowable(s) and glm_n < glm_buf.len) {
+            glm_buf[glm_n] = s;
+            glm_n += 1;
         } else {
             // legacy single-slot for spec / grammar / overflow
             noteSerial(sch, s, why);
@@ -7184,6 +7210,14 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         }
     }
     try runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
+    // A DFlash2 GLM slot in company decodes as a plain row of the grouped tick (a row for another
+    // request beats a draft row, arch-glm5-next#concurrency); alone it drafts.
+    for (glm_buf[0..glm_n]) |slot| {
+        if (glmRowsInCompany(slot, glm_buf[0..glm_n], batchable_buf[0..batchable_n]) and batchable_n < batchable_buf.len) {
+            batchable_buf[batchable_n] = slot;
+            batchable_n += 1;
+        } else try runSingleDecodeTick(sch, slot);
+    }
     if (batchable_n == 0) {
         if (sch.metrics) |m| m.batched_group_size.set(0);
         return;
@@ -7214,7 +7248,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
         const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
         // Per-row attention reads each slot's own cache: nothing pads.
-        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() else true;
+        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() and !t.supportsBatchedGlmRows() else true;
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
@@ -7996,6 +8030,24 @@ fn slotMimoMtpCrowdable(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedMimoDecode()) return false;
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
+}
+
+/// Does another slot of this one's model decode this tick (a drafting GLM slot or a plain batchable one)?
+fn glmRowsInCompany(slot: *const Slot, drafting: []const *Slot, plain: []const *Slot) bool {
+    var company: usize = 0;
+    for (drafting) |other| company += @intFromBool(other.model == slot.model);
+    for (plain) |other| company += @intFromBool(other.model == slot.model);
+    return company >= 2;
+}
+
+/// A DFlash2 GLM slot that can ride a plain grouped tick: its rounds only need the row committed
+/// with the assistant's taps (`Generator.glmRowCommit`).
+fn slotGlmRowable(slot: *const Slot) bool {
+    const gen = if (slot.legacy_gen) |*g| g else return false;
+    if (!gen.glm_dflash_native or gen.dflash_ctx == null or gen.done) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or generate_mod.penaltyActive(slot.sampling)) return false;
+    const t = slot.model.transformer orelse return false;
+    return t.supportsBatchedGlmRows();
 }
 
 fn slotMtpGroupable(slot: *const Slot) bool {
@@ -8919,6 +8971,45 @@ fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
     return live_n;
 }
 
+var glm_rows_logged = false;
+
+/// A plain batched GLM tick: one single-row group per slot through `verifyGroups`, each row
+/// committed by its own generator. Returns the rows' logits in `batch` order.
+fn glmRowsForward(allocator: std.mem.Allocator, xfm: *Transformer, batch: []const *Slot, tokens: []const u32) ![]mlx.mlx_array {
+    const verifier = @import("glm5_dflash_model.zig");
+    const target = xfm.glm5.?;
+    target.s = xfm.s;
+    target.suppress_mask = xfm.suppress_mask;
+    var groups: [verifier.max_rows]verifier.Group = undefined;
+    // A DFlash2 row keeps its assistant context; every row then carries the assistant's taps.
+    var taps: []const u32 = &.{};
+    for (batch, 0..) |slot, i| {
+        const gen = &slot.legacy_gen.?;
+        if (gen.glm_dflash_native) taps = gen.dflash.?.config.target_layer_ids;
+        groups[i] = .{ .request = gen.ctx.glm5_request orelse return error.GlmRequestMissing, .tokens = tokens[i .. i + 1], .parents = &.{-1} };
+    }
+    const schedule = try verifier.bindSchedule(4);
+    defer schedule.restore();
+    if (!glm_rows_logged) {
+        glm_rows_logged = true;
+        log.info("[glm-rows] grouped plain tick engaged: {d} rows\n", .{batch.len});
+    }
+    var out: [verifier.max_rows]verifier.Verified = undefined;
+    try verifier.verifyGroups(target, groups[0..batch.len], taps, .affine_rows_ffn, out[0..batch.len]);
+    defer for (out[0..batch.len]) |*v| v.deinit();
+    const logits = try allocator.alloc(mlx.mlx_array, batch.len);
+    var made: usize = 0;
+    errdefer {
+        for (logits[0..made]) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(logits);
+    }
+    for (batch, out[0..batch.len]) |slot, *v| {
+        logits[made] = try slot.legacy_gen.?.glmRowCommit(v);
+        made += 1;
+    }
+    return logits;
+}
+
 fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const N = active.len;
     if (N == 0) return;
@@ -8988,6 +9079,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // to merge, so that tick stays serial rather than merging a wrong width.
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
     const use_mimo = xfm_ptr.supportsBatchedMimoDecode();
+    const use_glm = xfm_ptr.supportsBatchedGlmRows();
     // Position source is per PATH: a GDN trunk positions from the slot's
     // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
     // linear layer there, so it reads 0 forever and every batched token was
@@ -9016,7 +9108,9 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (rows) |a| _ = mlx.mlx_array_free(a);
         allocator.free(rows);
     };
-    const logits_arr = if (use_gdn)
+    const logits_arr = if (use_glm)
+        try glmRowsForward(allocator, xfm_ptr, batch, next_tokens)
+    else if (use_gdn)
         try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else if (use_mimo)
         try xfm_ptr.forwardMimoBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
@@ -10703,6 +10797,25 @@ test "a cleanup allocation failure never frees MLX on the connection thread" {
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
     try testing.expectEqual(@as(usize, 24), Probe.frees);
     try testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
+}
+
+test "a drafting GLM slot rides plain rows only in company of its own model" {
+    var glm_a: LoadedModel = undefined;
+    var glm_b: LoadedModel = undefined;
+    var slots: [4]Slot = undefined;
+    for (&slots, 0..) |*s, i| s.model = if (i == 3) &glm_b else &glm_a;
+    try testing.expect(!glmRowsInCompany(&slots[0], &.{&slots[0]}, &.{}));
+    try testing.expect(!glmRowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[3]}));
+    try testing.expect(glmRowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[1]}));
+    try testing.expect(glmRowsInCompany(&slots[0], &.{ &slots[0], &slots[2] }, &.{}));
+}
+
+test "a resident GLM batches plain rows four at a time, a streamed one stays serial" {
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    try testing.expect(configBatchesDecode(&cfg));
+    try testing.expectEqual(@as(usize, 4), batchGroupCap(&cfg));
+    cfg.expert_streaming = true;
+    try testing.expect(!configBatchesDecode(&cfg));
 }
 
 test "every GLM slot owns its native request and hands it to its forward context" {

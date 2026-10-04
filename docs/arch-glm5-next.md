@@ -10,7 +10,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
 
 ## Scope
 
-- Concurrent requests interleave; they do not batch yet ([concurrency](#concurrency)). MTP and RAM/disk prefix reuse
+- Concurrent requests batch as plain rows, up to four ([concurrency](#concurrency)). MTP and RAM/disk prefix reuse
   are off: native KDA state has no prefix-cache restore and the checkpoint's MTP layer is not integrated.
 - Cache: kv8 compressed MLA latent plus FP32 KDA state, the engine default; it passed its KLD gate
   ([quality-kld](quality-kld.md)). `--kv-quant 16` (or `kv_quant: 16` per request or in model-settings) keeps the
@@ -115,14 +115,16 @@ inside 1.46% drift) because verification per round grew 20.6%.
 <a id="concurrency"></a>
 ## Concurrency
 
-- Each slot owns its target state ([server-lifecycle](server-lifecycle.md#scheduler-and-batching)), so concurrent
-  requests interleave one forward or round at a time and a prefill yields to the others' decode ticks; aggregate
-  throughput stays one stream's until rows batch. A streamed GLM load (the teacher) still queues.
-- **Rows are the currency**: a row costs ~10–12 ms over a ~20–27 ms fixed forward; draft rows pay only while their ms
-  per accepted token (~19 ordinary, ~37 prose) beats the batch's own (fixed/B + row: ~26 at two requests, ~19 at four).
-  Interleaving alone adds no throughput; batched plain rows do, and a B×3 verify crosses the four-row tile cliff.
-- A multi-request forward can reuse the verifier's row-exact projections, router, HC and EXL3 FFN (1–16 rows); only
-  the KDA recurrence and MLA attention hold per-request state.
+- Each slot owns its target state ([server-lifecycle](server-lifecycle.md#scheduler-and-batching)); a prefill yields to
+  the others' decode ticks. A streamed GLM load (the teacher) still queues.
+- **Concurrent requests decode as rows of one forward**: `verifyGroups` takes one group per request (rows in order);
+  projections, router, experts, HC and head read each weight once, the KDA recurrence and MLA attention run per
+  request on its own state, and every group's logits, targets, captures and commit equal its solo `verify` bit for bit.
+- **Speculate alone, plain rows in company** (`glmRowsInCompany`, up to `batchGroupCap` 4 slots): a DFlash2 request
+  with company commits its row with the assistant's taps (`Generator.glmRowCommit`), so its rounds resume alone.
+- **Rows are the currency** (rows ubench `02d2ee4d`, Sushi-2.3bpw kv8, 1K/6K context): a grouped forward costs ~25 ms
+  plus ~14.5 ms per row; two requests 54 ms (1.39× serial), four 82 ms (1.84×); one row is within 2% of serial decode.
+  A draft row pays only while its ms per accepted token (~19 copy, ~35 prose) beats the batch's (27 at two, 21 at four).
 
 ## Memory
 

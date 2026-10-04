@@ -93,18 +93,65 @@ pub const MlaTape = struct {
 };
 
 fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, mode: kda.ProjectionMode) !struct { output: Arr, tape: MlaTape } {
-    const native = @import("glm5_attention_decode_batch.zig");
-    const native_mode = native.enabled() and native.supportedConfig(cfg, mlx.mlx_array_dtype(x), ops.s);
-    if (native_mode and parents.len > 3) return error.GlmDecodeNativeTreeUnsupported;
-    const t: c_int = @intCast(parents.len);
+    const rows = try mlaProject(layer, ops, x, cfg, mode);
+    var attended: [16]Arr = undefined;
+    var tape = try mlaAttend(layer, ops, rows, 0, cfg, state, parents, &attended);
+    errdefer tape.deinit();
+    return .{ .output = try mlaFinish(layer, ops, rows, attended[0..parents.len], cfg, mode), .tape = tape };
+}
+
+const MlaRows = struct { qa: Arr, latent: Arr, index_q: Arr, keys: Arr, index_weights: Arr, gates: Arr, broadcast: bool };
+
+/// Every MLA projection over all rows. The absorbed query keeps each row's one-row geometry
+/// unless exactly three rows take the exact broadcast.
+fn mlaProject(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, mode: kda.ProjectionMode) !MlaRows {
+    const t: c_int = mlx.getShape(x)[1];
     const heads: c_int = @intCast(cfg.num_attention_heads);
     const kd: c_int = @intCast(cfg.mla_qk_nope_head_dim);
     const width: c_int = @intCast(cfg.mla_kv_lora_rank);
     const ih: c_int = @intCast(cfg.indexer_n_heads);
     const iw: c_int = @intCast(cfg.indexer_head_dim);
+    const qr = try ops.rms(try kda.linearRows(ops, layer.qa, x, mode), layer.qa_norm, cfg.rms_norm_eps);
+    const q = try ops.reshape(try kda.linearRows(ops, layer.qb, qr, mode), &.{ t, heads, 1, kd });
+    const verify_batch = @import("glm5_mla_verify_batch.zig");
+    const broadcast_q = if (layer.quantized) try verify_batch.run(ops, .{ .x = q, .w = layer.wk, .scales = layer.sk, .biases = layer.bk }, .query) else null;
+    const qa = try ops.reshape(if (broadcast_q) |out| out else blk: {
+        var absorbed: [16]Arr = undefined;
+        for (0..@intCast(t)) |row| {
+            const one = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
+            absorbed[row] = if (layer.quantized) try ops.qmm(one, layer.wk, layer.sk, layer.bk, false) else try ops.binary(.mm, one, layer.wk);
+        }
+        break :blk try ops.concat(absorbed[0..@intCast(t)], 0);
+    }, &.{ t, heads, width });
+    const index_q = try ops.reshape(try kda.linearRows(ops, layer.iq, qr, mode), &.{ t, ih, iw });
+    const compress = base.Linear{ .w = layer.compress, .scales = .{ .ctx = null }, .biases = .{ .ctx = null }, .input = @intCast(cfg.hidden_size), .output = @intCast(cfg.indexer_head_dim) };
+    return .{
+        .qa = qa,
+        .latent = try ops.reshape(try ops.rms(try kda.linearRows(ops, layer.kva, x, mode), layer.kv_norm, cfg.rms_norm_eps), &.{ t, width }),
+        .index_q = index_q,
+        .keys = try ops.reshape(try ops.layerNorm(try kda.linearRows(ops, layer.ik, x, mode), layer.ik_norm, layer.ik_bias, 1e-6), &.{ t, iw }),
+        .index_weights = try ops.reshape(try ops.cast(try ops.binary(.mul, try kda.linearRows(ops, layer.iw, x, mode), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(ih * iw))), .float32)), mlx.mlx_array_dtype(index_q)), &.{ t, ih }),
+        .gates = try ops.reshape(try kda.linearRows(ops, compress, x, mode), &.{ t, iw }),
+        .broadcast = broadcast_q != null,
+    };
+}
+
+/// One request's tree, rows `from ..` of `rows`: its branches attend its own cache. Each row's
+/// `[1, heads, 1, width]` output lands at `attended[row]`.
+fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, attended: []Arr) !MlaTape {
+    const native = @import("glm5_attention_decode_batch.zig");
+    const dtype = mlx.mlx_array_dtype(rows.latent);
+    const native_mode = native.enabled() and native.supportedConfig(cfg, dtype, ops.s);
+    if (native_mode and parents.len > 3) return error.GlmDecodeNativeTreeUnsupported;
+    const heads: c_int = @intCast(cfg.num_attention_heads);
+    const kd: c_int = @intCast(cfg.mla_qk_nope_head_dim);
+    const width: c_int = @intCast(cfg.mla_kv_lora_rank);
+    const iw: c_int = @intCast(cfg.indexer_head_dim);
+    const begin: c_int = @intCast(from);
+    const end: c_int = begin + @as(c_int, @intCast(parents.len));
     const latent_capacity: usize = if (state.latent.ctx != null) @intCast(mlx.getShape(state.latent)[0]) else 0;
     const pool_capacity: usize = if (state.pooled.ctx != null) @intCast(mlx.getShape(state.pooled)[0]) else 0;
-    var scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(x));
+    var scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(rows.latent));
     if (native_mode) {
         const limit = @import("glm5_dflash_memory.zig").limit_bytes;
         if (scratch.common_bytes >= limit - native.scratch_limit) return error.GlmTreeScratchLimit;
@@ -113,41 +160,26 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         scratch.live_bytes = scratch.common_bytes + scratch.branches * scratch.per_branch_bytes + native.scratch_limit;
     }
     mla_scratch_bound = @max(mla_scratch_bound, scratch.live_bytes);
-    const qr = try ops.rms(try kda.linearRows(ops, layer.qa, x, mode), layer.qa_norm, cfg.rms_norm_eps);
-    const q = try ops.reshape(try kda.linearRows(ops, layer.qb, qr, mode), &.{ t, heads, 1, kd });
-    const verify_batch = @import("glm5_mla_verify_batch.zig");
-    const broadcast_q = if (layer.quantized) try verify_batch.run(ops, .{ .x = q, .w = layer.wk, .scales = layer.sk, .biases = layer.bk }, .query) else null;
-    const qa = try ops.reshape(if (broadcast_q) |out| out else blk: {
-        var absorbed: [16]Arr = undefined;
-        for (0..parents.len) |row| {
-            const one = try ops.slice(q, 0, @intCast(row), @intCast(row + 1));
-            absorbed[row] = if (layer.quantized) try ops.qmm(one, layer.wk, layer.sk, layer.bk, false) else try ops.binary(.mm, one, layer.wk);
-        }
-        break :blk try ops.concat(absorbed[0..parents.len], 0);
-    }, &.{ t, heads, width });
-    const latent = try ops.reshape(try ops.rms(try kda.linearRows(ops, layer.kva, x, mode), layer.kv_norm, cfg.rms_norm_eps), &.{ t, width });
-    const index_q = try ops.reshape(try kda.linearRows(ops, layer.iq, qr, mode), &.{ t, ih, iw });
-    const keys = try ops.reshape(try ops.layerNorm(try kda.linearRows(ops, layer.ik, x, mode), layer.ik_norm, layer.ik_bias, 1e-6), &.{ t, iw });
-    const index_weights = try ops.reshape(try ops.cast(try ops.binary(.mul, try kda.linearRows(ops, layer.iw, x, mode), try ops.scalar(1 / @sqrt(@as(f32, @floatFromInt(ih * iw))), .float32)), mlx.mlx_array_dtype(index_q)), &.{ t, ih });
-    const compress = base.Linear{ .w = layer.compress, .scales = .{ .ctx = null }, .biases = .{ .ctx = null }, .input = @intCast(cfg.hidden_size), .output = @intCast(cfg.indexer_head_dim) };
-    const gates = try ops.reshape(try kda.linearRows(ops, compress, x, mode), &.{ t, iw });
+    const latent = try ops.slice(rows.latent, 0, begin, end);
+    const qa = try ops.slice(rows.qa, 0, begin, end);
+    const index_q = try ops.slice(rows.index_q, 0, begin, end);
+    const index_weights = try ops.slice(rows.index_weights, 0, begin, end);
     var tape = MlaTape{ .latent = .{ .ctx = null }, .keys = .{ .ctx = null }, .gates = .{ .ctx = null }, .ape = .{ .ctx = null } };
     errdefer tape.deinit();
     tape.latent = try ops.result(latent);
-    tape.keys = try ops.result(keys);
-    tape.gates = try ops.result(gates);
+    tape.keys = try ops.result(try ops.slice(rows.keys, 0, begin, end));
+    tape.gates = try ops.result(try ops.slice(rows.gates, 0, begin, end));
     tape.ape = try ops.result(layer.ape);
     // Branch rows are read as serial decode would read them once stored.
     const readable = try ops.own(try @import("glm5_latent.zig").readable(latent, state.latent_bits, ops.s));
     // Dense prefixes do not consume index_q/index_weights. Keep them lazy here;
     // sparse branches naturally bill their necessary indexer work in mla_branches.
-    var result_rows: [16]Arr = undefined;
-    var attention_rows: [16]Arr = undefined;
     var pending: [16]Arr = undefined;
     var pending_count: usize = 0;
     const batched_native = native_mode and parents.len == 3 and scratch.branches == 3;
     var native_ids: [3]Arr = undefined;
     var native_branches: [3]native.Branch = undefined;
+    const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
     for (0..parents.len) |row| {
         var branch = try state.share();
         defer branch.deinit();
@@ -158,12 +190,11 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
             try tape.append(&branch, kept, ops.s);
             break :blk Arr{ .ctx = null };
         };
-        const from: c_int = @intCast(row);
-        const query = try ops.slice(qa, 0, from, from + 1);
-        const index_query = try ops.slice(index_q, 0, from, from + 1);
-        const weights = try ops.slice(index_weights, 0, from, from + 1);
+        const at: c_int = @intCast(row);
+        const query = try ops.slice(qa, 0, at, at + 1);
+        const index_query = try ops.slice(index_q, 0, at, at + 1);
+        const weights = try ops.slice(index_weights, 0, at, at + 1);
         const offset = state.processed + kept.len - 1;
-        const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
         if (batched_native) {
             native_ids[row] = try ops.own(try attention.decodeSelected(&branch, index_query, weights, offset, ops.s));
             native_branches[row] = .{ .offset = offset, .length = branch.processed, .path = .{ 0, 0, 0 } };
@@ -184,39 +215,30 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
             mla_branch_flushes += 1;
             pending_count = 0;
         }
-        const y4 = try ops.reshape(y, &.{ 1, heads, 1, width });
-        attention_rows[row] = y4;
-        if (broadcast_q == null) {
-            const values = if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
-            result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
-        }
+        attended[row] = try ops.reshape(y, &.{ 1, heads, 1, width });
     }
     if (batched_native) {
         const prefix = if (state.processed == 0) attention.Latent{ .data = readable } else state.latentView();
         const selected = try ops.concat(&native_ids, 0);
-        const scale = 1 / @sqrt(@as(f32, @floatFromInt(kd)));
         const batched = try native.run(ops, qa, prefix, state.processed, readable, &native_branches, selected, scale);
         for (0..parents.len) |row| {
             const y = if (batched) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else (try native.run(ops, try ops.slice(qa, 0, @intCast(row), @intCast(row + 1)), prefix, state.processed, readable, native_branches[row .. row + 1], native_ids[row], scale)) orelse return error.GlmDecodeNativeUnsupported;
-            const y4 = try ops.reshape(y, &.{ 1, heads, 1, width });
-            attention_rows[row] = y4;
-            if (broadcast_q == null) {
-                const values = if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
-                result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
-            }
+            attended[row] = try ops.reshape(y, &.{ 1, heads, 1, width });
         }
     }
-    if (broadcast_q != null) {
-        const combined = try ops.concat(attention_rows[0..parents.len], 0);
-        if (try verify_batch.run(ops, .{ .x = combined, .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value)) |values| {
-            for (0..parents.len) |row| result_rows[row] = try ops.reshape(try ops.slice(values, 0, @intCast(row), @intCast(row + 1)), &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
-        } else for (0..parents.len) |row| {
-            const values = try ops.qmm(attention_rows[row], layer.wv, layer.sv, layer.bv, true);
-            result_rows[row] = try ops.reshape(values, &.{ 1, 1, @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim) });
-        }
+    return tape;
+}
+
+/// Value unembedding and output projection over all rows' attention outputs.
+fn mlaFinish(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, attended: []const Arr, cfg: *const @import("model.zig").ModelConfig, mode: kda.ProjectionMode) !Arr {
+    const value_width: c_int = @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim);
+    var result_rows: [16]Arr = undefined;
+    const broadcast = if (rows.broadcast) try @import("glm5_mla_verify_batch.zig").run(ops, .{ .x = try ops.concat(attended, 0), .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value) else null;
+    for (attended, 0..) |y4, row| {
+        const values = if (broadcast) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
+        result_rows[row] = try ops.reshape(values, &.{ 1, 1, value_width });
     }
-    const output = try kda.linearRows(ops, layer.out, try ops.concat(result_rows[0..parents.len], 1), mode);
-    return .{ .output = output, .tape = tape };
+    return kda.linearRows(ops, layer.out, try ops.concat(result_rows[0..attended.len], 1), mode);
 }
 
 const LayerTape = union(enum) {
@@ -307,40 +329,71 @@ pub const Verified = struct {
 };
 
 pub fn verify(target: *const forward.Model, request: *const forward.Request, tokens: []const u32, parents: []const i32, taps: []const u32, mode: kda.ProjectionMode) !Verified {
+    var out: [1]Verified = undefined;
+    try verifyGroups(target, &.{.{ .request = request, .tokens = tokens, .parents = parents }}, taps, mode, &out);
+    return out[0];
+}
+
+/// One request's tree in a grouped verification.
+pub const Group = struct { request: *const forward.Request, tokens: []const u32, parents: []const i32 };
+
+/// Rows a grouped verification carries: the row kernels' bound.
+pub const max_rows = 16;
+
+/// One target forward over several requests' trees, rows in group order. Projections, router,
+/// experts, HC and head read each weight once for all rows; the KDA recurrence and MLA attention
+/// run per request on its own state. `out[i]` is bit for bit what `verify` returns for `groups[i]`.
+pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: []const u32, mode: kda.ProjectionMode, out: []Verified) !void {
     if (target.expert_stream != null) return error.GlmStreamingSpecUnsupported;
-    try tree.validate(tokens, parents);
-    if (request.failed) return error.GlmRequestNeedsReset;
-    if (request.capture != null or request.layers.len != target.layers.len) return error.InvalidGlmDraftOffset;
-    for (tokens) |token| if (token >= target.cfg.vocab_size) return error.InvalidGlmDraftToken;
-    for (0..parents.len) |row| {
-        var path: [16]u32 = undefined;
-        const length = ancestry(parents, row, &path).len;
-        if (request.offset >= target.cfg.max_position_embeddings or length > target.cfg.max_position_embeddings - request.offset) return error.GlmContextExceeded;
-    }
+    if (groups.len == 0 or out.len != groups.len) return error.InvalidGlmDraftTree;
     for (taps, 0..) |id, i| if (id >= target.layers.len or (i > 0 and id <= taps[i - 1])) return error.InvalidGlmCapture;
-    const allocator = request.allocator;
-    const layers = try allocator.alloc(?LayerTape, target.layers.len);
-    @memset(layers, null);
-    const captures = adapter.Captures.init(allocator, taps) catch |err| {
-        allocator.free(layers);
-        return err;
-    };
-    var result = Verified{ .allocator = allocator, .layers = layers, .captures = captures, .count = tokens.len, .offset = request.offset };
-    errdefer result.deinit();
-    @memcpy(result.tokens[0..tokens.len], tokens);
-    @memcpy(result.parents[0..tokens.len], parents);
-    const rows: c_int = @intCast(tokens.len);
+    var tokens: [max_rows]u32 = undefined;
+    var starts: [max_rows + 1]usize = undefined;
+    var total: usize = 0;
+    for (groups, 0..) |group, g| {
+        const request = group.request;
+        try tree.validate(group.tokens, group.parents);
+        if (request.failed) return error.GlmRequestNeedsReset;
+        if (request.capture != null or request.layers.len != target.layers.len) return error.InvalidGlmDraftOffset;
+        for (group.tokens) |token| if (token >= target.cfg.vocab_size) return error.InvalidGlmDraftToken;
+        for (0..group.parents.len) |row| {
+            var path: [16]u32 = undefined;
+            const length = ancestry(group.parents, row, &path).len;
+            if (request.offset >= target.cfg.max_position_embeddings or length > target.cfg.max_position_embeddings - request.offset) return error.GlmContextExceeded;
+        }
+        if (total + group.tokens.len > max_rows) return error.InvalidGlmDraftShape;
+        starts[g] = total;
+        @memcpy(tokens[total .. total + group.tokens.len], group.tokens);
+        total += group.tokens.len;
+    }
+    starts[groups.len] = total;
+    var made: usize = 0;
+    errdefer for (out[0..made]) |*v| v.deinit();
+    for (groups, out) |group, *v| {
+        const allocator = group.request.allocator;
+        const layers = try allocator.alloc(?LayerTape, target.layers.len);
+        @memset(layers, null);
+        const captures = adapter.Captures.init(allocator, taps) catch |err| {
+            allocator.free(layers);
+            return err;
+        };
+        v.* = .{ .allocator = allocator, .layers = layers, .captures = captures, .count = group.tokens.len, .offset = group.request.offset };
+        @memcpy(v.tokens[0..group.tokens.len], group.tokens);
+        @memcpy(v.parents[0..group.parents.len], group.parents);
+        made += 1;
+    }
+    const rows: c_int = @intCast(total);
     const cadence = async_layers;
     var h: Arr = undefined;
     {
         var ops = Ops{ .s = target.s };
         defer ops.deinit();
-        const ids = try ops.own(mlx.mlx_array_new_data(tokens.ptr, &[_]c_int{ 1, rows }, 2, .uint32));
+        const ids = try ops.own(mlx.mlx_array_new_data(&tokens, &[_]c_int{ 1, rows }, 2, .uint32));
         const embedding = try ops.own(try target.rawEmbedding(ids));
         h = try ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(embedding, &.{ 1, rows, 1, @intCast(target.cfg.hidden_size) }), &.{ 1, rows, 4, @intCast(target.cfg.hidden_size) })));
     }
     defer _ = mlx.mlx_array_free(h);
-    for (target.layers, request.layers, 0..) |*layer, *state, index| {
+    for (target.layers, 0..) |*layer, index| {
         var ops = Ops{ .s = target.s };
         defer ops.deinit();
         const pre = try layer.hc_attn.collapse(&ops, h, &target.cfg);
@@ -348,14 +401,23 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
         const x = try ops.rms(pre.mixed, layer.norm_attn, target.cfg.rms_norm_eps);
         const attended = switch (layer.attn) {
             .kda => |weights| blk: {
-                const computed = try kda.applyLayer(weights, &ops, x, &target.cfg, &state.recurrent, parents, mode);
-                result.layers[index] = .{ .kda = computed.tape };
-                break :blk computed.output;
+                const p = try kda.project(weights, &ops, x, mode);
+                var ys: [max_rows]Arr = undefined;
+                for (groups, out, 0..) |group, *v, g| {
+                    const r = try kda.recur(weights, &ops, p, starts[g], &target.cfg, &group.request.layers[index].recurrent, group.parents);
+                    v.layers[index] = .{ .kda = r.tape };
+                    ys[g] = r.y;
+                }
+                const y = if (groups.len == 1) ys[0] else try ops.concat(ys[0..groups.len], 1);
+                break :blk try kda.finish(weights, &ops, y, p.gate, &target.cfg, mode);
             },
             .mla => |*weights| blk: {
-                const computed = try mlaTree(weights, &ops, x, &target.cfg, &state.attention, parents, mode);
-                result.layers[index] = .{ .mla = computed.tape };
-                break :blk computed.output;
+                const projected = try mlaProject(weights, &ops, x, &target.cfg, mode);
+                var outputs: [max_rows]Arr = undefined;
+                for (groups, out, 0..) |group, *v, g| {
+                    v.layers[index] = .{ .mla = try mlaAttend(weights, &ops, projected, starts[g], &target.cfg, &group.request.layers[index].attention, group.parents, outputs[starts[g]..starts[g + 1]]) };
+                }
+                break :blk try mlaFinish(weights, &ops, projected, outputs[0..total], &target.cfg, mode);
             },
         };
         const joined = try ops.own(try primitive.hcExpand(h, attended, pre.post, pre.comb, target.s));
@@ -363,31 +425,37 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
         defer ff.deinit();
         const fx = try ops.rms(ff.mixed, layer.norm_ffn, target.cfg.rms_norm_eps);
         const ffout = if (mode == .affine_rows_ffn) try @import("glm5_dflash_ffn.zig").apply(target, index, &ops, fx) else blk: {
-            var outputs: [16]Arr = undefined;
-            var made: usize = 0;
-            defer for (outputs[0..made]) |value| {
+            var outputs: [max_rows]Arr = undefined;
+            var done: usize = 0;
+            defer for (outputs[0..done]) |value| {
                 _ = mlx.mlx_array_free(value);
             };
-            for (0..tokens.len) |row| {
+            for (0..total) |row| {
                 var one = Ops{ .s = target.s };
                 defer one.deinit();
                 outputs[row] = try one.result(try target.feedForwardLayer(index, &one, try one.slice(fx, 1, @intCast(row), @intCast(row + 1))));
-                made += 1;
+                done += 1;
             }
-            break :blk try ops.concat(outputs[0..made], 1);
+            break :blk try ops.concat(outputs[0..done], 1);
         };
         const next = try ops.own(try primitive.hcExpand(joined, ffout, ff.post, ff.comb, target.s));
         for (taps, 0..) |id, tap| if (id == index) {
-            try mlx.check(mlx.mlx_array_set(&result.captures.hook.out[tap], try ops.reduce(next, 2, true, false)));
+            const mean = try ops.reduce(next, 2, true, false);
+            for (out, 0..) |*v, g| {
+                const value = if (groups.len == 1) mean else try ops.slice(mean, 1, @intCast(starts[g]), @intCast(starts[g + 1]));
+                try mlx.check(mlx.mlx_array_set(&v.captures.hook.out[tap], value));
+            }
         };
         if (cadence == 0 or (index + 1) % cadence == 0) {
             const evals = mlx.mlx_vector_array_new_value(next);
             defer _ = mlx.mlx_vector_array_free(evals);
             const first = if (cadence == 0) index else index + 1 - cadence;
-            for (result.layers[first .. index + 1]) |tape| try appendTape(evals, tape.?);
-            for (taps, 0..) |id, tap| if (id >= first and id <= index) {
-                try mlx.check(mlx.mlx_vector_array_append_value(evals, result.captures.hook.out[tap]));
-            };
+            for (out) |v| {
+                for (v.layers[first .. index + 1]) |tape| try appendTape(evals, tape.?);
+                for (taps, 0..) |id, tap| if (id >= first and id <= index) {
+                    try mlx.check(mlx.mlx_vector_array_append_value(evals, v.captures.hook.out[tap]));
+                };
+            }
             if (cadence == 0) {
                 try mlx.check(mlx.mlx_eval(evals));
                 sync_dispatches += 1;
@@ -409,15 +477,27 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     // Settle them explicitly before returning ownership to commit/replay.
     const final = mlx.mlx_vector_array_new_value(u);
     defer _ = mlx.mlx_vector_array_free(final);
-    if (cadence != 0) {
-        for (result.layers) |tape| try appendTape(final, tape.?);
-        for (result.captures.hook.out) |value| try mlx.check(mlx.mlx_vector_array_append_value(final, value));
-    }
+    if (cadence != 0) for (out) |v| {
+        for (v.layers) |tape| try appendTape(final, tape.?);
+        for (v.captures.hook.out) |value| try mlx.check(mlx.mlx_vector_array_append_value(final, value));
+    };
     try mlx.check(mlx.mlx_eval(final));
     sync_dispatches += 1;
-    @memcpy(result.targets[0..tokens.len], (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..tokens.len]);
-    result.logits = try ops.result(logits);
-    return result;
+    const targets = (mlx.mlx_array_data_uint32(u) orelse return error.MlxArrayDataNull)[0..total];
+    for (out, 0..) |*v, g| {
+        @memcpy(v.targets[0..v.count], targets[starts[g]..starts[g + 1]]);
+        v.logits = try ops.result(if (groups.len == 1) logits else try ops.slice(logits, 1, @intCast(starts[g]), @intCast(starts[g + 1])));
+    }
+}
+
+/// Commits a single-row verification as one decode step: the request takes the row in place.
+pub fn commitPlainRow(verified: *const Verified, request: *forward.Request, s: mlx.mlx_stream) !void {
+    if (verified.count != 1) return error.InvalidGlmDraftTree;
+    var committed = try verified.prepareCommitConsuming(request, 1, &.{}, s);
+    defer committed.deinit();
+    request.deinit();
+    request.* = committed.states[0].?;
+    committed.states[0] = null;
 }
 
 test {
@@ -573,4 +653,164 @@ fn consumingCommitCase(latent_bits: u8) !void {
         try expectArrayBits(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
     }
     try std.testing.expect(!request.failed);
+}
+
+fn randomizedFixture(weights: *@import("model.zig").Weights, s: mlx.mlx_stream) !@import("model.zig").ModelConfig {
+    const cfg = try forward.completeFixture(weights);
+    var iterator = weights.map.iterator();
+    var seed: usize = 41;
+    while (iterator.next()) |entry| {
+        const value = entry.value_ptr;
+        const sh = mlx.getShape(value.*);
+        if (sh.len < 2 or mlx.mlx_array_dtype(value.*) != .bfloat16 or std.mem.endsWith(u8, entry.key_ptr.*, ".scales") or std.mem.endsWith(u8, entry.key_ptr.*, ".biases")) continue;
+        const replacement = try @import("dflash.zig").TinyFix.bf16ArrShaped(sh, seed, s);
+        _ = mlx.mlx_array_free(value.*);
+        value.* = replacement;
+        seed += 1;
+    }
+    return cfg;
+}
+
+test "GLM grouped verification gives every request exactly what it gets alone" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = @import("model.zig").Weights.init(a);
+    defer weights.deinit();
+    const cfg = try randomizedFixture(&weights, s);
+    var target = try forward.Model.load(a, cfg, &weights, s);
+    defer target.deinit();
+    const prompts = [_][]const u32{ &.{ 1, 2, 3 }, &.{ 4, 0 }, &.{ 2, 2, 1, 0 } };
+    var requests: [3]forward.Request = undefined;
+    for (&requests, prompts, 0..) |*request, prompt, i| {
+        request.* = try forward.Request.init(a, target.layers.len);
+        try request.setLatentBits(if (i == 1) 8 else 0);
+        const ids = mlx.mlx_array_new_data(prompt.ptr, &.{ 1, @intCast(prompt.len) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const logits = try target.forwardLast(request, ids, true);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+    }
+    defer for (&requests) |*request| request.deinit();
+    const taps = [_]u32{ 0, 3 };
+    const groups = [_]Group{
+        .{ .request = &requests[0], .tokens = &.{ 1, 0, 0 }, .parents = &.{ -1, 0, 1 } },
+        .{ .request = &requests[1], .tokens = &.{3}, .parents = &.{-1} },
+        .{ .request = &requests[2], .tokens = &.{ 2, 1 }, .parents = &.{ -1, 0 } },
+    };
+    for ([_]kda.ProjectionMode{ .serial_rows, .affine_rows_ffn }) |mode| {
+        var together: [groups.len]Verified = undefined;
+        try verifyGroups(&target, &groups, &taps, mode, &together);
+        defer for (&together) |*v| v.deinit();
+        for (groups, &together) |group, *joint| {
+            var alone = try verify(&target, group.request, group.tokens, group.parents, &taps, mode);
+            defer alone.deinit();
+            try std.testing.expectEqual(alone.count, joint.count);
+            try std.testing.expectEqualSlices(u32, alone.targets[0..alone.count], joint.targets[0..joint.count]);
+            try expectArrayBits(alone.logits, joint.logits, s);
+            for (alone.captures.hook.out, joint.captures.hook.out) |x, y| try expectArrayBits(x, y, s);
+            var expected = try alone.prepareCommit(group.request, group.tokens.len, &.{}, s);
+            defer expected.deinit();
+            var actual = try joint.prepareCommit(group.request, group.tokens.len, &.{}, s);
+            defer actual.deinit();
+            const accepted = try tree.accept(group.tokens, group.parents, alone.targets[0..alone.count], group.tokens.len, &.{});
+            const last = accepted.rows[accepted.count - 1];
+            const left = expected.states[last].?;
+            const right = actual.states[last].?;
+            for (left.layers, right.layers) |x, y| {
+                for (x.attention.arrays(), y.attention.arrays()) |u, v| try expectArrayBits(u, v, s);
+                try expectArrayBits(x.recurrent.conv_state, y.recurrent.conv_state, s);
+                try expectArrayBits(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
+            }
+        }
+    }
+}
+
+test "GLM one verified row and its commit equal a serial decode step" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = @import("model.zig").Weights.init(a);
+    defer weights.deinit();
+    const cfg = try randomizedFixture(&weights, s);
+    var target = try forward.Model.load(a, cfg, &weights, s);
+    defer target.deinit();
+    for ([_]u8{ 0, 8 }) |bits| {
+        var request = try forward.Request.initServing(a, target.layers.len);
+        defer request.deinit();
+        try request.setLatentBits(bits);
+        const prompt = [_]u32{ 3, 1, 2, 1, 0 };
+        const ids = mlx.mlx_array_new_data(&prompt, &.{ 1, prompt.len }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const prefill = try target.forwardLast(&request, ids, true);
+        defer _ = mlx.mlx_array_free(prefill);
+        try mlx.check(mlx.mlx_array_eval(prefill));
+        for ([_]u32{ 2, 0, 3 }) |token| {
+            var verified = try verify(&target, &request, &.{token}, &.{-1}, &.{}, .affine_rows_ffn);
+            defer verified.deinit();
+            var serial = try adapter.cloneRequest(&request);
+            defer serial.deinit();
+            const one = mlx.mlx_array_new_data(&token, &.{ 1, 1 }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(one);
+            const logits = try target.forwardLast(&serial, one, true);
+            defer _ = mlx.mlx_array_free(logits);
+            try expectArrayBits(logits, verified.logits, s);
+            var committed = try verified.prepareCommitConsuming(&request, 1, &.{}, s);
+            defer committed.deinit();
+            request.deinit();
+            request = committed.states[0].?;
+            committed.states[0] = null;
+            // The next step's logits read every committed MLA row; the recurrent state is compared here.
+            try std.testing.expectEqual(serial.offset, request.offset);
+            for (serial.layers, request.layers) |x, y| {
+                try expectArrayBits(x.recurrent.conv_state, y.recurrent.conv_state, s);
+                try expectArrayBits(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
+            }
+        }
+    }
+}
+
+test "GLM plain rows of several requests advance each exactly as its serial decode" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = @import("model.zig").Weights.init(a);
+    defer weights.deinit();
+    const cfg = try randomizedFixture(&weights, s);
+    var target = try forward.Model.load(a, cfg, &weights, s);
+    defer target.deinit();
+    const prompts = [_][]const u32{ &.{ 3, 1, 2 }, &.{ 0, 2, 2, 1, 3 }, &.{1} };
+    var rows: [3]forward.Request = undefined;
+    var serial: [3]forward.Request = undefined;
+    for (&rows, &serial, prompts, 0..) |*row, *ref, prompt, i| {
+        row.* = try forward.Request.initServing(a, target.layers.len);
+        ref.* = try forward.Request.initServing(a, target.layers.len);
+        for ([_]*forward.Request{ row, ref }) |request| {
+            try request.setLatentBits(if (i == 1) 8 else 0);
+            const ids = mlx.mlx_array_new_data(prompt.ptr, &.{ 1, @intCast(prompt.len) }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(ids);
+            const logits = try target.forwardLast(request, ids, true);
+            defer _ = mlx.mlx_array_free(logits);
+            try mlx.check(mlx.mlx_array_eval(logits));
+        }
+    }
+    defer for (&rows, &serial) |*row, *ref| {
+        row.deinit();
+        ref.deinit();
+    };
+    var tokens = [_]u32{ 2, 0, 3 };
+    for (0..3) |_| {
+        var groups: [3]Group = undefined;
+        for (&groups, &rows, 0..) |*g, *row, i| g.* = .{ .request = row, .tokens = tokens[i .. i + 1], .parents = &.{-1} };
+        var out: [3]Verified = undefined;
+        try verifyGroups(&target, &groups, &.{}, .affine_rows_ffn, &out);
+        defer for (&out) |*v| v.deinit();
+        for (&out, &rows, &serial, &tokens) |*v, *row, *ref, *token| {
+            const one = mlx.mlx_array_new_data(token, &.{ 1, 1 }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(one);
+            const logits = try target.forwardLast(ref, one, true);
+            defer _ = mlx.mlx_array_free(logits);
+            try expectArrayBits(logits, v.logits, s);
+            try commitPlainRow(v, row, s);
+            try std.testing.expectEqual(ref.offset, row.offset);
+            token.* = v.targets[0];
+        }
+    }
 }

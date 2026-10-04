@@ -5390,6 +5390,27 @@ pub const Generator = struct {
         _ = try @import("glm5_dflash_tree.zig").sampledTargets(verified.tokens[0..verified.count], verified.parents[0..verified.count], verified.targets[0..verified.count], budget, eos, &context, sampleGlmNode);
     }
 
+    /// Commits this request's row of a grouped GLM tick (`verifyGroups`, one pending token) and
+    /// returns the row's logits. A DFlash2 request also appends the row's captures to its
+    /// assistant context, so its rounds resume when it decodes alone again.
+    pub fn glmRowCommit(self: *Generator, verified: *const @import("glm5_dflash_model.zig").Verified) !mlx.mlx_array {
+        const request = self.ctx.glm5_request orelse return error.GlmRequestMissing;
+        const s = self.xfm.s;
+        if (self.glm_dflash_native) {
+            var verification = try verified.prepareCommitConsuming(request, 1, self.eos_token_ids, s);
+            defer verification.deinit();
+            _ = @import("glm5_dflash.zig").commitVerified(self.dflash.?, &self.dflash_ctx.?, request, &verification, 1, self.eos_token_ids) catch |err| {
+                request.failed = true;
+                return err;
+            };
+        } else try @import("glm5_dflash_model.zig").commitPlainRow(verified, request, s);
+        self.ctx.cache.step = request.offset;
+        var logits = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_set(&logits, verified.logits));
+        return logits;
+    }
+
     fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done or try self.checkStop()) return null;
         if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
