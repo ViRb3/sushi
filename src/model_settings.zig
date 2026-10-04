@@ -99,6 +99,30 @@ pub const MtpChoice = struct {
     }
 };
 
+/// `--vision` (true) / `--no-vision` (false); null = neither given.
+pub var vision_flag: ?bool = null;
+
+pub fn visionFlagFrom(vision: bool, no_vision: bool) error{VisionFlagConflict}!?bool {
+    if (vision and no_vision) return error.VisionFlagConflict;
+    return if (vision) true else if (no_vision) false else null;
+}
+
+/// Whether a load brings up the checkpoint's vision tower, when it has one.
+pub const VisionChoice = struct {
+    on: bool,
+    source: Source,
+
+    /// A streamed load defaults off: its tower and encode reserve come out of the expert cache.
+    pub fn resolve(flag: ?bool, setting: ?bool, streamed: bool) VisionChoice {
+        const p = pick(bool, flag, setting, !streamed);
+        return .{ .on = p.value, .source = p.source };
+    }
+
+    pub fn sourceName(self: VisionChoice) []const u8 {
+        return sourceLabel(self.source, if (self.on) "--vision" else "--no-vision");
+    }
+};
+
 /// Log token for a manual context; 0 is auto.
 pub fn contextLabel(buf: []u8, ctx: u32) []const u8 {
     if (ctx == 0) return "auto";
@@ -124,11 +148,12 @@ pub const Override = struct {
     preserve_thinking: ?bool = null,
     think_penalty: ?f32 = null,
     logit_bias_file: ?@import("logit_bias.zig").FilePath = null,
+    vision: ?bool = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null;
+            o.think_penalty == null and o.logit_bias_file == null and o.vision == null;
     }
 };
 
@@ -197,6 +222,10 @@ fn fromValue(v: std.json.Value) Override {
         .bool => |b| o.preserve_thinking = b,
         else => {},
     };
+    if (obj.get("vision")) |p| switch (p) {
+        .bool => |b| o.vision = b,
+        else => {},
+    };
     if (obj.get("logit_bias_file")) |path_value| switch (path_value) {
         .string => |path| o.logit_bias_file = @import("logit_bias.zig").FilePath.from(path),
         else => {},
@@ -240,7 +269,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} preserve_thinking={s} think_penalty={d}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} preserve_thinking={s} think_penalty={d} vision={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -250,6 +279,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         o.ssd_budget_gb orelse 0,
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
         o.think_penalty orelse 0,
+        if (o.vision) |v| (if (v) "on" else "off") else "default",
     });
     return o;
 }
@@ -416,4 +446,39 @@ test "logit bias CPU: file setting is a populated override" {
     var s = try parse(std.testing.allocator, "{\"/m/a\":{\"logit_bias_file\":\"bias.json\"}}");
     defer s.deinit();
     try std.testing.expect(!s.lookup("/m/a").isEmpty());
+}
+
+test "vision: a streamed load leaves the tower off unless --vision or the per-model vision asks; resident keeps it on" {
+    const t = std.testing;
+    try t.expect(VisionChoice.resolve(null, null, false).on);
+    try t.expect(!VisionChoice.resolve(null, null, true).on);
+    try t.expectEqualStrings("default", VisionChoice.resolve(null, null, true).sourceName());
+    const asked = VisionChoice.resolve(true, null, true);
+    try t.expect(asked.on);
+    try t.expectEqualStrings("--vision", asked.sourceName());
+    const from_file = VisionChoice.resolve(null, true, true);
+    try t.expect(from_file.on);
+    try t.expectEqualStrings("model-settings.json", from_file.sourceName());
+    try t.expect(!VisionChoice.resolve(false, true, false).on);
+    try t.expectEqualStrings("--no-vision", VisionChoice.resolve(false, true, false).sourceName());
+    try t.expect(!VisionChoice.resolve(null, false, false).on);
+}
+
+test "vision: --vision and --no-vision together are refused; either alone is the flag" {
+    const t = std.testing;
+    try t.expectEqual(@as(?bool, null), try visionFlagFrom(false, false));
+    try t.expectEqual(@as(?bool, true), try visionFlagFrom(true, false));
+    try t.expectEqual(@as(?bool, false), try visionFlagFrom(false, true));
+    try t.expectError(error.VisionFlagConflict, visionFlagFrom(true, true));
+}
+
+test "model_settings: vision is a bool, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"vision": true}, "/m/b": {"vision": false}, "/m/c": {"vision": "on"}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?bool, true), s.lookup("/m/a").vision);
+    try std.testing.expect(!s.lookup("/m/a").isEmpty());
+    try std.testing.expectEqual(@as(?bool, false), s.lookup("/m/b").vision);
+    try std.testing.expect(s.lookup("/m/c").isEmpty());
 }

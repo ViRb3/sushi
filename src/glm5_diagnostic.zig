@@ -69,9 +69,11 @@ pub fn residentBytesWithVision(io: std.Io, allocator: std.mem.Allocator, model_d
     return selectedBytes(io, allocator, model_dir, layers, false, vision);
 }
 
-/// What a streamed load keeps resident: the text trunk without its routed experts.
-pub fn streamedTrunkBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize) !u64 {
-    return selectedBytes(io, allocator, model_dir, layers, true, false);
+/// What a streamed load keeps resident: the text trunk without its routed experts, and the tower it may add.
+pub fn streamedSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize) !model.ResidentSplit {
+    const trunk = try selectedBytes(io, allocator, model_dir, layers, true, false);
+    const with_tower = try selectedBytes(io, allocator, model_dir, layers, true, true);
+    return .{ .trunk = trunk, .mtp = 0, .vision = with_tower - trunk };
 }
 
 fn selectedBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layers: usize, trunk_only: bool, vision: bool) !u64 {
@@ -365,7 +367,7 @@ test "GLM stream CPU trunk loader never opens expert shards and refuses a reside
     try std.testing.expectEqual(@as(u16, 0x3f80), mlx.mlx_array_data_bfloat16(weights.get("lm_head.weight").?).?[0]);
 }
 
-test "GLM streamed load and bill keep only the text trunk: no routed experts, MTP layer or vision" {
+test "GLM streamed load and bill keep the text trunk and, only when asked, the tower: no routed experts or MTP layer" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -380,13 +382,16 @@ test "GLM streamed load and bill keep only the text trunk: no routed experts, MT
     defer a.free(path);
     for ([_]@import("expert_quant.zig").Layout{ .bf16_individual, .exl3_k4 }) |layout| {
         const cfg = model.ModelConfig{ .model_type = "glm5_next", .num_hidden_layers = 4, .expert_streaming = true, .expert_layout = layout, .glm5_vision = true };
-        try std.testing.expectEqual(model.ResidentSplit{ .trunk = 2, .mtp = 0 }, try model.streamingResidentSplit(std.testing.io, a, path, &cfg));
+        try std.testing.expectEqual(model.ResidentSplit{ .trunk = 2, .mtp = 0, .vision = 2 }, try model.streamingResidentSplit(std.testing.io, a, path, &cfg));
     }
     const cfg = model.ModelConfig{ .model_type = "glm5_next", .num_hidden_layers = 4, .expert_streaming = true, .expert_layout = .bf16_individual, .glm5_vision = true };
-    var weights = try model.loadWeightsForConfig(std.testing.io, a, path, &cfg, true);
-    defer weights.deinit();
-    try std.testing.expectEqual(@as(u32, 1), weights.count());
-    try std.testing.expect(weights.get("lm_head.weight") != null);
+    for ([_]bool{ false, true }) |vision| {
+        var weights = try model.loadWeightsForConfig(std.testing.io, a, path, &cfg, vision);
+        defer weights.deinit();
+        try std.testing.expectEqual(@as(u32, if (vision) 2 else 1), weights.count());
+        try std.testing.expect(weights.get("lm_head.weight") != null);
+        try std.testing.expectEqual(vision, weights.get("model.visual.patch_embed.weight") != null);
+    }
 }
 
 test "GLM vision enabled payload bill and CPU loader retain exactly the same indexed tensors" {

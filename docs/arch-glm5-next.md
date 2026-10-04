@@ -17,7 +17,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
   latent BF16. The pooled index and KDA state stay lossless. kv4 is refused (`GlmKvQuantUnsupported`), and the KLD teacher capture refuses any kv-quant.
 - Thinking: `low`, `high`, `max` (the template's `effective_reasoning_effort`); Sushi defaults to `high` (the HF
   template defaults to `max`); thinking off is refused. The effort words impose no token cap.
-- Image and video input through the native tower, on when present; `--no-vision` drops its weights and buffers.
+- Image and video input through the native tower, on when present (a streamed load only with `--vision`);
+  `--no-vision` drops its weights and buffers.
 - DFlash2 speculation when an assistant is found ([below](#dflash2)), for greedy and sampled requests.
 - M1–M4 GPUs (no NAX) run the same model with the arms in
   [engine-glm5-kernels](engine-glm5-kernels.md#without-nax); `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses them.
@@ -57,7 +58,8 @@ kept raw (Sushi-2.45bpw). Small BF16/FP32 tensors keep their source precision. T
 - The BF16 source checkpoint is the KLD teacher, run with SSD-streamed experts
   ([engine-expert-streaming](engine-expert-streaming.md)).
 - `--ssd-budget-gb`/`--expert-cache-gb` stream any pack's EXL3 experts, or the BF16 source's, through the same engine
-  for `serve`, `run` and `kld compare`: text only, DFlash2 off, output identical to the resident load.
+  for `serve`, `run` and `kld compare`: DFlash2 off, image and video only with `--vision`, output identical to the
+  resident load.
 - The FP8 release (E4M3FN block-128 trunk and experts) streams its experts as stored and runs its trunk on `fp8_block`
   like Sushi-2.45bpw; it is never a teacher. Hermetic proof only: the checkpoint is no longer on the box.
 

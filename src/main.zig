@@ -163,6 +163,8 @@ fn printUsage(io: std.Io) void {
         \\                      span (default 0 = off). Request think_penalty > this
         \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --vision            Load the vision tower on an SSD-streamed load too (off by
+        \\                      default there: its weights come out of the expert cache)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
@@ -516,6 +518,7 @@ pub fn main(init: std.process.Init) !void {
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
+    var vision = false;
     var enable_pld = true; // Prompt Lookup Decoding (on by default; --no-pld to disable)
     var pld_explicit = false;
     var pld_draft_len: u32 = 5;
@@ -671,9 +674,8 @@ pub fn main(init: std.process.Init) !void {
             timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
-            // Module global so on-demand /v1/load-model cold loads honor the
-            // flag too (they used to hardcode vision from config.has_vision).
-            scheduler_mod.no_vision_global = true;
+        } else if (std.mem.eql(u8, args[i], "--vision")) {
+            vision = true;
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
@@ -984,6 +986,10 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    model_settings_mod.vision_flag = model_settings_mod.visionFlagFrom(vision, no_vision) catch {
+        log.err("--vision and --no-vision conflict; pass one\n", .{});
+        std.process.exit(1);
+    };
 
     if (prompt != null and (serve_explicit or (use_default_models_root and run_model_dir == null) or host_flag != null or port_flag != null or run_opts.tools)) {
         log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
@@ -1199,12 +1205,12 @@ pub fn main(init: std.process.Init) !void {
         log.info("[args] drafter: <none>\n", .{});
     }
     if (serve_mode) {
-        log.info("[args] serve: {s}:{d}, ctx-size={d}, pld={s}, no-vision={}, prevent-sleep={}\n", .{
+        log.info("[args] serve: {s}:{d}, ctx-size={d}, pld={s}, vision={s}, prevent-sleep={}\n", .{
             host,
             port,
             ctx_size,
             if (enable_pld) "on" else "off",
-            no_vision,
+            if (vision) "--vision" else if (no_vision) "--no-vision" else "default",
             sleep_inhibit_mod.isEnabled(),
         });
     }

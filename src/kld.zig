@@ -893,7 +893,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
             },
             .drop_default, .off => {},
         }
-        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, opts.expert_cache_bytes, budget.bytes);
+        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, opts.expert_cache_bytes, budget.bytes, false);
         scheduler_mod.applyStreamingPlan(&self.config, plan, budget.bytes);
         if (self.config.expert_source_dir == null) self.config.expert_source_dir = try allocator.dupe(u8, opts.model_dir);
         log.info("[kld] expert streaming: cache {d:.2} GB, {d} slots/layer\n", .{

@@ -1809,17 +1809,17 @@ pub const Scheduler = struct {
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
             }
-            const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, self.expert_cache_bytes, settings_budget);
-            break :blk expertStreamingGateBytes(plan.split.trunk +| plan.split.mtp, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
+            const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, self.expert_cache_bytes, settings_budget, coldLoadVision(owned.config, true));
+            break :blk expertStreamingGateBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
-            try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config.has_vision), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
+            try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config, false), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
         else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
             try residentColdLoadBillBytes(
                 self.io,
                 self.allocator,
                 owned.config,
                 entry.path,
-                coldLoadVision(owned.config.has_vision),
+                coldLoadVision(owned.config, false),
                 mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config).on,
                 self.no_drafter,
                 coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
@@ -1905,7 +1905,7 @@ pub const Scheduler = struct {
             // loads too; the path itself is scoped by `coldLoadDrafterDir`.
             .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
             .no_drafter = self.no_drafter,
-            .load_vision = coldLoadVision(owned.config.has_vision),
+            .load_vision = coldLoadVision(owned.config, false),
             .warmup_eager = true,
             .draft_block_size = self.draft_block_size,
             .draft_block_size_explicit = self.draft_block_size_explicit,
@@ -2533,6 +2533,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.preserve_thinking_override = o.preserve_thinking;
     config.think_penalty_override = o.think_penalty;
     config.logit_bias_file_override = o.logit_bias_file;
+    config.vision_override = o.vision;
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
 }
@@ -2823,23 +2824,86 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
 
 pub const StreamingPlan = struct {
     layout: expert_stream_mod.quant.Layout,
+    /// `vision` is the tower only when the load keeps it.
     split: model_mod.ResidentSplit,
     resolved: ExpertCacheResolution,
     cache: expert_stream_mod.CachePlan,
+    vision: VisionCost,
+};
+
+/// What the pack's tower costs a streamed load: its weights in the budget, its largest image
+/// encode beside it. Slot counts come from the ssd-budget ledger: `slots_without` 0 = no
+/// ledger (`--expert-cache-gb`), `slots_with` null = the budget cannot hold the tower.
+pub const VisionCost = struct {
+    on: bool = false,
+    tower_bytes: u64 = 0,
+    encode_bytes: u64 = 0,
+    slots_without: u16 = 0,
+    slots_with: ?u16 = null,
 };
 
 /// The ONE streamed-load plan, read by the serving load, its registry gate and `kld`: the
 /// on-disk layout, what stays resident, and the expert cache the budget leaves.
-pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, explicit_cache_bytes: u64, budget_bytes: u64) !StreamingPlan {
+pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, explicit_cache_bytes: u64, budget_bytes: u64, vision: bool) !StreamingPlan {
     const geometry = config.expertGeometry();
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
     split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry);
+    if (!config.has_vision) split.vision = 0;
     const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
-    const resolved = try resolveExpertCache(explicit_cache_bytes, budget_bytes, config, split, false, per_expert);
-    const cache = try expert_stream_mod.cachePlanBytesForGeometry(resolved.cache_bytes, geometry, per_expert);
-    return .{ .layout = streamed.expert_layout, .split = split, .resolved = resolved, .cache = cache };
+    const picked = resolveStreamedVision(explicit_cache_bytes, budget_bytes, config, split, per_expert, vision) catch |err| {
+        if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
+            budget_bytes >> 30,
+            @as(f64, @floatFromInt(split.vision)) / 1e9,
+        });
+        return err;
+    };
+    if (!picked.cost.on) split.vision = 0;
+    const cache = try expert_stream_mod.cachePlanBytesForGeometry(picked.resolved.cache_bytes, geometry, per_expert);
+    return .{ .layout = streamed.expert_layout, .split = split, .resolved = picked.resolved, .cache = cache, .vision = picked.cost };
+}
+
+/// PURE: the expert cache with the pack's tower (`split.vision`) kept or left off, and what
+/// keeping it costs. Asked for on a budget that cannot hold it, it is refused by name.
+pub fn resolveStreamedVision(explicit_bytes: u64, budget_bytes: u64, config: *const ModelConfig, split: model_mod.ResidentSplit, per_expert: u64, want: bool) !struct { resolved: ExpertCacheResolution, cost: VisionCost } {
+    var text = split;
+    text.vision = 0;
+    const without = try resolveExpertCache(explicit_bytes, budget_bytes, config, text, false, per_expert);
+    if (split.vision == 0) return .{ .resolved = without, .cost = .{} };
+    const with: ?ExpertCacheResolution = resolveExpertCache(explicit_bytes, budget_bytes, config, split, false, per_expert) catch |err| switch (err) {
+        error.SsdBudgetBelowResident => null,
+        else => return err,
+    };
+    if (want and with == null) return error.SsdBudgetBelowVision;
+    const cost = VisionCost{
+        .on = want,
+        .tower_bytes = split.vision,
+        .encode_bytes = @import("server.zig").largestImageEncodeBytes(config),
+        .slots_without = if (without.ledger) |l| l.slots_per_layer else 0,
+        .slots_with = if (with) |w| (if (w.ledger) |l| l.slots_per_layer else null) else null,
+    };
+    return .{ .resolved = if (want) with.? else without, .cost = cost };
+}
+
+/// One `[vision]` line per load: its choice and source, and on a streamed load what the tower costs.
+fn visionLoadLine(buf: []u8, choice: model_settings.VisionChoice, streamed: bool, cost: VisionCost) []const u8 {
+    const tower = @as(f64, @floatFromInt(cost.tower_bytes)) / 1e9;
+    const encode = @as(f64, @floatFromInt(cost.encode_bytes)) / 1e9;
+    if (!streamed or (!choice.on and choice.source != .default))
+        return std.fmt.bufPrint(buf, "[vision] {s} ({s})", .{ if (choice.on) "on" else "off", choice.sourceName() }) catch "[vision]";
+    if (cost.tower_bytes == 0) return "[vision] off: this checkpoint ships no vision tower weights";
+    const lost = cost.slots_without -| (cost.slots_with orelse 0);
+    return (if (cost.on and cost.slots_without == 0)
+        std.fmt.bufPrint(buf, "[vision] on ({s}): tower {d:.2} GB resident beside the expert cache; an image encode up to {d:.2} GB is billed per request", .{ choice.sourceName(), tower, encode })
+    else if (cost.on)
+        std.fmt.bufPrint(buf, "[vision] on ({s}): tower {d:.2} GB in the ssd budget (-{d} slots/layer); an image encode up to {d:.2} GB is billed per request", .{ choice.sourceName(), tower, lost, encode })
+    else if (cost.slots_without == 0)
+        std.fmt.bufPrint(buf, "[vision] off under expert streaming; pass --vision to load the tower (+{d:.2} GB resident)", .{tower})
+    else if (cost.slots_with == null)
+        std.fmt.bufPrint(buf, "[vision] off under expert streaming; pass --vision to load the tower (+{d:.2} GB: more than this ssd budget holds)", .{tower})
+    else
+        std.fmt.bufPrint(buf, "[vision] off under expert streaming; pass --vision to load the tower (+{d:.2} GB, -{d} slots/layer)", .{ tower, lost })) catch "[vision]";
 }
 
 /// FP8 experts compute from bf16 copies of a layer's routed slots (`glm5_stream.fp8Routed`): at most
@@ -2859,6 +2923,8 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
     config.expert_bounce_bytes = plan.cache.bounce_bytes;
     config.expert_fill_peak_bytes = plan.cache.prefill_peak_bytes;
+    config.expert_vision_tower_bytes = plan.split.vision;
+    config.expert_vision_encode_bytes = if (plan.vision.on) plan.vision.encode_bytes else 0;
 }
 
 pub const ExpertCacheResolution = struct {
@@ -2869,8 +2935,8 @@ pub const ExpertCacheResolution = struct {
 
 /// PURE: the expert-cache byte budget for this load. `--expert-cache-gb` wins outright;
 /// otherwise `--ssd-budget-gb` is a TOTAL resident target and the cache is what is left of it
-/// after the resident trunk, the MTP head (only when it stays resident), the whole-layer
-/// prefill union, the selected-expert slab and the fill bounce buffers.
+/// after the resident trunk, the MTP head (only when it stays resident), the vision tower the
+/// split carries, the whole-layer prefill union, the selected-expert slab and the fill bounce buffers.
 pub fn resolveExpertCache(
     explicit_bytes: u64,
     budget_bytes: u64,
@@ -2886,6 +2952,7 @@ pub fn resolveExpertCache(
         budget_bytes,
         split.trunk,
         if (mtp_resident) split.mtp else 0,
+        split.vision,
         @intCast(config.expertLayerCount()),
         @intCast(config.num_experts),
         @intCast(config.num_experts_per_tok),
@@ -3252,13 +3319,6 @@ test "sidecars and ANE keep the flat load headroom" {
     try testing.expectEqual(@as(?u64, null), loadContextBill(&config, "", false, false));
 }
 
-/// Process-wide vision opt-out (`--no-vision` / the iPhone app, which has no
-/// image-input UI yet). A module global for the same reason as
-/// `skip_mem_preflight`: it must apply to on-demand /v1/load-model cold loads
-/// too, not just the startup `LoadParams` — the cold-load path used to
-/// hardcode `load_vision = config.has_vision` and silently ignore the flag.
-pub var no_vision_global: bool = false;
-
 /// Which drafter directory a COLD load should use.
 ///
 /// `--no-drafter` is a policy — it silences every model, including one whose
@@ -3280,9 +3340,15 @@ pub fn coldLoadDrafterDir(
     return drafter_dir;
 }
 
+/// The load's vision choice: `--vision`/`--no-vision` (process-wide, so cold loads honour it
+/// too) > the per-model `vision` > on resident, off streamed.
+pub fn visionChoiceFor(config: *const ModelConfig, streamed: bool) model_settings.VisionChoice {
+    return model_settings.VisionChoice.resolve(model_settings.vision_flag, config.vision_override, streamed);
+}
+
 /// Should a cold load bring up the checkpoint's vision tower?
-pub fn coldLoadVision(has_vision: bool) bool {
-    return has_vision and !no_vision_global;
+pub fn coldLoadVision(config: *const ModelConfig, streamed: bool) bool {
+    return config.has_vision and visionChoiceFor(config, streamed).on;
 }
 
 test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to its OWN model" {
@@ -3331,6 +3397,81 @@ test "the expert cache resolves from --ssd-budget-gb unless --expert-cache-gb is
     try t.expect(!no_budget.overridden);
 
     try t.expectError(error.SsdBudgetBelowResident, resolveExpertCache(0, 14 * GiB, &cfg, split, false, fused));
+}
+
+test "streamed vision: the tower comes out of the ssd budget only when asked, refused by name when it does not fit" {
+    const t = testing;
+    const cfg = model_mod.ModelConfig{
+        .num_hidden_layers = 48,
+        .num_experts = 512,
+        .num_experts_per_tok = 10,
+        .hidden_size = 2560,
+        .moe_intermediate_size = 640,
+        .has_vision = true,
+        .qwen_vision = true,
+        .qv_heads = 16,
+        .qv_hidden = 1152,
+        .qv_intermediate = 4304,
+        .qv_out_hidden = 2560,
+        .qv_patch = 16,
+        .qv_temporal_patch = 2,
+        .qv_merge = 2,
+    };
+    const split = model_mod.ResidentSplit{ .trunk = 9_900_000_000, .mtp = 0, .vision = 897_862_112 };
+    const GiB: u64 = 1 << 30;
+    const fused: u64 = 9_830_400;
+    const encode = @import("server.zig").largestImageEncodeBytes(&cfg);
+    try t.expect(encode > 0);
+
+    const off = try resolveStreamedVision(0, 60 * GiB, &cfg, split, fused, false);
+    try t.expect(!off.cost.on);
+    try t.expectEqual(@as(u64, 0), off.resolved.ledger.?.vision_bytes);
+    const on = try resolveStreamedVision(0, 60 * GiB, &cfg, split, fused, true);
+    try t.expect(on.cost.on);
+    try t.expectEqual(split.vision, on.resolved.ledger.?.vision_bytes);
+    try t.expectEqual(encode, on.cost.encode_bytes);
+    try t.expectEqual(off.resolved.ledger.?.slots_per_layer, on.cost.slots_without);
+    try t.expectEqual(on.resolved.ledger.?.slots_per_layer, on.cost.slots_with.?);
+    try t.expect(on.cost.slots_with.? < on.cost.slots_without);
+    // Off, the plan still prices what --vision would take.
+    try t.expectEqual(on.cost.slots_with, off.cost.slots_with);
+
+    const fixed = split.trunk + 522 * fused + expert_stream_mod.BOUNCE_BYTES;
+    const tight = fixed + 2 * 48 * fused;
+    try t.expectEqual(@as(?u16, null), (try resolveStreamedVision(0, tight, &cfg, split, fused, false)).cost.slots_with);
+    try t.expectError(error.SsdBudgetBelowVision, resolveStreamedVision(0, tight, &cfg, split, fused, true));
+    try t.expectError(error.SsdBudgetBelowResident, resolveStreamedVision(0, 14 * GiB, &cfg, split, fused, true));
+
+    // --expert-cache-gb sizes the cache itself; the tower is resident beside it.
+    const explicit = try resolveStreamedVision(60_000_000_000, 0, &cfg, split, fused, true);
+    try t.expect(explicit.cost.on);
+    try t.expectEqual(@as(u64, 60_000_000_000), explicit.resolved.cache_bytes);
+    var bare = split;
+    bare.vision = 0;
+    try t.expect(!(try resolveStreamedVision(0, 60 * GiB, &cfg, bare, fused, true)).cost.on);
+}
+
+test "the vision load line names its source, and what --vision would cost a streamed load" {
+    const t = testing;
+    var buf: [256]u8 = undefined;
+    const cost = VisionCost{ .tower_bytes = 900_000_000, .encode_bytes = 1_700_000_000, .slots_without = 103, .slots_with = 101 };
+    const off = visionLoadLine(&buf, .{ .on = false, .source = .default }, true, cost);
+    try t.expectEqualStrings("[vision] off under expert streaming; pass --vision to load the tower (+0.90 GB, -2 slots/layer)", off);
+    var on_cost = cost;
+    on_cost.on = true;
+    try t.expectEqualStrings("[vision] on (--vision): tower 0.90 GB in the ssd budget (-2 slots/layer); an image encode up to 1.70 GB is billed per request", visionLoadLine(&buf, .{ .on = true, .source = .flag }, true, on_cost));
+    var cache_cost = cost;
+    cache_cost.slots_with = null;
+    cache_cost.slots_without = 0;
+    try t.expectEqualStrings("[vision] off under expert streaming; pass --vision to load the tower (+0.90 GB resident)", visionLoadLine(&buf, .{ .on = false, .source = .default }, true, cache_cost));
+    cache_cost.on = true;
+    try t.expectEqualStrings("[vision] on (model-settings.json): tower 0.90 GB resident beside the expert cache; an image encode up to 1.70 GB is billed per request", visionLoadLine(&buf, .{ .on = true, .source = .model_settings }, true, cache_cost));
+    cache_cost.on = false;
+    cache_cost.slots_without = 103;
+    try t.expectEqualStrings("[vision] off under expert streaming; pass --vision to load the tower (+0.90 GB: more than this ssd budget holds)", visionLoadLine(&buf, .{ .on = false, .source = .default }, true, cache_cost));
+    try t.expectEqualStrings("[vision] off (--no-vision)", visionLoadLine(&buf, .{ .on = false, .source = .flag }, true, cost));
+    try t.expectEqualStrings("[vision] on (default)", visionLoadLine(&buf, .{ .on = true, .source = .default }, false, .{}));
+    try t.expectEqualStrings("[vision] off (model-settings.json)", visionLoadLine(&buf, .{ .on = false, .source = .model_settings }, false, .{}));
 }
 
 test "the ssd budget falls back to the per-model setting, and a non-streaming model ignores it" {
@@ -3487,13 +3628,24 @@ test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never
     try testing.expect(found >= 1);
 }
 
-test "coldLoadVision honors the process-wide vision opt-out" {
-    no_vision_global = false;
-    try std.testing.expect(coldLoadVision(true));
-    try std.testing.expect(!coldLoadVision(false));
-    no_vision_global = true;
-    defer no_vision_global = false;
-    try std.testing.expect(!coldLoadVision(true));
+test "coldLoadVision honors --no-vision, --vision and the per-model vision, resident and streamed" {
+    const saved = model_settings.vision_flag;
+    defer model_settings.vision_flag = saved;
+    var cfg = ModelConfig{ .has_vision = true };
+    model_settings.vision_flag = null;
+    try std.testing.expect(coldLoadVision(&cfg, false));
+    try std.testing.expect(!coldLoadVision(&cfg, true));
+    try std.testing.expect(!coldLoadVision(&ModelConfig{}, false));
+    model_settings.vision_flag = false;
+    try std.testing.expect(!coldLoadVision(&cfg, false));
+    model_settings.vision_flag = true;
+    try std.testing.expect(coldLoadVision(&cfg, true));
+    try std.testing.expect(!coldLoadVision(&ModelConfig{}, true));
+    model_settings.vision_flag = null;
+    cfg.vision_override = true;
+    try std.testing.expect(coldLoadVision(&cfg, true));
+    cfg.vision_override = false;
+    try std.testing.expect(!coldLoadVision(&cfg, false));
 }
 
 /// Which "available memory" figure the preflight should trust. On iOS the
@@ -3801,12 +3953,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
     const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());
-    if (expert_stream_mod.expertStreamingEngaged(
+    const streamed = expert_stream_mod.expertStreamingEngaged(
         params.config.supportsExpertStreaming(),
         params.config.expertStreamingRequired(),
         params.expert_cache_bytes,
         streaming_budget.bytes,
-    )) {
+    );
+    const vision_choice = visionChoiceFor(params.config, streamed);
+    var load_vision = params.load_vision and vision_choice.on;
+    var vision_cost: VisionCost = .{};
+    if (streamed) {
         const budget = streaming_budget;
         if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
@@ -3824,15 +3980,18 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         if (budget.from_setting)
             log.info("[expert-stream] ssd budget {d} GiB from model-settings.json\n", .{budget.bytes >> 30});
-        const plan = try planExpertStreaming(sch.io, sch.allocator, params.config, params.model_dir, params.expert_cache_bytes, budget.bytes);
+        const plan = try planExpertStreaming(sch.io, sch.allocator, params.config, params.model_dir, params.expert_cache_bytes, budget.bytes, load_vision);
+        vision_cost = plan.vision;
+        load_vision = plan.vision.on;
         if (plan.resolved.overridden)
             log.info("[expert-stream] --expert-cache-gb overrides --ssd-budget-gb: cache {d:.2} GB\n", .{
                 @as(f64, @floatFromInt(plan.resolved.cache_bytes)) / 1e9,
             });
-        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
+        if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
             led.budget_bytes >> 30,
             @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.mtp_bytes)) / 1e9,
+            @as(f64, @floatFromInt(led.vision_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.workspace_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.selected_bytes)) / 1e9,
             @as(f64, @floatFromInt(led.bounce_bytes)) / 1e9,
@@ -3844,15 +4003,19 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
             expert_source_assigned = true;
         }
-        streaming_resident_bytes = plan.split.trunk +| plan.split.mtp;
+        streaming_resident_bytes = plan.split.trunk +| plan.split.mtp +| plan.split.vision;
         if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
     } else if (params.config.isGlm5()) {
-        streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, params.load_vision and params.config.glm5_vision);
+        streaming_resident_bytes = try @import("glm5_diagnostic.zig").residentBytesWithVision(sch.io, sch.allocator, params.model_dir, params.config.num_hidden_layers, load_vision and params.config.glm5_vision);
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
-        streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
+        streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     } else if (params.config.usesMimoSourceTrunk()) {
-        streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
+        streaming_resident_bytes = try mimoResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
     }
+    if (params.config.has_vision) {
+        var line_buf: [256]u8 = undefined;
+        log.info("{s}\n", .{visionLoadLine(&line_buf, vision_choice, streamed, vision_cost)});
+    } else if (model_settings.vision_flag == true) log.warn("[vision] --vision ignored: this checkpoint has no vision tower\n", .{});
 
     // Resolve the sidecar before preflight so billing and loading see the same dependency.
     const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter or try glmStreamedDrafterOff(params.config, params.drafter_dir), params.drafter_dir, params.model_dir);
@@ -3972,7 +4135,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var load_config = params.config.*;
     // The resolved launch choice gates lazy native-head tensors before Transformer.init binds them.
     load_config.mtp_override = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
-    weights_ptr.* = try model_mod.loadWeightsForConfig(sch.io, sch.allocator, params.model_dir, &load_config, params.load_vision);
+    weights_ptr.* = try model_mod.loadWeightsForConfig(sch.io, sch.allocator, params.model_dir, &load_config, load_vision);
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
 
@@ -4014,7 +4177,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.config.isGlm5()) {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (kv_quant_config.isQuant()) "kv8" else "BF16", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
-        log.info("[glm] native vision {s}\n", .{if (params.config.expert_streaming) "off (expert streaming)" else if (params.load_vision and params.config.glm5_vision) "enabled (included in resident weight bill)" else "off (--no-vision or absent tower)"});
         log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0) log.warn("[glm] native recurrent state has no prefix-cache restore yet; RAM/disk prefix reuse off\n", .{});
@@ -4300,7 +4462,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // (model declares vision in config but the safetensors didn't ship the
     // tower); other errors fail the whole load.
     var vision_ptr: ?*VisionEncoder = null;
-    if (params.load_vision and !params.config.expert_streaming) {
+    if (load_vision) {
         const v = try sch.allocator.create(VisionEncoder);
         if (VisionEncoder.init(sch.allocator, params.config.*, weights_ptr)) |encoder| {
             v.* = encoder;
@@ -10866,25 +11028,32 @@ test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media bo
 
 test "every real streamed pack and source on this box plans a streamed load" {
     const t = std.testing;
-    const Case = struct { name: []const u8, layout: expert_stream_mod.quant.Layout };
+    const Case = struct { name: []const u8, layout: expert_stream_mod.quant.Layout, tower: u64 };
     for ([_]Case{
-        .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4 },
-        .{ .name = "Qwen3.8-Flash-Next-Sushi-4bpw", .layout = .exl3_k4 },
-        .{ .name = "Qwen/Qwen3.8-Flash-Next", .layout = .bf16_fused },
-        .{ .name = "MiMo-V2.6-Flash-Sushi-2.3bpw", .layout = .exl3_k4 },
-        .{ .name = "GLM-5.3-Flash-Sushi-2.3bpw", .layout = .exl3_k4 },
-        .{ .name = "GLM-5.3-Flash-Sushi-2.5bpw", .layout = .exl3_k4 },
-        .{ .name = "GLM-5.3-Flash-BF16", .layout = .bf16_individual },
-        .{ .name = "GLM-5.3-Flash-FP8", .layout = .fp8_individual },
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4, .tower = 897_862_112 },
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-4bpw", .layout = .exl3_k4, .tower = 897_862_112 },
+        .{ .name = "Qwen/Qwen3.8-Flash-Next", .layout = .bf16_fused, .tower = 897_862_112 },
+        .{ .name = "MiMo-V2.6-Flash-Sushi-2.3bpw", .layout = .exl3_k4, .tower = 1_457_188_864 },
+        .{ .name = "GLM-5.3-Flash-Sushi-2.3bpw", .layout = .exl3_k4, .tower = 493_389_824 },
+        .{ .name = "GLM-5.3-Flash-Sushi-2.5bpw", .layout = .exl3_k4, .tower = 493_389_824 },
+        .{ .name = "GLM-5.3-Flash-BF16", .layout = .bf16_individual, .tower = 1_127_254_016 },
+        .{ .name = "GLM-5.3-Flash-FP8", .layout = .fp8_individual, .tower = 1_127_254_016 },
     }) |case| {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = try @import("test_models.zig").packPath(&path_buf, case.name);
         var config = model_mod.parseConfig(t.io, t.allocator, path) catch continue;
         defer config.deinit(t.allocator);
-        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30);
+        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30, false);
         try t.expectEqual(case.layout, plan.layout);
         try t.expect(plan.cache.slots_per_layer > 1);
         try t.expect(plan.split.trunk > 0 and plan.split.trunk < 40 << 30);
+        try t.expectEqual(@as(u64, 0), plan.split.vision);
+        try t.expectEqual(case.tower, plan.vision.tower_bytes);
+        const seen = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30, true);
+        try t.expectEqual(case.tower, seen.split.vision);
+        try t.expectEqual(plan.split.trunk, seen.split.trunk);
+        try t.expectEqual(seen.vision.slots_with.?, seen.cache.slots_per_layer);
+        try t.expect(seen.cache.slots_per_layer < plan.cache.slots_per_layer);
     }
 }
 

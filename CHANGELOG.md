@@ -17,6 +17,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **`sushi kld capture --layer-major` captures many short GLM-5.3 windows from the BF16 source** with each layer's
   experts read once per batch of windows, byte-identical to the one-window-at-a-time capture, resumable by rerunning
   the command; `SUSHI_HIDDEN_OUT` now records the native GLM teacher's block boundaries (all four HC streams).
+- **`--vision` loads the vision tower on an SSD-streamed load** (GLM-5.3, MiMo, Qwen3.8), billed in the
+  `--ssd-budget-gb` budget; without it a streamed load serves text and says what the tower would cost. Thanks
+  @sanasol for raising it (#18).
 - **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
   instead of failing to compile mlx-c after a plain `git pull`.
 - **Concurrent GLM-5.3 requests decode together instead of queueing**: each keeps its own native state, and up to
@@ -27,8 +30,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **GLM-5.3 now stores its MLA latent at 8 bits by default**, like every model: 6,688 instead of 11,968 bytes per
   token. `--kv-quant 16` (or a request's `kv_quant: 16`) keeps it BF16; `16` is accepted for every model.
 - **GLM-5.3-Flash streams its experts from SSD** under `--ssd-budget-gb`/`--expert-cache-gb`, for Sushi packs and the
-  BF16 source checkpoint alike, in `serve`, `run` and `kld compare`; streamed output is identical to resident, text
-  only, without the DFlash2 assistant.
+  BF16 source checkpoint alike, in `serve`, `run` and `kld compare`; streamed output is identical to resident,
+  without the DFlash2 assistant.
 - **`sushi kld` plans a streamed load exactly as `serve` does**: rate-group packs are refused by name and a streamed
   MiMo bills its coarse lm_head.
 - **A streamed Qwen's load admission counts its QSA history** beside the KV cache, as the context sizer already did.

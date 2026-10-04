@@ -185,6 +185,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what
   the GPU has left it is a named 400. The tower evaluates per block, so the peak is one block's f32 score sheet
   (heads x N^2) and rows; table in [arch-qwen4exp](arch-qwen4exp.md#vision-tower).
+- **A streamed `--vision` load bills its tower in the ssd budget and proves its largest image beside it**: the load
+  admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
+  ([engine-expert-streaming](engine-expert-streaming.md#vision)).
 - **A video's block is ONE temporal group**, never the whole video: `forwardVideo` encodes and evaluates each group
   alone, so the bill grows linearly with the group count (the old N^2 over all groups billed 79 GB at 8x46x82).
   Measured peak (pixel upload to evaluated output) = one group's scratch + all pixels + the earlier groups' rows:

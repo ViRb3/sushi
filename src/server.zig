@@ -3166,17 +3166,23 @@ fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
     return prefillNeededAtChunk(config, @max(seq, chunk), 2048, defaultKvBits(config), chunk, .{}) -| config.expert_fill_peak_bytes;
 }
 
+/// What a streamed load holds beside its ssd budget: the planned KV and, under `--vision`, its largest image encode.
+fn expertStreamingBesideBudgetBytes(config: *const model_mod.ModelConfig) u64 {
+    return expertStreamingPlannedKvBytes(config) +| config.expert_vision_encode_bytes;
+}
+
 pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_bytes: u64) !void {
     if (!config.expert_streaming) return;
     if (config.expert_ssd_budget_bytes > 0) {
-        const kv_bytes = expertStreamingPlannedKvBytes(config);
+        const beside = expertStreamingBesideBudgetBytes(config);
         const limit = ssdBudgetCeiling(wiredLimitBytes(), staticGpuMemoryCeiling());
-        if (!ssdBudgetAdmits(config.expert_ssd_budget_bytes, kv_bytes, limit)) {
-            log.err("--ssd-budget-gb {d} plus {d:.2} GB of planned KV exceeds the {d:.2} GB residency limit; raise iogpu.wired_limit_mb to {d} or lower the budget\n", .{
+        if (!ssdBudgetAdmits(config.expert_ssd_budget_bytes, beside, limit)) {
+            log.err("--ssd-budget-gb {d} plus {d:.2} GB of planned KV and {d:.2} GB of image encode exceeds the {d:.2} GB residency limit; raise iogpu.wired_limit_mb to {d} or lower the budget\n", .{
                 config.expert_ssd_budget_bytes >> 30,
-                @as(f64, @floatFromInt(kv_bytes)) / 1e9,
+                @as(f64, @floatFromInt(expertStreamingPlannedKvBytes(config))) / 1e9,
+                @as(f64, @floatFromInt(config.expert_vision_encode_bytes)) / 1e9,
                 @as(f64, @floatFromInt(limit)) / 1e9,
-                wiredLimitMbForBudget(config.expert_ssd_budget_bytes, kv_bytes),
+                wiredLimitMbForBudget(config.expert_ssd_budget_bytes, beside),
             });
             return error.SsdBudgetExceedsWiredLimit;
         }
@@ -3191,7 +3197,7 @@ pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_byte
         config.expert_cache_bytes,
         config.expert_bounce_bytes,
         config.expert_fill_peak_bytes,
-        expertStreamingServingBytes(config),
+        @max(expertStreamingServingBytes(config), config.expert_vision_encode_bytes),
     )) return error.ExpertCacheDoesNotFit;
 }
 
@@ -7215,9 +7221,17 @@ const TextGenTarget = struct {
 /// (`--no-vision`, or a checkpoint with no vision weights) is refused by name.
 /// Before this the media parts were parsed and then silently dropped — the
 /// model answered the text alone (a 200 with a hallucinated "Sky" for a house).
-fn mediaRejectReason(messages: []const chat_mod.Message) ?[]const u8 {
+/// A streamed load left its tower off only because nothing asked for it (not `--no-vision`).
+fn streamedTowerOffByDefault(config: *const model_mod.ModelConfig) bool {
+    return config.expert_streaming and config.has_vision and scheduler_mod.visionChoiceFor(config, true).source == .default;
+}
+
+fn mediaRejectReason(messages: []const chat_mod.Message, streamed_tower_off: bool) ?[]const u8 {
     for (messages) |m| {
-        if (m.images != null or m.videos != null) return "This model is serving without its vision tower (--no-vision or no vision weights); image/video content is not supported";
+        if (m.images != null or m.videos != null) return if (streamed_tower_off)
+            "This model streams its experts from SSD and was loaded without its vision tower; relaunch with --vision to accept image/video content"
+        else
+            "This model is serving without its vision tower (--no-vision or no vision weights); image/video content is not supported";
         if (m.audio != null) return "This model is serving without its audio embedder; input_audio content is not supported";
     }
     return null;
@@ -7226,11 +7240,36 @@ fn mediaRejectReason(messages: []const chat_mod.Message) ?[]const u8 {
 test "mediaRejectReason: media on a tower-less model is refused by name, text passes" {
     const t = std.testing;
     const text = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
-    try t.expect(mediaRejectReason(&text) == null);
+    try t.expect(mediaRejectReason(&text, false) == null);
     const img = [_]chat_mod.Message{ .{ .role = "user", .content = "hi" }, .{ .role = "user", .content = "look", .images = &[_]chat_mod.ImageData{} } };
-    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&img).?, "vision tower") != null);
+    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&img, false).?, "vision tower") != null);
     const aud = [_]chat_mod.Message{.{ .role = "user", .content = "listen", .audio = &[_]chat_mod.AudioData{} }};
-    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&aud).?, "audio") != null);
+    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&aud, false).?, "audio") != null);
+    // A streamed load that left its tower off names the flag that loads it.
+    const streamed = mediaRejectReason(&img, true).?;
+    try t.expect(std.mem.indexOf(u8, streamed, "streams its experts") != null);
+    try t.expect(std.mem.indexOf(u8, streamed, "--vision") != null);
+    try t.expect(std.mem.indexOf(u8, streamed, "--no-vision") == null);
+}
+
+test "only a streamed load whose tower is off by default names --vision in its media refusal" {
+    const t = std.testing;
+    const saved = model_settings.vision_flag;
+    defer model_settings.vision_flag = saved;
+    var cfg = model_mod.ModelConfig{ .has_vision = true, .expert_streaming = true };
+    model_settings.vision_flag = null;
+    try t.expect(streamedTowerOffByDefault(&cfg));
+    model_settings.vision_flag = false;
+    try t.expect(!streamedTowerOffByDefault(&cfg));
+    model_settings.vision_flag = null;
+    cfg.vision_override = false;
+    try t.expect(!streamedTowerOffByDefault(&cfg));
+    cfg.vision_override = null;
+    cfg.expert_streaming = false;
+    try t.expect(!streamedTowerOffByDefault(&cfg));
+    cfg.expert_streaming = true;
+    cfg.has_vision = false;
+    try t.expect(!streamedTowerOffByDefault(&cfg));
 }
 
 /// Reason a text-generation route must reject this model with a 400, or null
@@ -7991,6 +8030,8 @@ const PropsSettings = struct {
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
     prefix_cache_ram_enabled: bool = true,
+    /// The byte figures are a streamed load's (0 resident or off).
+    vision: struct { loaded: bool = false, source: []const u8 = "default", tower_bytes: u64 = 0, encode_bytes: u64 = 0 } = .{},
 };
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
@@ -8027,6 +8068,12 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefix_cache_mem_bytes = if (config.isGlm5()) 0 else resolvedPrefixCacheMem(),
         .prefix_cache_ram_enabled = !config.isGlm5() and prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
         .prefix_cache_disk_bytes = if (config.isGlm5()) 0 else prefix_cache_disk_bytes,
+        .vision = .{
+            .loaded = lm.vision_encoder != null,
+            .source = scheduler_mod.visionChoiceFor(config, config.expert_streaming).sourceName(),
+            .tower_bytes = config.expert_vision_tower_bytes,
+            .encode_bytes = config.expert_vision_encode_bytes,
+        },
     };
 }
 
@@ -8038,7 +8085,9 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"source\":\"{s}\",\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    var vision_buf: [160]u8 = undefined;
+    const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"source\":\"{s}\",\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}},\"vision\":{s}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                st.kv_cache.label(),
         st.kv_cache.sourceName(),                   @tagName(st.kv_attn_mode),
@@ -8053,7 +8102,7 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
         st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
-        st.prefix_cache_disk_bytes,
+        st.prefix_cache_disk_bytes,                 vision,
     });
 }
 
@@ -13038,6 +13087,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "ExpertCacheDoesNotFit",
         "ExpertStreamingRequired",
         "SsdBudgetBelowResident",
+        "SsdBudgetBelowVision",
         "SsdBudgetExceedsWiredLimit",
         "ExpertStreamingMtpUnsupported",
         "ExpertStreamingUnsupportedLayout",
@@ -13065,6 +13115,8 @@ test "every load refusal the registry preserves answers under its own name" {
     try t.expectEqualStrings("exl3_trellis_geometry", loadRefusalFor(error.Exl3TrellisGeometry).?.type);
     try t.expectEqualStrings("exl3_window_unsupported", loadRefusalFor(error.Exl3WindowUnsupported).?.type);
     try t.expectEqualStrings("exl3_shard_stamp_mismatch", loadRefusalFor(error.Exl3ShardStampMismatch).?.type);
+    try t.expectEqualStrings("ssd_budget_below_vision", loadRefusalFor(error.SsdBudgetBelowVision).?.type);
+    try t.expect(std.mem.indexOf(u8, loadRefusalFor(error.SsdBudgetBelowVision).?.message, "--vision") != null);
     try t.expect(loadRefusalFor(error.LoadFailed) == null);
     try t.expect(loadRefusalFor(error.UnknownModelId) == null);
 }
@@ -13107,7 +13159,8 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3WindowUnsupported => .{ .type = "exl3_window_unsupported", .message = "This EXL3 pack names a codeword window this build cannot decode: expert_quant.window must be an integer from 8 to 16, or absent for 16." },
         error.Exl3ShardStampMismatch => .{ .type = "exl3_shard_stamp_mismatch", .message = "An EXL3 shard in this pack was written for a different decoder than config.json's expert_quant names (k, codebook or window). Re-convert the pack, or fix expert_quant to match the shards." },
         error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
-        error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
+        error.SsdBudgetBelowVision => .{ .type = "ssd_budget_below_vision", .message = "--ssd-budget-gb cannot hold the vision tower that --vision asks for beside the minimum expert cache. Raise the budget or drop --vision." },
+        error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache (and, under --vision, the largest image encode) exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
         else => null,
     };
 }
@@ -14136,8 +14189,8 @@ fn flattenMedia(allocator: std.mem.Allocator, messages: []const chat_mod.Message
 
 /// A media kind the loaded model cannot encode is refused by name, never
 /// answered from the text alone.
-fn mediaKindRefusal(messages: []const chat_mod.Message, flat: FlatMedia, has_tower: bool) ?MediaFault {
-    if (!has_tower) return MediaFault.init(false, "{s}", .{mediaRejectReason(messages).?});
+fn mediaKindRefusal(messages: []const chat_mod.Message, flat: FlatMedia, has_tower: bool, streamed_tower_off: bool) ?MediaFault {
+    if (!has_tower) return MediaFault.init(false, "{s}", .{mediaRejectReason(messages, streamed_tower_off).?});
     if (flat.has_audio) return MediaFault.init(false, "input_audio is not supported by this model: its tower encodes images and video only", .{});
     return null;
 }
@@ -14168,6 +14221,19 @@ pub fn visionEncodeBill(config: *const model_mod.ModelConfig, images: []const ch
     }
     const output_bytes = @as(u64, rows) * @max(config.qv_out_hidden, 1) * 2;
     return .{ .bytes = visionScratchBytes(config, worst) + input_bytes + 3 * output_bytes, .largest_group_patches = worst };
+}
+
+/// The encode bill of the largest single image this tower's processor admits: a streamed
+/// `--vision` load proves it fits beside its budget. Every request is still checked live.
+pub fn largestImageEncodeBytes(config: *const model_mod.ModelConfig) u64 {
+    const vp = visionPreprocFromConfig(config);
+    const merge: u64 = @max(vp.merge, 1);
+    const patches: u64 = if (vp.mode == .glm5)
+        @as(u64, vp.max_tokens) * merge * merge
+    else
+        qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / @max(@as(u64, vp.patch) * vp.patch, 1);
+    const largest = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
+    return visionEncodeBill(config, &largest, &.{}, @intCast(patches / (merge * merge))).bytes;
 }
 
 /// The encode's fit check, before it runs: `visionEncodeBill` must fit what the
@@ -14346,8 +14412,8 @@ fn prepareRequestMedia(
     var flat = try flattenMedia(allocator, messages);
     defer flat.deinit(allocator);
     if (flat.images.len == 0 and flat.videos.len == 0 and !flat.has_audio) return .{ .ready = .{} };
-    if (mediaKindRefusal(messages, flat, lm.vision_encoder != null)) |fault| return .{ .refused = fault };
     const config = lm.config.?;
+    if (mediaKindRefusal(messages, flat, lm.vision_encoder != null, streamedTowerOffByDefault(config))) |fault| return .{ .refused = fault };
 
     const found = countMediaPlaceholders(ids.*, config);
     if (found.images != flat.images.len or found.videos != flat.videos.len) {
@@ -15060,6 +15126,19 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
     return .{ .rgb = rgb, .w = @intCast(webp_w), .h = @intCast(webp_h) };
 }
 
+/// The pixel size a patch-grid tower's processor resizes an `src_h` x `src_w` image to.
+fn imageResize(vp: chat_mod.VisionPreproc, factor: u32, src_h: u32, src_w: u32) qwen_vision.Resized {
+    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+    if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
+    return switch (vp.mode) {
+        .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
+        .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
+        .mimo => mimo_vision.smartResize(src_h, src_w, factor, bounds.min, bounds.max),
+        .glm5 => glm5_vision.smartResize(vp.tps, src_h, src_w, vp.tps, factor, vp.min_tokens, vp.max_tokens),
+        else => qwen_vision.smartResizeImage(src_h, src_w, factor, bounds.min, bounds.max),
+    };
+}
+
 fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
 
@@ -15077,17 +15156,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     if (vp.mode != .gemma) {
         const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
         if (factor == 0 or vp.tps == 0) return null;
-        const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
-        const min_pixels = bounds.min;
-        const max_pixels = bounds.max;
-        if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
-        const rs = switch (vp.mode) {
-            .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
-            .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
-            .mimo => mimo_vision.smartResize(src_h, src_w, factor, min_pixels, max_pixels),
-            .glm5 => glm5_vision.smartResize(vp.tps, src_h, src_w, vp.tps, factor, vp.min_tokens, vp.max_tokens),
-            else => qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels),
-        };
+        const rs = imageResize(vp, factor, src_h, src_w);
         const rh = rs.h;
         const rw = rs.w;
         const C: u32 = 3;
@@ -15470,9 +15539,51 @@ test "an input_audio part sent to a vision-only model is refused by name" {
     const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "listen", .audio = &audio }};
     var flat = try flattenMedia(std.testing.allocator, &msgs);
     defer flat.deinit(std.testing.allocator);
-    const fault = mediaKindRefusal(&msgs, flat, true) orelse return error.TestExpectedRefusal;
+    const fault = mediaKindRefusal(&msgs, flat, true, false) orelse return error.TestExpectedRefusal;
     try std.testing.expect(std.mem.startsWith(u8, fault.text(), "input_audio is not supported by this model"));
-    try std.testing.expect(std.mem.indexOf(u8, mediaKindRefusal(&msgs, flat, false).?.text(), "audio") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mediaKindRefusal(&msgs, flat, false, false).?.text(), "audio") != null);
+}
+
+fn testTowerConfigs() [3]model_mod.ModelConfig {
+    return .{
+        // Qwen3.8 packs: no processor config, so the 1,003,520 px default.
+        .{ .has_vision = true, .qwen_vision = true, .qv_heads = 16, .qv_hidden = 1152, .qv_intermediate = 4304, .qv_out_hidden = 2560, .qv_patch = 16, .qv_temporal_patch = 2, .qv_merge = 2 },
+        .{ .has_vision = true, .mimo_vision = true, .qv_heads = 32, .mvit_kv_heads = 8, .qv_head_dim = 64, .qv_hidden = 1280, .qv_intermediate = 4608, .qv_out_hidden = 4096, .qv_patch = 16, .qv_temporal_patch = 2, .qv_merge = 2, .qv_min_pixels = 8192, .qv_max_pixels = 8388608 },
+        .{ .has_vision = true, .glm5_vision = true, .qv_heads = 16, .qv_head_dim = 64, .qv_hidden = 1024, .qv_intermediate = 4096, .qv_out_hidden = 4096, .glmv_projection_intermediate = 10240, .qv_patch = 14, .qv_temporal_patch = 2, .qv_merge = 2, .glmv_min_image_tokens = 16, .glmv_max_image_tokens = 8000 },
+    };
+}
+
+test "the largest-image encode bill covers any single image the tower's processor admits" {
+    const t = std.testing;
+    const sides = [_][2]u32{ .{ 1080, 1920 }, .{ 20000, 20000 }, .{ 30000, 64 }, .{ 64, 30000 }, .{ 4321, 3210 }, .{ 7, 9 } };
+    for (testTowerConfigs()) |config| {
+        const reserve = largestImageEncodeBytes(&config);
+        const vp = visionPreprocFromConfig(&config);
+        var largest: u64 = 0;
+        for (sides) |s| {
+            const rs = imageResize(vp, vp.patch * vp.merge, s[0], s[1]);
+            const img = [_]chat_mod.ImageData{testGridImage(rs.h / vp.patch, rs.w / vp.patch, "")};
+            const bill = visionEncodeBill(&config, &img, &.{}, mediaRows(1, img[0].grid_h, img[0].grid_w, vp.merge)).bytes;
+            try t.expect(bill <= reserve);
+            largest = @max(largest, bill);
+        }
+        try t.expect(largest * 10 >= reserve * 9);
+    }
+}
+
+test "an image request bills its encode the same on a streamed load as on a resident one" {
+    const t = std.testing;
+    const img = [_]chat_mod.ImageData{testGridImage(46, 82, "")};
+    for (testTowerConfigs()) |resident| {
+        var streamed = resident;
+        streamed.expert_streaming = true;
+        streamed.expert_vision_tower_bytes = 1 << 30;
+        streamed.expert_vision_encode_bytes = largestImageEncodeBytes(&resident);
+        const bill = visionEncodeBill(&resident, &img, &.{}, 943);
+        try t.expectEqual(bill.bytes, visionEncodeBill(&streamed, &img, &.{}, 943).bytes);
+        try t.expect(towerFitFault(&streamed, &img, &.{}, 943, bill.bytes) == null);
+        try t.expect(towerFitFault(&streamed, &img, &.{}, 943, bill.bytes - 1) != null);
+    }
 }
 
 test "towerFitFault admits an image at the 1536^2 cap when 9 GB is free" {
@@ -21022,6 +21133,21 @@ test "queryModel: GET /props?model=<id> routes to that model, percent-decoded" {
     try testing.expect(queryModel(&buf, "/props?models=a") == null);
 }
 
+test "settingsPropsJson: /props names the vision choice and a streamed tower's bill" {
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 2048, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .vision = .{ .loaded = true, .source = "--vision", .tower_bytes = 493_389_824, .encode_bytes = 5_000_000_000 } });
+    defer testing.allocator.free(frag);
+    var config = model_mod.ModelConfig{};
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const vision = parsed.value.object.get("settings").?.object.get("vision").?.object;
+    try testing.expect(vision.get("loaded").?.bool);
+    try testing.expectEqualStrings("--vision", vision.get("source").?.string);
+    try testing.expectEqual(@as(i64, 493_389_824), vision.get("streamed_tower_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 5_000_000_000), vision.get("streamed_encode_bytes").?.integer);
+}
+
 test "settingsPropsJson: /props names the effective serving settings a benchmark ran under" {
     const frag = try settingsPropsJson(testing.allocator, .{
         .engine = "mlx",
@@ -26147,6 +26273,17 @@ test "a streamed Qwen plans its QSA history beside its KV for every planned toke
     try std.testing.expect(state > 0);
     const per_token = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + state;
     try std.testing.expectEqual(per_token * expertStreamingPlannedSeq(&cfg) + slotRingBytes(&cfg, 8), expertStreamingPlannedKvBytes(&cfg));
+}
+
+test "a streamed --vision load proves its largest image encode beside the budget, with the planned KV" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.expert_streaming = true;
+    const kv = expertStreamingPlannedKvBytes(&cfg);
+    try std.testing.expectEqual(kv, expertStreamingBesideBudgetBytes(&cfg));
+    cfg.expert_vision_encode_bytes = largestImageEncodeBytes(&cfg);
+    try std.testing.expect(cfg.expert_vision_encode_bytes > 1 << 30);
+    try std.testing.expectEqual(kv + cfg.expert_vision_encode_bytes, expertStreamingBesideBudgetBytes(&cfg));
+    try std.testing.expect(!ssdBudgetAdmits(32 << 30, expertStreamingBesideBudgetBytes(&cfg), (32 << 30) + kv));
 }
 
 test "thinking policy HTTP: Qwen and GLM accept their own words, MiMo takes every thinking word as on" {

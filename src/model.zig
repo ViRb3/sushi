@@ -187,6 +187,10 @@ pub const ModelConfig = struct {
     expert_workspace_bytes: u64 = 0,
     expert_bounce_bytes: u64 = 0,
     expert_fill_peak_bytes: u64 = 0,
+    /// A streamed load's resident vision tower (in the ssd budget) and its largest single-image
+    /// encode (beside the budget, at the wired-limit admission); 0 = tower off.
+    expert_vision_tower_bytes: u64 = 0,
+    expert_vision_encode_bytes: u64 = 0,
 
     // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
     query_pre_attn_scalar: u32 = 256,
@@ -481,6 +485,7 @@ pub const ModelConfig = struct {
     preserve_thinking_override: ?bool = null,
     think_penalty_override: ?f32 = null,
     logit_bias_file_override: ?@import("logit_bias.zig").FilePath = null,
+    vision_override: ?bool = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -4341,7 +4346,8 @@ pub fn qwen4StreamingWeightKey(layout: expert_quant.Layout, buf: []u8, key: []co
     return key;
 }
 
-pub const ResidentSplit = struct { trunk: u64, mtp: u64 };
+/// `vision`: the tower's bytes, kept apart from `trunk` where a streamed load decides on it.
+pub const ResidentSplit = struct { trunk: u64, mtp: u64, vision: u64 = 0 };
 
 /// Resident Sushi EXL3 packs have a measured load envelope and exact component bills.
 pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
@@ -4351,22 +4357,29 @@ pub fn usesSushiQuantMemoryBill(config: *const ModelConfig) bool {
 
 /// Flash-Next's resident tensor payloads, with the loader's vision filter and optional native head.
 pub fn qwenResidentWeightBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, vision: bool, mtp_on: bool) !ResidentSplit {
-    return indexedResidentSplit(io, allocator, model_dir, null, vision, mtp_on);
+    const split = try indexedResidentSplit(io, allocator, model_dir, null, mtp_on);
+    return .{ .trunk = split.trunk +| (if (vision) split.vision else 0), .mtp = split.mtp };
 }
 
-/// What a streamed load keeps resident under `config.expert_layout`: everything but the routed banks.
+/// What a streamed load keeps resident under `config.expert_layout`: everything but the routed banks,
+/// with the tower apart.
 pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !ResidentSplit {
     if (config.isGlm5())
-        return .{ .trunk = try @import("glm5_diagnostic.zig").streamedTrunkBytes(io, allocator, model_dir, config.num_hidden_layers), .mtp = 0 };
+        return @import("glm5_diagnostic.zig").streamedSplit(io, allocator, model_dir, config.num_hidden_layers);
     if (config.usesMimoSourceTrunk()) {
         var streamed = config.*;
         streamed.expert_streaming = true;
-        return .{ .trunk = try @import("mimo_source.zig").residentBytesWithConfig(io, allocator, model_dir, &streamed), .mtp = 0 };
+        const mimo_source = @import("mimo_source.zig");
+        return .{
+            .trunk = try mimo_source.residentBytesWithConfig(io, allocator, model_dir, &streamed),
+            .mtp = 0,
+            .vision = try mimo_source.visionResidentBytes(io, allocator, model_dir),
+        };
     }
-    return indexedResidentSplit(io, allocator, model_dir, config.expert_layout, false, true);
+    return indexedResidentSplit(io, allocator, model_dir, config.expert_layout, true);
 }
 
-fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, streaming: ?expert_quant.Layout, vision: bool, mtp_on: bool) !ResidentSplit {
+fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, streaming: ?expert_quant.Layout, mtp_on: bool) !ResidentSplit {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     var referenced = model_discovery.indexShardSet(io, dir) orelse return error.InvalidSafetensorsIndex;
@@ -4375,6 +4388,7 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     defer if (owners) |*o| o.deinit();
     var total: u64 = 0;
     var mtp: u64 = 0;
+    var tower: u64 = 0;
     var found: usize = 0;
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
@@ -4404,7 +4418,8 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
                 qwen4StreamingWeightKey(layout, &key_buf, tensor.key_ptr.*) orelse continue
             else
                 tensor.key_ptr.*;
-            if (!shouldKeepWeightKey(canonical, vision)) continue;
+            if (!shouldKeepWeightKey(canonical, true)) continue;
+            const is_vision = !shouldKeepWeightKey(canonical, false);
             const is_mtp = std.mem.startsWith(u8, canonical, "language_model.mtp.");
             if (is_mtp and !mtp_on) continue;
             if (tensor.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
@@ -4414,16 +4429,13 @@ fn indexedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
             const end = offsets.array.items[1].integer;
             if (start < 0 or end < start or @as(u64, @intCast(end)) > stat.size -| header_len -| 8) return error.InvalidSafetensorsHeader;
             const size: u64 = @intCast(end - start);
-            if (is_mtp) {
-                mtp = std.math.add(u64, mtp, size) catch return error.InvalidSafetensorsHeader;
-            } else {
-                total = std.math.add(u64, total, size) catch return error.InvalidSafetensorsHeader;
-            }
+            const bucket = if (is_mtp) &mtp else if (is_vision) &tower else &total;
+            bucket.* = std.math.add(u64, bucket.*, size) catch return error.InvalidSafetensorsHeader;
             found += 1;
         }
     }
     if (found == 0) return error.NoWeightFiles;
-    return .{ .trunk = total, .mtp = mtp };
+    return .{ .trunk = total, .mtp = mtp, .vision = tower };
 }
 
 /// Load all safetensors files from model_dir.
@@ -4582,14 +4594,17 @@ pub fn loadWeightsForConfig(
     if (config.expert_layout == .exl3_k4) try @import("mimo_source.zig").validateExl3Pack(io, allocator, model_dir, config);
     if (config.isGlm5()) {
         const glm = @import("glm5_diagnostic.zig");
-        if (config.expert_streaming) return glm.loadWeightsBounded(io, allocator, model_dir, mlx.gpuStream(), true, std.math.maxInt(u64));
-        return glm.loadWeightsWithVision(io, allocator, model_dir, mlx.gpuStream(), load_vision and config.glm5_vision);
+        return glm.loadWeightsBoundedWithVision(io, allocator, model_dir, mlx.gpuStream(), config.expert_streaming, std.math.maxInt(u64), load_vision and config.glm5_vision);
     }
     if (config.expert_streaming and config.usesMimoSourceTrunk()) {
-        logMimoSourceLoad(config, false);
-        return @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
+        const vision = load_vision and config.mimo_vision;
+        logMimoSourceLoad(config, vision);
+        var weights = try @import("mimo_source.zig").loadWeights(io, allocator, model_dir, config);
+        errdefer weights.deinit();
+        if (vision) try @import("mimo_source.zig").loadVisionWeightsInto(&weights, io, allocator, model_dir);
+        return weights;
     }
-    if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout);
+    if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
     var weights = if (load_vision)
         try loadWeightsWithVision(io, allocator, model_dir)
@@ -4601,11 +4616,11 @@ pub fn loadWeightsForConfig(
     return weights;
 }
 
-pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !Weights {
-    if (layout == .mxfp4_individual) return loadWeightsMimoSource(io, allocator, model_dir, false);
+pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout, vision: bool) !Weights {
+    if (layout == .mxfp4_individual) return loadWeightsMimoSource(io, allocator, model_dir, vision);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, false, layout);
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, vision, layout);
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -8132,7 +8147,7 @@ test "qwen4 streaming loader materializes only transformed resident tensors" {
     @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
 
-    var weights = try loadWeightsStreaming(io, allocator, model_dir, .bf16_fused);
+    var weights = try loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false);
     defer weights.deinit();
     try t.expect(weights.get("model.language_model.layers.0.mlp.experts.gate_up_proj") == null);
     try t.expect(weights.get("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight") == null);
@@ -8176,10 +8191,10 @@ test "a streamed load that fails mid-transform frees the tensor it was holding" 
             return n;
         }
     };
-    try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused));
+    try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false));
     const before = FdProbe.count(io);
     for (0..8) |_| {
-        try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused));
+        try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused, false));
     }
     const after = FdProbe.count(io);
     try t.expect(after <= before + 1);
@@ -8205,7 +8220,7 @@ test "the streamed load drops the MTP head the ledger bills at zero" {
     @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
 
-    var weights = try loadWeightsStreaming(io, allocator, path_buf[0..path_len], .bf16_fused);
+    var weights = try loadWeightsStreaming(io, allocator, path_buf[0..path_len], .bf16_fused, false);
     defer weights.deinit();
     try t.expect(weights.get("language_model.model.layers.0.mlp.gate.weight") != null);
     var it = weights.map.iterator();

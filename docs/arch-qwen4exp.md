@@ -31,8 +31,8 @@ hidden 2560, expert intermediate 640.
   `hyper_connection_mixer` replaces `model.norm`. The residual stream is bf16 like the checkpoint; the f32 fixture
   is the MATH oracle (`QWEN4_STREAM_F32=1`).
 - **Module state is READ-ONLY**: text slots batch-decode (`forwardMoeBatchedDecode`), prefix cache ON. Vision
-  (Qwen3-VL tower, `model.visual.` prefix, added at conversion) decodes serially and is excluded from
-  streamed loads.
+  (Qwen3-VL tower, `model.visual.` prefix, added at conversion) decodes serially; a streamed load carries it
+  only under `--vision` ([engine-expert-streaming](engine-expert-streaming.md#vision)).
 - **The deferred PLE leaf is filled before anything evaluates the build**: see [engine-mtp](engine-mtp.md#ple-defer).
   A host token read inside the graph build serialized the build with the GPU.
 - **Decode kernels**: the fused hc read is LATENCY-bound (`SUSHI_HC_FUSED=0`; `hcWrite` DEFERS into the next

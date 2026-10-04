@@ -94,7 +94,8 @@ the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at
 | 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M |
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
-the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD.
+the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
+serves text unless `--vision` loads the vision tower, whose weights then come out of the N GiB.
 
 ## Benchmarks
 

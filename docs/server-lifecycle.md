@@ -110,7 +110,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`model_settings.pick`;
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
-  `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`; a request's own field still applies on top. Design reviews reject "file beats
+  `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >
   `model-settings.json` > the default, per key (`model_settings.pickLaunch`; the one table is
@@ -126,7 +126,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `[pld] on|off (source)` and `/props settings.pld` report what a slot runs (`server.pldReport`): a module-wired arch
   (qwen4_exp) reads `off (module spec wiring)` whatever `--pld` says, since `scheduler.specInitWiring` never runs it.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
-  `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `preserve_thinking`, `think_penalty`, `logit_bias_file`), stamped at BOTH load construction sites and resolved
+  `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
@@ -192,7 +192,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `server.RequestMedia`; `Message` BORROWS. Ownership by PROVENANCE (`{slice, owned}` returns), never
   free-unless-equals-literal.
 - **A media placeholder id occurs in ordinary TEXT**, so a media boundary is gated on the request CARRYING media
-  (`firstMediaPlaceholder(has_media)`); media on a tower-less/streamed load is refused by NAME (`mediaRejectReason`).
+  (`firstMediaPlaceholder(has_media)`); media on a tower-less load is refused by NAME (`mediaRejectReason`; a streamed load without `--vision` names the flag).
 - **Every message's media is decoded and placed where it was sent**: user parts, OpenAI `tool` messages, Anthropic
   `tool_result` blocks, Responses `input_image` (tool outputs too). The wire walk (`readOpenAiMessages`,
   `readAnthropicMessages`, `responses.parseInput`) records each part's offset in the joined text

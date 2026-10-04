@@ -259,6 +259,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   image does not fit is a named 400. The stream is evaluated per block so one block's buffers are the peak:
   measured 57 / 1645 / 1686 MB at 196 / 8160 / 9216 patches against bills of 111 / 1905 / 2143 MB. Without the
   per-block eval the lazy graph held 508 MB even at 196 patches.
+- A streamed load carries the tower only under `--vision`, billed in the ssd budget
+  ([engine-expert-streaming](engine-expert-streaming.md#vision)).
 - Video (MM:SS timestamp text between 2-frame groups) and audio are not wired.
 
 ## Bills (the bill follows the storage in the SAME commit)

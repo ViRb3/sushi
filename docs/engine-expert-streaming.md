@@ -39,7 +39,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 - Rate-group (`.gN`) and pruned EXL3 packs are refused by name (`Exl3RateGroupsStreamingUnsupported`,
   `Exl3RaggedStreamingUnsupported`) and serve resident: an open gap, not the design.
-- Vision is not loaded under streaming: every streamed model serves text only.
+- Vision is off under streaming unless asked for ([below](#vision)); a streamed model then serves text only.
 - GLM's routed experts go through `glm5_stream.Stream`: BF16 source experts through the clamped `gather_mm`
   composite, EXL3 banks through the resident `routedExl3` dispatch; router ids become slot ids, scores, clamps and
   the FP32 reduction are untouched, and each layer completes before its slabs are reused.
@@ -61,17 +61,41 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   for every window of the batch, so a batch reads each MoE layer once (GLM BF16: 14.50 GB per layer, 608.8 GB per
   batch). Slot position does not change the gather's result, so output stays byte-identical.
 
+<a id="vision"></a>
+## Vision (`--vision`)
+
+- **A streamed load leaves the tower off by default** and logs what it would cost (`[vision] off under expert
+  streaming; pass --vision to load the tower (+X GB, -N slots/layer)`); an image is then a 400 naming `--vision`.
+  `--vision` or a per-model `vision: true` loads it (`--no-vision` > `--vision`/`vision` > default; both flags at
+  once are refused). A resident load keeps its tower on by default and takes `--vision` as a no-op.
+- **The tower is resident and billed in the ledger** (`vision` term, `resolveStreamedVision`): the expert cache
+  shrinks by its weights. A budget that cannot hold it beside two slots per layer is `SsdBudgetBelowVision` (503).
+- **The encode transient is not reserved.** The load proves the largest single image the tower's processor admits
+  (`server.largestImageEncodeBytes`) beside the budget: `budget + planned KV + that encode <= wired limit`, else
+  `SsdBudgetExceedsWiredLimit`. Every request is then billed live like a resident one (`towerFitFault`); its vision
+  tokens ride the prompt's admission bill.
+- The forward splices the rows the same way streamed or resident (the embedding step is shared): greedy bytes match.
+- `/props settings.vision` reports `loaded`, `source` and the streamed tower and encode bytes.
+
+| Model | Tower (stored) | Largest image (patches) | Encode bill |
+|---|---:|---|---:|
+| Qwen3.8-Flash-Next packs, BF16 source | 897,862,112 B | 1,003,520 px default bound (3,920) | 1.77 GB |
+| MiMo-V2.6-Flash 2.3bpw | 1,457,188,864 B | 1536² engine cap (9,216) | 2.26 GB |
+| GLM-5.3-Flash 2.3/2.5bpw (affine tower) | 493,389,824 B | 8,000 merged tokens (32,000) | ~5.8 GB |
+| GLM-5.3-Flash BF16 source | 1,127,254,016 B | 8,000 merged tokens (32,000) | ~5.8 GB |
+
 ## Budget
 
 - `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident
-  target of N GiB = trunk + MTP + the all-experts union workspace + selected slab + bounce; the remainder is a uniform
-  per-layer LRU. `--expert-cache-gb` overrides (decimal GB of expert cache).
+  target of N GiB = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
+  bounce; the remainder is a uniform per-layer LRU. `--expert-cache-gb` overrides (decimal GB of expert cache).
 - Precedence: `--expert-cache-gb` > `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming all three.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit
   `--prefill-chunk` only lowers the floor the load proves.
-- Admission `budget + planned KV <= wired limit`; the refusal names the `iogpu.wired_limit_mb` that would admit.
+- Admission `budget + planned KV (+ the largest image encode under --vision) <= wired limit`; the refusal names the
+  `iogpu.wired_limit_mb` that would admit.
   Planned KV is the session bill per token (KV at its width plus Qwen's QSA history or GLM's pooled index) times the
   planned context. Under `--no-mtp` the head is not loaded at all.
 - An imatrix capture's accumulators live in GPU headroom that admission reads: budgets for capture runs drop

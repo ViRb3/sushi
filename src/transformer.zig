@@ -74829,7 +74829,7 @@ test "mimo v2 mixed-precision streamed and resident forwards agree" {
     defer config.deinit(a);
     var resident_weights = try model_mod.loadWeights(io, a, path);
     defer resident_weights.deinit();
-    var streamed_weights = try model_mod.loadWeightsStreaming(io, a, path, .mxfp4_split);
+    var streamed_weights = try model_mod.loadWeightsStreaming(io, a, path, .mxfp4_split, false);
     defer streamed_weights.deinit();
     const per_expert = try expert_stream_mod.mxfp4ExpertBytes(config.hidden_size, config.moe_intermediate_size);
     var stream_config = config;

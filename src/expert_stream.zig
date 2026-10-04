@@ -157,6 +157,7 @@ pub const BudgetLedger = struct {
     budget_bytes: u64,
     trunk_bytes: u64,
     mtp_bytes: u64,
+    vision_bytes: u64,
     workspace_bytes: u64,
     selected_bytes: u64,
     bounce_bytes: u64,
@@ -169,12 +170,14 @@ pub fn budgetOverriddenByExplicitCache(explicit_cache_bytes: u64, budget_bytes: 
 }
 
 /// The budget is the TOTAL resident target (GiB, the `--ssd-budget-gb` unit); the expert
-/// cache is what remains after trunk, MTP, the all-experts union workspace, the selected
-/// slab and the bounce buffers. The PLE table is a disk gather and is never billed.
+/// cache is what remains after trunk, MTP, the vision tower with its encode reserve, the
+/// all-experts union workspace, the selected slab and the bounce buffers. The PLE table is a
+/// disk gather and is never billed.
 pub fn budgetLedger(
     budget_bytes: u64,
     trunk_bytes: u64,
     mtp_bytes: u64,
+    vision_bytes: u64,
     layers: u16,
     experts: u16,
     top_k: u16,
@@ -184,7 +187,7 @@ pub fn budgetLedger(
     if (layers == 0 or experts == 0 or top_k == 0 or expert_bytes == 0) return error.InvalidExpertGeometry;
     const workspace_bytes = @as(u64, experts) *| expert_bytes;
     const selected_bytes = @as(u64, @min(top_k, experts)) *| expert_bytes;
-    const fixed = trunk_bytes +| mtp_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes;
+    const fixed = trunk_bytes +| mtp_bytes +| vision_bytes +| workspace_bytes +| selected_bytes +| bounce_bytes;
     if (fixed >= budget_bytes) return error.SsdBudgetBelowResident;
     const per_slot = @as(u64, layers) *| expert_bytes;
     const slots_u64 = @min((budget_bytes - fixed) / per_slot, experts);
@@ -194,6 +197,7 @@ pub fn budgetLedger(
         .budget_bytes = budget_bytes,
         .trunk_bytes = trunk_bytes,
         .mtp_bytes = mtp_bytes,
+        .vision_bytes = vision_bytes,
         .workspace_bytes = workspace_bytes,
         .selected_bytes = selected_bytes,
         .bounce_bytes = bounce_bytes,
@@ -1958,7 +1962,7 @@ test "expert stream ssd budget ledger derives the cache and refuses by name" {
     const bounce: u64 = 8 * 64 * 1024 * 1024;
     const trunk: u64 = 9_900_000_000;
 
-    const led = try budgetLedger(100 * GiB, trunk, 0, 48, 512, 10, expert_bytes, bounce);
+    const led = try budgetLedger(100 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce);
     try t.expectEqual(@as(u64, 512 * expert_bytes), led.workspace_bytes);
     try t.expectEqual(@as(u64, 10 * expert_bytes), led.selected_bytes);
     try t.expectEqual(@as(u64, 0), led.mtp_bytes);
@@ -1967,15 +1971,21 @@ test "expert stream ssd budget ledger derives the cache and refuses by name" {
     try t.expectEqual(@as(u16, 194), led.slots_per_layer);
     try t.expectEqual(@as(u64, 194) * 48 * expert_bytes, led.cache_bytes);
 
-    const with_mtp = try budgetLedger(100 * GiB, trunk, 5_200_000_000, 48, 512, 10, expert_bytes, bounce);
+    const with_mtp = try budgetLedger(100 * GiB, trunk, 5_200_000_000, 0, 48, 512, 10, expert_bytes, bounce);
     try t.expectEqual(@as(u16, 183), with_mtp.slots_per_layer);
 
-    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(14 * GiB, trunk, 0, 48, 512, 10, expert_bytes, bounce));
+    // The vision tower and its encode reserve come out of the budget before the expert slots.
+    const with_vision = try budgetLedger(100 * GiB, trunk, 0, 5_200_000_000, 48, 512, 10, expert_bytes, bounce);
+    try t.expectEqual(@as(u64, 5_200_000_000), with_vision.vision_bytes);
+    try t.expectEqual(@as(u16, 183), with_vision.slots_per_layer);
+
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(14 * GiB, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce));
     const fixed = trunk + 512 * expert_bytes + 10 * expert_bytes + bounce;
     const per_slot = 48 * expert_bytes;
-    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot - 1, trunk, 0, 48, 512, 10, expert_bytes, bounce));
-    const two = try budgetLedger(fixed + 2 * per_slot, trunk, 0, 48, 512, 10, expert_bytes, bounce);
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot - 1, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce));
+    const two = try budgetLedger(fixed + 2 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce);
     try t.expectEqual(@as(u16, 2), two.slots_per_layer);
+    try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot, trunk, 0, 1, 48, 512, 10, expert_bytes, bounce));
 
     try t.expect(!budgetOverriddenByExplicitCache(0, 100 * GiB));
     try t.expect(!budgetOverriddenByExplicitCache(60_000_000_000, 0));
@@ -3251,7 +3261,7 @@ fn checkMimoExl3Streaming(runtime: bool) !void {
     const per = try expertBytesFor(t.allocator, path, geometry, .exl3_k4);
     try t.expectEqual(try exl3ExpertBytes(geometry), per);
     const fixed = (1 << 20) + 4 * per + 2 * per + BOUNCE_BYTES;
-    const ledger = try budgetLedger(fixed + 4 * per, 1 << 20, 0, moeLayerCount(geometry), 4, 2, per, BOUNCE_BYTES);
+    const ledger = try budgetLedger(fixed + 4 * per, 1 << 20, 0, 0, moeLayerCount(geometry), 4, 2, per, BOUNCE_BYTES);
     try t.expectEqual(@as(u16, 2), ledger.slots_per_layer);
     try t.expectEqual(fixed + ledger.cache_bytes, ledger.budget_bytes);
     var store = try ExpertStore.openLayout(t.allocator, path, geometry, .exl3_k4);

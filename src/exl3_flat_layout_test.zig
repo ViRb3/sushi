@@ -293,6 +293,12 @@ test "flat EXL3 resident split drops co-located routed banks and isolates MTP" {
     // tensors, the MTP routed tensor, and model.visual are not trunk bytes.
     try std.testing.expectEqual(@as(u64, 3136), split.trunk);
     try std.testing.expectEqual(@as(u64, 1024), split.mtp);
+    try std.testing.expectEqual(@as(u64, 4), split.vision);
+    for ([_]bool{ false, true }) |vision| {
+        var weights = try model.loadWeightsStreaming(io, allocator, model_path, .exl3_k4, vision);
+        defer weights.deinit();
+        try std.testing.expectEqual(vision, weights.get("model.visual.fake") != null);
+    }
 }
 
 test "Sushi quant memory bills resident routed banks and enabled vision and MTP exactly" {
@@ -388,7 +394,7 @@ test "EXL3 streaming CPU Sushi geometry ledger at 20 GiB bills every bank" {
     for ([_]u32{ 32, 42, 48, 64 }) |n| {
         const per = try stream.exl3ExpertBytes(.{ .layers = 48, .experts = 512, .hidden = 2560, .intermediate = 640, .exl3_n = n });
         try std.testing.expectEqual(@as(u64, 38400) * n + 19200, per);
-        const ledger = try stream.budgetLedger(20 << 30, 6 << 30, 0, 48, 512, 10, per, stream.BOUNCE_BYTES);
+        const ledger = try stream.budgetLedger(20 << 30, 6 << 30, 0, 0, 48, 512, 10, per, stream.BOUNCE_BYTES);
         const fixed = (6 << 30) + 512 * per + 10 * per + stream.BOUNCE_BYTES;
         try std.testing.expectEqual(@min(512, ((20 << 30) - fixed) / (48 * per)), ledger.slots_per_layer);
         try std.testing.expect(fixed + ledger.cache_bytes <= 20 << 30);
