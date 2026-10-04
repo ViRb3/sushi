@@ -146,6 +146,9 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
   discarding RAM); writes ride `kv_disk_writer.zig` (FIFO, `meta.json` last, epoch fence at the ONE removal site);
   per-chunk write-through; a diverging turn hard-links the donor's LANDED chunks; a full-prefix hit CHECKS the entry
   OUT so the first append donates.
+- **The free-space probe runs only before an actual store** (after the superseded check): the idle spill commits every
+  idle entry at each request finish, so a copy already on disk must cost no probe; below the store floor it still
+  counts as persisted.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
   below every refusal; `releaseCheckout` hands an undonated entry back intact).
 - **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's

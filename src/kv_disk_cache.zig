@@ -161,8 +161,12 @@ var test_space: ?VolumeSpace = null;
 var test_qsa_overlay_mismatch = false;
 var test_ssm_write_qsa_aux = false;
 
+/// How many free-space probes the test hook answered.
+var test_space_probes: usize = 0;
+
 fn testSpaceProbe(path: []const u8) ?VolumeSpace {
     _ = path;
+    test_space_probes += 1;
     return test_space;
 }
 
@@ -1401,11 +1405,6 @@ pub const DiskTier = struct {
             return .skipped;
         }
 
-        // Re-derive the budget from free space before every store.
-        if (self.ssd_first) self.refreshDiskBudget();
-        // The refresh gates THIS store, not merely the next one.
-        if (self.store_declined) return .skipped;
-
         // Superseded check: an existing entry that already covers `tokens`
         // (same key, tokens is a prefix of its tokens, kv already >= ours)
         // makes this commit a no-op — UNLESS the entry is hybrid and still has
@@ -1441,6 +1440,10 @@ pub const DiskTier = struct {
                 extend_idx = i;
             }
         }
+        // Re-derive the budget before every store, and only a store: the probe is slow and the idle
+        // spill reaches this point once per idle entry. It also gates the SSM-only append.
+        if (self.ssd_first) self.refreshDiskBudget();
+        if (self.store_declined) return .skipped;
         if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs, s);
 
         const sw = io_util.Stopwatch.init(self.io);
@@ -6800,6 +6803,61 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     try testing.expect(!tier.store_declined);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
+}
+
+test "DiskTier: the free-space probe runs only before a store, never for a copy already on disk" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-probe", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    const roomy: u64 = 1024 * 1024 * 1024 * 1024;
+    tier.armTestSpace(roomy, 2 * roomy);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var p = test_space_probes;
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    tier.drainWriter();
+    try testing.expect(test_space_probes > p);
+
+    // Unchanged recommit: the tier already holds it.
+    p = test_space_probes;
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s));
+    try testing.expectEqual(p, test_space_probes);
+
+    // Pending spec work is a store.
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    const snap: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    p = test_space_probes;
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, null, null, snap, s);
+    tier.drainWriter();
+    try testing.expect(test_space_probes > p);
+
+    // An extension is a store.
+    p = test_space_probes;
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(test_space_probes > p);
+
+    // Below the store floor a copy already on disk still counts; a new entry declines.
+    tier.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s));
+    var other: [640]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    try testing.expectEqual(PersistOutcome.skipped, try tier.appendCommit(cache.entries, 640, cache.config, &other, false, null, s));
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
 }
 
 test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-first itself bumps no manifest)" {
