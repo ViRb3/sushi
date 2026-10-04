@@ -321,6 +321,8 @@ const Ledger = struct {
             }
         } else |err| {
             if (err != error.FileNotFound) return err;
+            // Only a fresh run refuses rows it did not write; a resume owns its hidden files and truncates them.
+            if (run_value.hidden_out.len != 0 and try hidden_capture.holdsData(run_value.hidden_out, run_value.hidden_boundaries)) return error.GlmLayerMajorHiddenNotEmpty;
             try cwd.createDir(io, staging, .default_dir);
             const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{manifest});
             defer a.free(tmp);
@@ -469,11 +471,7 @@ const Ledger = struct {
             errdefer a.free(id);
             try records.append(a, .{ .id = id, .dir = try a.dupe(u8, r.dir), .prompt_tokens = r.tokens, .generated_tokens = 1, .strict_nll_mean = nll, .strict_perplexity = @exp(nll) });
         }
-        if (b.hidden) |w| {
-            if (self.records.len == 0) {
-                if (!try w.isEmpty()) return error.GlmLayerMajorHiddenNotEmpty;
-            } else try w.truncateTo(self.committed_tokens);
-        }
+        if (b.hidden) |w| try w.truncateTo(self.committed_tokens);
         var next = self.records.len;
         var offset = self.committed_tokens;
         const run_clock = @import("expert_stream.zig").Clock.init();
@@ -1127,6 +1125,32 @@ test "GLM layer-major resume refuses a mutated, deleted or truncated committed t
     try tiny.capture(a, try tiny.opts("run", 2));
     try tiny.capture(a, try tiny.opts("window-major", 0));
     try tiny.expectSame("window-major", "run");
+}
+
+test "GLM layer-major capture interrupted inside its first batch resumes to the uninterrupted bytes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    try tiny.capture(a, try tiny.opts("window-major", 0));
+    interrupt_boundaries_for_test = 3 + 5;
+    try std.testing.expectError(error.TestInterrupted, tiny.capture(a, try tiny.opts("resumed", 3)));
+    interrupt_boundaries_for_test = null;
+    try std.testing.expectEqual(@as(usize, 0), (try tiny.read("resumed.partial/windows.jsonl")).len);
+    try std.testing.expect((try tiny.read("resumed-hidden/boundary-00.bin")).len > 0);
+    try tiny.capture(a, try tiny.opts("resumed", 2));
+    try tiny.expectSame("window-major", "resumed");
+}
+
+test "GLM layer-major capture refuses a hidden directory that already holds rows, and keeps refusing" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    try tiny.tmp.dir.createDirPath(std.testing.io, "run-hidden");
+    try tiny.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "run-hidden/boundary-02.bin", .data = "stale" });
+    for (0..2) |_| try std.testing.expectError(error.GlmLayerMajorHiddenNotEmpty, tiny.capture(a, try tiny.opts("run", 2)));
+    try std.testing.expectEqualStrings("stale", try tiny.read("run-hidden/boundary-02.bin"));
 }
 
 test "GLM layer-major capture idles on its pause file and continues when it is removed" {

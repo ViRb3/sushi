@@ -115,17 +115,29 @@ pub const Writer = struct {
         if (std.c.fsync(self.tokens) != 0) return error.HiddenCaptureSyncFailed;
     }
 
-    pub fn isEmpty(self: *const Writer) !bool {
-        for (self.boundaries) |fd| if (try fdBytes(fd) != 0) return false;
-        return try fdBytes(self.tokens) == 0;
-    }
-
     /// Drops whatever an interrupted run appended past `tokens` committed tokens; a file shorter than that is refused.
     pub fn truncateTo(self: *Writer, tokens: u64) !void {
         for (self.boundaries) |fd| try truncateFd(fd, tokens * self.hidden * 2);
         try truncateFd(self.tokens, tokens * 4);
     }
 };
+
+/// Whether any capture file of `dir` (boundaries 0..`boundaries`-1 and `tokens.bin`) holds bytes.
+pub fn holdsData(dir: []const u8, boundaries: usize) !bool {
+    var name: [32]u8 = undefined;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (0..boundaries + 1) |b| {
+        const leaf = if (b == boundaries) "tokens.bin" else try std.fmt.bufPrint(&name, "boundary-{d:0>2}.bin", .{b});
+        const fd = std.c.open(try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, leaf }, 0), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) {
+            if (std.c._errno().* == @intFromEnum(std.c.E.NOENT)) continue;
+            return error.HiddenCaptureOpenFailed;
+        }
+        defer _ = std.c.close(fd);
+        if (try fdBytes(fd) != 0) return true;
+    }
+    return false;
+}
 
 fn fdBytes(fd: std.c.fd_t) !u64 {
     var st: std.c.Stat = undefined;

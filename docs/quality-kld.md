@@ -59,8 +59,10 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
   directory, engine binary hash); `windows.jsonl` gains a line per window only after its logits and boundary rows
   (and its `prompt_tokens.txt` / `generated_tokens.txt`) are synced. Rerunning the command re-hashes every
   committed window (inputs, logits, boundary rows, `tokens.bin`) and compares both token files with the committed
-  record, truncates the hidden files to the committed tokens and continues; a changed, truncated or missing window
-  file or another run is refused (`GlmLayerMajorWindowChanged`, `GlmLayerMajorResumeMismatch`). While P exists the capture idles between batches
+  record, truncates the hidden files to the committed tokens (zero too: an interruption inside the first batch
+  resumes) and continues; a changed, truncated or missing window file or another run is refused
+  (`GlmLayerMajorWindowChanged`, `GlmLayerMajorResumeMismatch`). A hidden directory that already holds rows is
+  refused only by a fresh run (`GlmLayerMajorHiddenNotEmpty`), before its staging exists. While P exists the capture idles between batches
   and writes `P.ack`. A volume without room for every remaining boundary, id and logits row plus 16 GiB is refused
   before the first batch (`GlmLayerMajorDiskTooSmall`).
 
