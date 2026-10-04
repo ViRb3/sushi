@@ -3,7 +3,7 @@
 #
 # CLAUDE.md already bans stdout from a test: under `zig build test` fd 1 is the
 # build runner's protocol pipe and one stray byte hangs the runner forever.
-# stderr is not free either. The pinned Zig nightly reports ANY stderr a test
+# stderr is not free either. Zig 0.17 reports ANY stderr a test
 # step produced through its failure renderer, so a suite that passed 69/69
 # prints
 #

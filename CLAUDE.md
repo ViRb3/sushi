@@ -70,7 +70,7 @@ Skills: `/release` (SemVer, CHANGELOG), `/bench` (llmprobe methodology, comparis
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES
+Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx + mlx-c PINNED SUBMODULES
 (`lib/mlx-src` 64ea011c / v0.32.3, `lib/mlxc-src` 56b2d39: mlx-serve's pins) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/`
 (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0) as `lib/jinja_cpp/libjinja.a`; safetensors; BPE; `stb_image`
 + libwebp decode image INPUT. Min macOS 26.2; NAX kernels need the 26.2 deployment target (asserted by
@@ -112,10 +112,9 @@ lists the rest.
 
 ## Building
 
-- First-time: `./scripts/fetch-zig.sh` stages the pinned Zig (`0.17.0-dev.2248`) at `.zig-toolchain/`; ziglang.org
-  drops old nightlies, so a 404 means bump the pin. A git worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink
-  both from the main checkout (fetch-zig replaces a stale link with its own copy). After a toolchain/SDK change
-  `rm -rf .zig-cache` (configure-time output is cached).
+- First-time: `./scripts/fetch-zig.sh` stages the pinned Zig (`0.17.0`, sha256-checked) at `.zig-toolchain/`. A git
+  worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink both from the main checkout (fetch-zig replaces a stale
+  link with its own copy). After a toolchain/SDK change `rm -rf .zig-cache` (configure-time output is cached).
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
   `zig build test` does NOT refresh `zig-out/bin/sushi` — rebuild before any live A/B.
 - mlx + mlx-c: `scripts/build-mlx.sh`. Bump = checkout tag → `git add` the submodule → rerun → re-diff `src/mlx.zig` externs against
@@ -138,7 +137,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 
 - **A test never writes to stdout** (stderr only): under `zig build test` fd 1 is the build runner's protocol pipe;
   one stray line hangs the runner while the standalone binary passes.
-- **A PASSING test prints NOTHING, on either stream**: the pinned nightly renders any test stderr through its failure
+- **A PASSING test prints NOTHING, on either stream**: Zig 0.17 renders any test stderr through its failure
   renderer (`failed command: … --listen=-`, exit 0), which reads as a failed suite. Diagnostics ride an env switch
   (`SUSHI_EXL3_LAYER_UBENCH`). Guard: `tests/test_test_runner_quiet.sh`.
 - **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour.

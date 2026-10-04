@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Source builds use the Zig 0.17.0 release** instead of a 0.17 nightly; `scripts/fetch-zig.sh` checks its sha256.
 - **Concurrent GLM-5.3 requests no longer over-admit or publish EOS**: a later request now waits while earlier ones
   still owe cache growth, and a DFlash2 request that sampled EOS first finishes without emitting it beside others.
 - **GLM-5.3-Flash's FP8 release streams its experts from SSD** as stored FP8 codes and block scales, in `serve`, `run`

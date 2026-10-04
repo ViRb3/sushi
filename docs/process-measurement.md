@@ -102,7 +102,7 @@ local path.
 
 ## Build environment notes
 
-- ziglang.org keeps only recent Zig nightlies: when `scripts/fetch-zig.sh` 404s, pin a newer one that builds and
-  passes the full suite.
+- A Zig bump changes `ZIG_VERSION` and the sha256 table in `scripts/fetch-zig.sh` together, and lands only on a tree
+  that builds and passes the full suite.
 - A git worktree has neither `.zig-toolchain/` nor the built `lib/mlx/`: symlink both from the main checkout.
 - `lib/mlx-src` and `lib/mlxc-src` are the only submodules; they are needed only to rebuild MLX.

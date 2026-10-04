@@ -1,22 +1,10 @@
 #!/usr/bin/env bash
-# Fetch the pinned Zig nightly and stage it at .zig-toolchain/ (stable path,
-# independent of the version string in the tarball's own top-level dir name).
-#
-# 0.17.0 isn't tagged stable yet (homebrew's `zig` formula still ships
-# 0.16.0), and 0.16.0's bundled libc++ fails to compile against the macOS 27
-# SDK (`use of undeclared identifier 'INFINITY'` in its vendored <random> —
-# see build.zig's version-gate comptime block). Fixed upstream by 0.17.0-dev;
-# this script pins the exact dev snapshot until 0.17.0 stable ships, at which
-# point ZIG_VERSION should drop back to a plain "0.17.0" and this script can
-# eventually retire in favor of the homebrew formula again.
-#
-# This is the single source of truth for the pinned Zig version. Bump
-# ZIG_VERSION to upgrade; CI and local builds re-fetch automatically.
-# ziglang.org/builds keeps only recent nightlies: when the download 404s, pin
-# a newer one that the build and the full test suite accept.
+# Fetch the pinned Zig release, check its sha256, and stage it at .zig-toolchain/
+# (a stable path, whatever the tarball's own top-level dir is called). This is the
+# single source of truth for the Zig version: CI and local builds refetch on a bump.
 set -euo pipefail
 
-ZIG_VERSION="${ZIG_VERSION:-0.17.0-dev.2248+3f6a02acd}"
+ZIG_VERSION="0.17.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -46,13 +34,25 @@ case "$(uname -s)" in
 esac
 
 ASSET="zig-${ARCH}-${OS}-${ZIG_VERSION}.tar.xz"
-URL="https://ziglang.org/builds/${ASSET}"
+URL="https://ziglang.org/download/${ZIG_VERSION}/${ASSET}"
+# sha256 of each release tarball (minisign-verified); update them with ZIG_VERSION.
+case "$ARCH-$OS" in
+  aarch64-macos) SHA256="b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a" ;;
+  x86_64-macos) SHA256="4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6" ;;
+  aarch64-linux) SHA256="9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8" ;;
+  x86_64-linux) SHA256="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026" ;;
+esac
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "[fetch-zig] downloading $URL"
 curl -fSL --retry 3 -o "$TMP/zig.tar.xz" "$URL"
+GOT="$(shasum -a 256 "$TMP/zig.tar.xz" | cut -d' ' -f1)"
+if [ "$GOT" != "$SHA256" ]; then
+  echo "[fetch-zig] ERROR: $ASSET sha256 $GOT, expected $SHA256" >&2
+  exit 1
+fi
 
 echo "[fetch-zig] extracting"
 tar xf "$TMP/zig.tar.xz" -C "$TMP"

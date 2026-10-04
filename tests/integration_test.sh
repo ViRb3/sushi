@@ -88,7 +88,7 @@ trap cleanup EXIT
 # ── Build ──
 # ReleaseFast, never bare `zig build`: a Debug binary is 2-4x slower AND it
 # overwrites zig-out/bin/sushi, so a later perf run silently measures Debug.
-# Prefer the pinned toolchain — brew's 0.16.0 cannot build this tree at all.
+# Prefer the pinned toolchain over whatever `zig` is on PATH.
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo -e "${YELLOW}Building (ReleaseFast)...${NC}"
     ZIG="zig"

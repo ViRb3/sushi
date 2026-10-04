@@ -33,7 +33,7 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Install Zig (pinned nightly)
+      - name: Install Zig (pinned)
         run: |
           bash scripts/fetch-zig.sh
           echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
