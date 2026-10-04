@@ -84,18 +84,22 @@ architectures need their own measured envelope. These runs do not simulate a 64 
 
 ## Context and chunk
 
-- **Auto-context is PINNED at load** (`pinAutoContext`, 85% margin on the memory ceiling); ask
-  `getEffectiveContextLength`. It bills KV at the CONFIGURED width and activations ONCE.
+- **Auto-context is PINNED at load** (`pinAutoContext`, 85% margin on the memory ceiling, 93% on GLM, whose
+  admission refuses past its exact bill); ask `getEffectiveContextLength`. It bills KV at the CONFIGURED width and
+  activations ONCE.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
-- GLM's chunk is the widest rung up to 2048 that costs no admissible context: the same bill `max_safe_context` and
-  admission charge picks it, not a quarter of free memory ([arch-glm5-next](arch-glm5-next.md#memory)).
+- GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
+  as much context as 512: the `max_safe_context` bill picks it, not a quarter of free memory
+  ([arch-glm5-next](arch-glm5-next.md#memory)).
 - The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
-- A per-request arch (`perRequestPrefillChunk`: qwen4_exp and the ringed mimo_v2) re-picks the width for every
-  request: the widest rung whose admission bill fits live memory (`chooseRequestPrefillChunk`), stepping down per
-  chunk under pressure; the load-time pin is only the fallback. `boundedPrefillChunk` still caps the rung per arch
-  (qk 192: 2048 by default, up to 4096 with an explicit `--prefill-chunk`).
+- A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next) prefills every request
+  from its start width (`prefillStartWidth`: 4096, 2048, 2048; an explicit `--prefill-chunk` sets it instead). Each
+  chunk boundary steps down a rung, never up again, only where the next chunk's cost no longer fits the live
+  headroom beside the KV (`adaptivePrefillWidth`). Admission bills the request's top at the widest rung whose whole
+  bill fits (`chooseRequestPrefillChunk`), so a long prompt is never under-billed; the load-time pin is only the
+  fallback and the width the advertised context is billed at.
 - **The load line names a per-request arch's pin as the fallback** (`prefillChunkLoadLine`: "per request, up to N at
   a short prompt; load-time fallback M"; Flash-Next's bound narrows as the context grows). MiMo's pin swings 512-2048 between boots with the memory active at load (the ungated cap,
   (ceiling - active - hot-cache ask) / 4, is ~4 GiB beside a 3.6 GiB 2048 reserve), while every request up to 256k

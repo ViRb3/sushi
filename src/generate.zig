@@ -2920,14 +2920,14 @@ pub const Generator = struct {
             // below keeps the row scatter chunk-exact. Kill switch restores
             // the whole-prompt forward.
             const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
-            // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
-            // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
+            // Per-chunk adaptive width: the first chunk runs the arch's widest width, and every
+            // boundary re-asks the same estimator. `cap_adapt` is the widest this arch forwards
             // for this prompt, never wider than `ssm_cp_stride`.
             const adapt_chunked = !(has_vision and !vision_chunked);
             // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
             // (installed process-wide).
             const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
-            const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(effectivePrefillChunk(
+            const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(@min(effectivePrefillChunk(
                 xfm.config.prefillScoreHeadDim(),
                 xfm.config.num_attention_heads,
                 total_ctx_for_chunk,
@@ -2935,7 +2935,7 @@ pub const Generator = struct {
                 xfm.config.isMoe(),
                 xfm.config.longCtxGated(),
                 0,
-            ));
+            ), @as(usize, xfm.config.prefillStartWidth())));
             adapt_state.width_min = @intCast(default_chunk);
             adapt_state.width_max = @intCast(default_chunk);
             var cur_chunk: usize = default_chunk;
@@ -2960,6 +2960,18 @@ pub const Generator = struct {
                 if (xfm.qwen4_mtp) |*m| &m.entry else null,
                 @intCast(reserved_tokens),
             );
+            // Admission billed the request's top at `default_chunk`; the chunks before it start at
+            // the widest width and step down only where one no longer fits beside the reserved KV.
+            const start_chunk = if (width_is_adaptive) decodeShareCapped(cap_adapt, options.decode_share_width_cap) else 0;
+            if (start_chunk > cur_chunk) {
+                cur_chunk = start_chunk;
+                adapt_state.width_min = @intCast(start_chunk);
+                adapt_state.width_max = @intCast(start_chunk);
+                if (options.chunk_width_hook) |hk| {
+                    const w = hk.call(hk.ctx, ssm_cp_offset, @intCast(cur_chunk), cap_adapt, &adapt_state);
+                    if (w != 0 and w < cur_chunk) commitAdaptiveWidth(&cur_chunk, &adapt_state, w);
+                }
+            }
 
             var pos: usize = 0;
             if (options.prefill_expected) |e| e.store(@intCast(loop_end), .monotonic);

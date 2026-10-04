@@ -6672,7 +6672,8 @@ fn chunkWidthCb(
     const pick = prefill_chunk_adapt orelse return cur;
     const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
     if (!adaptiveChunkWidthFor(cfg)) return next;
-    return decodeShareWidthCap(next, liveDecodingCount(wc.sch), prefillDecodeShare());
+    const share_cap = prefillShareCapFor(cfg, liveDecodingCount(wc.sch), prefillDecodeShare());
+    return if (share_cap == 0) next else @min(next, share_cap);
 }
 
 /// Called with `mu` held; returns with it held. Drops `mu` while waiting so the

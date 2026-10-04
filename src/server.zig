@@ -2146,13 +2146,13 @@ pub fn serve(
         log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, model_settings.sourceLabel(ctx.source, "--ctx-size") });
     } else {
         const memory_ctx = computeMemoryContext(config);
-        const memory_allows = safeAutoContext(memory_ctx);
+        const memory_allows = safeAutoContextAt(memory_ctx, autoContextPct(config));
         const rope_ctx = config.contextCap();
         if (rope_ctx > 0 and pinned >= rope_ctx) {
             // The checkpoint's own maximum binds; memory had room to spare.
             log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
         } else {
-            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, auto_ctx_safety_pct, memory_ctx });
+            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, autoContextPct(config), memory_ctx });
         }
     }
 
@@ -2787,6 +2787,13 @@ fn handleConnection(
 /// Metal OOM it would eventually hit is uncatchable (see the auto-context
 /// gotcha). Reserve headroom instead.
 const auto_ctx_safety_pct: u32 = 85;
+/// GLM's admission bills every request exactly and refuses past it, so its advertised context keeps a thinner
+/// margin: the smallest at which Sushi-2.5bpw at release defaults advertises 1,048,576 at 2048-row chunks.
+const glm_auto_ctx_safety_pct: u32 = 93;
+
+fn autoContextPct(config: *const model_mod.ModelConfig) u32 {
+    return if (config.isGlm5()) glm_auto_ctx_safety_pct else auto_ctx_safety_pct;
+}
 
 /// PURE: apply the safety margin and round down to a 1024 boundary so the
 /// number reads sanely in logs and client configs. Never returns 0.
@@ -2797,7 +2804,11 @@ const auto_ctx_safety_pct: u32 = 85;
 /// 15% off a 131,072-token model that comfortably fits in RAM just throws
 /// context away.
 fn safeAutoContext(raw: u32) u32 {
-    const scaled: u64 = (@as(u64, raw) * auto_ctx_safety_pct) / 100;
+    return safeAutoContextAt(raw, auto_ctx_safety_pct);
+}
+
+fn safeAutoContextAt(raw: u32, pct: u32) u32 {
+    const scaled: u64 = (@as(u64, raw) * pct) / 100;
     const rounded: u64 = (scaled / 1024) * 1024;
     if (rounded == 0) return @intCast(@max(scaled, 1));
     return @intCast(rounded);
@@ -2812,13 +2823,13 @@ fn safeAutoContext(raw: u32) u32 {
 /// The context the server advertises, from the largest context memory alone allows (85%
 /// margin on the memory number, checkpoint cap afterwards). Shared by the load-time session
 /// bill and the boot-time sizer so the two cannot spell the relation two ways.
-fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
-    const with_headroom = safeAutoContext(memory_ctx);
+fn autoContextFrom(memory_ctx: u32, ctx_cap: u32, pct: u32) u32 {
+    const with_headroom = safeAutoContextAt(memory_ctx, pct);
     return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
 }
 
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    return autoContextFrom(computeMemoryContext(config), config.contextCap());
+    return autoContextFrom(computeMemoryContext(config), config.contextCap(), autoContextPct(config));
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -3545,18 +3556,21 @@ pub fn resolvePrefillChunk(
     return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
 }
 
-/// GLM's widest rung, at most its numerics width, that admits the same capped context as the
+/// GLM's widest rung, at most its numerics width, that advertises the same auto context as the
 /// narrowest: the bill `max_safe_context` and admission charge decides, not a share of free memory.
 fn glmPrefillChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64) u32 {
     const narrowest = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
-    const cap = if (config.contextCap() > 0) config.contextCap() else std.math.maxInt(u32);
-    const floor = @min(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, narrowest), cap);
+    const floor = glmAdvertisedContextAt(config, kv_bits, ceiling, active_mem, narrowest);
     for (PREFILL_CHUNK_LADDER) |chunk| {
         // A rung wider than this would make output depend on whether an assistant loaded.
         if (chunk > @import("glm5_forward.zig").prefill_chunk) continue;
-        if (@min(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), cap) >= floor) return chunk;
+        if (glmAdvertisedContextAt(config, kv_bits, ceiling, active_mem, chunk) >= floor) return chunk;
     }
     return narrowest;
+}
+
+fn glmAdvertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
+    return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap(), autoContextPct(config));
 }
 
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
@@ -3880,7 +3894,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
 /// request prices its own rung against live memory, so the pin is only the fallback.
 pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pinned: u32, launch: usize) ?[]const u8 {
     if (perRequestPrefillChunkEnabled(config) and generate_mod.envPrefillChunk() == 0) {
-        const widest = rungWidth(config, 1, PREFILL_CHUNK_LADDER[0], config.longCtxGated());
+        const widest = rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated());
         return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d} (SUSHI_PREFILL_CHUNK_PER_REQUEST=0)\n", .{ widest, pinned }) catch null;
     }
     if (pinned >= launch) return null;
@@ -3994,6 +4008,7 @@ pub fn resolvedContextForLoad(
     transient_reserve: u64,
     per_tok: u64,
     ctx_cap: u32,
+    margin_pct: u32,
 ) u32 {
     if (explicit_ctx > 0) return explicit_ctx;
     if (pinned_ctx > 0) return pinned_ctx;
@@ -4003,7 +4018,7 @@ pub fn resolvedContextForLoad(
         cache_reserve +| transient_reserve,
         per_tok,
         0,
-    ), ctx_cap);
+    ), ctx_cap, margin_pct);
 }
 
 /// The SSD-first call site. Takes the static ceiling (the budget is a property of the machine),
@@ -4019,6 +4034,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
+        autoContextPct(config),
     );
 }
 
@@ -4097,6 +4113,7 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
+        autoContextPct(config),
     );
 }
 
@@ -4960,16 +4977,16 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
     const cap: u32 = cfg.contextCap();
 
     // The sizing reserve is a constant, so the answer cannot move with the ask.
-    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
-    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, auto_ctx_safety_pct);
+    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expectEqual(ctx_default, ctx_big_ask);
     try t.expect(ctx_default > 900_000); // a real context, not the floor
 
     // The defect, both spellings: sizing against the granted budget...
-    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
+    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expect(vs_granted <= 1024);
     // ...and against the raw ask, which saturates usable to zero.
-    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
+    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expect(vs_raw_ask <= 1024);
     try t.expect(ctx_default > vs_granted * 500);
 }
@@ -5060,6 +5077,7 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     const advertised = autoContextFrom(
         safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
         cfg.contextCap(),
+        auto_ctx_safety_pct,
     );
     try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
 }
@@ -5148,6 +5166,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const advertised = autoContextFrom(
         safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0),
         cfg.contextCap(),
+        auto_ctx_safety_pct,
     );
     const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
     try t.expectEqual(advertised, billed);
@@ -5155,7 +5174,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     // Shown on a tighter box where the checkpoint cap does not bind.
     const tight: u64 = active + 24_000 * MiB;
     const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
-    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
+    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap(), auto_ctx_safety_pct);
     try t.expect(old_billed > billed_t);
     try t.expect(billed > 500_000);
     try t.expect(billed_t > 300_000);
@@ -5284,7 +5303,7 @@ test "an explicit --ctx-size boot never consults the session reserve" {
     for ([_]u64{ 0, CTX_SIZING_CACHE_RESERVE, 99_000 * MiB }) |reserve| {
         try t.expectEqual(
             @as(u32, 262_144),
-            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap()),
+            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap(), auto_ctx_safety_pct),
         );
     }
 
@@ -5297,8 +5316,8 @@ test "an explicit --ctx-size keeps the load-time context byte-identical" {
     const t = std.testing;
     const MiB: u64 = 1 << 20;
     const per_tok: u64 = 20_736;
-    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144));
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576));
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144, auto_ctx_safety_pct));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576, auto_ctx_safety_pct));
 }
 
 test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
@@ -5414,9 +5433,9 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     const available: u64 = 28_909 * MiB;
     const pin = cfg.pinned_prefill_chunk;
 
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
     try t.expect(4096 > pin);
 
     // The full 1M context fits at 4096 on this box under the one-copy history bill.
@@ -5451,6 +5470,7 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
     var prev_width: u32 = 0;
     var distinct: usize = 0;
     for (PREFILL_CHUNK_LADDER) |rung| {
+        if (rung > ladderTop(&cfg, 0)) continue; // above the arch's start width
         const width = widthForRung(&cfg, seq, rung);
         if (width == prev_width) continue; // a rung this arch narrows onto a width already walked
         prev_width = width;
@@ -5491,12 +5511,14 @@ test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by th
     try t.expectEqual(@as(u32, 8192), widthForRung(&cfg, seq, 8192));
     try t.expectEqual(@as(u64, 4096), rungWidth(&cfg, seq, 8192, false));
 
+    // Only an explicit `--prefill-chunk 8192` offers the rung past the 4096 start width.
     const with_margin = wide_bill * (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100;
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 8192, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, 8192, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 8192, .{}));
     // The rungs the gate did not widen are still taken at their plain bill.
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 8192, .{}));
 }
 
 test "prefillMemoryNeeded: the wider chunk bills every chunk-scaled term at the wider width" {
@@ -5545,8 +5567,9 @@ test "chooseRequestPrefillChunk: the explicit flag caps it, the gate outranks it
     const roomy: u64 = 200 * (@as(u64, 1) << 30);
     const pin = cfg.pinned_prefill_chunk;
 
-    // An explicit `--prefill-chunk` caps the ladder: never wider however roomy, the floor when nothing fits.
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    // An explicit `--prefill-chunk` sets the ladder's top: never wider however roomy, the floor when nothing fits.
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 8192, .{}));
     try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 4096, .{}));
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 2048, .{}));
     try t.expectEqual(widthForRung(&cfg, 300_000, 512), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, 0, pin, 2048, .{}));
@@ -6620,8 +6643,9 @@ pub fn chooseRequestPrefillChunk(
     if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
     // `SUSHI_PREFILL_CHUNK` is a tuning pin, forwarded verbatim.
     if (generate_mod.envPrefillChunk() > 0) return explicitPrefillChunk();
+    const top = ladderTop(config, chunk_override);
     for (PREFILL_CHUNK_LADDER) |r| {
-        const rung = cappedRung(r, chunk_override);
+        const rung = cappedRung(r, top);
         const width: u64 = rungWidth(config, seq, rung, config.longCtxGated());
         const bill = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm);
         const needed = if (width > rungWidth(config, seq, rung, false))
@@ -6630,11 +6654,16 @@ pub fn chooseRequestPrefillChunk(
             bill;
         if (needed <= available) return @intCast(width);
     }
-    return @intCast(rungWidth(config, seq, cappedRung(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], chunk_override), config.longCtxGated()));
+    return @intCast(rungWidth(config, seq, cappedRung(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], top), config.longCtxGated()));
 }
 
 fn cappedRung(rung: u32, cap: u32) u32 {
     return if (cap == 0) rung else @min(rung, cap);
+}
+
+/// The widest rung a request may take: an explicit `--prefill-chunk`, else the arch's start width.
+fn ladderTop(config: *const model_mod.ModelConfig, chunk_override: u32) u32 {
+    return if (chunk_override > 0) chunk_override else config.prefillStartWidth();
 }
 
 /// The width one ladder rung forwards at. `long_ctx_gated = false` asks what the rung would be
@@ -6701,9 +6730,8 @@ pub var adaptive_chunk_override: ?bool = null;
 /// The per-chunk adaptive width: subordinate to the per-request gate, plus
 /// `SUSHI_PREFILL_CHUNK_ADAPTIVE=0`, plus "no operator pinned a width".
 pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
-    // Arch first: the cheapest and most selective, and this runs once per chunk boundary. The
-    // per-chunk cost estimator is calibrated on qwen4_exp; a ringed arch runs its admitted width.
-    if (!config.longCtxGated()) return false;
+    // Arch first: the cheapest and most selective, and this runs once per chunk boundary.
+    if (!config.perRequestPrefillChunk()) return false;
     if (explicitPrefillChunk() > 0) return false;
     if (generate_mod.envPrefillChunk() > 0) return false;
     if (!perRequestPrefillChunkEnabled(config)) return false;
@@ -20173,7 +20201,7 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     unbounded.max_position_embeddings = 0;
     try testing.expect(autoContextFor(&unbounded) > 0);
     const memory_ctx = memoryContextAt(&unbounded, 96 << 30, 40 << 30);
-    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap()));
+    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap(), auto_ctx_safety_pct));
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
@@ -24252,7 +24280,7 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
 
     // Auto boot, nothing pinned: the session is what the machine can serve. `cache_reserve = 0`
     // is a test isolation.
-    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
+    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct);
     try t.expect(auto > 100_000);
     try t.expect(auto <= cap);
 
@@ -24273,9 +24301,9 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
     try t.expect(fixed -| real_kv < (bogus -| placeholder_kv) / 2);
 
     // An explicit --ctx-size wins outright, and a pinned context is used as-is.
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap));
-    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap));
-    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
+    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
+    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
 }
 
 test "the advertised context does not move with the cache ask" {
@@ -24303,8 +24331,8 @@ test "the advertised context does not move with the cache ask" {
     try t.expect(vs_resolved <= 1024);
 
     // The pair agrees at the advertised number: both sides go through `autoContextFrom`.
-    const advertised = autoContextFrom(memory_ctx, cfg.contextCap());
-    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
+    const advertised = autoContextFrom(memory_ctx, cfg.contextCap(), auto_ctx_safety_pct);
+    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap(), auto_ctx_safety_pct);
     try t.expectEqual(advertised, clamp_ctx);
 }
 
@@ -25258,10 +25286,9 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, need, pin, 0, .{}));
     try t.expectEqual(@as(u32, 1024), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, need - 1, pin, 0, .{}));
 
-    // The forward never runs wider than the chooser prices, and runs the admitted width to the end:
-    // the per-chunk estimator is calibrated on qwen4_exp and stepped a 64k MiMo prompt down to 512.
+    // The forward starts at 2048 and steps down per chunk only where a chunk stops fitting.
     try t.expectEqual(@as(usize, 2048), generate_mod.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 0));
-    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0, adaptivePrefillChunkEnabled(&cfg));
 
     // 2048 is a default: an explicit `--prefill-chunk 4096` raises the ladder's top rung, billed at that width.
     const saved_explicit = generate_mod.prefill_chunk_explicit;
@@ -25275,6 +25302,28 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
     try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 4096, .{}));
     const need4096 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{});
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, need4096 - 1, pin, 4096, .{}));
+}
+
+test "mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has room" {
+    // The per-chunk estimator once stepped a 64k MiMo prompt down to 512 on a box that had room.
+    const t = std.testing;
+    transformer_mod.fused256_override = true;
+    defer transformer_mod.fused256_override = null;
+    const cfg = mimoV2FlashBillConfig();
+    const kv_bits: u64 = 8;
+    const GiB: u64 = 1 << 30;
+    // A 93 GiB resident MiMo under the 120,000 MB wired floor, beside its 64k request's reserved
+    // KV, ring and MTP state: the live headroom each chunk boundary reads.
+    const ceiling: u64 = 115_904 * 1024 * 1024;
+    const resident: u64 = 93 * GiB;
+    const seq: u64 = 65_536;
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, ceiling - resident, 2048, 0, .{}));
+    const terms = prefillRequestTerms(&cfg, seq, 2048, kv_bits, 2048, .{});
+    const held = seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) + terms.reserved_kv_bytes + terms.state_bytes + terms.qsa_ring_bytes;
+    const headroom = ceiling - resident - held;
+    var st: generate_mod.AdaptiveWidthState = .{};
+    var pos: u64 = 0;
+    while (pos < seq) : (pos += 2048) try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, pos, headroom, 2048, 2048, &st));
 }
 
 test "the load line calls a per-request arch's pin the fallback, not the width it prefills at" {
@@ -26318,7 +26367,7 @@ fn glmAssistantFixture() !model_mod.ModelConfig {
 }
 
 test "GLM MLA prefill scratch is held by the MLA layers a pending window can contain" {
-    var cfg = try glmAssistantFixture();
+    const cfg = try glmAssistantFixture();
     // Layers 3, 7, ..., 43: two consecutive layers never hold two of them.
     try std.testing.expectEqual(@as(u32, 1), glmMlaLayersPending(&cfg, 2));
     try std.testing.expectEqual(@as(u32, 2), glmMlaLayersPending(&cfg, 5));
@@ -26327,26 +26376,66 @@ test "GLM MLA prefill scratch is held by the MLA layers a pending window can con
     try std.testing.expectEqual(@as(u32, 2), glmMlaLayersPending(&adjacent, 2));
 }
 
-test "GLM prefill chunk takes the widest rung that costs no admissible context" {
+test "GLM release defaults advertise the full context at the widest prefill chunk that keeps it" {
     var cfg = try glmAssistantFixture();
     cfg.pinned_prefill_chunk = 0;
     const kv_bits: u64 = 8;
-    // Sushi-2.5bpw with vision and the A4 assistant: ~104.5 GB active under a 115.9 GB ceiling.
+    const cap = cfg.contextCap();
+    // Sushi-2.5bpw with vision and the A4 assistant, as its boot measured: 104.35 GB active, 115.9 GB ceiling.
     const ceiling: u64 = 115_904 * 1024 * 1024;
-    const active: u64 = 104_500_000_000;
+    const active: u64 = 104_350_000_000;
     try std.testing.expectEqual(@as(u32, 2048), resolvePrefillChunk(&cfg, kv_bits, ceiling, active, 0, 0));
-    // The least free memory at which a 1024-row prefill still admits the position cap: there a
-    // 2048-row prefill would cost context, so the sizer keeps 1024.
+    try std.testing.expectEqual(cap, glmAdvertisedContextAt(&cfg, kv_bits, ceiling, active, 2048));
+    // A 1 GiB idle cache reserve takes the same bytes as a 1 GiB lower ceiling: 2048 rows would cost
+    // advertised context there, 1024 keeps all of it.
+    const reserved = ceiling - 1024 * 1024 * 1024;
+    try std.testing.expect(glmAdvertisedContextAt(&cfg, kv_bits, reserved, active, 2048) < cap);
+    try std.testing.expectEqual(@as(u32, 1024), resolvePrefillChunk(&cfg, kv_bits, reserved, active, 0, 0));
+    try std.testing.expectEqual(cap, glmAdvertisedContextAt(&cfg, kv_bits, reserved, active, 1024));
+    // The least free memory at which 1024 rows still advertise the position cap keeps 1024.
     var low: u64 = 0;
     var high: u64 = ceiling - active;
     while (low < high) {
         const mid = low + (high - low) / 2;
-        if (memoryContextAtChunk(&cfg, kv_bits, active + mid, active, 1024) >= cfg.contextCap()) high = mid else low = mid + 1;
+        if (glmAdvertisedContextAt(&cfg, kv_bits, active + mid, active, 1024) >= cap) high = mid else low = mid + 1;
     }
-    try std.testing.expect(memoryContextAtChunk(&cfg, kv_bits, active + low, active, 2048) < cfg.contextCap());
+    try std.testing.expect(glmAdvertisedContextAt(&cfg, kv_bits, active + low, active, 2048) < cap);
     try std.testing.expectEqual(@as(u32, 1024), resolvePrefillChunk(&cfg, kv_bits, active + low, active, 0, 0));
-    // Far less memory: every widening costs context.
+    // Far less memory: every widening costs advertised context.
     try std.testing.expectEqual(@as(u32, 512), resolvePrefillChunk(&cfg, kv_bits, active + 8 * 1024 * 1024 * 1024, active, 0, 0));
+}
+
+test "GLM requests prefill at 2048 and step down a rung only where a chunk stops fitting" {
+    const t = std.testing;
+    const cfg = try glmAssistantFixture();
+    const kv_bits: u64 = 8;
+    try t.expect(cfg.perRequestPrefillChunk());
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 4096, 256, kv_bits, 1 << 40, 2048, 0, .{}));
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
+
+    // Release defaults: a 1M request is admitted with a 2048-row tail, and 2048 still fits there.
+    const available: u64 = 115_904 * 1024 * 1024 - 104_350_000_000;
+    const top: u64 = 1_048_576 - 256;
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, available, 2048, 0, .{}));
+    var st: generate_mod.AdaptiveWidthState = .{};
+    const kv_top = sessionBytesPerToken(&cfg, kv_bits) * top;
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, top, available - kv_top, 2048, 2048, &st));
+
+    // A tighter box: the top only fits at 1024 rows, and that tail's bill is what admits it.
+    const at_2048 = prefillNeededAtChunk(&cfg, top, 256, kv_bits, 2048, .{});
+    try t.expectEqual(@as(u32, 1024), chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, at_2048 - 1, 2048, 0, .{}));
+    try t.expect(prefillNeededAtChunk(&cfg, top, 256, kv_bits, 1024, .{}) <= at_2048 - 1);
+    // Early chunks keep 2048; the chunk that no longer fits beside the KV steps down one rung.
+    st = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, 4096, prefillChunkCost(&cfg, kv_bits, 2048, 4096), 2048, 2048, &st));
+    try t.expectEqual(@as(u32, 1024), adaptivePrefillWidth(&cfg, kv_bits, top, prefillChunkCost(&cfg, kv_bits, 2048, top) - 1, 2048, 2048, &st));
+    // Once stepped down, a request never widens again.
+    try t.expectEqual(@as(u32, 1024), adaptivePrefillWidth(&cfg, kv_bits, top, available, 1024, 2048, &st));
+
+    // A small box narrows from the first chunk.
+    st = .{};
+    try t.expectEqual(@as(u32, 512), adaptivePrefillWidth(&cfg, kv_bits, 0, prefillChunkCost(&cfg, kv_bits, 512, 0), 2048, 2048, &st));
 }
 
 test "GLM prefill chunk never widens past the width its numerics are built for" {

@@ -864,7 +864,16 @@ pub const ModelConfig = struct {
     /// once at load: a long session's load-time reserve (and, ungated, the hot-cache ask) pins
     /// every ordinary prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return self.longCtxGated() or self.swaRingTokens() > 0;
+        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5();
+    }
+
+    /// The width a per-request arch's prefill starts at; only a chunk that no longer fits beside its
+    /// KV steps down. GLM's native prefill paths are built for 2048 rows.
+    pub fn prefillStartWidth(self: *const ModelConfig) u32 {
+        if (self.isGlm5()) return @import("glm5_forward.zig").prefill_chunk;
+        if (self.longCtxGated()) return 4096;
+        if (self.swaRingTokens() > 0) return 2048;
+        return std.math.maxInt(u32);
     }
 
     /// Dense bf16 bytes ONE token of layer `li`'s K and V occupy. Only correct

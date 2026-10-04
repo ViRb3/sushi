@@ -65,7 +65,8 @@ kept raw (Sushi-2.45bpw). Small BF16/FP32 tensors keep their source precision. T
 
 ## Serving loop
 
-- Prefill runs 2048-token chunks with two layers in flight; chunks ending at or before token 2051 use dense
+- Prefill runs 2048-token chunks with two layers in flight, stepping a chunk down to 1024 or 512 only where it no
+  longer fits beside the KV (at release defaults 2048 fits past 1M); chunks ending at or before token 2051 use dense
   expanded-K/V attention, later chunks the absorbed sparse path. Decode submits every four layers and evaluates logits
   and every cache array once per token.
 - Vision: padded CLIP preprocessing, temporal placement of video frames, visual embeddings spliced into the HC input.
@@ -145,11 +146,11 @@ inside 1.46% drift) because verification per round grew 20.6%.
   attention with its second tile 256 MiB, index scores 8 MiB, and under kv8 the dense-prefill dequantization
   (≤ 2051 rows) plus one chunk's quantizer output, 3.1 MiB. Without NAX the packed tiles (the FP32 composite) keep
   their 256 MiB, B1/B3 rise to 128 MiB, and the A6, MLA, index and cluster terms drop.
-- Prefill width: the widest rung up to 2048 that admits the same capped context as 512 (`glmPrefillChunk`, the
-  `max_safe_context` bill), not the quarter-share rule. Sushi-2.5bpw + vision + A4 at ~104.5 GB active gets 2048:
-  1.376M / 1.311M / 1.130M tokens at 512 / 1024 / 2048 by the bill, all past the 1,048,576 cap. The quarter share had
-  pinned it to 512 (bill 5,635 MiB at 2048 against a 3,549 MiB cap that also held a 2 GiB hot-cache ask for a cache
-  GLM never loads).
+- Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with
+  a 93% margin (85% elsewhere): GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +
+  vision + A4 at its measured 104.35 GB active advertises 1,048,576 at a 2048 bill (1,144,691 tokens by the bill), and
+  at a 1024 bill with a 1 GiB RAM prefix tier (2048 would advertise 958K there). The quarter-share rule had pinned
+  the prefill to 512 rows; at 85% the auto context read 972,800.
 - `max_safe_context` = (ceiling − active − transients) × 0.8 × 0.8 / per-token bill. The kv8 default drops the bill
   44%: Sushi-2.5bpw + vision + A4 assistant boots at 104.32 GB active with `max_safe_context` 1,048,576 (the position
   cap; about 1.36M by the bill), against 758,793 at `--kv-quant 16` (976a0dbb, auto context, margin 4 GiB).
