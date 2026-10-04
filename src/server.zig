@@ -10049,6 +10049,7 @@ fn handleStreamingCompletion(
         defer allocator.free(token_text);
 
         stopped = stop_gate.matched != null;
+        if (stopped) slot_handle.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             if (stopped) break;
             continue;
@@ -10212,7 +10213,7 @@ fn drainSlotTokens(slot: anytype, conn: ?*Conn, allocator: std.mem.Allocator, ou
             }
         }
         if (early) |e| if (try e.observe(allocator, output_ids.items)) {
-            slot.cancel();
+            slot.cancelOnStop();
             return .stopped;
         };
     }
@@ -11369,6 +11370,7 @@ fn handleStreamingGeneration(
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
         stopped = stop_gate.matched != null;
+        if (stopped) slot_handle.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             allocator.free(token_text);
             if (stopped) break;
@@ -16877,6 +16879,7 @@ fn handleAnthropicStreaming(
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
         stopped = stop_gate.matched != null;
+        if (stopped) slot_handle.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             allocator.free(token_text);
             if (stopped) break;
@@ -18352,6 +18355,7 @@ fn handleResponsesInner(
             defer allocator.free(token_text);
 
             stopped = stop_gate.matched != null;
+            if (stopped) slot_handle.?.stop_hit.store(true, .release);
             if (token_text.len == 0) {
                 if (stopped) break;
                 continue;
@@ -26874,6 +26878,7 @@ const FakeSlot = struct {
     tokens: []const u32,
     next: usize = 0,
     cancelled: bool = false,
+    stop_hit: bool = false,
 
     fn waitNextTimeout(self: *FakeSlot, _: i64) ?scheduler_mod.NextResult {
         if (self.cancelled or self.next == self.tokens.len) return .{ .done = {} };
@@ -26883,6 +26888,11 @@ const FakeSlot = struct {
 
     fn cancel(self: *FakeSlot) void {
         self.cancelled = true;
+    }
+
+    fn cancelOnStop(self: *FakeSlot) void {
+        self.stop_hit = true;
+        self.cancel();
     }
 };
 
@@ -26905,6 +26915,7 @@ fn expectNonStreamStopsAt(stop: []const u8, pieces: []const []const u8, stop_tok
     try std.testing.expectEqual(DrainEnd.stopped, end);
     try std.testing.expectEqual(stop_token, out.items.len);
     try std.testing.expect(slot.cancelled);
+    try std.testing.expect(slot.stop_hit);
 }
 
 test "a non-stream generation ends on the token that completes a stop" {

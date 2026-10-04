@@ -553,6 +553,9 @@ pub const Slot = struct {
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
+    /// Set by the connection thread when the request's own stop sequence completed, before it cancels
+    /// the slot: that end is a normal stop, not a disconnect.
+    stop_hit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
     /// the pass reads (`think_bound`, `constraint`) and frees it once `complete` returns.
@@ -1040,6 +1043,12 @@ pub const Slot = struct {
 
     /// Connection thread: signal cancellation. The inference thread will
     /// drop this slot at the next tick boundary.
+    /// Connection thread: the request's own stop sequence completed; end generation as a normal stop.
+    pub fn cancelOnStop(self: *Slot) void {
+        self.stop_hit.store(true, .release);
+        self.cancel();
+    }
+
     pub fn cancel(self: *Slot) void {
         self.cancelled.store(true, .release);
         self.out_mu.lockUncancelable(self.io);
@@ -6552,6 +6561,7 @@ fn finishOutcome(reason: []const u8, latched: ?[]const u8) metrics_mod.Outcome {
 fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
     if (slot.error_code != null) return .failed;
     if (slot.finished) return finishOutcome(slot.finish_reason, null);
+    if (slot.stop_hit.load(.acquire)) return .success;
     return .cancelled;
 }
 
@@ -10600,6 +10610,7 @@ const OutcomeStub = struct {
     error_code: ?[]const u8 = null,
     finish_reason: []const u8 = "",
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stop_hit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     metrics_recorded: bool = false,
     first_token_ns: u64 = 5_000_000,
     prefill_ns: u64 = 4_000_000,
@@ -10725,6 +10736,27 @@ test "outcome: metrics off does no work and leaves the slot untouched" {
     recordSlotCleanup(null, &s);
     s.finish(null, "stop");
     try testing.expect(!s.metrics_recorded);
+}
+
+test "outcome: a request ended by its own stop sequence is a success, a disconnect stays cancelled" {
+    var m = metrics_mod.Metrics.init();
+    var stopped = OutcomeStub{};
+    stopped.stop_hit.store(true, .release);
+    stopped.complete();
+    recordSlotCleanup(&m, &stopped);
+    try expectOutcomes(&m, 1, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 10), m.generation_tokens_total.load());
+
+    var gone = OutcomeStub{};
+    gone.complete();
+    recordSlotCleanup(&m, &gone);
+    try expectOutcomes(&m, 1, 1, 0, 0);
+
+    var stop_then_error = OutcomeStub{};
+    stop_then_error.stop_hit.store(true, .release);
+    stop_then_error.fail("MlxFailure");
+    recordSlotCleanup(&m, &stop_then_error);
+    try expectOutcomes(&m, 1, 1, 1, 0);
 }
 
 test "outcome: a real Slot's fields satisfy the recorder, and a cancelled GLM slot counts once" {
