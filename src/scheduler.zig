@@ -276,8 +276,9 @@ pub const SubmitParams = struct {
 /// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory
 /// right now? Null (unit tests, no HTTP server) disables evict-to-admit. The trailing warm
 /// arguments are the restored rows, their capacity, and whether the restore checked the
-/// entry out (the only restore whose rows the request will not allocate).
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool = null;
+/// entry out (the only restore whose rows the request will not allocate); then MTP and the GLM
+/// checkpoints the request keeps (`server.WarmPrefix.checkpoints`).
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) bool = null;
 
 /// {needed, available, commit} of the same cold bill, live memory re-read (`server.prefillBillNumbersNow`).
 /// Null (unit tests) skips the inference thread's hold for an ungated arch.
@@ -307,6 +308,18 @@ pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) PostEvictionWidth {
         .widened = admitted != 0 and reasked > admitted,
         .moved = admitted != 0 and reasked < admitted,
     };
+}
+
+/// A GLM request whose prefix-cache checkpoints do not fit even with the hot cache evicted keeps
+/// fewer rather than be refused: the most below `cap` that `fits` admits, 0 = none; null = not
+/// even that.
+pub fn fewerCheckpointsToAdmit(cap: u32, ctx: ?*anyopaque, fits: *const fn (?*anyopaque, u32) bool) ?u32 {
+    var n = cap;
+    while (n > 0) {
+        n -= 1;
+        if (fits(ctx, n)) return n;
+    }
+    return null;
 }
 
 /// Does the inference thread run the evict-to-admit pass for this model? The connection
@@ -349,7 +362,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) ?model_registry_mod.MemoryContextRefusal = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) ?model_registry_mod.MemoryContextRefusal = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -2526,12 +2539,14 @@ test "admitsWithinMemory: siblings are billed together, a lone request always pr
     try testing.expectEqual(@as(usize, 3), admitsWithinMemory(&.{ null, b, b }, false, 0));
 }
 
-test "admissionPassArmed: the evict-to-admit pass runs for qwen4_exp and mimo_v2, never an unserved arch" {
+test "admissionPassArmed: the evict-to-admit pass runs for every served arch, never an unserved one" {
     const mimo = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 1, .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
     const qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
+    const glm = ModelConfig{ .model_type = "glm5_next" };
     const llama = ModelConfig{ .model_type = "llama", .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
     try testing.expect(admissionPassArmed(&mimo));
     try testing.expect(admissionPassArmed(&qwen4));
+    try testing.expect(admissionPassArmed(&glm));
     try testing.expect(!admissionPassArmed(&llama));
     try testing.expect(!admissionPassArmed(null));
 }
@@ -4231,7 +4246,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (kv_quant_config.isQuant()) "kv8" else "BF16", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
-        if (params.prefix_cache_capacity > 0) log.warn("[glm] native recurrent state has no prefix-cache restore yet; RAM/disk prefix reuse off\n", .{});
+        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints at every prefill chunk and the prompt end (<= {d} per entry, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
     }
     if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
         const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
@@ -4908,10 +4923,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (ram_prefix_cache) params.prefix_cache_capacity else 0,
             clamped_prefix_mem,
         );
-        entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
+        entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0 and !params.config.isGlm5();
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
-        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
+        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5()) .min_span_recency else .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
@@ -4942,8 +4957,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 break :attach;
             };
             entry.prefix_cache.?.disk.?.cp_thin =
-                if (params.config.longCtxGated() or !ram_prefix_cache) .min_span_recency else .oldest;
-            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated() or !ram_prefix_cache)
+                if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5()) .min_span_recency else .oldest;
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isGlm5())
+                @import("glm5_prefix.zig").checkpoint_cap
+            else if (params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
@@ -4962,10 +4979,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk.?.sweepSiblings();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
-        entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
+        const cp_max = if (params.config.isGlm5()) @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max) else params.ssm_checkpoint_max;
+        entry.ssm_checkpoint_max = cp_max;
         // The cache re-applies the cap after a replace-path merge; without this
         // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.
-        entry.prefix_cache.?.ssm_checkpoint_max = params.ssm_checkpoint_max;
+        entry.prefix_cache.?.ssm_checkpoint_max = cp_max;
     }
     // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
     // chat-template renders (`chat_mod.formatChat` at the handler boundary).
@@ -5549,6 +5567,11 @@ fn postPrefillTerminal(slot: *Slot) bool {
 /// The slot still belongs to its connection thread until that thread calls `complete`; the
 /// inference thread just stops touching it.
 fn cullDecoding(sch: *Scheduler) void {
+    // A GLM decode-phase cancel commits before its native state is released below; the cleanup
+    // drain's commit would read a reset request. The drain then finds no checkpoints and adds nothing.
+    for (sch.decoding.items) |s| {
+        if (s.glm5_request != null and s.cancelled.load(.acquire) and !s.finished and s.error_code == null) commitSlotIfApplicable(sch, s);
+    }
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);
     var i: usize = 0;
@@ -6053,6 +6076,13 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
+    if (slot.glm5_request) |*request| {
+        const window: ?transformer_mod.KVCache = if (gen_ptr.glm_prefill_window) |*w| .{ .entries = w.snapshot.entries, .step = w.snapshot.step, .allocator = w.snapshot.allocator, .config = w.snapshot.config } else null;
+        const dflash: ?prefix_cache_mod.DflashCommit = if (window) |*w| .{ .cache = w, .base_pos = gen_ptr.glm_prefill_window.?.base_pos } else null;
+        commitGlmSlot(hc, slot, request, total_tokens, ssm_cps_opt, dflash, slot.full_prompt.len);
+        publishHotCacheResidency(sch);
+        return;
+    }
     // qwen4_exp: the newest checkpoint takes the slot's live QSA indexer history as a view
     // of the capacity buffer (the slot is torn down right after). A failure commits the
     // entry history-less, which a QSA arch treats as a miss.
@@ -6131,6 +6161,23 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     _ = finish_st;
 }
 
+/// GLM: the request's MLA rows to its last pool boundary serve every KDA checkpoint its prefill
+/// took; without one nothing restores. Ownership of `cps` passes to the cache.
+fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request: *const glm5_forward_mod.Request, tokens: []const u32, cps_opt: ?[]transformer_mod.SSMCheckpoint, dflash: ?prefix_cache_mod.DflashCommit, prompt_len: usize) void {
+    const cps = cps_opt orelse return;
+    const rows = @import("glm5_prefix.zig").MlaRows.capture(hc.allocator, request, request.offset / 4 * 4, slot.model.transformer.?.s) catch |err| {
+        log.warn("[hot-cache] GLM MLA rows not captured: {s}; not committed\n", .{@errorName(err)});
+        for (cps) |*cp| cp.deinit(hc.allocator);
+        hc.allocator.free(cps);
+        return;
+    };
+    const st = hc.commitGlm(&slot.cache, tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, cps, rows, dflash, prompt_len) catch |err| {
+        log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    if (st == .ok) log.info("[hot-cache] committed {d}/{d} GLM tokens ({d} KDA checkpoints)\n", .{ st.ok, tokens.len, cps.len });
+}
+
 /// Logical committed length for a cancelled-prefill commit: the tokens
 /// actually forwarded into the KV when the chunk loop aborted, clamped to
 /// the prompt and gated on the floor below which an entry is LRU pollution
@@ -6183,6 +6230,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
+    if (slot.glm5_request) |*request| return commitGlmSlot(hc, slot, request, slot.full_prompt[0..len], cps, null, len);
     const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
@@ -7038,7 +7086,21 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
             // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
             // releases it on every path that ends the slot.
-            const lookup = hc.lookupAndRestoreWithMedia(
+            const dfl_restore: ?prefix_cache_mod.DflashTarget = if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null;
+            const lookup = (if (slot.glm5_request) |*request| hc.lookupAndRestoreGlm(
+                &slot.cache,
+                &slot.moe_seq_offset,
+                request,
+                xfm_ptr.s,
+                slot.full_prompt,
+                slot.has_tools,
+                slot.vision_key,
+                slot.media_start,
+                slot.media_chain,
+                dfl_restore,
+                @intFromPtr(slot),
+                slot.skip_prefix_cache,
+            ) else hc.lookupAndRestoreWithMedia(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -7048,11 +7110,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.vision_key,
                 slot.media_start,
                 slot.media_chain,
-                if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
+                dfl_restore,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
                 @intFromPtr(slot),
                 slot.skip_prefix_cache,
-            ) catch |err| blk: {
+            )) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
             };
@@ -7101,8 +7163,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // and ignore the stride entirely (no-op even at stride > 0). When the
     // hot prefix cache is disabled or off, set stride to 0 to skip
     // snapshot work that would just be discarded.
-    const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
-    const cp_max: u32 = slot.model.ssm_checkpoint_max;
+    var cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
+    var cp_max: u32 = slot.model.ssm_checkpoint_max;
 
     // Evict the hot cache to admit (#353). Here, not on the connection thread: the inference
     // thread is the sole mlx caller and the restore has already happened, so the entry this
@@ -7128,10 +7190,17 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 /// Only a checked-out restore is credited: a refcount share is copied by the first append.
                 warm_will_donate: bool,
                 enable_mtp: bool,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool,
+                /// The KDA checkpoints a GLM request keeps: billed here only, and fewer where they do not fit.
+                checkpoints: u32,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
+                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp, self.checkpoints);
+                }
+                fn keeping(ctx: ?*anyopaque, n: u32) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    self.checkpoints = n;
+                    return call(ctx);
                 }
             };
             var probe = Probe{
@@ -7144,6 +7213,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
                 .enable_mtp = slot.enable_mtp,
+                .checkpoints = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
                 .fits = fits_fn,
             };
             var fits = Probe.call(&probe);
@@ -7170,10 +7240,19 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 publishHotCacheResidency(sch);
                 // What the allocator returned, not what the cache was billed for.
                 evicted_live_bytes = report.bytes;
-                if (!report.admitted) {
+                const kept: ?u32 = if (!report.admitted and cfg.isGlm5() and cp_stride > 0)
+                    fewerCheckpointsToAdmit(cp_max, &probe, Probe.keeping)
+                else
+                    null;
+                if (kept) |n| {
+                    log.info("[hot-cache] GLM request keeps {d} of {d} KDA checkpoints: the rest do not fit beside its {d}-token prefill\n", .{ n, cp_max, slot.full_prompt.len });
+                    cp_max = n;
+                    if (n == 0) cp_stride = 0;
+                }
+                if (!report.admitted and kept == null) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
-                        slot.memory_context_refusal = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                        slot.memory_context_refusal = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp, probe.checkpoints);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.

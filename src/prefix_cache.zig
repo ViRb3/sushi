@@ -23,6 +23,8 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
+const glm5_forward = @import("glm5_forward.zig");
+const glm5_prefix = @import("glm5_prefix.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -341,6 +343,9 @@ const Entry = struct {
     mtp: ?DflashSnap = null,
     /// Bytes resident in `mtp`, folded into `kv_bytes` like `ssm_bytes`.
     mtp_bytes: u64 = 0,
+    /// GLM only: the MLA rows every checkpoint of `ssm_checkpoints` restores from, billed in `kv_bytes`.
+    glm: ?glm5_prefix.MlaRows = null,
+    glm_bytes: u64 = 0,
     /// Ringed caches only: restore points below the entry's END (`KVCache.ringCheckpoint`),
     /// ascending by `step`, billed in `kv_bytes`: the prompt end, which a long reply carries the
     /// ring past, and those inherited from the entry this prompt forked off (`bestRingDonor`).
@@ -354,6 +359,27 @@ const Entry = struct {
     checkout_donated: bool = false,
     /// Snapshot bytes the donation handed the slot; `kv_bytes` keeps billing them until release.
     donated_bytes: u64 = 0,
+};
+
+/// Where a hybrid restore puts its recurrent state: the slot's SSM entries, or a GLM request.
+const Recurrent = union(enum) {
+    none,
+    ssm: []SSMCacheEntry,
+    glm: *glm5_forward.Request,
+
+    fn hybrid(self: Recurrent) bool {
+        return self != .none;
+    }
+    fn ssmEntries(self: Recurrent) ?[]SSMCacheEntry {
+        return if (self == .ssm) self.ssm else null;
+    }
+    fn reset(self: Recurrent) void {
+        switch (self) {
+            .none => {},
+            .ssm => |entries| HotPrefixCache.resetSsmEntries(entries),
+            .glm => |request| request.reset(),
+        }
+    }
 };
 
 /// What a spec-snap adoption may do, decided before any mlx call.
@@ -435,9 +461,11 @@ const PendingDiskFlush = struct {
     ring_cps: ?[]KVCacheSnapshot = null,
     dflash: ?DflashSnap = null,
     mtp: ?DflashSnap = null,
+    glm: ?glm5_prefix.MlaRows = null,
 
     fn deinit(self: *PendingDiskFlush, allocator: std.mem.Allocator) void {
         self.snapshot.deinit();
+        if (self.glm) |*rows| rows.deinit();
         allocator.free(self.tokens);
         if (self.ssm_cps) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
@@ -593,6 +621,8 @@ pub const HotPrefixCache = struct {
     fn freeEntryOwnedState(allocator: std.mem.Allocator, e: *Entry) void {
         allocator.free(e.tokens);
         e.snapshot.deinit();
+        if (e.glm) |*rows| rows.deinit();
+        e.glm = null;
         if (e.ssm_checkpoints) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
@@ -800,7 +830,7 @@ pub const HotPrefixCache = struct {
         // the KVCache — a snapshot restore would advance cache.step without
         // rebuilding that state. Off until dsv4 state rides the ssm-entry
         // machinery (needsSsmEntries class).
-        if (std.mem.eql(u8, config.model_type, "deepseek_v4") or config.isGlm5()) return false;
+        if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return false;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -1295,6 +1325,104 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         vision_key: u64,
         media_start: ?usize,
+        media_chain: []const MediaSpan,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+        slot_id: ?usize,
+        skip: bool,
+    ) !LookupResult {
+        const rec: Recurrent = if (target_ssm_entries) |e| .{ .ssm = e } else .none;
+        return self.lookupImpl(target_cache, target_moe_seq_offset, rec, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, mtp_target, slot_id, skip);
+    }
+
+    /// A GLM request restores its KDA state from the entry's checkpoints and its MLA rows from `Entry.glm`.
+    pub fn lookupAndRestoreGlm(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        request: *glm5_forward.Request,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        media_chain: []const MediaSpan,
+        dflash_target: ?DflashTarget,
+        slot_id: ?usize,
+        skip: bool,
+    ) !LookupResult {
+        return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .glm = request }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, null, slot_id, skip);
+    }
+
+    /// GLM's SSD arm: the entry whose highest persisted KDA checkpoint under the match beats the RAM
+    /// match restores its MLA rows and that checkpoint into buffers the request then owns.
+    fn restoreGlmFromDisk(
+        self: *HotPrefixCache,
+        d: *kv_disk_cache.DiskTier,
+        request: *glm5_forward.Request,
+        target_cache: *KVCache,
+        ram_eff: usize,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        limit: u32,
+        dflash_target: ?DflashTarget,
+        s: mlx.mlx_stream,
+    ) ?LookupResult {
+        const bits = target_cache.config.glmLatentBits() orelse return null;
+        const quant = glm5_prefix.diskQuant(bits);
+        const hm = d.bestHybridMatch(prompt_ids, has_tools, quant, limit) orelse return null;
+        if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) return null;
+        const sw = io_util.Stopwatch.init(d.io);
+        var pseudo = KVCache.initWithConfig(self.allocator, @intCast(request.layers.len * 2), quant) catch return null;
+        defer pseudo.deinit();
+        const kda = self.allocator.alloc(SSMCacheEntry, request.layers.len) catch return null;
+        for (kda) |*k| k.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        defer {
+            resetSsmEntries(kda);
+            for (kda) |*k| {
+                _ = mlx.mlx_array_free(k.conv_state);
+                _ = mlx.mlx_array_free(k.ssm_state);
+            }
+            self.allocator.free(kda);
+        }
+        const restored = d.restoreIntoKda(&pseudo, kda, hm.idx, hm.cp, s) catch |err| {
+            log.warn("  [disk-cache] GLM restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+            return null;
+        };
+        var rows = glm5_prefix.rowsFromDisk(self.allocator, &pseudo, bits) catch return null;
+        defer rows.deinit();
+        rows.restore(request, restored) catch |err| {
+            log.warn("  [disk-cache] GLM restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+            request.reset();
+            return null;
+        };
+        for (request.layers, kda) |*layer, *k| {
+            std.mem.swap(mlx.mlx_array, &layer.recurrent.conv_state, &k.conv_state);
+            std.mem.swap(mlx.mlx_array, &layer.recurrent.ssm_state, &k.ssm_state);
+            layer.recurrent.initialized = k.initialized;
+        }
+        target_cache.truncate(0, s) catch {};
+        target_cache.step = restored;
+        self.last_restored_disk_id = d.entries.items[hm.idx].id;
+        log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (glm kda@{d})\n", .{ restored, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
+        return .{
+            .matched = restored,
+            .full_match = false,
+            .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
+            .slot_owned = true,
+        };
+    }
+
+    fn lookupImpl(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        rec: Recurrent,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
         /// The request's media blocks (`MediaSpan`); an entry holding a prefix
         /// of them restores up to the first block it lacks.
         media_chain: []const MediaSpan,
@@ -1309,7 +1437,7 @@ pub const HotPrefixCache = struct {
         self.last_restored_disk_id = null;
         if (skip) {
             try target_cache.truncate(0, s);
-            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            rec.reset();
             target_moe_seq_offset.* = 0;
             return .{ .matched = 0, .full_match = false };
         }
@@ -1321,7 +1449,7 @@ pub const HotPrefixCache = struct {
             media_start,
             media_chain,
             target_cache.config,
-            target_ssm_entries != null,
+            rec.hybrid(),
             &probe,
         );
 
@@ -1330,6 +1458,20 @@ pub const HotPrefixCache = struct {
         // the tier persists per-position SSM checkpoints beside the KV chunks
         // and restores both.
         if (self.disk) |*d| disk: {
+            if (rec == .glm) {
+                const ram_eff: usize = if (match) |m| blk: {
+                    const e = &self.entries.items[m.idx];
+                    const cps = e.ssm_checkpoints orelse break :blk 0;
+                    const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
+                    break :blk cp.pos;
+                } else 0;
+                const limit: u32 = if (media_start) |ms| @intCast(@min(ms, prompt_ids.len)) else @intCast(prompt_ids.len);
+                if (self.restoreGlmFromDisk(d, rec.glm, target_cache, ram_eff, prompt_ids, has_tools, limit, dflash_target, s)) |res| {
+                    target_moe_seq_offset.* = res.matched;
+                    return res;
+                }
+                break :disk;
+            }
             // A media-carrying request still restores the pure-text prefix
             // before its earliest media row: disk entries are text-only by
             // construction (the flush refuses vision-keyed entries), and
@@ -1380,7 +1522,7 @@ pub const HotPrefixCache = struct {
             };
             const usable: u32 = @min(dm.usable, disk_limit);
 
-            if (target_ssm_entries) |ssm_entries| {
+            if (rec.ssmEntries()) |ssm_entries| {
                 // Hybrid: compare EFFECTIVE restorable positions — the largest
                 // SSM checkpoint ≤ the match on each tier, not the raw prefix
                 // length (KV alone is useless without matching SSM state).
@@ -1464,7 +1606,7 @@ pub const HotPrefixCache = struct {
 
         if (match == null) {
             try target_cache.truncate(0, s);
-            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            rec.reset();
             target_moe_seq_offset.* = 0;
             // The filter dropped every candidate. This arm used to be silent,
             // so a 393k-token prompt that the cache almost had cold-prefilled
@@ -1484,10 +1626,10 @@ pub const HotPrefixCache = struct {
         // Decline a restore that is a lien (`restoreWouldPinEntry`), before the bump and before
         // `last_restored_used`; weighed on the DELIVERABLE share (a hybrid is clamped to its
         // highest checkpoint at or below the match). SSD-first only.
-        const deliverable = deliverableShare(e.ssm_checkpoints, target_ssm_entries != null, m.shared);
+        const deliverable = deliverableShare(e.ssm_checkpoints, rec.hybrid(), m.shared);
         if (self.ssd_first and restoreWouldPinEntry(e.kv_bytes, self.restore_pin_min_bytes, e.tokens.len, deliverable)) {
             try target_cache.truncate(0, s);
-            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            rec.reset();
             target_moe_seq_offset.* = 0;
             log.info("  [hot-cache] declined a {d}-token restore ({d} deliverable) from a {d}-token entry ({d} MB): the share is a lien on the whole entry; cold prefill\n", .{
                 m.shared,
@@ -1500,13 +1642,13 @@ pub const HotPrefixCache = struct {
         // A full reuse re-forwards the last token; a one-token prompt has nothing before it.
         if (prompt_ids.len == 1) {
             try target_cache.truncate(0, s);
-            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            rec.reset();
             target_moe_seq_offset.* = 0;
             return .{ .matched = 0, .full_match = false };
         }
         const would_full = m.shared == prompt_ids.len and m.shared > 1;
         const restore_cap: usize = blk: {
-            if (target_ssm_entries == null or !would_full) break :blk m.shared;
+            if (!rec.hybrid() or !would_full) break :blk m.shared;
             const cps = e.ssm_checkpoints orelse break :blk m.shared;
             const cp = highestCoveringCheckpoint(cps, m.shared) orelse break :blk m.shared;
             if (cp.pos == m.shared) break :blk m.shared - 1;
@@ -1527,7 +1669,7 @@ pub const HotPrefixCache = struct {
         // failed restore must hand back an EMPTY cache, never a half-bound one.
         errdefer {
             target_cache.truncate(0, s) catch {};
-            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            rec.reset();
             target_moe_seq_offset.* = 0;
             self.last_restored_used = null;
             e.last_used = used_before_restore;
@@ -1541,7 +1683,14 @@ pub const HotPrefixCache = struct {
         // The two MUST stay in sync, so we rewind KV further too.
         var dump = restore_dump.RestoreDumpMeta{ .kind = "restore", .pos = 0 };
         var effective_matched: usize = restore_cap;
-        if (target_ssm_entries) |entries| {
+        if (rec == .glm) {
+            effective_matched = 0;
+            if (e.glm) |*rows| if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, @min(restore_cap, rows.len))) |cp| {
+                try glm5_prefix.restore(rec.glm, rows, cp);
+                effective_matched = cp.pos;
+            };
+            if (effective_matched == 0) rec.reset();
+        } else if (rec.ssmEntries()) |entries| {
             if (e.ssm_checkpoints) |cps| {
                 if (highestCoveringCheckpoint(cps, restore_cap)) |cp| {
                     try restoreSsmCheckpoint(entries, cp);
@@ -1631,7 +1780,7 @@ pub const HotPrefixCache = struct {
             // and the request cold-prefills.
             log.warn("  [hot-cache] clamp to {d} declined: {s}; cold prefill\n", .{ final_len, @errorName(err) });
             try target_cache.truncate(0, s);
-            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            rec.reset();
             target_moe_seq_offset.* = 0;
             self.last_restored_used = null;
             // Nothing was restored: promoted, this entry made a usable one the next eviction victim.
@@ -1661,7 +1810,7 @@ pub const HotPrefixCache = struct {
         dump.mtp_base = res.mtp_base;
         dump.entry_idx = m.idx + 1;
         dump.entry_count = self.entries.items.len;
-        _ = restore_dump.dumpRestoreIfEnabled(target_cache, target_ssm_entries, s, dump);
+        _ = restore_dump.dumpRestoreIfEnabled(target_cache, rec.ssmEntries(), s, dump);
         return res;
     }
 
@@ -1726,8 +1875,9 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             if (e.checked_out_by != slot_id) continue;
             if (e.checkout_donated) continue;
-            e.donated_bytes = snapshotBytes(&e.snapshot);
+            e.donated_bytes = snapshotBytes(&e.snapshot) + e.glm_bytes;
             e.snapshot.releaseHandles();
+            if (e.glm) |*rows| rows.releaseHandles();
             e.checkout_donated = true;
         }
     }
@@ -1846,15 +1996,54 @@ pub const HotPrefixCache = struct {
         prompt_len: usize,
         ring_cps: SlotRingCps,
     ) !CommitStatus {
+        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, ssm_cps, dflash, mtp, prompt_len, ring_cps, null);
+    }
+
+    /// A GLM commit: `cps` are its KDA checkpoints and `rows` the MLA rows below them; ownership of
+    /// both transfers to the cache on every outcome.
+    pub fn commitGlm(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        cache_key: u64,
+        media_start: ?usize,
+        cps: []SSMCheckpoint,
+        rows: glm5_prefix.MlaRows,
+        dflash: ?DflashCommit,
+        prompt_len: usize,
+    ) !CommitStatus {
+        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, rows);
+    }
+
+    fn commitImpl(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        cache_key: u64,
+        media_start: ?usize,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+        prompt_len: usize,
+        ring_cps: SlotRingCps,
+        glm: ?glm5_prefix.MlaRows,
+    ) !CommitStatus {
         // Freed on every path that does not move it into an entry.
         var new_rings = ownRingCps(self.allocator, ring_cps);
         defer if (new_rings) |r| freeRingCps(self.allocator, r);
         var new_ring_bytes = ringCpsBytes(new_rings);
+        var new_glm = glm;
+        defer if (new_glm) |*rows| rows.deinit();
+        var new_glm_bytes: u64 = if (new_glm) |*rows| rows.bytes() else 0;
         const quant_config = source_cache.config;
 
         // Record what the live cache holds now, before any byte-budget trim.
         if (self.ssd_first and self.disk != null and vision_key == 0) {
-            self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp, new_rings);
+            self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp, new_rings, if (new_glm) |*rows| rows else null);
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
@@ -1940,7 +2129,7 @@ pub const HotPrefixCache = struct {
         if (ssm_cps) |cps| {
             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
         }
-        var new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes + new_ring_bytes;
+        var new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes + new_ring_bytes + new_glm_bytes;
         // Effective candidate: a byte-budget trim below shortens these.
         var eff_tokens = tokens;
         var eff_cps = ssm_cps;
@@ -1959,14 +2148,14 @@ pub const HotPrefixCache = struct {
             var limit = if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
             var inputs_logged = false;
             trim_blk: while (true) {
-                const row_bytes = snapshotRowBytes(&new_snap);
+                const row_bytes = snapshotRowBytes(&new_snap) + (if (new_glm) |*rows| rows.rowBytes() else 0);
                 const ring_bytes = ringedBytes(&new_snap);
                 var ring_cp: ?*const KVCacheSnapshot = null;
                 const tl_opt = if (ring_bytes > 0) blk: {
                     const rt = ringTrimLen(self.max_kv_bytes, limit, row_bytes, tokens.len, ring_bytes, new_rings orelse &.{}) orelse break :blk null;
                     if (rt.cp) |k| ring_cp = &new_rings.?[k];
                     break :blk rt.len;
-                } else self.trimLenForBudget(self.max_kv_bytes, limit, row_bytes, eff_cps);
+                } else self.trimLenForBudget(self.max_kv_bytes -| (if (new_glm != null) new_dflash_bytes else 0), limit, row_bytes, eff_cps);
                 if (!inputs_logged) {
                     inputs_logged = true;
                     logTrimInputs(tokens.len, row_bytes, self.max_kv_bytes, eff_cps, tl_opt, self.cp_thin != .min_span);
@@ -1983,7 +2172,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        if (eff_vision_key == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps, new_rings);
+                        if (eff_vision_key == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps, new_rings, if (new_glm) |*rows| rows else null);
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -2014,13 +2203,24 @@ pub const HotPrefixCache = struct {
                 };
                 new_snap.deinit();
                 new_snap = trimmed;
+                if (new_glm) |*rows| if (tl < rows.len) {
+                    const short = rows.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
+                        decline = .snapshot_copy_failed;
+                        decline_err = err;
+                        break :trim_blk;
+                    };
+                    rows.deinit();
+                    new_glm = short;
+                    new_glm_bytes = short.bytes();
+                };
                 // Spec payloads describe the FULL-length state; a trimmed
-                // prefix rebuilds them on its first reused turn.
-                if (new_dflash) |*d| {
+                // prefix rebuilds them on its first reused turn. GLM's window is the prompt end's,
+                // which a restore at any lower checkpoint clamps (`specAdoptPlan`).
+                if (new_glm == null) if (new_dflash) |*d| {
                     d.deinit();
                     new_dflash = null;
                     new_dflash_bytes = 0;
-                }
+                };
                 if (new_mtp) |*m3| {
                     m3.deinit();
                     new_mtp = null;
@@ -2076,7 +2276,7 @@ pub const HotPrefixCache = struct {
                     new_rings = ringCpsUpTo(self.allocator, r, if (ring_cp != null) tl - 1 else tl);
                     new_ring_bytes = ringCpsBytes(new_rings);
                 }
-                new_bytes = new_kv_bytes + new_ssm_bytes + new_ring_bytes;
+                new_bytes = new_kv_bytes + new_ssm_bytes + new_ring_bytes + new_glm_bytes + new_dflash_bytes;
                 log.info("  [hot-cache] trimmed oversized entry to {d}/{d} tokens ({d:.2} MB before checkpoint shedding; {d:.2} MB budget)\n", .{
                     tl,
                     tokens.len,
@@ -2089,7 +2289,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                if (eff_vision_key == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps, new_rings);
+                if (eff_vision_key == 0) self.spillDeclinedToDisk(&new_snap, tokens, has_tools, eff_cps, new_rings, if (new_glm) |*rows| rows else null);
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -2303,7 +2503,11 @@ pub const HotPrefixCache = struct {
             e.cache_key = cache_key;
             e.media_start = eff_media_start;
             e.quant_config = quant_config;
-            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes + ring_bytes;
+            e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes + ring_bytes + new_glm_bytes;
+            if (e.glm) |*rows| rows.deinit();
+            e.glm = new_glm;
+            e.glm_bytes = new_glm_bytes;
+            new_glm = null;
             e.ssm_checkpoints = merged_cps;
             e.ssm_bytes = merged_ssm_bytes;
             e.dflash = new_dflash;
@@ -2358,8 +2562,11 @@ pub const HotPrefixCache = struct {
             .mtp = new_mtp,
             .mtp_bytes = new_mtp_bytes,
             .ring_cps = new_rings,
+            .glm = new_glm,
+            .glm_bytes = new_glm_bytes,
         };
         new_rings = null;
+        new_glm = null;
         if (!try self.retainNewEntry(incoming)) return .declined;
         // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
@@ -2425,6 +2632,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         cps: ?[]SSMCheckpoint,
         ring_cps: ?[]const KVCacheSnapshot,
+        glm: ?*const glm5_prefix.MlaRows,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
         // SSD-first captured the live state as `pending_disk` before the trim; the
@@ -2443,7 +2651,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = d.appendCommitWithRing(snap.entries, snap.step, snap.config, tokens, has_tools, cps, null, null, ringCommitOf(snap, ring_cps), mlx.gpuStream()) catch |err| {
+        const outcome = (if (glm) |rows| persistGlm(d, rows, tokens, has_tools, cps, null, mlx.gpuStream()) else d.appendCommitWithRing(snap.entries, snap.step, snap.config, tokens, has_tools, cps, null, null, ringCommitOf(snap, ring_cps), mlx.gpuStream())) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2466,6 +2674,7 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
         ring_cps: ?[]const KVCacheSnapshot,
+        glm: ?*const glm5_prefix.MlaRows,
     ) void {
         if (self.pending_disk) |*old| {
             old.deinit(self.allocator);
@@ -2484,6 +2693,10 @@ pub const HotPrefixCache = struct {
             .has_tools = has_tools,
         };
         if (ring_cps) |cps| rec.ring_cps = shareRingCpsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
+        if (glm) |rows| rec.glm = rows.share() catch {
+            rec.deinit(self.allocator);
+            return;
+        };
         if (ssm_cps) |cps| {
             rec.ssm_cps = cloneCheckpointsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
         }
@@ -2667,6 +2880,13 @@ pub const HotPrefixCache = struct {
     /// chunk-append is bounded (partial tail + new chunks) but synchronous on
     /// the inference thread. Snapshot arrays are refcount-shared with the RAM
     /// entry, so slicing them here reads the same buffers the commit captured.
+    /// A GLM entry goes to disk as its MLA rows in the dense disk layout beside its KDA checkpoints.
+    fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const glm5_prefix.MlaRows, tokens: []const u32, has_tools: bool, cps: ?[]SSMCheckpoint, dflash: ?kv_disk_cache.SpecCommit, s: mlx.mlx_stream) !kv_disk_cache.PersistOutcome {
+        const entries = try glm5_prefix.diskEntries(d.allocator, rows);
+        defer glm5_prefix.freeDiskEntries(d.allocator, entries);
+        return d.appendCommitWithSpec(entries, rows.len, glm5_prefix.diskQuant(rows.latent_bits), tokens, has_tools, cps, dflash, null, s);
+    }
+
     pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
         if (!self.disk_dirty) return;
         self.disk_dirty = false;
@@ -2692,7 +2912,7 @@ pub const HotPrefixCache = struct {
                 .head_pos_base = mm.head_pos_base,
                 .head_marks = mm.head_marks.slice(),
             } else null;
-            const ok = d.appendCommitWithRing(
+            const ok = (if (pending.glm) |*rows| persistGlm(d, rows, pending.tokens, pending.has_tools, pending.ssm_cps, p_dflash, s) else d.appendCommitWithRing(
                 pending.snapshot.entries,
                 pending.snapshot.step,
                 pending.snapshot.config,
@@ -2703,7 +2923,7 @@ pub const HotPrefixCache = struct {
                 p_mtp,
                 ringCommitOf(&pending.snapshot, pending.ring_cps),
                 s,
-            ) catch |err| {
+            )) catch |err| {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
                 return;
             };
@@ -2727,6 +2947,14 @@ pub const HotPrefixCache = struct {
         const specs = entrySpecCommits(newest);
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
+        if (newest.glm) |*rows| {
+            const done = persistGlm(d, rows, newest.tokens, newest.has_tools, newest.ssm_checkpoints, dflash_spec, s) catch |err| {
+                log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
+                return;
+            };
+            if (!done.nothingPending()) self.disk_dirty = true;
+            return;
+        }
         const complete = d.appendCommitWithRing(
             newest.snapshot.entries,
             newest.snapshot.step,
@@ -11007,5 +11235,489 @@ test "SSD-only ring checkpoints survive restart without idle RAM" {
         }
         try testing.expectEqual(@as(usize, 0), hc.entryCount());
         try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    }
+}
+
+/// A GLM fixture turn: `tokens` prefilled in `chunks`, a KDA checkpoint after each chunk listed in
+/// `checkpoints` (chunk indices), MLA rows to the request's last pool boundary.
+const GlmTurn = struct {
+    cps: []SSMCheckpoint,
+    rows: glm5_prefix.MlaRows,
+    cache: KVCache,
+
+    fn run(net: *const glm5_forward.Model, bits: u8, tokens: []const u32, chunks: []const usize, checkpoints: []const usize) !GlmTurn {
+        var req = try glm5_prefix.servedRequest(bits);
+        defer req.deinit();
+        var cps = try testing.allocator.alloc(SSMCheckpoint, checkpoints.len);
+        var built: usize = 0;
+        errdefer {
+            for (cps[0..built]) |*cp| cp.deinit(testing.allocator);
+            testing.allocator.free(cps);
+        }
+        var at: usize = 0;
+        for (chunks, 0..) |n, i| {
+            _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &req, tokens[at .. at + n], &.{n}));
+            at += n;
+            if (std.mem.indexOfScalar(usize, checkpoints, i) != null) {
+                cps[built] = try glm5_prefix.captureKda(testing.allocator, &req, mlx.gpuStream());
+                built += 1;
+            }
+        }
+        var rows = try glm5_prefix.MlaRows.capture(testing.allocator, &req, req.offset / 4 * 4, mlx.gpuStream());
+        errdefer rows.deinit();
+        var cache = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
+        cache.step = req.offset;
+        return .{ .cps = cps, .rows = rows, .cache = cache };
+    }
+
+    /// Hands `cps` and `rows` to the cache.
+    fn commit(self: *GlmTurn, hc: *HotPrefixCache, tokens: []const u32, vision_key: u64, media_start: ?usize) !CommitStatus {
+        defer self.cache.deinit();
+        return hc.commitGlm(&self.cache, tokens, false, vision_key, 0, media_start, self.cps, self.rows, null, tokens.len);
+    }
+};
+
+fn glmKvConfig(bits: u8) kv_quant.KVQuantConfig {
+    return if (bits == 0) kv_quant.KVQuantConfig.dense else kv_quant.KVQuantConfig.affine(8);
+}
+
+const glm_first = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0, 0 };
+const glm_next = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 2, 1, 3, 1, 0, 2 };
+const glm_other = [_]u32{ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 };
+
+fn glmLookup(hc: *HotPrefixCache, req: *glm5_forward.Request, bits: u8, prompt: []const u32, vision_key: u64, media_start: ?usize, chain: []const MediaSpan) !LookupResult {
+    var target = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreGlm(&target, &moe, req, mlx.gpuStream(), prompt, false, vision_key, media_start, chain, null, null, false);
+    try testing.expectEqual(res.matched, target.step);
+    try testing.expectEqual(res.matched, req.offset);
+    return res;
+}
+
+const GlmNet = struct {
+    weights: model_mod.Weights,
+    net: glm5_forward.Model,
+
+    fn load(self: *GlmNet) !void {
+        self.weights = model_mod.Weights.init(testing.allocator);
+        errdefer self.weights.deinit();
+        var cfg = try glm5_forward.nonzeroDecodeFixture(&self.weights);
+        cfg.max_position_embeddings = 4096;
+        self.net = try glm5_forward.Model.load(testing.allocator, cfg, &self.weights, mlx.gpuStream());
+    }
+    fn deinit(self: *GlmNet) void {
+        self.net.deinit();
+        self.weights.deinit();
+    }
+};
+
+test "GLM hot cache restores the highest checkpoint under the match and continues like a cold prefill" {
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    for ([_]u8{ 0, 8 }) |bits| {
+        var hc = HotPrefixCache.init(testing.allocator, 4);
+        defer hc.deinit();
+        var turn = try GlmTurn.run(&fx.net, bits, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
+        try testing.expectEqual(CommitStatus{ .ok = glm_first.len }, try turn.commit(&hc, &glm_first, 0, null));
+        const e = &hc.entries.items[0];
+        var cps_bytes: u64 = 0;
+        for (e.ssm_checkpoints.?) |*cp| cps_bytes += ssmCheckpointBytes(cp);
+        try testing.expectEqual(e.glm.?.bytes() + cps_bytes, e.kv_bytes);
+        try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
+
+        var warm = try glm5_prefix.servedRequest(bits);
+        defer warm.deinit();
+        const res = try glmLookup(&hc, &warm, bits, &glm_next, 0, null, &.{});
+        try testing.expectEqual(@as(usize, 16), res.matched);
+        const got = try glm5_prefix.prefill(&fx.net, &warm, glm_next[16..], &.{8});
+        defer _ = mlx.mlx_array_free(got);
+        var cold = try glm5_prefix.servedRequest(bits);
+        defer cold.deinit();
+        const want = try glm5_prefix.prefill(&fx.net, &cold, &glm_next, &.{ 8, 8, 8 });
+        defer _ = mlx.mlx_array_free(want);
+        try glm5_forward.expectArrayBits(want, got);
+        try glm5_prefix.expectSameLogicalState(&cold, &warm);
+
+        // The other latent width never restores this entry, and its miss leaves the request cold.
+        const other_bits: u8 = if (bits == 0) 8 else 0;
+        var other = try glm5_prefix.servedRequest(other_bits);
+        defer other.deinit();
+        try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &other, other_bits, &glm_next, 0, null, &.{})).matched);
+    }
+}
+
+test "GLM hot cache trims an entry over the byte budget to a checkpoint and bills what it keeps" {
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var long: [300]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var probe = try GlmTurn.run(&fx.net, 8, &long, &.{ 264, 32, 4 }, &.{ 0, 1 });
+    const row = probe.rows.rowBytes();
+    const per_cp = ssmCheckpointBytes(&probe.cps[0]);
+    probe.cache.deinit();
+    probe.rows.deinit();
+    for (probe.cps) |*cp| cp.deinit(testing.allocator);
+    testing.allocator.free(probe.cps);
+
+    // The assistant window survives the trim and is priced inside the budget.
+    var window = try KVCache.init(testing.allocator, 2);
+    defer window.deinit();
+    try testFillCache(&window, mlx.gpuStream(), 2, 64);
+    var window_snap = try window.snapshot();
+    defer window_snap.deinit();
+    const window_bytes = HotPrefixCache.snapshotBytes(&window_snap);
+
+    // Room for the window, the rows to 264 and one checkpoint, not for 300 rows and two.
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, window_bytes + 264 * row + per_cp);
+    defer hc.deinit();
+    var turn = try GlmTurn.run(&fx.net, 8, &long, &.{ 264, 32, 4 }, &.{ 0, 1 });
+    defer turn.cache.deinit();
+    try testing.expectEqual(CommitStatus{ .ok = 264 }, try hc.commitGlm(&turn.cache, &long, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 236 }, long.len));
+    const e = &hc.entries.items[0];
+    try testing.expectEqual(@as(usize, 264), e.glm.?.len);
+    try testing.expect(e.dflash != null);
+    try testing.expectEqual(window_bytes + 264 * row + per_cp, e.kv_bytes);
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+    var warm = try glm5_prefix.servedRequest(8);
+    defer warm.deinit();
+    try testing.expectEqual(@as(usize, 264), (try glmLookup(&hc, &warm, 8, &long, 0, null, &.{})).matched);
+}
+
+test "GLM hot cache evicts by count, invalidates, and a miss leaves the request cold" {
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var hc = HotPrefixCache.init(testing.allocator, 1);
+    defer hc.deinit();
+    var a = try GlmTurn.run(&fx.net, 0, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
+    _ = try a.commit(&hc, &glm_first, 0, null);
+    var b = try GlmTurn.run(&fx.net, 0, &glm_other, &.{ 8, 4 }, &.{0});
+    _ = try b.commit(&hc, &glm_other, 0, null);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    var warm = try glm5_prefix.servedRequest(0);
+    defer warm.deinit();
+    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 0, &glm_next, 0, null, &.{})).matched);
+    const again = glm_other ++ [_]u32{1};
+    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
+    hc.invalidateAll("test");
+    try testing.expectEqual(@as(u64, 0), hc.current_kv_bytes);
+    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
+    try testing.expectEqual(@as(usize, 0), warm.layers[3].attention.processed);
+}
+
+test "GLM hot cache gives entries back LRU first to admit a long prefill, sparing the one it restored from" {
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var hc = HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    var a = try GlmTurn.run(&fx.net, 0, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
+    _ = try a.commit(&hc, &glm_first, 0, null);
+    var b = try GlmTurn.run(&fx.net, 0, &glm_other, &.{ 8, 4 }, &.{0});
+    _ = try b.commit(&hc, &glm_other, 0, null);
+    var warm = try glm5_prefix.servedRequest(0);
+    defer warm.deinit();
+    const again = glm_other ++ [_]u32{1};
+    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
+    const Room = struct {
+        fn oneEntry(ctx: ?*anyopaque) bool {
+            const cache: *HotPrefixCache = @ptrCast(@alignCast(ctx.?));
+            return cache.entryCount() <= 1;
+        }
+        fn never(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    const report = hc.evictLruToAdmit(again.len, &hc, Room.oneEntry, true);
+    try testing.expect(report.admitted);
+    try testing.expectEqual(@as(usize, 1), report.entries);
+    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
+    try testing.expect(!hc.evictLruToAdmit(again.len, &hc, Room.never, true).admitted);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+}
+
+test "GLM hot cache shares across media keys only below the first block the request lacks" {
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var hc = HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    // One media block at 10 (key 0xA); the next turn appends a second block at 20 (key 0xB).
+    var turn = try GlmTurn.run(&fx.net, 0, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
+    _ = try turn.commit(&hc, &glm_first, 0xA, 10);
+    var warm = try glm5_prefix.servedRequest(0);
+    defer warm.deinit();
+    const chain = [_]MediaSpan{ .{ .start = 10, .key = 0xA }, .{ .start = 20, .key = 0xB } };
+    try testing.expectEqual(@as(usize, 16), (try glmLookup(&hc, &warm, 0, &glm_next, 0xB, 10, &chain)).matched);
+    const stranger = [_]MediaSpan{.{ .start = 10, .key = 0xC }};
+    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &glm_next, 0xC, 10, &stranger)).matched);
+}
+
+test "GLM hot cache checkout hands the MLA rows to the slot so its first append donates" {
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var hc = HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    hc.ssd_first = true;
+    var turn = try GlmTurn.run(&fx.net, 8, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
+    _ = try turn.commit(&hc, &glm_first, 0, null);
+    const billed = hc.entries.items[0].glm_bytes;
+    var warm = try glm5_prefix.servedRequest(8);
+    defer warm.deinit();
+    var target = try KVCache.initWithConfig(testing.allocator, 4, kv_quant.KVQuantConfig.affine(8));
+    defer target.deinit();
+    var moe: usize = 0;
+    const longer = glm_first ++ [_]u32{ 2, 2, 2, 2 };
+    const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, mlx.gpuStream(), &longer, false, 0, null, &.{}, null, 7, false);
+    try testing.expect(res.checked_out);
+    try testing.expectEqual(@as(usize, 16), res.matched);
+    hc.donateCheckout(7);
+    try testing.expectEqual(@as(u64, 0), hc.entries.items[0].glm.?.bytes());
+    try testing.expectEqual(billed, hc.donatedBytes(7));
+    hc.releaseCheckout(7, "test");
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+}
+
+test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continues like a cold prefill" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var next: [750]u32 = undefined;
+    @memcpy(next[0..650], first[0..650]);
+    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    for ([_]u8{ 0, 8 }) |bits| {
+        const fp: []const u8 = if (bits == 0) "fp-glm-bf16" else "fp-glm-kv8";
+        {
+            var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+            defer hc.deinit();
+            var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
+            _ = try turn.commit(&hc, &first, 0, null);
+            hc.flushPendingDisk(s);
+            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        }
+        // A restart: nothing in RAM.
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+        defer hc.deinit();
+        var warm = try glm5_prefix.servedRequest(bits);
+        defer warm.deinit();
+        const res = try glmLookup(&hc, &warm, bits, &next, 0, null, &.{});
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        try testing.expect(res.ownsRestoredRows());
+        const got = try glm5_prefix.prefill(&fx.net, &warm, next[512..], &.{238});
+        defer _ = mlx.mlx_array_free(got);
+        var cold = try glm5_prefix.servedRequest(bits);
+        defer cold.deinit();
+        const want = try glm5_prefix.prefill(&fx.net, &cold, &next, &.{ 256, 256, 238 });
+        defer _ = mlx.mlx_array_free(want);
+        try glm5_forward.expectArrayBits(want, got);
+        try glm5_prefix.expectSameLogicalState(&cold, &warm);
+        // The other latent width finds nothing on disk.
+        var other = try glm5_prefix.servedRequest(if (bits == 0) 8 else 0);
+        defer other.deinit();
+        try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &other, if (bits == 0) 8 else 0, &next, 0, null, &.{})).matched);
+    }
+}
+
+test "GLM entries carry the assistant window, and a restore hands back its rows below the checkpoint, RAM and SSD" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var next: [750]u32 = undefined;
+    @memcpy(next[0..650], first[0..650]);
+    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    // The window as prefill left it: 300 rows ending at the prompt end.
+    var window = try KVCache.init(testing.allocator, 2);
+    defer window.deinit();
+    try testFillCache(&window, s, 2, 300);
+    var committing = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    committing.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
+    var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
+    defer turn.cache.deinit();
+    _ = try committing.commitGlm(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
+    committing.flushPendingDisk(s);
+    var restarted = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer restarted.deinit();
+    for ([_]*HotPrefixCache{ &committing, &restarted }) |hc| {
+        if (hc == &restarted) {
+            committing.deinit();
+            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
+        }
+        var drafter = try KVCache.init(testing.allocator, 2);
+        defer drafter.deinit();
+        var drafter_base: usize = 0;
+        var warm = try glm5_prefix.servedRequest(8);
+        defer warm.deinit();
+        var target = try KVCache.initWithConfig(testing.allocator, 4, kv_quant.KVQuantConfig.affine(8));
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, null, false);
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        try testing.expectEqual(@as(?usize, 400), res.dflash_base);
+        try testing.expectEqual(@as(usize, 112), drafter.step);
+    }
+}
+
+fn glmSsdOnlyCache(io: std.Io, base: []const u8, fp: []const u8, max_bytes: u64, budget_from_volume: bool) !HotPrefixCache {
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    errdefer hc.deinit();
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, max_bytes, 128);
+    hc.disk.?.ssd_first = budget_from_volume;
+    if (budget_from_volume) hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.enableBackgroundWriter();
+    return hc;
+}
+
+test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart restores it like a cold prefill" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var next: [750]u32 = undefined;
+    @memcpy(next[0..650], first[0..650]);
+    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    var window = try KVCache.init(testing.allocator, 2);
+    defer window.deinit();
+    try testFillCache(&window, s, 2, 300);
+    for ([_]u8{ 0, 8 }) |bits| {
+        const fp: []const u8 = if (bits == 0) "glm-ssd-only-bf16" else "glm-ssd-only-kv8";
+        {
+            var hc = try glmSsdOnlyCache(io, base, fp, 0, true);
+            defer hc.deinit();
+            var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
+            defer turn.cache.deinit();
+            const status = try hc.commitGlm(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
+            try testing.expectEqual(CommitStatus{ .disk_only = first.len }, status);
+            try testing.expectEqual(@as(usize, 0), hc.entryCount());
+            try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+            hc.flushPendingDisk(s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+            try testing.expect(hc.pending_disk == null);
+        }
+        var hc = try glmSsdOnlyCache(io, base, fp, 0, true);
+        defer hc.deinit();
+        var drafter = try KVCache.init(testing.allocator, 2);
+        defer drafter.deinit();
+        var drafter_base: usize = 0;
+        var warm = try glm5_prefix.servedRequest(bits);
+        defer warm.deinit();
+        var target = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
+        defer target.deinit();
+        var moe: usize = 0;
+        const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, 9, false);
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        try testing.expect(res.ownsRestoredRows());
+        try testing.expectEqual(@as(?usize, 400), res.dflash_base);
+        try testing.expectEqual(@as(usize, 112), drafter.step);
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        const got = try glm5_prefix.prefill(&fx.net, &warm, next[512..], &.{238});
+        defer _ = mlx.mlx_array_free(got);
+        var cold = try glm5_prefix.servedRequest(bits);
+        defer cold.deinit();
+        const want = try glm5_prefix.prefill(&fx.net, &cold, &next, &.{ 256, 256, 238 });
+        defer _ = mlx.mlx_array_free(want);
+        try glm5_forward.expectArrayBits(want, got);
+        try glm5_prefix.expectSameLogicalState(&cold, &warm);
+    }
+}
+
+test "GLM SSD-only: the disk budget evicts the least recently used conversation" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var prompts: [3][600]u32 = undefined;
+    for (&prompts, 0..) |*p, k| for (p, 0..) |*t, i| {
+        t.* = @intCast((i * (k + 3) + k + i / 7) % 4);
+    };
+    // Measure one entry, then allow two.
+    var one: u64 = 0;
+    {
+        var hc = try glmSsdOnlyCache(io, base, "glm-ssd-probe", 0, false);
+        defer hc.deinit();
+        var turn = try GlmTurn.run(&fx.net, 8, &prompts[0], &.{ 512, 88 }, &.{0});
+        _ = try turn.commit(&hc, &prompts[0], 0, null);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        one = hc.disk.?.total_bytes;
+    }
+    var hc = try glmSsdOnlyCache(io, base, "glm-ssd-budget", one * 5 / 2, false);
+    defer hc.deinit();
+    for (&prompts) |*p| {
+        var turn = try GlmTurn.run(&fx.net, 8, p, &.{ 512, 88 }, &.{0});
+        _ = try turn.commit(&hc, p, 0, null);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+    }
+    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+    try testing.expect(hc.disk.?.total_bytes <= one * 5 / 2);
+    var warm = try glm5_prefix.servedRequest(8);
+    defer warm.deinit();
+    const again: [3][601]u32 = .{ prompts[0] ++ [_]u32{1}, prompts[1] ++ [_]u32{1}, prompts[2] ++ [_]u32{1} };
+    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 8, &again[0], 0, null, &.{})).matched);
+    try testing.expectEqual(@as(usize, 512), (try glmLookup(&hc, &warm, 8, &again[1], 0, null, &.{})).matched);
+    try testing.expectEqual(@as(usize, 512), (try glmLookup(&hc, &warm, 8, &again[2], 0, null, &.{})).matched);
+}
+
+test "GLM's 1 GiB RAM tier keeps a 30K or 60K session at its prompt end and sheds checkpoints, a longer one trims" {
+    const cp: u64 = 147_619_840;
+    const row: u64 = 6688;
+    const window: u64 = 2047 * 5 * 8 * 128 * 2 * 2;
+    const budget: u64 = (1 << 30) - window;
+    const Case = struct { positions: [8]usize, kept: usize, cps: u64 };
+    const cases = [_]Case{
+        .{ .positions = .{ 2048, 8192, 14336, 20480, 24576, 26624, 28672, 30688 }, .kept = 30688, .cps = 5 },
+        .{ .positions = .{ 2048, 14336, 26624, 38912, 51200, 55296, 59392, 61408 }, .kept = 61408, .cps = 4 },
+        .{ .positions = .{ 2048, 34816, 67584, 100352, 120832, 133120, 137216, 140256 }, .kept = 120832, .cps = 1 },
+    };
+    const bytes: [8]u64 = @splat(cp);
+    for (cases) |c| {
+        const tl = HotPrefixCache.trimLenForBudgetPure(budget, std.math.maxInt(usize), row, &c.positions, &bytes, .min_span_recency, null);
+        try testing.expectEqual(@as(?usize, c.kept), tl);
+        const k = std.mem.indexOfScalar(usize, &c.positions, c.kept).? + 1;
+        const survivors = HotPrefixCache.shedSurvivorBytes(c.positions[0..k], bytes[0..k], budget - c.kept * row, .min_span_recency).?;
+        try testing.expectEqual(c.cps * cp, survivors);
     }
 }

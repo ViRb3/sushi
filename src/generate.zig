@@ -34,6 +34,8 @@ const ssmSnapshotDeinit = transformer_mod.ssmSnapshotDeinit;
 const ssmRestore = transformer_mod.ssmRestore;
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
+const glm5_forward = @import("glm5_forward.zig");
+const glm5_prefix = @import("glm5_prefix.zig");
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const DflashModel = dflash_mod.DflashModel;
@@ -1245,6 +1247,8 @@ pub fn glmLookupProposal(got: ?mtp_lookup.Match, pending: u32, budget: u32) ?@im
 
 /// Takes the verifier's MLA capacity right after prefill, inside the request's admission bill: no
 /// round grows a buffer, and a later admission already sees the capacity as live memory.
+pub const GlmSpecWindow = struct { snapshot: transformer_mod.KVCacheSnapshot, base_pos: usize };
+
 fn reserveGlmDflash(config: *const model_mod.ModelConfig, ctx: ForwardCtx, assistant: *const dflash_mod.DflashCtx, max_tokens: u32, s: mlx.mlx_stream) !void {
     const request = ctx.glm5_request orelse return error.GlmRequestMissing;
     const kv = ctx.cache.config;
@@ -1418,6 +1422,32 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     if (!want_ssm_cp) return 0;
     if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return if (restored) prefix_len else 0;
     return SSM_SNAPSHOT_BACKOFF;
+}
+
+/// GLM's checkpoint grid: absolute multiples of its widest prefill chunk. A narrower chunk divides
+/// it and `nextChunkEnd` ends a chunk on every grid point, so a grid point is a chunk boundary in
+/// every request whatever widths it runs. A test seam; serving never changes it.
+pub var glm_checkpoint_stride: usize = glm5_forward.prefill_chunk;
+
+/// GLM restores only on an IndexPool boundary, so its prompt-end snapshot backs off up to 3
+/// more tokens to land on an absolute multiple of 4.
+pub fn glmSnapshotBackoff(backoff: usize, offset: usize, prefix_len: usize) usize {
+    if (backoff >= prefix_len) return backoff;
+    return @min(backoff + (offset + prefix_len - backoff) % glm5_prefix.pool_size, prefix_len);
+}
+
+/// GLM restores only on an IndexPool boundary; every other arch at any checkpoint position.
+fn restorableCheckpoint(glm: ?*glm5_forward.Request, pos: usize) bool {
+    return glm == null or pos % glm5_prefix.pool_size == 0;
+}
+
+/// A prefill checkpoint at absolute `pos`: the slot's SSM entries, or the GLM request's KDA state.
+fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Transformer, ctx: *const ForwardCtx, glm: ?*glm5_forward.Request, pos: usize) !SSMCheckpoint {
+    if (glm) |request| {
+        if (request.offset != pos) return error.GlmCachePositionMismatch;
+        return glm5_prefix.captureKda(allocator, request, xfm.s);
+    }
+    return captureSsmCheckpoint(allocator, ctx.ssm_entries.?, pos, xfm.s);
 }
 
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
@@ -1746,6 +1776,9 @@ pub const Generator = struct {
     glm_draft_rate: f32 = 0.8,
     /// Verbatim-copy rounds (`glmLookupChain`) and the drafts they landed, for `[spec-stats]`.
     glm_lookup: struct { rounds: u64 = 0, landed: u64 = 0 } = .{},
+    /// The GLM assistant window as prefill left it, committed with the prefix: every GLM restore
+    /// point lies at or below the prompt end, which a window cropped at the reply's end can miss.
+    glm_prefill_window: ?GlmSpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, clamped by --draft-block-size).
@@ -2798,9 +2831,10 @@ pub const Generator = struct {
             ssm_checkpoints.deinit(allocator);
         }
         const has_vision = ctx.vision_embeddings != null;
+        const glm_request = ctx.glm5_request;
         const want_ssm_cp = shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
-            ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0,
+            (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,
             has_vision,
         );
         // The snapshot backoff: a checkpoint AT the prompt end is
@@ -2817,10 +2851,12 @@ pub const Generator = struct {
         // above must not densify checkpoint spacing (16× more captures at
         // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
         // on stride boundaries, so a capped chunk stays compatible.
-        const ssm_cp_stride: usize = if (want_ssm_cp)
-            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))
+        const ssm_cp_stride: usize = if (!want_ssm_cp)
+            0
+        else if (glm_request != null)
+            glm_checkpoint_stride
         else
-            0;
+            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override));
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
         // scheduler after restoring a checkpoint) pass the matched prefix
         // length so the snapshots stamp positions valid in the full original
@@ -2913,7 +2949,8 @@ pub const Generator = struct {
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
+            const base_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
+            const snapshot_backoff = if (glm_request != null and want_state_cp) glmSnapshotBackoff(base_backoff, ssm_cp_offset, prefix_len) else base_backoff;
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
@@ -2950,7 +2987,7 @@ pub const Generator = struct {
             // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
             // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
             const cp_thin: transformer_mod.ThinPolicy =
-                if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
+                if (xfm.config.longCtxGated() or glm_request != null) .min_span_recency else .oldest;
 
             const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
             // The arch's own per-request buffers reserve at the same length.
@@ -3147,8 +3184,8 @@ pub const Generator = struct {
                     // scan (measured −4% on an 8K Qwen3.6-27B prefill). The
                     // states are ~KB-to-MB scale; evaluating them alongside
                     // the KV costs nothing measurable.
-                    if (want_ssm_cp) {
-                        for (ctx.ssm_entries.?) |*ssm| {
+                    if (want_ssm_cp) if (ctx.ssm_entries) |entries| {
+                        for (entries) |*ssm| {
                             if (!ssm.initialized) continue;
                             if (ssm.conv_state.ctx != null) {
                                 _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.conv_state);
@@ -3157,7 +3194,7 @@ pub const Generator = struct {
                                 _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.ssm_state);
                             }
                         }
-                    }
+                    };
                     _ = mlx.mlx_eval(eval_vec);
                 }
                 _ = mlx.mlx_clear_cache();
@@ -3179,8 +3216,8 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
-                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
+                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) {
+                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
                         doomed.deinit(allocator);
@@ -3293,13 +3330,13 @@ pub const Generator = struct {
                 // to be a stride multiple).
                 const already_have = ssm_checkpoints.items.len > 0 and
                     ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
-                if (!already_have) {
+                if (!already_have and restorableCheckpoint(glm_request, final_abs)) {
                     // SSM state is already materialized — the chunked loop
                     // evaluated it at every chunk boundary. The final chunk
                     // may have been a stride-aligned one (already evaluated)
                     // or a partial tail (also evaluated). The snapshot is a
                     // cheap refcount-share.
-                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs, xfm.s);
+                    const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, final_abs);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
                         doomed.deinit(allocator);
@@ -3326,9 +3363,9 @@ pub const Generator = struct {
                 // captures skipped it so a 400k prefill is not 32× the
                 // indexer buffer. With the share switch on nothing is attached here: the newest
                 // snap takes a view of the live buffer at commit (`handoffQsaHistoryToLatest`).
-                if (ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShareEnabled()) {
-                    try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ctx.ssm_entries.?, xfm.s);
-                }
+                if (ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShareEnabled()) if (ctx.ssm_entries) |entries| {
+                    try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, entries, xfm.s);
+                };
             }
         }
 
@@ -3543,6 +3580,8 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(sample_lazy);
 
             if (glm_dflash_native) try reserveGlmDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
+            var glm_window: ?GlmSpecWindow = if (glm_dflash_native and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
+            errdefer if (glm_window) |*w| w.snapshot.deinit();
             const mtp_cost_profile: mtp_mod.MtpCostProfile = if (mtp_active)
                 options.mtp.?.costProfile(xfm, ctx.cache.config)
             else
@@ -3588,6 +3627,7 @@ pub const Generator = struct {
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
                 .glm_dflash_native = glm_dflash_native,
+                .glm_prefill_window = glm_window,
                 .dflash_block_size = dflash_bs,
                 .dflash_chooser = if (dflash_active and !glm_dflash_native and dflashChooserEnabled())
                     round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
@@ -3611,6 +3651,7 @@ pub const Generator = struct {
             };
             mtp_cache = null; // ownership transferred to the Generator
             dflash_ctx = null; // ownership transferred to the Generator
+            glm_window = null;
             // pending_logits/pending_token left empty — the lazy pipeline is
             // skipped under PLD / drafter / MTP. The speculative `next*` paths
             // drive every subsequent step with predictable cache offset.
@@ -3931,6 +3972,10 @@ pub const Generator = struct {
         if (self.dflash_ctx) |*dc| {
             dc.deinit();
             self.dflash_ctx = null;
+        }
+        if (self.glm_prefill_window) |*w| {
+            w.snapshot.deinit();
+            self.glm_prefill_window = null;
         }
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
@@ -22246,4 +22291,153 @@ test "GLM serving DFlash2 arms only requests the native verifier can reproduce" 
     try testing.expect(!glmDflashEligible(.{ .temperature = 0 }, 1));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }, 0));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1 } }, 0));
+}
+
+test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {
+    for ([_]usize{ 0, 256, 1024 }) |offset| {
+        for ([_]usize{ 31, 32, 33, 34, 35, 100, 299, 4097 }) |prefix_len| {
+            const back = glmSnapshotBackoff(ssmSnapshotBackoff(true, prefix_len, offset > 0), offset, prefix_len);
+            try testing.expect(back >= SSM_SNAPSHOT_BACKOFF and back <= SSM_SNAPSHOT_BACKOFF + 3 or back == prefix_len);
+            if (back < prefix_len) try testing.expectEqual(@as(usize, 0), (offset + prefix_len - back) % 4);
+        }
+    }
+    // A restored tail inside the window still forwards as one span.
+    try testing.expectEqual(@as(usize, 12), glmSnapshotBackoff(ssmSnapshotBackoff(true, 12, true), 256, 12));
+    // A short cold prompt still ends its loop on a pool boundary.
+    try testing.expectEqual(@as(usize, 1), glmSnapshotBackoff(ssmSnapshotBackoff(true, 13, false), 0, 13));
+}
+
+test "GLM short prompts and odd chunk widths still checkpoint only on pool boundaries" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    var prompt: [150]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 4);
+    glm_checkpoint_stride = 64;
+    defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    for ([_]struct { len: usize, chunk: usize }{ .{ .len = 14, .chunk = 64 }, .{ .len = 150, .chunk = 37 } }) |case| {
+        var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(testing.io, a, &xfm, &tok, prompt[0..case.len], 2, greedy, &.{}, .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = case.chunk, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = 16 });
+        defer gen.deinit(a);
+        try testing.expect(gen.ssm_checkpoints.items.len > 0);
+        for (gen.ssm_checkpoints.items) |cp| try testing.expectEqual(@as(usize, 0), cp.pos % 4);
+    }
+}
+
+fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {
+    var cfg = try glm5_forward.nonzeroDecodeFixture(weights);
+    cfg.max_position_embeddings = 4096;
+    return cfg;
+}
+
+test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefills its suffix exactly like cold" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var first: [300]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var next: [330]u32 = undefined;
+    @memcpy(next[0..290], first[0..290]);
+    for (next[290..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 64, .ssm_checkpoint_max = 16 };
+    glm_checkpoint_stride = 64;
+    defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    var turn = try Transformer.init(testing.io, a, cfg, &weights);
+    defer turn.deinit();
+    var gen = try Generator.initWithOptions(testing.io, a, &turn, &tok, &first, 4, greedy, &.{}, opts);
+    defer gen.deinit(a);
+    var at: [5]usize = undefined;
+    for (gen.ssm_checkpoints.items, 0..) |cp, i| at[i] = cp.pos;
+    // Stride boundaries, then the backoff snapshot pulled back to a pool boundary (299 - 31).
+    try testing.expectEqualSlices(usize, &.{ 64, 128, 192, 256, 268 }, at[0..gen.ssm_checkpoints.items.len]);
+    var rows = try glm5_prefix.MlaRows.capture(a, &turn.glm5_request.?, 268, turn.s);
+    defer rows.deinit();
+
+    var cold_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer cold_xfm.deinit();
+    var cold = try Generator.initWithOptions(testing.io, a, &cold_xfm, &tok, &next, 4, greedy, &.{}, opts);
+    defer cold.deinit(a);
+
+    var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer warm_xfm.deinit();
+    try glm5_prefix.restore(&warm_xfm.glm5_request.?, &rows, &gen.ssm_checkpoints.items[3]);
+    warm_xfm.cache.step = 256;
+    var warm_opts = opts;
+    warm_opts.ssm_checkpoint_pos_offset = 256;
+    var warm = try Generator.initWithOptions(testing.io, a, &warm_xfm, &tok, next[256..], 4, greedy, &.{}, warm_opts);
+    defer warm.deinit(a);
+    try glm5_prefix.expectSameLogicalState(&cold_xfm.glm5_request.?, &warm_xfm.glm5_request.?);
+    try testing.expectEqual(cold.next_token_id, warm.next_token_id);
+    try testing.expectEqual(cold.ssm_checkpoints.items[cold.ssm_checkpoints.items.len - 1].pos, warm.ssm_checkpoints.items[warm.ssm_checkpoints.items.len - 1].pos);
+}
+
+const GlmStepDown = struct {
+    fn call(_: *anyopaque, pos: usize, cur: u32, _: u32, _: *AdaptiveWidthState) u32 {
+        return if (pos >= 128) 32 else cur;
+    }
+    fn confirm(_: *anyopaque, _: usize, _: u32) bool {
+        return false;
+    }
+};
+
+test "GLM checkpoints stay on the grid when a request steps its chunk down, and a restore there with the same widths matches cold" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    glm_checkpoint_stride = 64;
+    defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    var first: [300]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var next: [330]u32 = undefined;
+    @memcpy(next[0..290], first[0..290]);
+    for (next[290..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    var dummy: u8 = 0;
+    const hook: Generator.ChunkWidthHook = .{ .ctx = &dummy, .call = GlmStepDown.call, .confirm = GlmStepDown.confirm };
+    const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .chunk_width_hook = hook, .ssm_checkpoint_stride = 64, .ssm_checkpoint_max = 16 };
+
+    var turn = try Transformer.init(testing.io, a, cfg, &weights);
+    defer turn.deinit();
+    var gen = try Generator.initWithOptions(testing.io, a, &turn, &tok, &first, 2, greedy, &.{}, opts);
+    defer gen.deinit(a);
+    var at: [5]usize = undefined;
+    for (gen.ssm_checkpoints.items, 0..) |cp, i| at[i] = cp.pos;
+    // 64-wide chunks to 128, 32-wide after: the grid points are still chunk ends.
+    try testing.expectEqualSlices(usize, &.{ 64, 128, 192, 256, 268 }, at[0..gen.ssm_checkpoints.items.len]);
+    var rows = try glm5_prefix.MlaRows.capture(a, &turn.glm5_request.?, 268, turn.s);
+    defer rows.deinit();
+
+    var cold_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer cold_xfm.deinit();
+    var cold = try Generator.initWithOptions(testing.io, a, &cold_xfm, &tok, &next, 2, greedy, &.{}, opts);
+    defer cold.deinit(a);
+
+    var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer warm_xfm.deinit();
+    try glm5_prefix.restore(&warm_xfm.glm5_request.?, &rows, &gen.ssm_checkpoints.items[2]);
+    warm_xfm.cache.step = 192;
+    var warm_opts = opts;
+    warm_opts.ssm_checkpoint_pos_offset = 192;
+    // The width in force at 192 in the cold run.
+    warm_opts.pinned_prefill_chunk = 32;
+    var warm = try Generator.initWithOptions(testing.io, a, &warm_xfm, &tok, next[192..], 2, greedy, &.{}, warm_opts);
+    defer warm.deinit(a);
+    try glm5_prefix.expectSameLogicalState(&cold_xfm.glm5_request.?, &warm_xfm.glm5_request.?);
+    try testing.expectEqual(cold.next_token_id, warm.next_token_id);
 }

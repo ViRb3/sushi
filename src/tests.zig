@@ -83,6 +83,7 @@ test {
     _ = @import("glm5_dflash.zig");
     _ = @import("glm5_dflash_cache.zig");
     _ = @import("glm5_forward.zig");
+    _ = @import("glm5_prefix.zig");
     _ = @import("glm5_stream.zig");
     _ = @import("glm5_mla_reference_test.zig");
     _ = @import("glm5_diagnostic.zig");

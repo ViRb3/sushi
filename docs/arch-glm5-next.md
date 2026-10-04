@@ -10,8 +10,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
 
 ## Scope
 
-- Concurrent requests batch as plain rows, up to four ([concurrency](#concurrency)). MTP and RAM/disk prefix reuse
-  are off: native KDA state has no prefix-cache restore and the checkpoint's MTP layer is not integrated.
+- Concurrent requests batch as plain rows, up to four ([concurrency](#concurrency)). MTP is off: the checkpoint's MTP
+  layer is not integrated.
+- Prefix reuse, RAM, SSD and SSD-only: KDA checkpoints on the prefill chunk grid and at the prompt end, MLA rows below them, the
+  assistant window beside them ([engine-prefix-cache](engine-prefix-cache.md#glm)). The RAM tier defaults to 1 GiB,
+  which admission evicts for a long prefill; long reuse belongs on `--prefix-cache-disk` or SSD-only.
 - Cache: kv8 compressed MLA latent plus FP32 KDA state, the engine default; it passed its KLD gate
   ([quality-kld](quality-kld.md)). `--kv-quant 16` (or `kv_quant: 16` per request or in model-settings) keeps the
   latent BF16. The pooled index and KDA state stay lossless. kv4 is refused (`GlmKvQuantUnsupported`), and the KLD teacher capture refuses any kv-quant.
@@ -147,12 +150,15 @@ inside 1.46% drift) because verification per round grew 20.6%.
   layer a two-layer pending window can contain (`glmMlaLayersPending`): head-batched MLA copies 384 MiB, packed
   attention with its second tile 256 MiB, index scores 8 MiB, and under kv8 the dense-prefill dequantization
   (≤ 2051 rows) plus one chunk's quantizer output, 3.1 MiB. Without NAX the packed tiles (the FP32 composite) keep
-  their 256 MiB, B1/B3 rise to 128 MiB, and the A6, MLA, index and cluster terms drop.
+  their 256 MiB, B1/B3 rise to 128 MiB, and the A6, MLA, index and cluster terms drop. With the prefix cache on, a
+  prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit
+  ([prefix cache](engine-prefix-cache.md#glm)).
 - Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with
   a 93% margin (85% elsewhere): GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +
-  vision + A4 at its measured 104.35 GB active advertises 1,048,576 at a 2048 bill (1,144,691 tokens by the bill), and
-  at a 1024 bill with a 1 GiB RAM prefix tier (2048 would advertise 958K there). The quarter-share rule had pinned
-  the prefill to 512 rows; at 85% the auto context read 972,800.
+  vision + A4 at its measured 104.35 GB active advertises 1,048,576 at a 2048 bill (1,144,691 tokens by the bill).
+  The prefix cache reserves nothing here: admission evicts its RAM tier and bills a request's checkpoints, keeping
+  fewer where they do not fit. The quarter-share rule had pinned the prefill to 512 rows; at 85% the auto context
+  read 972,800.
 - `max_safe_context` = (ceiling − active − transients) × 0.8 × 0.8 / per-token bill. The kv8 default drops the bill
   44%: Sushi-2.5bpw + vision + A4 assistant boots at 104.32 GB active with `max_safe_context` 1,048,576 (the position
   cap; about 1.36M by the bill), against 758,793 at `--kv-quant 16` (976a0dbb, auto context, margin 4 GiB).

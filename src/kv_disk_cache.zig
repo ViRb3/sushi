@@ -298,9 +298,14 @@ pub fn persistTargetLen(
     tokens_len: usize,
 ) usize {
     var max_off: usize = 0;
+    var any = false;
     for (kv_entries) |*entry| {
-        if (entry.initialized and !entry.ringed and entry.offset > max_off) max_off = entry.offset;
+        if (!entry.initialized) continue;
+        any = true;
+        if (!entry.ringed and entry.offset > max_off) max_off = entry.offset;
     }
+    // A cache whose state lives elsewhere (GLM's request) holds no rows to persist.
+    if (!any) return 0;
     return @min(@max(step, max_off), tokens_len);
 }
 
@@ -940,6 +945,32 @@ pub const DiskTier = struct {
         if (qsa_overlay) |*qsa_cp| {
             try transformer_mod.applyQsaHistoryAt(ssm_entries, qsa_cp, cp_pos, s, true);
         }
+        e.last_used = self.bump();
+        self.writeMeta(e.*) catch {};
+        return cp_pos;
+    }
+
+    /// `restoreIntoHybrid` for a state with no QSA history (GLM's KDA): the KV prefix and the
+    /// checkpoint at `cp_pos`, without reading any other checkpoint file.
+    pub fn restoreIntoKda(
+        self: *DiskTier,
+        cache: *KVCache,
+        ssm_entries: []transformer_mod.SSMCacheEntry,
+        idx: usize,
+        cp_pos: u32,
+        s: mlx.mlx_stream,
+    ) !u32 {
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
+        self.drainEntry(self.entries.items[idx].id);
+        const e = &self.entries.items[idx];
+        if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
+        if (std.mem.indexOfScalar(u32, e.ssm_positions, cp_pos) == null) return error.DiskCacheNoCheckpoint;
+        var cp = try self.loadSsmFile(e.id, cp_pos, ssm_entries.len);
+        defer cp.deinit(self.allocator);
+        try self.restoreKvInto(cache, e, cp_pos, s);
+        errdefer cache.truncate(0, s) catch {};
+        try transformer_mod.restoreSsmCheckpoint(ssm_entries, &cp);
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
         return cp_pos;
@@ -3840,7 +3871,8 @@ fn manifestQuant(obj: std.json.ObjectMap) ?kv_quant.KVQuantConfig {
     const scheme_v = obj.get("scheme") orelse return null;
     if (scheme_v != .string) return null;
     const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
-    if (scheme == .off) return kv_quant.KVQuantConfig.dense;
+    // A dense entry may still name a width: GLM's disk layout keys its kv8 latent rows so.
+    if (scheme == .off) return .{ .scheme = .off, .bits = jsonInt(u8, obj, "bits") orelse 0, .group_size = jsonInt(u32, obj, "group_size") orelse 0 };
     if (scheme != .affine) return null;
     const bits = jsonInt(u8, obj, "bits") orelse return null;
     if (bits != 4 and bits != 8) return null;
@@ -8084,4 +8116,28 @@ test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to
     try testing.expect(e.qsa_history_bytes > 0);
     try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
     try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
+test "DiskTier: a commit holding no KV rows persists nothing, even with checkpoints" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var tier = try DiskTier.init(std.testing.allocator, io, base, "fp-no-rows", 0, 128);
+    defer tier.deinit();
+    // A cache whose state lives elsewhere (GLM's request): every layer uninitialized, step set.
+    var cache = try KVCache.init(std.testing.allocator, 3);
+    defer cache.deinit();
+    cache.step = 2048;
+    var entries = buildHybridEntries(s, 1, 100);
+    defer freeHybridEntries(&entries);
+    var cp = try transformer_mod.captureSsmCheckpoint(std.testing.allocator, &entries, 2048, s);
+    defer cp.deinit(std.testing.allocator);
+    var tokens: [2048]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i);
+    try std.testing.expectEqual(PersistOutcome.skipped, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &.{cp}, s));
+    try std.testing.expectEqual(@as(usize, 0), tier.entryCount());
+    try std.testing.expectEqual(@as(u64, 0), tier.total_bytes);
 }

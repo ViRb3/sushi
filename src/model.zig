@@ -1159,9 +1159,10 @@ pub const ModelConfig = struct {
 
     /// Does admission credit the hot cache and evict it to admit a prefill? One predicate for the
     /// connection thread's credits and the inference thread's eviction pass. A ringed arch joins:
-    /// its warm credit is the global layers' rows alone, the ring is billed whole.
+    /// its warm credit is the global layers' rows alone, the ring is billed whole. GLM joins: its
+    /// context is sized with no cache reserve.
     pub fn admissionEvictsHotCache(self: *const ModelConfig) bool {
-        return self.longCtxGated() or self.swaRingTokens() > 0;
+        return self.longCtxGated() or self.swaRingTokens() > 0 or self.isGlm5();
     }
 
     /// Does a request reserve its whole cache capacity up front instead of

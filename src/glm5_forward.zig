@@ -930,7 +930,7 @@ test "GLM MLA stored affine kv rows preserve both projection orientations" {
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(layer.sk));
 }
 
-fn nonzeroDecodeFixture(weights: *model.Weights) !model.ModelConfig {
+pub fn nonzeroDecodeFixture(weights: *model.Weights) !model.ModelConfig {
     var cfg = try completeFixture(weights);
     cfg.max_position_embeddings = 512;
     var iter = weights.map.iterator();
@@ -960,7 +960,7 @@ fn nonzeroDecodeFixture(weights: *model.Weights) !model.ModelConfig {
     return cfg;
 }
 
-fn expectArrayBits(a: Arr, b: Arr) !void {
+pub fn expectArrayBits(a: Arr, b: Arr) !void {
     try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
     try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
     var ops = Ops{ .s = mlx.gpuStream() };

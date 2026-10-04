@@ -17,6 +17,10 @@ earlier history is mlx-serve's, in that project's changelog.
   still owe cache growth, and a DFlash2 request that sampled EOS first finishes without emitting it beside others.
 - **GLM-5.3-Flash's FP8 release streams its experts from SSD** as stored FP8 codes and block scales, in `serve`, `run`
   and `kld compare`; `kld capture` refuses it, since the BF16 source stays the teacher. Verified by hermetic tests only.
+- **GLM-5.3 reuses prompt prefixes across turns, in RAM, on SSD and SSD-only** (`--no-prefix-cache-ram`): a turn
+  that appends to the conversation restores the previous prompt's state instead of prefilling it again, and a restore
+  on the prefill chunk grid is bit-identical to a cold prefill. Its RAM tier defaults to 1 GiB and gives way to a long
+  prompt, so the full 1M context stays available; add `--prefix-cache-disk` for long sessions.
 - **GLM-5.3-Flash on M1–M4 Macs is faster**: it keeps its fused KDA, prework and router kernels, runs sparse prefill
   and decode attention as FP32 GEMMs instead of the scalar kernel, and bills no NAX-only scratch;
   `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` now rehearses that path on an M5.
