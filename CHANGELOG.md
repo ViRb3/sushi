@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Concurrent GLM-5.3 requests no longer leak a verifier result per tick** when one of them runs a DFlash2 draft tree
+  beside the others.
 - **Unloading a model waits for every finished request to be torn down**, a submission that fails after its slot is
   built frees its media on the inference thread, and an error whose name cannot be copied still ends its request.
 - **GLM-5.3 DFlash2 no longer fails a request that ends within a few positions of the context limit**, and a request

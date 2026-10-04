@@ -9451,10 +9451,50 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
         glm_tree_logged = true;
         log.info("[glm-rows] a {d}-row draft tree joined {d} plain rows\n", .{ proposal.count, batch.len - 1 });
     }
+    var rows = GlmRows{ .sch = sch, .target = target, .taps = taps, .proposal = &proposal, .draft_ns = draft_ns, .timer = timer };
+    return glmRowsSettle(&rows, allocator, batch, groups[0..batch.len], tree_at);
+}
+
+/// The grouped tick's production side of `glmRowsSettle`.
+const GlmRows = struct {
+    const verifier = @import("glm5_dflash_model.zig");
+    sch: *Scheduler,
+    target: *const @import("glm5_forward.zig").Model,
+    taps: []const u32,
+    proposal: *const @import("glm5_dflash.zig").Proposal,
+    draft_ns: u64,
+    timer: io_util.Stopwatch,
+    verify_ns: u64 = 0,
+
+    fn verify(self: *GlmRows, groups: []const verifier.Group, out: []verifier.Verified) !void {
+        try verifier.verifyGroups(self.target, groups, self.taps, .affine_rows_ffn, out);
+        self.verify_ns = self.timer.read();
+    }
+
+    fn commitRow(_: *GlmRows, slot: *Slot, v: *const verifier.Verified) !mlx.mlx_array {
+        return slot.legacy_gen.?.glmRowCommit(v);
+    }
+
+    fn endTree(self: *GlmRows, slot: *Slot, v: *verifier.Verified) void {
+        const gen = &slot.legacy_gen.?;
+        const result = gen.glmRoundEnd(slot.allocator, self.proposal, v, self.draft_ns, self.verify_ns, false) catch |err| {
+            slot.markError(@errorName(err));
+            return;
+        };
+        defer slot.allocator.free(result.tokens);
+        publishSpeculativeBlock(self.sch, slot, gen, result.tokens);
+    }
+};
+
+/// Verifies `groups` (one per `batch` slot), commits the plain rows and ends the tree slot's round
+/// through `ops`; the plain slots stay in `batch`, in order, and their logits are returned.
+fn glmRowsSettle(ops: anytype, allocator: std.mem.Allocator, batch: *[]*Slot, groups: []const GlmRows.verifier.Group, tree_at: ?usize) ![]mlx.mlx_array {
+    const verifier = GlmRows.verifier;
     var out: [verifier.max_rows]verifier.Verified = undefined;
-    try verifier.verifyGroups(target, groups[0..batch.len], taps, .affine_rows_ffn, out[0..batch.len]);
-    defer for (out[0..batch.len]) |*v| v.deinit();
-    const verify_ns = timer.read();
+    // `batch` shrinks below; the verified rows are destroyed by the count that built them.
+    const verified = out[0..batch.len];
+    try ops.verify(groups, verified);
+    defer for (verified) |*v| v.deinit();
     const logits = try allocator.alloc(mlx.mlx_array, batch.len - @intFromBool(tree_at != null));
     var made: usize = 0;
     errdefer {
@@ -9462,18 +9502,12 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
         allocator.free(logits);
     }
     var kept: usize = 0;
-    for (batch.*, out[0..batch.len], 0..) |slot, *v, i| {
-        const gen = &slot.legacy_gen.?;
+    for (batch.*, verified, 0..) |slot, *v, i| {
         if (tree_at == i) {
-            const result = gen.glmRoundEnd(slot.allocator, &proposal, v, draft_ns, verify_ns, false) catch |err| {
-                slot.markError(@errorName(err));
-                continue;
-            };
-            defer slot.allocator.free(result.tokens);
-            publishSpeculativeBlock(sch, slot, gen, result.tokens);
+            ops.endTree(slot, v);
             continue;
         }
-        logits[made] = try gen.glmRowCommit(v);
+        logits[made] = try ops.commitRow(slot, v);
         made += 1;
         batch.*[kept] = slot;
         kept += 1;
@@ -11480,6 +11514,55 @@ test "the four-row planner gives spare rows to drafts only while they beat the g
     try testing.expectEqual(@as(usize, 1), glmTreeNodes(3, 0.95, cost));
     try testing.expectEqual(@as(usize, 0), glmTreeNodes(3, 0.7, cost));
     try testing.expectEqual(@as(usize, 0), glmTreeNodes(4, 1.0, cost));
+}
+
+test "a grouped GLM tick destroys every verified row whichever slot holds the tree" {
+    const verifier = GlmRows.verifier;
+    const Fake = struct {
+        allocator: std.mem.Allocator,
+        built: usize = 0,
+        ended: usize = 0,
+        committed: [4]*Slot = undefined,
+        committed_n: usize = 0,
+
+        fn verify(self: *@This(), _: []const verifier.Group, out: []verifier.Verified) !void {
+            const Tape = @typeInfo(@FieldType(verifier.Verified, "layers")).pointer.child;
+            for (out) |*v| {
+                const layers = try self.allocator.alloc(Tape, 1);
+                layers[0] = null;
+                const arrays = try self.allocator.alloc(mlx.mlx_array, 0);
+                v.* = .{ .allocator = self.allocator, .layers = layers, .captures = .{ .allocator = self.allocator, .hook = .{ .ids = &.{}, .out = arrays } }, .count = 1, .offset = 0 };
+                self.built += 1;
+            }
+        }
+        fn commitRow(self: *@This(), slot: *Slot, _: *const verifier.Verified) !mlx.mlx_array {
+            self.committed[self.committed_n] = slot;
+            self.committed_n += 1;
+            return mlx.mlx_array_new();
+        }
+        fn endTree(self: *@This(), _: *Slot, _: *verifier.Verified) void {
+            self.ended += 1;
+        }
+    };
+    var slots: [4]*Slot = undefined;
+    for (&slots, 1..) |*s, i| s.* = @ptrFromInt(@alignOf(Slot) * i);
+    var groups: [4]verifier.Group = undefined;
+    for (2..5) |width| {
+        for (0..width) |tree_at| {
+            var fake = Fake{ .allocator = testing.allocator };
+            var live = slots;
+            var batch: []*Slot = live[0..width];
+            const logits = try glmRowsSettle(&fake, testing.allocator, &batch, groups[0..width], tree_at);
+            defer testing.allocator.free(logits);
+            for (logits) |a| _ = mlx.mlx_array_free(a);
+            try testing.expectEqual(width, fake.built);
+            try testing.expectEqual(@as(usize, 1), fake.ended);
+            try testing.expectEqual(width - 1, batch.len);
+            try testing.expectEqual(width - 1, logits.len);
+            for (batch, fake.committed[0..fake.committed_n]) |kept, done| try testing.expectEqual(kept, done);
+            for (batch) |kept| try testing.expect(kept != slots[tree_at]);
+        }
+    }
 }
 
 test "a submit that fails before its slot exists hands the vision array to the inference thread" {
