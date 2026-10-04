@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3 prefix-cache commits no longer overrun memory on long generations**: a finished request copies only the
+  MLA rows its checkpoints can restore and its cache tier will keep, and admission bills that copy and the checkpoints a prefill really takes.
 - **Concurrent GLM-5.3 requests no longer leak a verifier result per tick** when one of them runs a DFlash2 draft tree
   beside the others.
 - **A streamed answer that ends in the middle of a character delivers it** like the non-streaming answer does, on chat,

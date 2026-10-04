@@ -1390,6 +1390,13 @@ pub fn nextChunkEnd(
     return end;
 }
 
+/// `nextChunkEnd` for a GLM prefill, whose checkpoint grid must be hit exactly: the tail merge never
+/// absorbs a grid point.
+pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
+    const next_grid = ((pos + offset) / grid + 1) * grid - offset;
+    return @min(nextChunkEnd(pos, prefix_len, default_chunk, true, grid, offset, adaptive_width), next_grid);
+}
+
 /// Tokens held back from the chunked-prefill loop and forwarded together with
 /// the final (logits) forward when SSM checkpointing is active, so the
 /// always-on snapshot lands SSM_SNAPSHOT_BACKOFF tokens BEFORE the prompt end.
@@ -1434,6 +1441,41 @@ pub var glm_checkpoint_stride: usize = glm5_forward.prefill_chunk;
 pub fn glmSnapshotBackoff(backoff: usize, offset: usize, prefix_len: usize) usize {
     if (backoff >= prefix_len) return backoff;
     return @min(backoff + (offset + prefix_len - backoff) % glm5_prefix.pool_size, prefix_len);
+}
+
+/// What a GLM prefill captures: the grid points inside `(offset, loop end]`, then one checkpoint at the
+/// loop's end. Admission's bill and the prefill loop both read it.
+pub const GlmCaptureSchedule = struct {
+    /// Tail tokens held back from the chunk loop for the final span.
+    backoff: usize,
+    /// Checkpoints taken over the request.
+    events: u32,
+    /// Most held at once: one past the cap before each thin.
+    peak: u32,
+    /// Absolute position of the newest checkpoint, 0 = none.
+    newest: usize,
+};
+
+/// The GLM prefill's capture schedule for a tail of `tail_len` tokens starting at absolute `offset`;
+/// `cap` 0 thins nothing.
+pub fn glmCaptureSchedule(grid: usize, cap: u32, offset: usize, tail_len: usize) GlmCaptureSchedule {
+    var out: GlmCaptureSchedule = .{ .backoff = 0, .events = 0, .peak = 0, .newest = 0 };
+    if (tail_len <= 1) return out;
+    const prefix_len = tail_len - 1;
+    out.backoff = glmSnapshotBackoff(ssmSnapshotBackoff(true, prefix_len, offset > 0), offset, prefix_len);
+    const loop_end = prefix_len - out.backoff;
+    if (loop_end == 0) return out;
+    const end = offset + loop_end;
+    var events: usize = end / grid - offset / grid;
+    out.newest = end / grid * grid;
+    // A grid point at the loop's end is already captured by the chunk loop.
+    if (end % grid != 0) {
+        events += 1;
+        out.newest = end;
+    }
+    out.events = @intCast(@min(events, std.math.maxInt(u32)));
+    out.peak = if (cap > 0) @min(out.events, cap + 1) else out.events;
+    return out;
 }
 
 /// GLM restores only on an IndexPool boundary; every other arch at any checkpoint position.
@@ -1981,6 +2023,8 @@ pub const Generator = struct {
     /// allocator to free, since the layer-slice backing memory was allocated
     /// here.
     ssm_checkpoint_alloc: ?std.mem.Allocator = null,
+    /// Most checkpoints the prefill held at once, counting the copy taken before each thin.
+    ssm_cp_peak: u32 = 0,
 
     // ── Runtime acceptance gate ──
     // Set to true mid-request when the per-request acceptance rate
@@ -2826,6 +2870,7 @@ pub const Generator = struct {
         // even at stride > 0 — but we still bail early so we never allocate
         // empty checkpoints.
         var ssm_checkpoints: std.ArrayList(SSMCheckpoint) = std.ArrayList(SSMCheckpoint).empty;
+        var ssm_cp_peak: u32 = 0;
         errdefer {
             for (ssm_checkpoints.items) |*cp| cp.deinit(allocator);
             ssm_checkpoints.deinit(allocator);
@@ -2949,8 +2994,10 @@ pub const Generator = struct {
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const base_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-            const snapshot_backoff = if (glm_request != null and want_state_cp) glmSnapshotBackoff(base_backoff, ssm_cp_offset, prefix_len) else base_backoff;
+            const snapshot_backoff = if (glm_request != null and want_state_cp)
+                glmCaptureSchedule(glm_checkpoint_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
+            else
+                ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
@@ -3055,7 +3102,10 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                const end = if (glm_request != null)
+                    glmChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                else
+                    nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3223,6 +3273,7 @@ pub const Generator = struct {
                         doomed.deinit(allocator);
                         return e;
                     };
+                    ssm_cp_peak = @max(ssm_cp_peak, @as(u32, @intCast(ssm_checkpoints.items.len)));
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
                     if (mtp_active) {
@@ -3342,6 +3393,7 @@ pub const Generator = struct {
                         doomed.deinit(allocator);
                         return e;
                     };
+                    ssm_cp_peak = @max(ssm_cp_peak, @as(u32, @intCast(ssm_checkpoints.items.len)));
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
                     if (mtp_active) {
@@ -3503,8 +3555,9 @@ pub const Generator = struct {
         // doesn't double-free. All four init paths below call this once
         // before returning their Generator.
         const attachCp = struct {
-            fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), a: std.mem.Allocator) void {
+            fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), a: std.mem.Allocator, peak: u32) void {
                 g.ssm_checkpoints = list.*;
+                g.ssm_cp_peak = peak;
                 g.ssm_checkpoint_alloc = a;
                 list.* = std.ArrayList(SSMCheckpoint).empty;
             }
@@ -3548,7 +3601,7 @@ pub const Generator = struct {
             };
             gen.pending_logits = logits;
             gen.has_pending_logits = true;
-            attachCp(&gen, &ssm_checkpoints, allocator);
+            attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
         }
 
@@ -3655,7 +3708,7 @@ pub const Generator = struct {
             // pending_logits/pending_token left empty — the lazy pipeline is
             // skipped under PLD / drafter / MTP. The speculative `next*` paths
             // drive every subsequent step with predictable cache offset.
-            attachCp(&gen, &ssm_checkpoints, allocator);
+            attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
         }
 
@@ -3704,7 +3757,7 @@ pub const Generator = struct {
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
             };
-            attachCp(&gen, &ssm_checkpoints, allocator);
+            attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
         }
 
@@ -3765,7 +3818,7 @@ pub const Generator = struct {
         gen.pending_logits = next_logits;
         gen.has_pending_logits = true;
 
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
         return gen;
     }
 
@@ -15856,6 +15909,33 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
     try testing.expectEqual(@as(usize, 2 + cycle.len), d.start);
 }
 
+/// The checkpoints a GLM prefill takes, replayed from the loop's own chunk ends (test oracle for `glmCaptureSchedule`).
+pub fn glmCaptureOracle(grid: usize, cap: u32, offset: usize, tail_len: usize, width: usize) GlmCaptureSchedule {
+    var r: GlmCaptureSchedule = .{ .backoff = 0, .events = 0, .peak = 0, .newest = 0 };
+    if (tail_len <= 1) return r;
+    const prefix_len = tail_len - 1;
+    r.backoff = glmSnapshotBackoff(ssmSnapshotBackoff(true, prefix_len, offset > 0), offset, prefix_len);
+    const loop_end = prefix_len - r.backoff;
+    var held: u32 = 0;
+    var pos: usize = 0;
+    while (pos < loop_end) {
+        pos = glmChunkEnd(pos, loop_end, width, grid, offset, true);
+        if ((pos + offset) % grid != 0) continue;
+        r.events += 1;
+        r.newest = pos + offset;
+        held += 1;
+        r.peak = @max(r.peak, held);
+        if (cap > 0 and held > cap) held -= 1;
+    }
+    if (loop_end > 0 and r.newest != loop_end + offset) {
+        r.events += 1;
+        r.newest = loop_end + offset;
+        held += 1;
+        r.peak = @max(r.peak, held);
+    }
+    return r;
+}
+
 /// Walk a chunked prefill as `runPrefill` does, taking the width from `widths` at each boundary (the last entry repeats).
 fn walkChunkEnds(
     out: []usize,
@@ -22381,6 +22461,58 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
     try glm5_prefix.expectSameLogicalState(&cold_xfm.glm5_request.?, &warm_xfm.glm5_request.?);
     try testing.expectEqual(cold.next_token_id, warm.next_token_id);
     try testing.expectEqual(cold.ssm_checkpoints.items[cold.ssm_checkpoints.items.len - 1].pos, warm.ssm_checkpoints.items[warm.ssm_checkpoints.items.len - 1].pos);
+    const sched = glmCaptureSchedule(64, 16, 256, next.len - 256);
+    try testing.expectEqual(sched.peak, warm.ssm_cp_peak);
+    try testing.expectEqual(sched.newest, warm.ssm_checkpoints.items[warm.ssm_checkpoints.items.len - 1].pos);
+}
+
+test "the GLM capture schedule is what the prefill loop captures: peak, newest and count, cold and warm, at every cap" {
+    const widths = [_]usize{ 2048, 512, 64 };
+    for ([_]usize{ 64, 2048 }) |grid| for ([_]usize{ 0, 4, 60, 2044 }) |offset| {
+        for ([_]usize{ 1, 2, 15, 16, 31, 33, 34, 64, 65, 200, 2048, 2049, 5000, 18432 }) |tail| for (0..9) |cap_usize| {
+            const cap: u32 = @intCast(cap_usize);
+            const got = glmCaptureSchedule(grid, cap, offset, tail);
+            for (widths) |w| {
+                const want = glmCaptureOracle(grid, cap, offset, tail, w);
+                testing.expectEqual(want, got) catch |e| {
+                    std.debug.print("grid {d} offset {d} tail {d} cap {d} width {d}: want {any} got {any}\n", .{ grid, offset, tail, cap, w, want, got });
+                    return e;
+                };
+            }
+        };
+    };
+    // 18,432 cold tokens: eight grid points, then the prompt-end checkpoint beside them before the thin.
+    try testing.expectEqual(@as(u32, 9), glmCaptureSchedule(2048, 8, 0, 18432).peak);
+    // A 16-token cold prompt captures one checkpoint, at 12.
+    try testing.expectEqual(@as(usize, 12), glmCaptureSchedule(2048, 8, 0, 16).newest);
+    // A grid point at a chunk's end is not absorbed by the tail merge that follows it.
+    try testing.expectEqual(@as(usize, 2058), nextChunkEnd(0, 2058, 2048, true, 2048, 0, true));
+    try testing.expectEqual(@as(usize, 2048), glmChunkEnd(0, 2058, 2048, 2048, 0, true));
+}
+
+test "the GLM prefill holds as many checkpoints as its schedule says, and ends on the newest" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    var prompt: [300]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 4);
+    glm_checkpoint_stride = 64;
+    defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    for ([_]usize{ 14, 40, 70, 150, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
+        var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(testing.io, a, &xfm, &tok, prompt[0..len], 2, greedy, &.{}, .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = cap });
+        defer gen.deinit(a);
+        const sched = glmCaptureSchedule(64, cap, 0, len);
+        try testing.expectEqual(sched.peak, gen.ssm_cp_peak);
+        try testing.expectEqual(@min(sched.events, cap), @as(u32, @intCast(gen.ssm_checkpoints.items.len)));
+        try testing.expectEqual(sched.newest, gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].pos);
+    };
 }
 
 const GlmStepDown = struct {

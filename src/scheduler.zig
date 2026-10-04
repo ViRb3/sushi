@@ -6186,11 +6186,21 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     _ = finish_st;
 }
 
-/// GLM: the request's MLA rows to its last pool boundary serve every KDA checkpoint its prefill
-/// took; without one nothing restores. Ownership of `cps` passes to the cache.
+/// GLM: the request's MLA rows through the newest checkpoint its destination tier keeps serve every
+/// KDA checkpoint at or below it; without one nothing restores. Ownership of `cps` passes to the cache.
 fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request: *const glm5_forward_mod.Request, tokens: []const u32, cps_opt: ?[]transformer_mod.SSMCheckpoint, dflash: ?prefix_cache_mod.DflashCommit, prompt_len: usize) void {
-    const cps = cps_opt orelse return;
-    const rows = @import("glm5_prefix.zig").MlaRows.capture(hc.allocator, request, request.offset / 4 * 4, slot.model.transformer.?.s) catch |err| {
+    const cps_all = cps_opt orelse return;
+    const glm5_prefix = @import("glm5_prefix.zig");
+    // The rows are chosen before the copy: only what the destination tier keeps, never a full copy followed by a trim.
+    const window: u64 = if (dflash) |d| prefix_cache_mod.HotPrefixCache.liveCacheBytes(d.cache) else 0;
+    const len = hc.glmCommitLen(cps_all, request.offset, glm5_prefix.rowBytesOf(request), window) orelse {
+        log.debug("[hot-cache] GLM commit keeps no rows within its destination's budget; not committed\n", .{});
+        for (cps_all) |*cp| cp.deinit(hc.allocator);
+        hc.allocator.free(cps_all);
+        return;
+    };
+    const cps = glm5_prefix.keepThrough(hc.allocator, cps_all, len);
+    const rows = glm5_prefix.MlaRows.capture(hc.allocator, request, len, slot.model.transformer.?.s) catch |err| {
         log.warn("[hot-cache] GLM MLA rows not captured: {s}; not committed\n", .{@errorName(err)});
         for (cps) |*cp| cp.deinit(hc.allocator);
         hc.allocator.free(cps);

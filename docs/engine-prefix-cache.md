@@ -171,7 +171,7 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
 - **A restore point is a pool boundary** (a multiple of 4), where the IndexPool tail is empty. The state there is:
   - the KDA conv and recurrence of every linear layer, an `SSMCheckpoint` of 147,619,840 bytes;
   - latent rows [0,P) and pooled rows [0,P/4), a prefix of the entry's `MlaRows`.
-  One `MlaRows` (every row to the request's last pool boundary) serves all of the entry's checkpoints.
+  One `MlaRows` (every row through the entry's newest checkpoint) serves all of the entry's checkpoints.
 - **Checkpoints sit on a 2048-token grid and at the prompt end.**
   - The grid is absolute multiples of GLM's widest chunk (`glm_checkpoint_stride`), never a request's width.
   - A narrower chunk divides 2048, and `nextChunkEnd` ends a chunk on every grid point, so every grid point is a
@@ -214,8 +214,11 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
   - At kv8 it keeps a 30K session at its prompt end with 5 of 8 checkpoints, a 60K one with 4, and trims a 140K one
     to its checkpoint near 121K with 1. Each case keeps the assistant window.
   - For long reuse add `--prefix-cache-disk`, or run SSD-only (`--no-prefix-cache-ram --prefix-cache-disk 12GB`).
-- **Rows are a real copy at commit**, exactly to the last pool boundary. A share would keep the request's
-  reservation (up to the whole context) alive while billing only the rows.
+- **Rows are a real copy at commit**, through the newest checkpoint the destination keeps
+  (`HotPrefixCache.glmCommitLen`, chosen before the copy; a restore resumes from a checkpoint, so later rows are never
+  read). The RAM tier keeps rows, checkpoints and window within its budget, SSD-only one flush (2 GiB), and the
+  checkpoints above the chosen row are freed first, so there is no full copy followed by a trim. A share would keep
+  the request's reservation (up to the whole context) alive while billing only the rows.
   - Billed in `kv_bytes` beside the checkpoints: 6,688 bytes per row at kv8, 11,968 at BF16.
   - A budget trim lands on a checkpoint (`MlaRows.trimmedCopy`), sheds interior checkpoints and keeps the window.
 - **A restore shares the rows; the first append copies them.** A checkout releases them, so that append donates.
@@ -234,8 +237,13 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
     turn's commit extends a partial entry.
 - **A decode-phase cancel commits in `cullDecoding`**, before `releaseNativeState` resets the request that the
   cleanup drain's commit would otherwise read.
+- **One schedule drives the capture and its bill** (`generate.glmCaptureSchedule`: the grid points in the tail, the
+  prompt-end checkpoint, pool alignment, cold/warm backoff, the cap). The configured stride never enters, and
+  `glmChunkEnd` keeps the tail merge from absorbing a grid point, so the billed count is the captured count.
 - **Bills.** A GLM request holds up to 9 checkpoints during prefill (the cap plus the copy taken before each thin)
-  and one assistant window. SSD-only adds the writer's 1 GiB permit (the previous request's staged flush) and
+  and one assistant window. The commit moment is billed beside the live cache (`glmCommitStateBytes`): the row copy
+  (at most the RAM budget, or one SSD flush), the checkpoints and the window, whichever of that and the prefill's
+  transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. SSD-only adds the writer's 1 GiB permit (the previous request's staged flush) and
   reserves no idle cache.
   - Only the inference thread's admission pass bills the checkpoints (`WarmPrefix.checkpoints`). The connection
     thread, the context sizer and the cache clamp bill none, so the advertised context is the cache-off one.

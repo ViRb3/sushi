@@ -845,6 +845,11 @@ pub const HotPrefixCache = struct {
     /// across every initialized entry's storage arrays. mlx-c arrays carry
     /// their shape + dtype so this is exact, not a heuristic. Quant schemes
     /// account for q, scales, biases together.
+    /// What `snapshotBytes` will bill of `cache` once a commit snapshots it.
+    pub fn liveCacheBytes(cache: *const KVCache) u64 {
+        return snapshotBytes(&.{ .entries = cache.entries, .step = cache.step, .allocator = cache.allocator, .config = cache.config });
+    }
+
     fn snapshotBytes(snap: *const KVCacheSnapshot) u64 {
         var total: u64 = 0;
         for (snap.entries) |e| {
@@ -1088,6 +1093,53 @@ pub const HotPrefixCache = struct {
             if (shedSurvivorBytes(positions[0 .. k + 1], candidate_bytes, budget - rows, policy) != null) return p;
         }
         return null;
+    }
+
+    /// The MLA rows (a checkpoint position) a GLM commit keeps, chosen before anything is copied.
+    /// `budget` 0 keeps every row. A RAM tier keeps the rows, its checkpoints and the window within
+    /// `budget`, as `commitImpl`'s trim does; `rows_only` (the SSD tier) bounds the rows alone.
+    pub fn glmCommitLenFor(
+        policy: transformer_mod.ThinPolicy,
+        budget: u64,
+        rows_only: bool,
+        newest: usize,
+        row_bytes: u64,
+        window_bytes: u64,
+        positions: []const usize,
+        cp_bytes: []const u64,
+    ) ?usize {
+        if (newest == 0) return null;
+        if (budget == 0 and !rows_only) return newest;
+        var cps_total: u64 = 0;
+        if (!rows_only) for (cp_bytes) |b| {
+            cps_total += b;
+        };
+        if (@as(u64, newest) * row_bytes + cps_total + (if (rows_only) 0 else window_bytes) <= budget) return newest;
+        if (!rows_only) return trimLenForBudgetPure(budget -| window_bytes, newest, row_bytes, positions, cp_bytes, policy, null);
+        var k = positions.len;
+        while (k > 0) {
+            k -= 1;
+            if (positions[k] <= newest and @as(u64, positions[k]) * row_bytes <= budget) return positions[k];
+        }
+        return null;
+    }
+
+    /// `glmCommitLenFor` for this cache's destination: its RAM budget, else the SSD tier's one flush.
+    /// Null = nothing to keep, so nothing is copied.
+    pub fn glmCommitLen(self: *const HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, row_bytes: u64, window_bytes: u64) ?usize {
+        if (cps.len > SHED_SIM_MAX) return null;
+        var pos_buf: [SHED_SIM_MAX]usize = undefined;
+        var byte_buf: [SHED_SIM_MAX]u64 = undefined;
+        for (cps, 0..) |*cp, i| {
+            pos_buf[i] = cp.pos;
+            byte_buf[i] = ssmCheckpointBytes(cp);
+        }
+        const newest = glm5_prefix.commitRows(cps, offset);
+        const positions = pos_buf[0..cps.len];
+        const bytes = byte_buf[0..cps.len];
+        if (self.ram_enabled) return glmCommitLenFor(self.cp_thin, self.max_kv_bytes, false, newest, row_bytes, window_bytes, positions, bytes);
+        const d = if (self.disk) |*dd| dd else return null;
+        return glmCommitLenFor(self.cp_thin, @min(d.max_bytes, d.max_flush_bytes), true, newest, row_bytes, window_bytes, positions, bytes);
     }
 
     /// Which arm `trimLenForBudget` bills a list of this length with (for the log).
@@ -11720,4 +11772,27 @@ test "GLM's 1 GiB RAM tier keeps a 30K or 60K session at its prompt end and shed
         const survivors = HotPrefixCache.shedSurvivorBytes(c.positions[0..k], bytes[0..k], budget - c.kept * row, .min_span_recency).?;
         try testing.expectEqual(c.cps * cp, survivors);
     }
+}
+
+test "a GLM commit copies only the rows its destination tier keeps, chosen before the copy" {
+    const t = testing;
+    const row: u64 = 6688;
+    const cp: u64 = 147_619_840;
+    const gib: u64 = 1 << 30;
+    const positions = [_]usize{ 2048, 131072, 262144, 524288, 1_040_000 };
+    const bytes: [5]u64 = @splat(cp);
+    const policy: transformer_mod.ThinPolicy = .min_span_recency;
+    // Everything fits: every row to the newest checkpoint.
+    try t.expectEqual(@as(?usize, 64), HotPrefixCache.glmCommitLenFor(policy, gib, false, 64, row, 0, &.{64}, &.{cp}));
+    try t.expectEqual(@as(?usize, 1_040_000), HotPrefixCache.glmCommitLenFor(policy, 0, false, 1_040_000, row, 0, &positions, &bytes));
+    // A 1 GiB RAM tier keeps the newest checkpoint whose rows and a surviving checkpoint fit, never the full 7 GB.
+    const ram = HotPrefixCache.glmCommitLenFor(policy, gib, false, 1_040_000, row, 0, &positions, &bytes).?;
+    try t.expectEqual(@as(usize, 131072), ram);
+    try t.expect(@as(u64, ram) * row + cp <= gib);
+    // The window comes out of the budget first.
+    try t.expectEqual(@as(?usize, 2048), HotPrefixCache.glmCommitLenFor(policy, gib, false, 1_040_000, row, 200 << 20, &positions, &bytes));
+    // The SSD tier's one flush bounds the rows alone.
+    try t.expectEqual(@as(?usize, 262144), HotPrefixCache.glmCommitLenFor(policy, 2 * gib, true, 1_040_000, row, 0, &positions, &bytes));
+    try t.expectEqual(@as(?usize, null), HotPrefixCache.glmCommitLenFor(policy, 0, true, 1_040_000, row, 0, &positions, &bytes));
+    try t.expectEqual(@as(?usize, null), HotPrefixCache.glmCommitLenFor(policy, gib, false, 0, row, 0, &.{}, &.{}));
 }

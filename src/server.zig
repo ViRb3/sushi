@@ -29,6 +29,7 @@ const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const kv_disk_writer = @import("kv_disk_writer.zig");
+const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -6210,33 +6211,49 @@ pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 
 pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, matched: u64, chunk: u64) u64 {
     const per_cp = config.ssmCheckpointBytes();
     if (per_cp == 0 or ssm_checkpoint_stride == 0) return 0;
-    // GLM checkpoints on its 2048 grid (`generate.glm_checkpoint_stride`) and holds one past its cap before each thin.
-    const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
-        ssm_checkpoint_stride,
-        if (config.isGlm5()) generate_mod.glm_checkpoint_stride else @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override),
-    );
+    if (config.isGlm5()) return glmPrefillSchedule(seq, matched, glm5_prefix.checkpointMax(ssm_checkpoint_max)).peak * per_cp;
+    const stride: u64 = generate_mod.effectiveSsmCheckpointStride(ssm_checkpoint_stride, @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override));
     if (stride == 0) return 0;
     // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
     // snapshot, the only capture a warm append shorter than one stride makes.
     const span: u64 = seq -| @min(matched, seq);
     var n: u64 = seq / stride -| @min(matched, seq) / stride;
     if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
-    if (config.isGlm5()) return @min(n, glm5_prefix.checkpointMax(ssm_checkpoint_max) + 1) * per_cp;
     if (ssm_checkpoint_max > 0) n = @min(n, ssm_checkpoint_max);
     return n * per_cp;
 }
 
+/// The checkpoints a GLM prefill of `seq` tokens takes after restoring `matched`: the one schedule the generator runs.
+fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureSchedule {
+    const offset: usize = @intCast(@min(matched, seq));
+    return generate_mod.glmCaptureSchedule(generate_mod.glm_checkpoint_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
+}
+
 /// What a GLM request holds for the prefix cache while it runs: its prefill's KDA checkpoints (at
-/// most `warm.checkpoints`) and the assistant window it keeps from prefill end.
-fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix, chunk: u64) u64 {
+/// most `warm.checkpoints`, plus the copy taken before each thin) and the assistant window it keeps from prefill end.
+fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix) u64 {
     if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, prefix_cache_disk_bytes) == 0) return 0;
     // SSD-first stages the previous request's flush as host bytes, up to the writer's permit.
     const staged: u64 = if (prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
-    const cap: u64 = warm.checkpoints;
-    if (cap == 0) return staged;
+    if (warm.checkpoints == 0) return staged;
     const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
-    const held = @min(retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk), (cap + 1) *| config.ssmCheckpointBytes());
+    const held = @as(u64, glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints).peak) * config.ssmCheckpointBytes();
     return held +| window +| staged;
+}
+
+/// What the finished request holds while its commit runs, beside its live cache: the MLA rows copied, the
+/// checkpoints, the window and the SSD writer's staged flush. The rows are what the destination keeps
+/// (`HotPrefixCache.glmCommitLen`): at most the RAM tier's budget, or one SSD flush.
+fn glmCommitStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix, kv_bits: u64) u64 {
+    const staged: u64 = if (prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
+    if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, prefix_cache_disk_bytes) == 0 or warm.checkpoints == 0) return staged;
+    const sched = glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints);
+    const rows = @as(u64, sched.newest) * sessionBytesPerToken(config, kv_bits);
+    const bound: u64 = if (prefix_cache_ram_enabled) resolvedPrefixCacheMem() else @min(prefix_cache_disk_bytes, kv_disk_cache.SSD_FIRST_READBACK_BYTES);
+    const copied = if (bound == 0 and prefix_cache_ram_enabled) rows else @min(rows, bound);
+    const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
+    const kept = @as(u64, @min(sched.events, warm.checkpoints)) * config.ssmCheckpointBytes();
+    return copied +| kept +| window +| staged;
 }
 
 /// What `--mtp-head-kv-quant` does on this arch, for the boot log; null when unset.
@@ -6622,8 +6639,10 @@ pub fn prefillNeededAtChunk(
     warm: WarmPrefix,
 ) u64 {
     if (config.isGlm5()) {
-        return (glmCacheBytes(config, seq, max_tokens, kv_bits) +| glm5TransientBytes(config, seq, chunk, kv_bits) +|
-            glmPrefixStateBytes(config, seq, warm, chunk)) *| 5 / 4 +|
+        return (glmCacheBytes(config, seq, max_tokens, kv_bits) +| @max(
+            glm5TransientBytes(config, seq, chunk, kv_bits) +| glmPrefixStateBytes(config, seq, warm),
+            glmCommitStateBytes(config, seq, warm, kv_bits),
+        )) *| 5 / 4 +|
             (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
     }
     // deepseek_v4 gets its own estimator: it sub-chunks prefill internally and its state is module-owned f32.
@@ -26425,24 +26444,114 @@ test "GLM admission bills the checkpoints and assistant window a request keeps; 
     const sizer_off = prefillTransientReserve(&cfg, 8, 2048);
     const ctx_off = memoryContextAtChunk(&cfg, 8, 120 << 30, 100 << 30, 2048);
     const cap = glm5_prefix.checkpointMax(16);
-    try std.testing.expectEqual(@as(u64, 0), glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = cap }, 2048));
+    try std.testing.expectEqual(@as(u64, 0), glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = cap }));
     prefix_cache_capacity = 32;
     // Every 2048-token chunk boundary and the prompt end, thinned to the GLM cap; the newest
     // copy exists before each thin.
     const held = (@as(u64, cap) + 1) * per_cp + cfg.glm_dflash_window_bytes;
-    try std.testing.expectEqual(held, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = cap }, 2048));
+    try std.testing.expectEqual(held, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = cap }));
     const on = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{ .checkpoints = cap });
     try std.testing.expect(on - off >= held * 5 / 4 - 1 and on - off <= held * 5 / 4 + 1);
     // Fewer checkpoints hold fewer copies; none hold no window either.
-    try std.testing.expectEqual(2 * per_cp + cfg.glm_dflash_window_bytes, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = 1 }, 2048));
+    try std.testing.expectEqual(2 * per_cp + cfg.glm_dflash_window_bytes, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = 1 }));
     try std.testing.expectEqual(off, prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{}));
     // The advertised context and the RAM tier's clamp are sized as with the cache off.
     try std.testing.expectEqual(sizer_off, prefillTransientReserve(&cfg, 8, 2048));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
     try std.testing.expectEqual(ctx_off, memoryContextAtChunk(&cfg, 8, 120 << 30, 100 << 30, 2048));
-    // A warm restore at 61440 captures only over its own span: 63488, 65536 and the prompt end.
-    try std.testing.expectEqual(3 * per_cp, retainedSsmCheckpointBytes(&cfg, 65536, 61440, 2048));
+    // A warm restore at 61440 captures only over its own span: 63488 and the prompt-end checkpoint (65536 is past the loop's end).
+    try std.testing.expectEqual(2 * per_cp, retainedSsmCheckpointBytes(&cfg, 65536, 61440, 2048));
     try std.testing.expect(prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{ .matched_tokens = 61440, .checkpoints = cap }) < on);
+}
+
+test "GLM billed checkpoint peak equals the checkpoints its prefill captures, whatever stride is configured" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.glm_dflash_loaded = false;
+    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, prefix_cache_disk_bytes, prefix_cache_ram_enabled };
+    defer {
+        prefix_cache_capacity = saved[0];
+        ssm_checkpoint_stride = saved[1];
+        prefix_cache_disk_bytes = saved[2];
+        prefix_cache_ram_enabled = saved[3];
+    }
+    prefix_cache_capacity = 32;
+    prefix_cache_disk_bytes = 0;
+    prefix_cache_ram_enabled = true;
+    const per_cp = cfg.ssmCheckpointBytes();
+    const Case = struct { seq: u64, matched: u64 };
+    const cases = [_]Case{
+        .{ .seq = 16, .matched = 0 },       .{ .seq = 31, .matched = 0 },          .{ .seq = 40, .matched = 0 },
+        .{ .seq = 2049, .matched = 0 },     .{ .seq = 5000, .matched = 0 },        .{ .seq = 18432, .matched = 0 },
+        .{ .seq = 70000, .matched = 0 },    .{ .seq = 65536, .matched = 61440 },   .{ .seq = 18432, .matched = 16384 },
+        .{ .seq = 9000, .matched = 8188 },  .{ .seq = 9100, .matched = 8188 },
+    };
+    for ([_]u32{ 256, 2048, 8192, 65536 }) |stride| {
+        ssm_checkpoint_stride = stride;
+        for (cases) |c| for (0..9) |cap_usize| {
+            const cap: u32 = @intCast(cap_usize);
+            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, cap, c.matched, c.seq - c.matched, 2048);
+            const billed = glmPrefixStateBytes(&cfg, c.seq, .{ .matched_tokens = c.matched, .checkpoints = cap });
+            const want: u64 = if (cap == 0) 0 else @as(u64, oracle.peak) * per_cp;
+            std.testing.expectEqual(want, billed) catch |e| {
+                std.debug.print("stride {d} seq {d} matched {d} cap {d}: billed {d} cps, captured {d}\n", .{ stride, c.seq, c.matched, cap, billed / per_cp, want / per_cp });
+                return e;
+            };
+        };
+    }
+}
+
+test "GLM admission bills the commit's row copy, so a long generation cannot commit above the ceiling, and the copy never costs a long prompt its checkpoints" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.glm_dflash_loaded = true;
+    cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, prefix_cache_disk_bytes, prefix_cache_ram_enabled, prefix_cache_mem_bytes };
+    defer {
+        prefix_cache_capacity = saved[0];
+        ssm_checkpoint_stride = saved[1];
+        prefix_cache_disk_bytes = saved[2];
+        prefix_cache_ram_enabled = saved[3];
+        prefix_cache_mem_bytes = saved[4];
+    }
+    ssm_checkpoint_stride = 256;
+    prefix_cache_capacity = 32;
+    prefix_cache_mem_bytes = GLM_PREFIX_CACHE_MEM_DEFAULT;
+    const per_cp = cfg.ssmCheckpointBytes();
+    const row_bytes = sessionBytesPerToken(&cfg, 8);
+    const cap = glm5_prefix.checkpointMax(16);
+    for ([_]bool{ true, false }) |ram| {
+        prefix_cache_ram_enabled = ram;
+        prefix_cache_disk_bytes = if (ram) 0 else 12 << 30;
+        const staged: u64 = if (ram) 0 else kv_disk_writer.DEFAULT_PERMIT_BYTES;
+        for ([_]u64{ 64, 131_072, 900_000, 1_040_000 }) |seq| {
+            const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
+            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, cap, 0, seq, 2048);
+            // Eight spread checkpoints below the newest, each at its real size.
+            var positions: [8]usize = undefined;
+            const bytes: [8]u64 = @splat(per_cp);
+            for (&positions, 1..) |*p, i| p.* = if (i == 8) oracle.newest else @max(oracle.newest * i / 8 / 2048 * 2048, 4);
+            const kept: usize = @min(@as(usize, oracle.events), 8);
+            // What the commit copies: its destination's own bound, chosen before the copy.
+            const copied_len = prefix_cache_mod.HotPrefixCache.glmCommitLenFor(
+                .min_span_recency,
+                if (ram) resolvedPrefixCacheMem() else @min(prefix_cache_disk_bytes, kv_disk_cache.SSD_FIRST_READBACK_BYTES),
+                !ram,
+                oracle.newest,
+                row_bytes,
+                cfg.glm_dflash_window_bytes,
+                positions[8 - kept ..],
+                bytes[8 - kept ..],
+            ) orelse 0;
+            const commit_peak = glmCacheBytes(&cfg, seq, max_tokens, 8) + copied_len * row_bytes + @as(u64, @intCast(kept)) * per_cp + cfg.glm_dflash_window_bytes + staged;
+            const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, 8, 2048, .{ .checkpoints = cap });
+            std.testing.expect(needed >= commit_peak) catch |e| {
+                std.debug.print("ram={any} seq {d}: admitted {d} bytes, commit peaks at {d}\n", .{ ram, seq, needed, commit_peak });
+                return e;
+            };
+            // A long prompt's checkpoints are priced by its prefill alone: the copy is smaller than its transient.
+            const warm = WarmPrefix{ .checkpoints = cap };
+            try std.testing.expect(glmCommitStateBytes(&cfg, seq, warm, 8) <= glm5TransientBytes(&cfg, seq, 2048, 8) +| glmPrefixStateBytes(&cfg, seq, warm));
+        }
+    }
 }
 
 test "GLM SSD-only bills the writer's staged bytes whatever checkpoints a request keeps, and sizes no cache" {
@@ -26465,8 +26574,8 @@ test "GLM SSD-only bills the writer's staged bytes whatever checkpoints a reques
     prefix_cache_disk_bytes = 12 << 30;
     prefix_cache_ram_enabled = false;
     const held = (@as(u64, glm5_prefix.checkpointMax(16)) + 1) * cfg.ssmCheckpointBytes() + cfg.glm_dflash_window_bytes;
-    try std.testing.expectEqual(held + kv_disk_writer.DEFAULT_PERMIT_BYTES, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = glm5_prefix.checkpointMax(16) }, 2048));
-    try std.testing.expectEqual(kv_disk_writer.DEFAULT_PERMIT_BYTES, glmPrefixStateBytes(&cfg, 65536, .{}, 2048));
+    try std.testing.expectEqual(held + kv_disk_writer.DEFAULT_PERMIT_BYTES, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = glm5_prefix.checkpointMax(16) }));
+    try std.testing.expectEqual(kv_disk_writer.DEFAULT_PERMIT_BYTES, glmPrefixStateBytes(&cfg, 65536, .{}));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
     try std.testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     try std.testing.expectEqual(sizer_off, prefillTransientReserve(&cfg, 8, 2048));

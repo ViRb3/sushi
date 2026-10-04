@@ -19,6 +19,40 @@ pub fn checkpointMax(global: u32) u32 {
     return if (global == 0) checkpoint_cap else @min(global, checkpoint_cap);
 }
 
+/// MLA rows a commit copies: a restore resumes from a checkpoint, so the rows past the newest one are
+/// never read.
+pub fn commitRows(cps: []const transformer.SSMCheckpoint, offset: usize) usize {
+    var newest: usize = 0;
+    for (cps) |cp| newest = @max(newest, cp.pos);
+    return @min(newest, offset / pool_size * pool_size);
+}
+
+/// What one captured token costs: the bytes `MlaRows.capture` copies per row, rounded up.
+pub fn rowBytesOf(request: *const forward.Request) u64 {
+    var per_row: u64 = 0;
+    var per_pool: u64 = 0;
+    for (request.layers) |*layer| {
+        const st = &layer.attention;
+        if (st.processed == 0) continue;
+        for ([_]Arr{ st.latent, st.latent_scales, st.latent_biases, st.pooled }, [_]*u64{ &per_row, &per_row, &per_row, &per_pool }) |a, acc| {
+            if (a.ctx == null or mlx.mlx_array_size(a) == 0) continue;
+            acc.* += @as(u64, mlx.mlx_array_size(a)) * mlx.mlx_array_itemsize(a) / @as(u64, @intCast(mlx.getShape(a)[0]));
+        }
+    }
+    return per_row + (per_pool + pool_size - 1) / pool_size;
+}
+
+/// `cps` without those past `len`, whose KDA state nothing can restore; the rest are freed.
+pub fn keepThrough(allocator: std.mem.Allocator, cps: []transformer.SSMCheckpoint, len: usize) []transformer.SSMCheckpoint {
+    var kept: usize = 0;
+    while (kept < cps.len and cps[kept].pos <= len) kept += 1;
+    if (kept == cps.len) return cps;
+    const shrunk = allocator.dupe(transformer.SSMCheckpoint, cps[0..kept]) catch return cps;
+    for (cps[kept..]) |*cp| cp.deinit(allocator);
+    allocator.free(cps);
+    return shrunk;
+}
+
 /// The request's KDA state at its current offset, as owned copies (MLA slots stay empty).
 pub fn captureKda(allocator: std.mem.Allocator, request: *const forward.Request, s: mlx.mlx_stream) !transformer.SSMCheckpoint {
     if (request.failed) return error.GlmRequestNeedsReset;
@@ -422,6 +456,7 @@ test "GLM prefix rows bill exactly their rows and trim to a pool boundary" {
         const latent = @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, bits);
         const pooled = cfg.indexer_head_dim * 2 / pool_size;
         try testing.expectEqual(@as(u64, latent + pooled), rows.rowBytes());
+        try testing.expectEqual(rows.rowBytes(), rowBytesOf(&req));
         try testing.expectEqual(16 * rows.rowBytes(), rows.bytes());
         var short = try rows.trimmedCopy(8, mlx.gpuStream());
         defer short.deinit();
@@ -441,6 +476,25 @@ test "GLM prefix rows bill exactly their rows and trim to a pool boundary" {
         try restore(&target, &rows, &kda);
         try testing.expectEqual(@as(usize, 12), target.offset);
     }
+}
+
+test "a commit sheds the checkpoints above the rows it keeps" {
+    var weights = model.Weights.init(testing.allocator);
+    defer weights.deinit();
+    const cfg = try forward.nonzeroDecodeFixture(&weights);
+    var net = try forward.Model.load(testing.allocator, cfg, &weights, mlx.gpuStream());
+    defer net.deinit();
+    const tokens = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0 };
+    const cps = try testing.allocator.alloc(transformer.SSMCheckpoint, 2);
+    cps[0] = try captureKdaAt(&net, 8, tokens[0..8]);
+    cps[1] = try captureKdaAt(&net, 8, tokens[0..16]);
+    const kept = keepThrough(testing.allocator, cps, 12);
+    defer {
+        for (kept) |*cp| cp.deinit(testing.allocator);
+        testing.allocator.free(kept);
+    }
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    try testing.expectEqual(@as(usize, 8), kept[0].pos);
 }
 
 fn captureKdaAt(net: *const forward.Model, bits: u8, tokens: []const u32) !transformer.SSMCheckpoint {
@@ -469,4 +523,17 @@ test "GLM prefix checkpoints keep signed zeros of the KDA state" {
     try mlx.check(mlx.mlx_view(&raw, cp.layers[0].conv_state, .uint16, s));
     try mlx.check(mlx.mlx_array_eval(raw));
     try testing.expectEqualSlices(u16, &conv, mlx.mlx_array_data_uint16(raw).?[0..4]);
+}
+
+test "a commit copies MLA rows only through its newest checkpoint" {
+    const cp = struct {
+        fn at(pos: usize) transformer.SSMCheckpoint {
+            return .{ .pos = pos, .layers = &.{} };
+        }
+    }.at;
+    try testing.expectEqual(@as(usize, 0), commitRows(&.{}, 1 << 20));
+    try testing.expectEqual(@as(usize, 32), commitRows(&.{cp(32)}, (1 << 20) + 3));
+    try testing.expectEqual(@as(usize, 8192), commitRows(&.{ cp(2048), cp(8192), cp(4096) }, 9000));
+    // A prefill cancelled below its newest checkpoint cannot copy rows it never forwarded.
+    try testing.expectEqual(@as(usize, 100), commitRows(&.{cp(128)}, 103));
 }
