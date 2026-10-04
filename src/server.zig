@@ -10405,9 +10405,7 @@ fn handleNonStreamingGeneration(
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
     // it). Nulled before transfer so the early-return defer is a no-op.
     var ve_local = vision_embeddings;
-    defer {
-        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
-    }
+    defer if (ve_local) |arr| disposeVision(arr);
 
     var timer = Stopwatch.init(stream.io);
 
@@ -11070,9 +11068,7 @@ fn handleStreamingGeneration(
     // the slot on submit (slot.deinit frees). Nulled before transfer so
     // the early-return defer is a no-op.
     var ve_local = vision_embeddings;
-    defer {
-        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
-    }
+    defer if (ve_local) |arr| disposeVision(arr);
 
     const config = lm.config.?;
     const chat_id = nowMs(stream.io);
@@ -14354,6 +14350,12 @@ fn mediaChain(
     return out;
 }
 
+/// An embeddings array a handler still owns when its request ends without a slot taking it. The
+/// inference thread is the sole mlx caller, so this hands it over instead of freeing.
+fn disposeVision(arr: mlx.mlx_array) void {
+    global_scheduler.?.orphanVision(arr);
+}
+
 /// What a request's media hands its slot. Whatever the slot has not taken is
 /// freed by `deinit`.
 const PreparedMedia = struct {
@@ -14362,7 +14364,7 @@ const PreparedMedia = struct {
     mrope: MropeData = .{},
 
     fn deinit(self: *PreparedMedia, allocator: std.mem.Allocator) void {
-        if (self.embeddings) |arr| _ = mlx.mlx_array_free(arr);
+        if (self.embeddings) |arr| disposeVision(arr);
         allocator.free(self.chain);
         if (self.mrope.pos) |p| allocator.free(p);
         self.* = .{};
@@ -16343,9 +16345,7 @@ fn handleAnthropicNonStreaming(
     // Vision-array ownership: nulled below before scheduler.submit so the
     // early-return defer doesn't double-free.
     var ve_local = vision_embeddings;
-    defer {
-        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
-    }
+    defer if (ve_local) |arr| disposeVision(arr);
 
     var timer = Stopwatch.init(stream.io);
 
@@ -16602,9 +16602,7 @@ fn handleAnthropicStreaming(
     // Vision-array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer.
     var ve_local = vision_embeddings;
-    defer {
-        if (ve_local) |arr| _ = mlx.mlx_array_free(arr);
-    }
+    defer if (ve_local) |arr| disposeVision(arr);
 
     // Pick speculative-decoding mode (regular / PLD / drafter). The token-
     // stream adapter below feeds the per-token Anthropic state machine the
@@ -26519,4 +26517,55 @@ test "GLM admission credits the hot cache, so an eviction lets a long prefill in
     const bill = creditedAdmissionBill(&cfg, 20 * gb, 19 * gb, 3 * gb / 2, 3 * gb / 2, 2048);
     try std.testing.expectEqual(AdmissionVerdict.evict, admissionVerdict(bill));
     try std.testing.expectEqual(AdmissionVerdict.refuse, admissionVerdict(creditedAdmissionBill(&cfg, 21 * gb, 19 * gb, 3 * gb / 2, 3 * gb / 2, 2048)));
+}
+
+test "a request refused after its media was encoded hands the embeddings to the inference thread" {
+    const Probe = struct {
+        var inference_id: std.Thread.Id = undefined;
+        var frees: usize = 0;
+        var off_thread_frees: usize = 0;
+        fn free(_: mlx.mlx_array) void {
+            frees += 1;
+            if (std.Thread.getCurrentId() != inference_id) off_thread_frees += 1;
+        }
+        /// A pre-submit refusal: `req_media.deinit` or a sub-handler's early-return defer.
+        fn refuse(via_media: bool) void {
+            const embeddings = mlx.mlx_array_new();
+            if (via_media) {
+                var media = PreparedMedia{ .embeddings = embeddings };
+                media.deinit(std.testing.allocator);
+            } else {
+                disposeVision(embeddings);
+            }
+        }
+    };
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.io = std.testing.io;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.orphan_vision_n = 0;
+    global_scheduler = &sch;
+    defer global_scheduler = null;
+    Probe.inference_id = std.Thread.getCurrentId();
+    scheduler_mod.slot_vision_free_test_hook = Probe.free;
+    defer scheduler_mod.slot_vision_free_test_hook = null;
+
+    for ([_]bool{ true, false }) |via_media| {
+        Probe.frees = 0;
+        Probe.off_thread_frees = 0;
+        const conn = try std.Thread.spawn(.{}, Probe.refuse, .{via_media});
+        conn.join();
+        var parked: [scheduler_mod.orphan_vision_cap]mlx.mlx_array = undefined;
+        const n = scheduler_mod.takeOrphanedVisionLocked(&sch, &parked);
+        try std.testing.expectEqual(@as(usize, 1), n);
+        try std.testing.expectEqual(@as(usize, 0), Probe.frees);
+        for (parked[0..n]) |ve| {
+            scheduler_mod.freeVisionArray(ve);
+            _ = mlx.mlx_array_free(ve);
+        }
+        try std.testing.expectEqual(@as(usize, 1), Probe.frees);
+        try std.testing.expectEqual(@as(usize, 0), Probe.off_thread_frees);
+    }
 }

@@ -32,7 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
-var slot_vision_free_test_hook: ?*const fn (mlx.mlx_array) void = null;
+pub var slot_vision_free_test_hook: ?*const fn (mlx.mlx_array) void = null;
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -376,10 +376,10 @@ var vision_block_test_hook: ?*const fn (VisionImagePixels) anyerror!mlx.mlx_arra
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
 
-const orphan_vision_cap = 16;
+pub const orphan_vision_cap = 16;
 
 /// Inference thread only (the sole mlx caller), like every other free of a slot's arrays.
-fn freeVisionArray(ve: mlx.mlx_array) void {
+pub fn freeVisionArray(ve: mlx.mlx_array) void {
     if (@import("builtin").is_test and slot_vision_free_test_hook != null) {
         slot_vision_free_test_hook.?(ve);
     } else {
@@ -1734,7 +1734,7 @@ pub const Scheduler = struct {
 
     /// `submit` failed before any slot owned `ve`; only the inference thread may free it. Waits
     /// for room rather than allocating; a shutting-down scheduler drops it with the process.
-    fn orphanVision(self: *Scheduler, ve: mlx.mlx_array) void {
+    pub fn orphanVision(self: *Scheduler, ve: mlx.mlx_array) void {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
         while (self.orphan_vision_n == orphan_vision_cap and !self.shutdown.load(.acquire)) {
@@ -5178,7 +5178,7 @@ fn destroyAbandoned(head: ?*Slot) void {
 }
 
 /// Caller holds `queue_mu`; wakes a submit waiting for room in `orphan_vision`.
-fn takeOrphanedVisionLocked(sch: *Scheduler, out: *[orphan_vision_cap]mlx.mlx_array) usize {
+pub fn takeOrphanedVisionLocked(sch: *Scheduler, out: *[orphan_vision_cap]mlx.mlx_array) usize {
     const n = sch.orphan_vision_n;
     if (n == 0) return 0;
     @memcpy(out[0..n], sch.orphan_vision[0..n]);

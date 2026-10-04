@@ -188,6 +188,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `error_code != null` is the terminal predicate for the consumers and the cull, so it must never be lost.
 - A `submit` that fails before a slot exists (`ModelNotReady`, `GlmKvQuantUnsupported`, `Slot.init`) parks the request's
   `vision_embeddings` in `Scheduler.orphan_vision` (fixed size, no allocation); the inference thread frees it.
+- A handler frees no embeddings array itself: a request refused after its media was encoded (`PreparedMedia.deinit`, the
+  sub-handlers' early returns) parks it through `server.disposeVision` in the same `orphan_vision` list.
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.
