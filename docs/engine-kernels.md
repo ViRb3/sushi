@@ -48,6 +48,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - Decode on this box is dispatch-gap bound: ~860 kernels per Flash-Next token, kernel time ~9.8 of ~18 ms, ~7 us
   per boundary. `MLX_MAX_OPS_PER_BUFFER` and `MLX_METAL_FAST_SYNCH` gave nothing; decode wins come from fewer,
   denser kernels ([perf-baselines](perf-baselines.md#exl3)).
+- At one decode row the shared-expert gate's dot runs on the router kernel's idle simdgroups in MLX's own
+  `dot_product` order (bit-equal to the matmul; declines at 32 or fewer experts, K % 8 != 0 or K > 16384).
 
 ## Batched Qwen4 decode overlap
 

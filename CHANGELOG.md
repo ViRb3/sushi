@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen decode folds the shared-expert gate into the router kernel**, one fewer pair of launches per layer, same bytes.
 - **GLM-5.3-Flash prompts tokenize exactly like Hugging Face**: the plain Llama-3 pre-tokenizer no longer takes Muse's
   case-splitting grammar (`iPhone`, `McDonald`, `//!`, `½`), and the BPE `ignore_merges` flag is honoured.
 - **The load memory check counts an MTP head shipped as a separate `mtp/` file**, so a model that loads it beside a nearly
