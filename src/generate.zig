@@ -7506,6 +7506,12 @@ pub const Generator = struct {
         return on;
     }
 
+    /// A pre-draft chain is only worth its cost when a later round reads it: a request whose
+    /// budget is spent, or whose pending token ends it, keeps no reader.
+    fn mtpPreDraftOpenAllows(completion_tokens: u32, max_tokens: u32, pending_is_eos: bool) bool {
+        return completion_tokens < max_tokens and !pending_is_eos;
+    }
+
     /// Cross-round pre-draft (round pipelining): at the round's tail — the
     /// accept decision made, trunk committed/rolled back, EV updated,
     /// last_hidden/next_token_id already pointing at the next round — build
@@ -7517,7 +7523,7 @@ pub const Generator = struct {
     /// round's EV update, so it is byte-identical to the one the next
     /// round's entry would compute.
     fn mtpMaybePreDraft(self: *Generator, allocator: std.mem.Allocator) !void {
-        if (self.mtp_planner_owned and (self.completion_tokens >= self.max_tokens or isEosId(self.next_token_id, self.eos_token_ids))) return;
+        if (!mtpPreDraftOpenAllows(self.completion_tokens, self.max_tokens, isEosId(self.next_token_id, self.eos_token_ids))) return;
         if (!mtpPredraftEnabled() or self.spec_disabled_runtime or self.mtp_batch_head or self.mtp_planner_pending) return;
         std.debug.assert(self.mtp_pre_draft == null);
         const plan = self.mtpRoundPlan();
@@ -21159,6 +21165,14 @@ test "MTP commit stops before an accepted EOS and keeps EOS pending" {
     try testing.expect(rejected_eos.stop == null);
     try testing.expectEqual(@as(u32, 0), Generator.mtpStopPrefix(&drafts, 0, &eos).accepted);
     try testing.expectEqual(@as(u32, 4), Generator.mtpStopPrefix(&drafts, 4, &.{}).accepted);
+}
+
+test "mtpPreDraftOpenAllows: a pre-draft needs a later round to read it" {
+    const G = Generator;
+    try testing.expect(G.mtpPreDraftOpenAllows(9, 10, false));
+    try testing.expect(!G.mtpPreDraftOpenAllows(10, 10, false));
+    try testing.expect(!G.mtpPreDraftOpenAllows(11, 10, false));
+    try testing.expect(!G.mtpPreDraftOpenAllows(5, 10, true));
 }
 
 test "selected depth bypasses legacy planning and keeps acceptance private" {
