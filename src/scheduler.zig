@@ -3770,6 +3770,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const drafter = LoadDrafterDir.resolve(sch.io, sch.allocator, params.no_drafter, params.drafter_dir, params.model_dir);
     defer drafter.deinit(sch.allocator);
     const drafter_dir = drafter.dir;
+    if (drafter.owned != null) log.info("[dflash] auto-detected assistant: {s}\n", .{drafter_dir});
     if (model_mod.usesSushiQuantMemoryBill(params.config) and drafter_dir.len > 0)
         streaming_resident_bytes = streaming_resident_bytes.? +| try sushiAssistantLoadBytes(sch.io, sch.allocator, drafter_dir);
     if (params.config.isGlm5()) {

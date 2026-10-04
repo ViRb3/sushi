@@ -180,19 +180,21 @@ fn readConfigFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// hot model switch brings its own drafter, no pairing table decides which
 /// sidecar goes with which checkpoint, and a mismatched pair is unbuildable.
 pub const IN_DIR_SUBDIR = "drafter";
+pub const DFLASH2_IN_DIR_SUBDIR = "dflash2";
 
-/// `<model_dir>/drafter` when it declares the DFlash contract, else null.
+/// Prefer `<model_dir>/dflash2`, then the legacy `<model_dir>/drafter`,
+/// when the folder declares the DFlash contract; otherwise return null.
 /// Caller owns the returned path. Only ever consulted when no explicit
 /// `--drafter` was given — an explicit flag always wins, so an external
 /// sidecar can still be pointed at a merged checkpoint.
 pub fn resolveInDirDrafter(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
-    const path = std.fs.path.join(allocator, &.{ model_dir, IN_DIR_SUBDIR }) catch return null;
-    if (!probeIsDflash(io, allocator, path)) {
+    for ([_][]const u8{ DFLASH2_IN_DIR_SUBDIR, IN_DIR_SUBDIR }) |subdir| {
+        const path = std.fs.path.join(allocator, &.{ model_dir, subdir }) catch return null;
+        if (probeIsDflash(io, allocator, path)) return path;
         allocator.free(path);
-        return null;
     }
-    return path;
+    return null;
 }
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !DflashConfig {
@@ -2396,6 +2398,32 @@ test "dflash: an assistant merged into the checkpoint is found without a flag" {
     try testing.expectEqual(@as(?[]u8, null), resolveInDirDrafter(io, allocator, "relative/dir"));
 }
 
+test "dflash: dflash2 folder is preferred with valid legacy fallback" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = path_buf[0..root_len];
+    const config = "{\"architectures\":[\"DFlash2DraftModel\"],\"dflash_config\":{\"block_size\":8,\"mask_token_id\":7,\"target_layer_ids\":[1,3]}}";
+    for ([_][]const u8{ IN_DIR_SUBDIR, DFLASH2_IN_DIR_SUBDIR }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        var sub = try tmp.dir.openDir(io, name, .{});
+        defer sub.close(io);
+        try sub.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    }
+    const preferred = resolveInDirDrafter(io, a, model_dir) orelse return error.TestExpectedInDirDrafter;
+    defer a.free(preferred);
+    try testing.expect(std.mem.endsWith(u8, preferred, "/dflash2"));
+    var dflash2 = try tmp.dir.openDir(io, DFLASH2_IN_DIR_SUBDIR, .{});
+    defer dflash2.close(io);
+    try dflash2.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"other\"}" });
+    const fallback = resolveInDirDrafter(io, a, model_dir) orelse return error.TestExpectedInDirDrafter;
+    defer a.free(fallback);
+    try testing.expect(std.mem.endsWith(u8, fallback, "/drafter"));
+}
+
 test "dflash: no wide verify lane caps the block at the split-K width" {
     // Without an M 8..16 verify lane the trunk forward falls off a cliff at
     // width 8, so the block is capped even though the checkpoint asks for 16.
@@ -3933,7 +3961,6 @@ test "GLM assistant bounded block tail A6 component" {
     try testing.expect(trees_equal);
     // Shape rounding is reported; the full model quality gate remains separate.
 }
-
 
 test "GLM serving DFlash2 trims physical window and preserves absolute append positions" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
