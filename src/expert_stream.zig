@@ -1018,6 +1018,20 @@ const SlabOperand = struct {
     }
 
     fn viewAs(self: *const SlabOperand, template: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        const own = mlx.getShape(self.array);
+        const dims = mlx.getShape(template);
+        if (own.len == dims.len and std.mem.eql(c_int, own[1..], dims[1..])) {
+            // Same slot shape: slice the slot axis; one flat axis can pass MLX's 32-bit dimensions.
+            var start: [4]c_int = @splat(0);
+            var stop: [4]c_int = undefined;
+            @memcpy(stop[0..own.len], own);
+            stop[0] = @intCast(self.count);
+            const step: [4]c_int = @splat(1);
+            var view = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(view);
+            try mlx.check(mlx.mlx_slice(&view, self.array, &start, own.len, &stop, own.len, &step, own.len, s));
+            return view;
+        }
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
         try mlx.check(mlx.mlx_reshape(&flat, self.array, &.{-1}, 1, s));
@@ -1026,7 +1040,6 @@ const SlabOperand = struct {
         const elements: c_int = @intCast(self.count * self.stride / mlx.mlx_array_itemsize(self.array));
         try mlx.check(mlx.mlx_slice(&prefix, flat, &.{0}, 1, &.{elements}, 1, &.{1}, 1, s));
         var shape: [4]c_int = undefined;
-        const dims = mlx.getShape(template);
         @memcpy(shape[0..dims.len], dims);
         shape[0] = @intCast(self.count);
         var view = mlx.mlx_array_new();
@@ -2510,6 +2523,20 @@ test "expert stream a failure after the first lease leaves every slab reusable" 
     const slot = after.remapped[0];
     const gate_span = engine.store.span(0, 2, .gate_up);
     try t.expectEqualSlices(u8, fixture.raw[@intCast(gate_span.offset)..][0..@intCast(gate_span.len)], engine.cacheSlotBytes(0, slot, .gate_up));
+}
+
+test "expert stream a union view past 2^31 elements keeps its slot axes" {
+    const s = tinyStream();
+    var slab = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(slab);
+    try mlx.check(mlx.mlx_zeros(&slab, &[_]c_int{ 3, 32768, 32768 }, 3, .uint8, s));
+    var layer = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(layer);
+    try mlx.check(mlx.mlx_zeros(&layer, &[_]c_int{ 5, 32768, 32768 }, 3, .uint8, s));
+    const operand = SlabOperand{ .present = true, .array = slab, .stride = 32768 * 32768, .count = 2 };
+    const view = try operand.viewAs(layer, s);
+    defer _ = mlx.mlx_array_free(view);
+    try std.testing.expectEqualSlices(c_int, &.{ 2, 32768, 32768 }, mlx.getShape(view));
 }
 
 test "expert stream union workspace refuses reuse while the previous reader holds it" {
