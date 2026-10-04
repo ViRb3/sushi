@@ -6253,6 +6253,15 @@ pub fn glmDflashReserveBudget(config: *const model_mod.ModelConfig, seq: u64, ma
     return prefillNeededAtChunk(config, seq, max_tokens, kv_bits, 1, .{}) -| held;
 }
 
+/// A native GLM request's latent and pooled-index capacity at its eventual length.
+fn glmCacheBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u32, kv_bits: u64) u64 {
+    const ctx = getEffectiveContextLength(config);
+    const reserved = @max(prompt_len, @min(prompt_len +| max_tokens, ctx));
+    // Native appendRows rounds latent and pooled capacities separately to 256 rows.
+    const rows = (reserved +| 1023) / 1024 * 1024;
+    return sessionBytesPerToken(config, kv_bits) *| rows;
+}
+
 /// The per-request terms of the admission bill, in one place.
 pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
     // Arch gate for every term (all new, all measured on qwen4_exp alone; the reservation's
@@ -6518,11 +6527,7 @@ pub fn prefillNeededAtChunk(
     warm: WarmPrefix,
 ) u64 {
     if (config.isGlm5()) {
-        const ctx = getEffectiveContextLength(config);
-        const reserved = @max(seq, @min(seq +| max_tokens, ctx));
-        // Native appendRows rounds latent and pooled capacities separately to 256 rows.
-        const rows = (reserved +| 1023) / 1024 * 1024;
-        return (sessionBytesPerToken(config, kv_bits) *| rows +| glm5TransientBytes(config, seq, chunk, kv_bits)) *| 5 / 4 +|
+        return (glmCacheBytes(config, seq, max_tokens, kv_bits) +| glm5TransientBytes(config, seq, chunk, kv_bits)) *| 5 / 4 +|
             (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
     }
     // deepseek_v4 gets its own estimator: it sub-chunks prefill internally and its state is module-owned f32.
@@ -6946,10 +6951,19 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
     }).fits();
 }
 
-/// {needed, available} of the cold bill, live memory re-read, for the scheduler's sibling hold.
-pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) [2]u64 {
+/// The cold bill, live memory re-read, for the scheduler's sibling hold.
+pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) scheduler_mod.MemoryBill {
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
-    return .{ bill.needed, bill.available };
+    const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
+    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits) };
+}
+
+/// Bytes the bill prices for a request's cache that it allocates AFTER admission. A native GLM
+/// MLA cache grows row by row (a DFlash2 request reserves it after prefill); a Qwen or MiMo
+/// request takes its reserved capacity at its first grow, so it is resident before the next admission.
+pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64) u64 {
+    if (!config.isGlm5()) return 0;
+    return glmCacheBytes(config, prompt_len, max_tokens, kv_bits) +| slotRingBytes(config, kv_bits);
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
@@ -26035,6 +26049,38 @@ test "GLM serving memory bills one latent at the request's KV width and pooled i
     try std.testing.expectEqual(@as(u64, 0), cfg.layerKvBytes(0));
     try std.testing.expectEqual(@as(u64, 1024), cfg.layerKvBytes(3));
     try std.testing.expect(prefillTransientReserveAtKv(&cfg, 16, 2048, 500000) < 6 * 1024 * 1024 * 1024);
+}
+
+test "a second GLM admission leaves free the cache growth the first was admitted to allocate" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.pinned_context = 1_048_576;
+    const gib: u64 = 1 << 30;
+    const prompt: usize = 16;
+    const max_tokens: u32 = 1_048_560;
+    for ([_]u64{ 16, 8 }) |kv_bits| {
+        const bill = prefillAdmissionBill(&cfg, prompt, max_tokens, if (kv_bits == 16) transformer_mod.KVQuantConfig.dense else transformer_mod.KVQuantConfig.affine(8), false, null, .{});
+        const nums = prefillBillNumbersNow(&cfg, prompt, max_tokens, if (kv_bits == 16) transformer_mod.KVQuantConfig.dense else transformer_mod.KVQuantConfig.affine(8), false, false);
+        const commit = admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits);
+        try std.testing.expectEqual(commit, nums.commit);
+        // What the request retains is most of its bill, and it is not resident at admission.
+        try std.testing.expect(commit > bill.needed / 2 and commit <= bill.needed);
+        // Headroom that admits A alone and, a tick later with A's growth unallocated, B.
+        const headroom = bill.needed + gib;
+        const b = scheduler_mod.MemoryBill{ .needed = bill.needed, .available = headroom };
+        try std.testing.expectEqual(@as(usize, 1), scheduler_mod.admitsWithinMemory(&.{b}, true, 0));
+        try std.testing.expectEqual(@as(usize, 0), scheduler_mod.admitsWithinMemory(&.{b}, true, commit));
+    }
+    // kv8 audit shape: one request's eventual state is 6.669 GiB.
+    const kv8 = admissionCommitBytes(&cfg, prompt, max_tokens, 8);
+    try std.testing.expect(kv8 > 6 * gib + gib * 2 / 3 and kv8 < 6 * gib + gib * 7 / 10);
+    try std.testing.expect(admissionCommitBytes(&cfg, prompt, max_tokens, 16) > kv8);
+}
+
+test "a Qwen or MiMo request owes no growth after admission, its reserved capacity is taken at its first grow" {
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2" }) |model_type| {
+        const cfg = model_mod.ModelConfig{ .model_type = model_type };
+        try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&cfg, 40_000, 4096, 8));
+    }
 }
 
 test "a streamed GLM bills its fill peak per request and its latent at the KV width plus the pooled index per planned token" {

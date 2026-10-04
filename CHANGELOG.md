@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Concurrent GLM-5.3 requests no longer over-admit or publish EOS**: a later request now waits while earlier ones
+  still owe cache growth, and a DFlash2 request that sampled EOS first finishes without emitting it beside others.
 - **GLM-5.3-Flash's FP8 release streams its experts from SSD** as stored FP8 codes and block scales, in `serve`, `run`
   and `kld compare`; `kld capture` refuses it, since the BF16 source stays the teacher. Verified by hermetic tests only.
 - **GLM-5.3-Flash on M1–M4 Macs is faster**: it keeps its fused KDA, prework and router kernels, runs sparse prefill

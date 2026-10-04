@@ -279,9 +279,9 @@ pub const SubmitParams = struct {
 /// entry out (the only restore whose rows the request will not allocate).
 pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool = null;
 
-/// {needed, available} of the same cold bill, live memory re-read (`server.prefillBillNumbersNow`).
+/// {needed, available, commit} of the same cold bill, live memory re-read (`server.prefillBillNumbersNow`).
 /// Null (unit tests) skips the inference thread's hold for an ungated arch.
-pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, bool) [2]u64 = null;
+pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, bool) MemoryBill = null;
 
 /// The prefill width this request should run at, chosen against live post-eviction memory
 /// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
@@ -474,6 +474,9 @@ pub const Slot = struct {
     logprobs_n: u32,
     serial_reason_logged: bool = false,
     memory_hold_logged: bool = false,
+    /// Bytes of cache growth admission priced for this request that it had not allocated yet;
+    /// `slotOutstandingGrowth` is the part still unallocated.
+    growth_commit: u64 = 0,
     /// This tick decodes plain (batched) although the slot's MTP head is armed: the
     /// batched forward captures its hidden so the next solo tick can resume speculating.
     mtp_plain_tick: bool = false,
@@ -2392,15 +2395,18 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
     return n;
 }
 
-pub const MemoryBill = struct { needed: u64, available: u64 };
+/// `commit` is the part of `needed` the request allocates after admission (cache growth the bill
+/// prices up front); until it is resident, later admissions must leave it free.
+pub const MemoryBill = struct { needed: u64, available: u64, commit: u64 = 0 };
 
 /// How many of one tick's admits (queue order) go on to prefill. Each connection-thread bill
 /// ran before any sibling allocated, so an ungated arch is re-billed here: an admit that does
 /// not fit beside live requests plus this tick's earlier admits stays pending, and so does
 /// every admit after it. Alone it proceeds: nobody would ever free memory for it. The gated arch
 /// is billed here too, so a Qwen and a MiMo admit see each other, and again inside `runPrefill`.
-pub fn admitsWithinMemory(bills: []const ?MemoryBill, live_company: bool) usize {
-    var promised: u64 = 0;
+/// `outstanding` is what live requests were admitted to allocate and have not yet.
+pub fn admitsWithinMemory(bills: []const ?MemoryBill, live_company: bool, outstanding: u64) usize {
+    var promised: u64 = outstanding;
     for (bills, 0..) |bill, i| {
         const b = bill orelse continue;
         if ((live_company or i > 0) and b.needed +| promised > b.available) return i;
@@ -2409,14 +2415,27 @@ pub fn admitsWithinMemory(bills: []const ?MemoryBill, live_company: bool) usize 
     return bills.len;
 }
 
+/// What a live slot was admitted to allocate and has not: its commitment less its resident
+/// cache. A DFlash2 slot reserves its capacity after prefill, so its share drains at once.
+fn outstandingGrowth(commit: u64, resident: u64) u64 {
+    return commit -| resident;
+}
+
+fn slotOutstandingGrowth(s: *const Slot) u64 {
+    var resident = s.cache.residentBytes();
+    if (s.glm5_request) |*request| resident +|= request.residentBytes();
+    return outstandingGrowth(s.growth_commit, resident);
+}
+
 /// `admitsWithinMemory` over this tick's admits; called under `queue_mu`.
 fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
     const numbers_fn = prefill_admission_numbers orelse return admit_idx.len;
     var live = false;
+    var outstanding: u64 = 0;
     for (sch.decoding.items) |s| {
         if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
         live = true;
-        break;
+        outstanding +|= slotOutstandingGrowth(s);
     }
     var bills: [16]?MemoryBill = undefined;
     const n = @min(admit_idx.len, bills.len);
@@ -2425,16 +2444,16 @@ fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         const s = sch.pending.items[idx];
         const cfg = s.model.config orelse continue;
         if (s.model.transformer == null) continue;
-        const nums = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, generate_mod.visionPrefillUnchunked(s.vision_embeddings != null), s.enable_mtp);
-        bills[i] = .{ .needed = nums[0], .available = nums[1] };
+        bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, generate_mod.visionPrefillUnchunked(s.vision_embeddings != null), s.enable_mtp);
     }
-    const admitted = admitsWithinMemory(bills[0..n], live);
+    const admitted = admitsWithinMemory(bills[0..n], live, outstanding);
+    for (admit_idx[0..admitted], bills[0..admitted]) |idx, bill| sch.pending.items[idx].growth_commit = if (bill) |b| b.commit else 0;
     if (admitted < n) {
         const held = sch.pending.items[admit_idx[admitted]];
         if (!held.memory_hold_logged) {
             held.memory_hold_logged = true;
-            log.info("[admission] held: {d} tokens need ~{d}MB, ~{d}MB available beside live requests; waiting for one to finish\n", .{
-                held.full_prompt.len, bills[admitted].?.needed >> 20, bills[admitted].?.available >> 20,
+            log.info("[admission] held: {d} tokens need ~{d}MB, ~{d}MB available beside live requests (~{d}MB of their growth outstanding); waiting for one to finish\n", .{
+                held.full_prompt.len, bills[admitted].?.needed >> 20, bills[admitted].?.available >> 20, outstanding >> 20,
             });
         }
     }
@@ -2445,14 +2464,14 @@ test "admitsWithinMemory: siblings are billed together, a lone request always pr
     const gb: u64 = 1 << 30;
     const b: ?MemoryBill = .{ .needed = 8 * gb, .available = 20 * gb };
     // Four arrivals each fit alone against the same free memory; only two fit together.
-    try testing.expectEqual(@as(usize, 2), admitsWithinMemory(&.{ b, b, b, b }, false));
+    try testing.expectEqual(@as(usize, 2), admitsWithinMemory(&.{ b, b, b, b }, false, 0));
     // Beside a live request the first must fit by itself.
     const big: ?MemoryBill = .{ .needed = 30 * gb, .available = 20 * gb };
-    try testing.expectEqual(@as(usize, 0), admitsWithinMemory(&.{ big, b }, true));
+    try testing.expectEqual(@as(usize, 0), admitsWithinMemory(&.{ big, b }, true, 0));
     // Alone it proceeds whatever the bill: nothing would ever free memory for it.
-    try testing.expectEqual(@as(usize, 1), admitsWithinMemory(&.{big}, false));
+    try testing.expectEqual(@as(usize, 1), admitsWithinMemory(&.{big}, false, 0));
     // A gated admit carries no bill here and never blocks the queue.
-    try testing.expectEqual(@as(usize, 3), admitsWithinMemory(&.{ null, b, b }, false));
+    try testing.expectEqual(@as(usize, 3), admitsWithinMemory(&.{ null, b, b }, false, 0));
 }
 
 test "admissionPassArmed: the evict-to-admit pass runs for qwen4_exp and mimo_v2, never an unserved arch" {
@@ -8926,6 +8945,15 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (inner_err) |e| return e;
 }
 
+/// The stop check a slot with no pipeline state owes before its pending token is forwarded
+/// into a batch. Pad runs were counted when a batch sampled the token, not again here.
+fn batchEntryStops(gen: *Generator) !bool {
+    const pad_run = gen.consecutive_pad;
+    if (try gen.checkStop()) return true;
+    gen.consecutive_pad = pad_run;
+    return false;
+}
+
 /// The slots a plain batched tick forwards, in `live`: each past the per-tick guards every decode
 /// path runs (loop stop, thinking budget), drained of its pipeline state, the ones that finish
 /// or spend their tick left out.
@@ -8965,6 +8993,10 @@ fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
                 finishSlot(sch, slot, gen.finish_reason);
                 continue;
             }
+        } else if (try batchEntryStops(gen)) {
+            slot.completion_tokens = gen.completion_tokens;
+            finishSlot(sch, slot, gen.finish_reason);
+            continue;
         }
         live[live_n] = slot;
         live_n += 1;
@@ -10503,6 +10535,13 @@ test "a plain batched tick checks the thinking budget before its rows forward" {
     gen.max_tokens = 4;
     gen.has_pending_logits = false;
     gen.has_pending_token = false;
+    gen.step = 0;
+    gen.next_token_id = 9;
+    gen.eos_token_ids = &.{2};
+    gen.consecutive_pad = 0;
+    gen.timeout_ns = 0;
+    gen.stall = .{};
+    gen.timer = io_util.Stopwatch.init(testing.io);
     var slot: Slot = undefined;
     slot.legacy_gen = gen;
     var sch: Scheduler = undefined;
@@ -10510,6 +10549,43 @@ test "a plain batched tick checks the thinking budget before its rows forward" {
     var live: [1]*Slot = undefined;
     try testing.expectEqual(@as(usize, 1), try batchedTickRows(&sch, &active, &live));
     try testing.expect(tb.fired);
+}
+
+test "a slot with no pipeline state is stop-checked before it joins a batch, EOS is never forwarded" {
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(testing.allocator);
+    var gen: Generator = undefined;
+    gen.generated_ids = ids;
+    gen.eos_token_ids = &.{2};
+    gen.next_token_id = 2;
+    gen.step = 0;
+    gen.max_tokens = 8;
+    gen.consecutive_pad = 0;
+    gen.timeout_ns = 0;
+    gen.stall = .{};
+    gen.timer = io_util.Stopwatch.init(testing.io);
+    gen.done = false;
+    gen.finish_reason = "length";
+    // A fresh DFlash2 slot: prefill sampled EOS synchronously and left no pending pipeline.
+    try testing.expect(try batchEntryStops(&gen));
+    try testing.expect(gen.done);
+    try testing.expectEqualStrings("stop", gen.finish_reason);
+    try testing.expectEqual(@as(u32, 0), gen.step);
+    try testing.expectEqual(@as(usize, 0), gen.generated_ids.items.len);
+
+    // A real token joins the batch, and a pad the batch sampled is not counted a second time.
+    gen.done = false;
+    gen.next_token_id = 0;
+    gen.consecutive_pad = 1;
+    try testing.expect(!(try batchEntryStops(&gen)));
+    try testing.expectEqual(@as(u32, 1), gen.consecutive_pad);
+    try testing.expect(!gen.done);
+
+    // A spent budget or stall ends it as the solo path does.
+    gen.next_token_id = 5;
+    gen.step = 8;
+    try testing.expect(try batchEntryStops(&gen));
+    try testing.expectEqualStrings("length", gen.finish_reason);
 }
 
 test "merged verify: an uncertified [N,S] shape is declined by name, never dispatched" {
@@ -10959,8 +11035,8 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
 
 test "admission combines Qwen and MiMo reservations in either order" {
     const Probe = struct {
-        fn numbers(cfg: *const ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, _: bool) [2]u64 {
-            return .{ if (cfg.longCtxGated()) 8 else 7, 10 };
+        fn numbers(cfg: *const ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, _: bool) MemoryBill {
+            return .{ .needed = if (cfg.longCtxGated()) 8 else 7, .available = 10 };
         }
     };
     const saved = prefill_admission_numbers;
@@ -10994,6 +11070,75 @@ test "admission combines Qwen and MiMo reservations in either order" {
     try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{ 1, 0 }));
     try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{0}));
     try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{1}));
+}
+
+test "admitsWithinMemory: a live request's outstanding growth is not free headroom" {
+    const gb: u64 = 1 << 30;
+    const b: ?MemoryBill = .{ .needed = 9 * gb, .available = 10 * gb };
+    try testing.expectEqual(@as(usize, 1), admitsWithinMemory(&.{b}, true, 0));
+    try testing.expectEqual(@as(usize, 0), admitsWithinMemory(&.{b}, true, 2 * gb));
+    // Alone nothing is outstanding, and the lone request proceeds whatever the bill.
+    try testing.expectEqual(@as(usize, 1), admitsWithinMemory(&.{b}, false, 0));
+}
+
+test "a staggered admission waits for the growth an earlier request was admitted to allocate" {
+    const gb: u64 = 1 << 30;
+    const Probe = struct {
+        fn numbers(_: *const ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: bool, _: bool) MemoryBill {
+            return .{ .needed = 9 * gb, .available = 10 * gb, .commit = 6 * gb };
+        }
+    };
+    const saved = prefill_admission_numbers;
+    prefill_admission_numbers = Probe.numbers;
+    defer prefill_admission_numbers = saved;
+    var cfg = ModelConfig{ .model_type = "glm5_next" };
+    var xfm: Transformer = undefined;
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = &xfm;
+    var a: Slot = undefined;
+    a.model = &model;
+    a.full_prompt = &.{};
+    a.max_tokens = 1;
+    a.cache.config = .dense;
+    a.cache.entries = &.{};
+    a.glm5_request = null;
+    a.vision_embeddings = null;
+    a.enable_mtp = false;
+    a.memory_hold_logged = true;
+    a.cancelled = std.atomic.Value(bool).init(false);
+    a.finished = false;
+    a.error_code = null;
+    a.growth_commit = 0;
+    var b = a;
+    var sch: Scheduler = undefined;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.decoding.deinit(testing.allocator);
+
+    try sch.pending.append(testing.allocator, &a);
+    try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{0}));
+    try testing.expectEqual(6 * gb, a.growth_commit);
+
+    // A decodes with nothing of its growth resident yet; B arrives a tick later.
+    _ = sch.pending.orderedRemove(0);
+    try sch.decoding.append(testing.allocator, &a);
+    try sch.pending.append(testing.allocator, &b);
+    try testing.expectEqual(@as(usize, 0), memoryAdmitCount(&sch, &.{0}));
+    try testing.expectEqual(@as(u64, 0), b.growth_commit);
+
+    // Once A finishes its commitment is gone and B proceeds.
+    a.finished = true;
+    try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{0}));
+}
+
+test "a commitment is released as the cache allocates it" {
+    try testing.expectEqual(@as(u64, 6), outstandingGrowth(6, 0));
+    try testing.expectEqual(@as(u64, 2), outstandingGrowth(6, 4));
+    // A DFlash2 request reserves its whole capacity after prefill.
+    try testing.expectEqual(@as(u64, 0), outstandingGrowth(6, 6));
+    try testing.expectEqual(@as(u64, 0), outstandingGrowth(6, 7));
 }
 
 test "the fwd-ubench QSA pooled-key arms interleave composed and fused A B B A inside each verify-rows arm" {

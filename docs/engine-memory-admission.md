@@ -164,6 +164,12 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   (qwen4_exp) re-bills live memory before each prefill in `runPrefill`; an ungated one (mimo_v2) is re-billed at the
   pending drain (`admitsWithinMemory`: live requests plus this tick's earlier admits). One that does not fit beside
   company waits in `pending` (`[admission] held`); alone it proceeds.
+- **An admitted request keeps its unallocated cache growth promised across ticks** (`Slot.growth_commit`, the bill's
+  `commit`, released as the slot's resident cache reaches it): a later admission subtracts every live slot's
+  outstanding share from its headroom. Native GLM MLA grows row by row, so two short-prompt requests with large output
+  limits otherwise both admit and together outgrow the box; a DFlash2 request reserves its capacity after prefill and
+  owes nothing. Qwen and MiMo take their reserved KV at the first grow, resident before the next admission, so their
+  `commit` is zero.
 - The hot-cache budget is clamped at load and follows residency ([engine-prefix-cache](engine-prefix-cache.md#budget)).
 - Context-overflow 400s name BOTH counts.
 - **A freed reserved-KV slot goes back to the OS, not MLX's pool** (`deinitSlotsReturningPool`, and the prefill-end
