@@ -1279,3 +1279,16 @@ index path, arm 4 = `641a9300`'s; greedy text equal in every cell, logits hashes
 Verify per round at 128K: 69.1 → 61.5 ms, so DFlash2 again beats serial there (31.0 vs 28.6). The 2048-row prefill
 peaked 2.14 GB above active at 32K and 2.80 GB at 128K (bill 4,984 MiB). A 2K prompt prefilled at 669 tok/s at 512
 rows and 853 at 2048 (one request each).
+
+Quiet bench, binary `b8267038` (carries the four wins), llmprobe 0.6.13 `--bench-only --rungs 2k,8k,32k,128k --runs 1`,
+`--prefill-chunk 2048` on every arm, fans at max (die 54 °C), load ~1.2, no compiles, GPU lock per arm, 2026-10-04:
+
+| arm | decode tok/s | TTFT | prefill, 9.4K prompt | ladder decode 2K / 8K / 32K / 128K | speculation |
+|---|---:|---:|---:|---|---|
+| Sushi-2.3bpw, `--kv-quant 16` | 43.0 | 346 ms | 865.7 | 42.1 / 39.8 / 40.0 / 37.8 | ×1.52 (predictable 52.9, novel 34.9) |
+| Sushi-2.5bpw, kv8 (default) | 46.3 | 354 ms | 851.7 | 41.2 / 42.7 / 43.1 / 38.8 | ×1.56 (50.0, 32.1) |
+| Sushi-2.5bpw, `--kv-quant 16` | 45.7 | 351 ms | 849.7 | 39.4 / 41.9 / 33.3 / 36.3 | ×1.51 (50.2, 33.2) |
+
+kv8 and BF16 latents decode within noise on one pack; the 32K ladder gap is acceptance (2.74 against 2.06 tokens
+per step). Four concurrent requests decode 44 tok/s in aggregate against ~34 alone. The 2.3bpw row matches or beats
+the `4fcb541e` table in [arch-glm5-next](arch-glm5-next.md#recorded-performance).
