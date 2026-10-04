@@ -126,12 +126,22 @@ pub fn residentBytesWithVision(io: std.Io, allocator: std.mem.Allocator, model_d
     return total;
 }
 
-/// MLX safetensors does not represent source E4M3 storage. For a mixed FP8
-/// shard, upload selected payloads directly, preserving FP8 codes as U8 just
-/// as mimo_source does. No tensor is converted or requantized.
-fn loadFp8Shard(allocator: std.mem.Allocator, path: [:0]const u8, file: []const u8, owners: std.json.ObjectMap, layers: usize, trunk_only: bool, vision: bool, result: *model.Weights, max_bytes: u64) !bool {
+/// Upload selected payloads directly. MLX's lazy Load nodes retain a descriptor
+/// per shard, which exceeds a terminal's default limit on finely sharded packs.
+/// One descriptor and one temporary payload suffice here. Source E4M3 codes use
+/// U8 storage as in mimo_source; no tensor is converted or requantized.
+fn loadStoredShard(allocator: std.mem.Allocator, path: [:0]const u8, file: []const u8, owners: std.json.ObjectMap, layers: usize, trunk_only: bool, vision: bool, result: *model.Weights, max_bytes: u64) !void {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.MissingIndexedGlmWeight;
+    if (fd < 0) {
+        const code = std.c._errno().*;
+        @import("log.zig").err("[glm-loader] cannot open {s}: errno {d}\n", .{ path, code });
+        return switch (code) {
+            @backingInt(std.c.E.MFILE) => error.ProcessFdQuotaExceeded,
+            @backingInt(std.c.E.NFILE) => error.SystemFdQuotaExceeded,
+            @backingInt(std.c.E.NOENT) => error.MissingIndexedGlmWeight,
+            else => error.GlmShardOpenFailed,
+        };
+    }
     defer _ = std.c.close(fd);
     var size: [8]u8 = undefined;
     const readExact = @import("expert_io.zig").readExact;
@@ -145,14 +155,6 @@ fn loadFp8Shard(allocator: std.mem.Allocator, path: [:0]const u8, file: []const 
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSafetensorsHeader;
     var tensors = parsed.value.object.iterator();
-    var has_fp8 = false;
-    while (tensors.next()) |entry| {
-        if (entry.value_ptr.* != .object) continue;
-        const dtype = entry.value_ptr.object.get("dtype") orelse continue;
-        if (dtype == .string and isFp8Dtype(dtype.string)) has_fp8 = true;
-    }
-    if (!has_fp8) return false;
-    tensors = parsed.value.object.iterator();
     var bytes = storedBytes(result);
     while (tensors.next()) |entry| {
         const name = entry.key_ptr.*;
@@ -203,14 +205,13 @@ fn loadFp8Shard(allocator: std.mem.Allocator, path: [:0]const u8, file: []const 
         errdefer allocator.free(key);
         try result.map.put(key, value);
     }
-    return true;
 }
 
 fn isFp8Dtype(dtype: []const u8) bool {
     return std.mem.eql(u8, dtype, "F8_E4M3") or std.mem.eql(u8, dtype, "F8_E4M3FN");
 }
 
-/// The budget is checked on lazy metadata before any retained tensor is evaluated.
+/// The budget is checked before each selected payload is read or uploaded.
 /// Expert-only shards are never opened; mixed shards materialize only trunk tensors.
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream, vision: bool) !model.Weights {
     return loadWeightsBoundedWithVision(io, allocator, model_dir, s, false, std.math.maxInt(u64), vision);
@@ -221,9 +222,7 @@ pub fn loadWeightsBounded(io: std.Io, allocator: std.mem.Allocator, model_dir: [
 }
 
 pub fn loadWeightsBoundedWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: mlx.mlx_stream, trunk_only: bool, max_bytes: u64, vision: bool) !model.Weights {
-    _ = s; // Safetensors Load has a CPU implementation; unified storage is consumed by GPU ops.
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
+    _ = s; // Upload leaves only; unified storage is consumed by GPU operations.
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer dir.close(io);
     const config_raw = try dir.readFileAlloc(io, "config.json", allocator, .limited(2 * 1024 * 1024));
@@ -261,38 +260,19 @@ pub fn loadWeightsBoundedWithVision(io: std.Io, allocator: std.mem.Allocator, mo
     while (file_it.next()) |file| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file.* }, 0);
         defer allocator.free(path);
-        if (try loadFp8Shard(allocator, path, file.*, wm.object, layers, trunk_only, vision, &result, max_bytes)) continue;
-        const present = try std.Io.Dir.openFileAbsolute(io, path, .{});
-        present.close(io);
-        var arrays = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(arrays);
-        var metadata = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(metadata);
-        try mlx.check(mlx.mlx_load_safetensors(&arrays, &metadata, path, cpu));
-        const iterator = mlx.mlx_map_string_to_array_iterator_new(arrays);
-        defer _ = mlx.mlx_map_string_to_array_iterator_free(iterator);
-        while (true) {
-            var key: ?[*:0]const u8 = null;
-            var value = mlx.mlx_array_new();
-            const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iterator);
-            if (rc != 0 or key == null) {
-                _ = mlx.mlx_array_free(value);
-                break;
-            }
-            const name = std.mem.span(key.?);
-            const owner = wm.object.get(name);
-            if (!keepLoadKey(name, layers, trunk_only, vision) or owner == null or owner.? != .string or !std.mem.eql(u8, owner.?.string, file.*)) {
-                _ = mlx.mlx_array_free(value);
-                continue;
-            }
-            errdefer _ = mlx.mlx_array_free(value);
-            if (result.get(name) != null) return error.DuplicateGlmWeight;
-            const copy = try allocator.dupe(u8, name);
-            errdefer allocator.free(copy);
-            try result.map.put(copy, value);
-        }
+        try loadStoredShard(allocator, path, file.*, wm.object, layers, trunk_only, vision, &result, max_bytes);
     }
-    if (result.count() != expected) return error.MissingIndexedGlmWeight;
+    if (result.count() != expected) {
+        @import("log.zig").err("[glm-loader] loaded {d}/{d} indexed tensors\n", .{ result.count(), expected });
+        var missing = wm.object.iterator();
+        var reported: usize = 0;
+        while (missing.next()) |entry| {
+            if (!keepLoadKey(entry.key_ptr.*, layers, trunk_only, vision) or result.get(entry.key_ptr.*) != null) continue;
+            if (reported < 20) @import("log.zig").err("[glm-loader] missing {s} from {s}\n", .{ entry.key_ptr.*, entry.value_ptr.string });
+            reported += 1;
+        }
+        return error.MissingIndexedGlmWeight;
+    }
     if (storedBytes(&result) > max_bytes) return error.GlmResidentBudgetExceeded;
     // Filter ownership/vision/MTP before materializing any device allocation.
     var values = result.map.valueIterator();
@@ -761,4 +741,44 @@ test "GLM raw FP8 CPU loader preserves codes scales owners and exact resident bi
     @memcpy(raw[16512..16516], &[_]u8{ 0, 0, 128, 127 });
     try fixture(tmp.dir, "raw.safetensors", header, raw);
     try std.testing.expectError(error.InvalidFp8Scale, loadWeights(std.testing.io, a, path, cpu));
+}
+
+test "GLM sharded loader succeeds with more shards than its descriptor limit" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(a);
+    try index.appendSlice(a, "{\"weight_map\":{");
+    for (0..300) |i| {
+        const name = try std.fmt.allocPrint(a, "model.language_model.layers.0.p{d}.weight", .{i});
+        defer a.free(name);
+        const file = try std.fmt.allocPrint(a, "p{d}.safetensors", .{i});
+        defer a.free(file);
+        const header = try std.fmt.allocPrint(a, "{{\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]}}}}", .{name});
+        defer a.free(header);
+        try fixture(tmp.dir, file, header, &.{ 128, 63 });
+        const entry = try std.fmt.allocPrint(a, "{s}\"{s}\":\"{s}\"", .{ if (i == 0) "" else ",", name, file });
+        defer a.free(entry);
+        try index.appendSlice(a, entry);
+    }
+    try index.appendSlice(a, "}}");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"num_hidden_layers\":1}" });
+    const path = try tmpPath(tmp);
+    defer a.free(path);
+    var prior: std.c.rlimit = undefined;
+    if (std.c.getrlimit(.NOFILE, &prior) != 0) return error.SkipZigTest;
+    const limited = std.c.rlimit{ .cur = @min(prior.cur, 128), .max = prior.max };
+    if (std.c.setrlimit(.NOFILE, &limited) != 0) return error.SkipZigTest;
+    defer _ = std.c.setrlimit(.NOFILE, &prior);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var weights = try loadWeights(std.testing.io, a, path, cpu);
+    defer weights.deinit();
+    try std.testing.expectEqual(@as(usize, 300), weights.count());
+    try std.testing.expectEqual(@as(u64, 600), storedBytes(&weights));
+    try std.testing.expectEqual(@as(u64, 600), try residentBytes(std.testing.io, a, path, 1));
+    var values = weights.map.valueIterator();
+    while (values.next()) |v| try std.testing.expectEqual(@as(u16, 0x3f80), mlx.mlx_array_data_bfloat16(v.*).?[0]);
 }

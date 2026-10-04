@@ -203,6 +203,13 @@ Resident GLM also honors an explicitly raised `iogpu.wired_limit_mb` ceiling, re
 same configurable 8 GiB reserve as Qwen and MiMo. An unchanged system limit retains the
 physical free-memory ceiling.
 
+GLM uploads only indexed payloads from one shard at a time, preserving their stored
+dtypes. It closes each shard before opening the next. MLX lazy safetensor Load nodes
+kept one descriptor per shard alive until evaluation, so the 566-shard affine pack
+exceeded macOS's default 256-handle terminal limit despite a successful memory
+preflight. The bounded reader also reports descriptor exhaustion separately from
+missing files. A 300-shard regression runs with a 128-descriptor soft limit.
+
 ## Observing memory
 
 `/props` reports `active_bytes`, `memory.cache_bytes`, `batching`; RSS is blind to Metal.
