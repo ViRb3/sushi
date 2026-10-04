@@ -294,6 +294,9 @@ const LayerState = struct {
 
 pub const Capture = struct { ids: []const u32, out: []Arr };
 
+/// Receives every block boundary of a forward, [1, t, hc, hidden] BF16: 0 = layer 0's input, b = layer b-1's output.
+pub const BoundarySink = struct { ctx: *anyopaque, append: *const fn (ctx: *anyopaque, boundary: usize, rows: Arr) anyerror!void };
+
 pub const Request = struct {
     allocator: std.mem.Allocator,
     layers: []LayerState,
@@ -305,6 +308,7 @@ pub const Request = struct {
     /// Prefill layers queued between host waits.
     prefill_sync_layers: u8 = 2,
     capture: ?*Capture = null,
+    boundaries: ?BoundarySink = null,
     stream_owner: ?*Stream = null,
     /// MLA latent storage of every layer: 0 = BF16, 8 = kv8 (`glm5_latent.zig`).
     latent_bits: u8 = 0,
@@ -335,6 +339,13 @@ pub const Request = struct {
         }
         self.offset = 0;
         self.failed = false;
+    }
+
+    /// Frees one layer's caches once nothing reads them again: a layer-major prefill past that layer.
+    pub fn releaseLayer(self: *Request, index: usize) void {
+        self.layers[index].deinit();
+        self.layers[index] = .init();
+        self.layers[index].attention.latent_bits = self.latent_bits;
     }
 
     /// Picks the latent storage before the first token; the lossless teacher stays BF16.
@@ -522,40 +533,14 @@ pub const Model = struct {
         errdefer request.failed = true;
         const staged_decode = self.expert_stream == null and ish[1] == 1 and request.decode_async;
         const staged_prefill = self.expert_stream == null and ish[1] > 1 and request.prefill_async;
-        var h: Arr = undefined;
-        {
-            var ops = Ops{ .s = self.s };
-            defer ops.deinit();
-            const hidden = if (embedded) |input| blk: {
-                if (!std.mem.eql(c_int, mlx.getShape(input), &.{ 1, ish[1], @intCast(self.cfg.hidden_size) })) return error.InvalidGlmInput;
-                break :blk try ops.cast(input, .bfloat16);
-            } else blk: {
-                const e = self.embedding;
-                const code = try ops.take(e.w, ids, 0);
-                break :blk if (e.scales.ctx != null) try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0)) else code;
-            };
-            h = try ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(hidden, &.{ 1, ish[1], 1, @intCast(self.cfg.hidden_size) }), &.{ 1, ish[1], 4, @intCast(self.cfg.hidden_size) })));
-        }
+        if (request.boundaries != null and (staged_decode or staged_prefill)) return error.GlmBoundaryCaptureNeedsSyncLayers;
+        var h = try self.embedStreams(ids, embedded);
         defer _ = mlx.mlx_array_free(h);
+        if (request.boundaries) |sink| try sink.append(sink.ctx, 0, h);
         for (self.layers, request.layers, 0..) |*layer, *state, layer_index| {
             var ops = Ops{ .s = self.s };
             defer ops.deinit();
-            const pre = try layer.hc_attn.collapse(&ops, h, &self.cfg);
-            defer pre.deinit();
-            const x = try ops.rms(pre.mixed, layer.norm_attn, self.cfg.rms_norm_eps);
-            const a = switch (layer.attn) {
-                .kda => |kda| try kda.apply(&ops, x, &self.cfg, &state.recurrent),
-                .mla => |*mla| try mla.applyMode(&ops, x, &self.cfg, &state.attention, request.dense_prefill),
-            };
-            const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, self.s));
-            const ff = try layer.hc_ffn.collapse(&ops, joined, &self.cfg);
-            defer ff.deinit();
-            const fx = try ops.rms(ff.mixed, layer.norm_ffn, self.cfg.rms_norm_eps);
-            const y = switch (layer.ffn) {
-                .dense => |dense| try dense.apply(&ops, fx, self.cfg.glm_swiglu_limit),
-                .moe => |moe| try moe.apply(&ops, fx, &self.cfg),
-            };
-            const next = try ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
+            const next = try self.layerBody(&ops, layer, state, h, request.dense_prefill);
             if (request.capture) |capture| {
                 for (capture.ids, 0..) |id, i| {
                     if (id == layer_index) try mlx.check(mlx.mlx_array_set(&capture.out[i], try ops.reduce(next, 2, true, false)));
@@ -591,13 +576,9 @@ pub const Model = struct {
                 }
             }
             try mlx.check(mlx.mlx_array_set(&h, next));
+            if (request.boundaries) |sink| try sink.append(sink.ctx, layer_index + 1, h);
         }
-        var ops = Ops{ .s = self.s };
-        defer ops.deinit();
-        const chosen = if (last_only) try ops.slice(h, 1, ish[1] - 1, ish[1]) else h;
-        const normalized = try ops.rms(try ops.reduce(chosen, 2, true, false), self.norm, self.cfg.rms_norm_eps);
-        const logits = try self.head.apply(&ops, normalized);
-        const result = try ops.result(logits);
+        const result = try self.headLogits(h, last_only);
         errdefer _ = mlx.mlx_array_free(result);
         if (staged_decode or staged_prefill or request.capture != null) {
             // Cache side outputs must settle even when they are not ancestors of logits.
@@ -610,6 +591,66 @@ pub const Model = struct {
         }
         request.offset += @intCast(ish[1]);
         return result;
+    }
+
+    /// The token embeddings, or server media rows, broadcast into the four HC streams: [1, t, 4, hidden].
+    pub fn embedStreams(self: *const Model, ids: Arr, embedded: ?Arr) !Arr {
+        const t = mlx.getShape(ids)[1];
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        const hidden = if (embedded) |input| blk: {
+            if (!std.mem.eql(c_int, mlx.getShape(input), &.{ 1, t, @intCast(self.cfg.hidden_size) })) return error.InvalidGlmInput;
+            break :blk try ops.cast(input, .bfloat16);
+        } else blk: {
+            const e = self.embedding;
+            const code = try ops.take(e.w, ids, 0);
+            break :blk if (e.scales.ctx != null) try ops.dequant(code, try ops.take(e.scales, ids, 0), try ops.take(e.biases, ids, 0)) else code;
+        };
+        return ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(hidden, &.{ 1, t, 1, @intCast(self.cfg.hidden_size) }), &.{ 1, t, 4, @intCast(self.cfg.hidden_size) })));
+    }
+
+    fn layerBody(self: *const Model, ops: *Ops, layer: *const Layer, state: *LayerState, h: Arr, dense_prefill: bool) !Arr {
+        const pre = try layer.hc_attn.collapse(ops, h, &self.cfg);
+        defer pre.deinit();
+        const x = try ops.rms(pre.mixed, layer.norm_attn, self.cfg.rms_norm_eps);
+        const a = switch (layer.attn) {
+            .kda => |kda| try kda.apply(ops, x, &self.cfg, &state.recurrent),
+            .mla => |*mla| try mla.applyMode(ops, x, &self.cfg, &state.attention, dense_prefill),
+        };
+        const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, self.s));
+        const ff = try layer.hc_ffn.collapse(ops, joined, &self.cfg);
+        defer ff.deinit();
+        const fx = try ops.rms(ff.mixed, layer.norm_ffn, self.cfg.rms_norm_eps);
+        const y = switch (layer.ffn) {
+            .dense => |dense| try dense.apply(ops, fx, self.cfg.glm_swiglu_limit),
+            .moe => |moe| try moe.apply(ops, fx, &self.cfg),
+        };
+        return ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
+    }
+
+    /// One prefill chunk through one layer with the request's state for it, settled as a streamed forward settles
+    /// every layer; a layer-major batch calls this for each window in turn.
+    pub fn prefillLayer(self: *const Model, request: *Request, layer_index: usize, h: Arr) !Arr {
+        if (layer_index >= self.layers.len or request.layers.len != self.layers.len) return error.InvalidGlmLayer;
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        const state = &request.layers[layer_index];
+        const next = try self.layerBody(&ops, &self.layers[layer_index], state, h, request.dense_prefill);
+        const evals = mlx.mlx_vector_array_new_value(next);
+        defer _ = mlx.mlx_vector_array_free(evals);
+        try appendLayerState(evals, state);
+        try mlx.check(mlx.mlx_eval(evals));
+        return ops.result(next);
+    }
+
+    /// The final norm over the mean of the HC streams, then the head: the last position or every position.
+    pub fn headLogits(self: *const Model, h: Arr, last_only: bool) !Arr {
+        const t = mlx.getShape(h)[1];
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        const chosen = if (last_only) try ops.slice(h, 1, t - 1, t) else h;
+        const normalized = try ops.rms(try ops.reduce(chosen, 2, true, false), self.norm, self.cfg.rms_norm_eps);
+        return ops.result(try self.head.apply(&ops, normalized));
     }
 };
 

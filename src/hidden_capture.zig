@@ -2,7 +2,7 @@
 //! one directory while `sushi kld capture` runs the teacher:
 //!   boundary-XX.bin   XX = 00..num_layers, raw bf16 row-major [tokens, width], no header;
 //!                     boundary 0 is the input to layer 0, boundary b the output of layer b-1
-//!                     width is hidden_size (Qwen4: hc_count * hidden_size)
+//!                     width is hidden_size (Qwen4 and GLM: hc_count * hidden_size, [tokens, hc, hidden])
 //!   tokens.bin        u32 token ids [tokens]
 //! Every file is opened for append, so prompts (and runs) concatenate in token
 //! order. A prompt's ids land after all of its rows: `tokens.bin` counts only
@@ -87,7 +87,56 @@ pub const Writer = struct {
         }
         try writeAll(self.tokens, std.mem.sliceAsBytes(ids));
     }
+
+    /// One boundary's rows of one forward piece, BF16 with `hidden` values per token in any leading shape;
+    /// `hash` sees exactly the appended bytes. Returns the token count.
+    pub fn appendRows(self: *Writer, s: mlx.mlx_stream, boundary: usize, rows: mlx.mlx_array, hash: ?*std.crypto.hash.sha2.Sha256) !usize {
+        if (boundary >= self.boundaries.len) return error.HiddenCaptureBoundaryCount;
+        if (mlx.mlx_array_dtype(rows) != .bfloat16) return error.HiddenCaptureNotBf16;
+        const size = mlx.mlx_array_size(rows);
+        if (size == 0 or size % self.hidden != 0) return error.HiddenCaptureBadShape;
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, rows, false, s));
+        try mlx.check(mlx.mlx_array_eval(c));
+        const bytes = std.mem.sliceAsBytes((mlx.mlx_array_data_bfloat16(c) orelse return error.HiddenCaptureUnreadable)[0..size]);
+        if (hash) |h| h.update(bytes);
+        try writeAll(self.boundaries[boundary], bytes);
+        return size / self.hidden;
+    }
+
+    pub fn appendTokens(self: *Writer, ids: []const u32) !void {
+        try writeAll(self.tokens, std.mem.sliceAsBytes(ids));
+    }
+
+    /// Bytes reach the device before a caller records them as committed.
+    pub fn sync(self: *Writer) !void {
+        for (self.boundaries) |fd| if (std.c.fsync(fd) != 0) return error.HiddenCaptureSyncFailed;
+        if (std.c.fsync(self.tokens) != 0) return error.HiddenCaptureSyncFailed;
+    }
+
+    pub fn isEmpty(self: *const Writer) !bool {
+        for (self.boundaries) |fd| if (try fdBytes(fd) != 0) return false;
+        return try fdBytes(self.tokens) == 0;
+    }
+
+    /// Drops whatever an interrupted run appended past `tokens` committed tokens; a file shorter than that is refused.
+    pub fn truncateTo(self: *Writer, tokens: u64) !void {
+        for (self.boundaries) |fd| try truncateFd(fd, tokens * self.hidden * 2);
+        try truncateFd(self.tokens, tokens * 4);
+    }
 };
+
+fn fdBytes(fd: std.c.fd_t) !u64 {
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return error.HiddenCaptureOpenFailed;
+    return @intCast(st.size);
+}
+
+fn truncateFd(fd: std.c.fd_t, bytes: u64) !void {
+    if (try fdBytes(fd) < bytes) return error.HiddenCaptureShorterThanCommitted;
+    if (std.c.ftruncate(fd, @intCast(bytes)) != 0) return error.HiddenCaptureWriteFailed;
+}
 
 /// Output files are private: a new one is created exclusively without following
 /// a link, and an existing one is appended to only when it is a regular file with

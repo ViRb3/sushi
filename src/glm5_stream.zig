@@ -8,7 +8,7 @@ const fp8_block = @import("fp8_block.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
 
-pub const Budget = struct { total: u64, trunk: u64, reserve: u64, cache: u64, fixed: u64 };
+pub const Budget = struct { total: u64, trunk: u64, reserve: u64, cache: u64, fixed: u64, carried: u64 = 0 };
 fn bytesPerExpert(g: stream.Geometry) !u64 {
     return stream.expertBytes(try std.math.mul(u32, 2, g.intermediate), g.hidden, g.intermediate);
 }
@@ -81,6 +81,75 @@ pub fn minimumReserve(cfg: *const model.ModelConfig, tokens: usize, chunk: usize
     return std.math.cast(u64, prepared + recurrent * 2 + caches + activations + attention_scratch + 64 * 1024 * 1024) orelse error.InvalidGlmStreamBudget;
 }
 
+/// The BF16 HC residual one window carries between layers.
+fn carriedPerWindow(cfg: *const model.ModelConfig, max_tokens: usize) !u64 {
+    return std.math.mul(u64, max_tokens, @as(u64, cfg.hc_count) * cfg.hidden_size * 2) catch error.InvalidGlmStreamBudget;
+}
+
+/// A layer-major teacher capture: the window-major capture's bill plus every batch window's HC residual. The cache
+/// keeps one slot per MoE layer, since the batch reads each layer whole into the union workspace.
+pub fn layerMajorBudget(cfg: *const model.ModelConfig, total: u64, trunk: u64, reserve: u64, max_tokens: usize, max_chunk: usize, windows: u32) !Budget {
+    if (windows == 0) return error.InvalidGlmStreamBudget;
+    const carried = std.math.mul(u64, windows, try carriedPerWindow(cfg, max_tokens)) catch return error.GlmLayerMajorBudgetExceeded;
+    const held = std.math.add(u64, reserve, carried) catch return error.GlmLayerMajorBudgetExceeded;
+    var b = captureBudget(cfg, total, trunk, held, max_tokens, max_chunk) catch |e| return if (e == error.SsdBudgetBelowResident) error.GlmLayerMajorBudgetExceeded else e;
+    const g = cfg.expertGeometry();
+    b.reserve = reserve;
+    b.carried = carried;
+    b.cache = @as(u64, g.layers - g.first_moe_layer) * try bytesPerExpert(g);
+    return b;
+}
+
+/// The largest batch, at most `cap` windows, whose layer-major bill fits `total`.
+pub fn layerMajorWindows(cfg: *const model.ModelConfig, total: u64, trunk: u64, reserve: u64, max_tokens: usize, max_chunk: usize, cap: u32) !u32 {
+    const one = try layerMajorBudget(cfg, total, trunk, reserve, max_tokens, max_chunk, 1);
+    const fits = (total - one.fixed - one.cache) / one.carried + 1;
+    return @intCast(@min(fits, cap));
+}
+
+test "GLM layer-major CPU budget bills every batch window's HC residual and refuses by name" {
+    const t = std.testing;
+    const cfg = model.ModelConfig{
+        .model_type = "glm5_next",
+        .hidden_size = 4096,
+        .vocab_size = 154880,
+        .num_hidden_layers = 45,
+        .first_k_dense_replace = 3,
+        .num_experts = 288,
+        .num_experts_per_tok = 8,
+        .moe_intermediate_size = 2048,
+        .hc_count = 4,
+        .num_attention_heads = 64,
+        .full_attention_interval = 4,
+        .linear_num_value_heads = 64,
+        .linear_key_head_dim = 128,
+        .mla_kv_lora_rank = 512,
+        .mla_qk_nope_head_dim = 256,
+        .mla_v_head_dim = 256,
+        .indexer_head_dim = 128,
+        .max_position_embeddings = 1048576,
+    };
+    const GiB: u64 = 1 << 30;
+    const trunk: u64 = 17_842_600_184;
+    const reserve = @max(8 * GiB, try minimumReserve(&cfg, 501, 501));
+    const expert: u64 = 3 * 2048 * 4096 * 2;
+    const one = try layerMajorBudget(&cfg, 100 * GiB, trunk, reserve, 501, 501, 1);
+    const many = try layerMajorBudget(&cfg, 100 * GiB, trunk, reserve, 501, 501, 128);
+    // One window carries 501 tokens of four 4096-wide BF16 streams; the cache is one slot per MoE layer.
+    try t.expectEqual(@as(u64, 501 * 4 * 4096 * 2), one.carried);
+    try t.expectEqual(128 * one.carried, many.carried);
+    try t.expectEqual(@as(u64, 42) * expert, many.cache);
+    try t.expect(many.fixed >= trunk + reserve + many.carried + 288 * expert + @import("expert_stream.zig").BOUNCE_BYTES);
+    try t.expect(many.fixed + many.cache <= many.total);
+    try t.expectError(error.GlmLayerMajorBudgetExceeded, layerMajorBudget(&cfg, 40 * GiB, trunk, reserve, 501, 501, 1));
+    try t.expectError(error.GlmLayerMajorBudgetExceeded, layerMajorBudget(&cfg, 100 * GiB, trunk, reserve, 501, 501, 10_000));
+    try t.expectEqual(@as(u32, 32), try layerMajorWindows(&cfg, 100 * GiB, trunk, reserve, 501, 501, 32));
+    const fit = try layerMajorWindows(&cfg, 100 * GiB, trunk, reserve, 501, 501, 1 << 30);
+    _ = try layerMajorBudget(&cfg, 100 * GiB, trunk, reserve, 501, 501, fit);
+    try t.expectError(error.GlmLayerMajorBudgetExceeded, layerMajorBudget(&cfg, 100 * GiB, trunk, reserve, 501, 501, fit + 1));
+    try t.expectError(error.GlmLayerMajorBudgetExceeded, layerMajorWindows(&cfg, 40 * GiB, trunk, reserve, 501, 501, 32));
+}
+
 /// A lossless teacher capture's BF16 expert budget: one request of `max_tokens`, chunks of at most 512.
 pub fn captureBudget(cfg: *const model.ModelConfig, total: u64, trunk: u64, reserve: u64, max_tokens: usize, max_chunk: usize) !Budget {
     if (!cfg.isGlm5() or max_tokens == 0 or max_tokens > cfg.max_position_embeddings or max_chunk == 0 or max_chunk > max_tokens or max_chunk > 512) return error.InvalidGlmStreamBudget;
@@ -96,6 +165,24 @@ pub const Stream = struct {
     max_tokens: usize,
     max_chunk: usize,
     request_owner: ?*const anyopaque = null,
+    pinned: ?Pinned = null,
+    pinned_applies: u64 = 0,
+
+    const Pinned = struct { layer: u16, prepared: stream.Prepared };
+
+    /// Makes every expert of `layer` resident until `unpin`, so each later call for that layer reads no SSD
+    /// (`prepared.remapped` is indexed by expert id). A layer-major batch reads each layer once this way.
+    pub fn pin(self: *Stream, layer: u16) !void {
+        self.unpin();
+        const ids = try self.engine.allocator.alloc(u16, self.engine.geometry.experts);
+        defer self.engine.allocator.free(ids);
+        for (ids, 0..) |*id, i| id.* = @intCast(i);
+        self.pinned = .{ .layer = layer, .prepared = try self.engine.prepareHost(layer, ids) };
+    }
+    pub fn unpin(self: *Stream) void {
+        if (self.pinned) |*held| held.prepared.deinit();
+        self.pinned = null;
+    }
 
     /// Serving admits each request itself; the stream bounds only the model's own context.
     pub fn serving(engine: *stream.Engine, cfg: *const model.ModelConfig) Stream {
@@ -130,12 +217,17 @@ pub const Stream = struct {
             if (data[i] >= self.engine.geometry.experts) return error.ExpertOutOfRange;
             v.* = @intCast(data[i]);
         }
-        var prepared = try self.engine.prepareHost(layer, host);
-        defer prepared.deinit();
+        const held: ?*stream.Prepared = if (self.pinned) |*p| (if (p.layer == layer) &p.prepared else null) else null;
+        var fresh: ?stream.Prepared = if (held == null) try self.engine.prepareHost(layer, host) else null;
+        defer if (fresh) |*p| p.deinit();
+        const prepared = held orelse &fresh.?;
         errdefer _ = mlx.mlx_synchronize(ops.s);
         const local = try self.engine.allocator.alloc(u32, count);
         defer self.engine.allocator.free(local);
-        for (local, prepared.remapped) |*v, remap| v.* = remap;
+        if (held != null) {
+            for (local, host) |*v, expert| v.* = prepared.remapped[expert];
+            self.pinned_applies += 1;
+        } else for (local, prepared.remapped) |*v, remap| v.* = remap;
         const remapped = try scope.own(mlx.mlx_array_new_data(local.ptr, ish.ptr, @intCast(ish.len), .uint32));
         const out = switch (self.engine.store.layout()) {
             .bf16_individual => try bf16Routed(&scope, x, prepared.gate, prepared.up, prepared.down, remapped, scores, cfg.glm_swiglu_limit),

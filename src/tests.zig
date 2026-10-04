@@ -98,6 +98,7 @@ test {
     _ = @import("glm5_dflash_dense_rows.zig");
     _ = @import("glm5_dflash_reserve.zig");
     _ = @import("glm5_kld_capture.zig");
+    _ = @import("glm5_layer_major.zig");
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");

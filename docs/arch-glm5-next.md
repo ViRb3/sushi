@@ -178,6 +178,10 @@ release reading; table and settings in [quality-kld](quality-kld.md#glm-53-flash
 The M1–M4 path rehearsed on the M5 scores the first prompt at 0.0457 against the stock path's 0.0446, top-1 equal
 ([perf-baselines](perf-baselines.md#glm-nonnax)).
 
+The native teacher also captures block boundaries (`SUSHI_HIDDEN_OUT`, all four HC streams, 16,384 BF16 values per
+token per boundary, 46 boundaries) and, for many short windows, runs layer-major: a batch of windows reads each
+layer's experts once, with byte-identical output ([quality-kld](quality-kld.md#layer-major)).
+
 ## Lessons
 
 - mHC expansion contracts the residual streams first, then adds the separately rounded FP32 branch product; the

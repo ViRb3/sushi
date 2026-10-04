@@ -11,6 +11,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **GLM-5.3-Flash on M1–M4 Macs is faster**: it keeps its fused KDA, prework and router kernels, runs sparse prefill
   and decode attention as FP32 GEMMs instead of the scalar kernel, and bills no NAX-only scratch;
   `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` now rehearses that path on an M5.
+- **`sushi kld capture --layer-major` captures many short GLM-5.3 windows from the BF16 source** with each layer's
+  experts read once per batch of windows, byte-identical to the one-window-at-a-time capture, resumable by rerunning
+  the command; `SUSHI_HIDDEN_OUT` now records the native GLM teacher's block boundaries (all four HC streams).
 - **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
   instead of failing to compile mlx-c after a plain `git pull`.
 - **Concurrent GLM-5.3 requests decode together instead of queueing**: each keeps its own native state, and up to

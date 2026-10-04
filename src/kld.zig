@@ -42,6 +42,12 @@ pub const Options = struct {
     mtp_explicit: bool = false,
     /// `SUSHI_HIDDEN_OUT`: capture appends each prompt forward's block boundaries here.
     hidden_out: []const u8 = "",
+    /// Native GLM teacher capture: windows run in batches, layer by layer (resumable).
+    layer_major: bool = false,
+    /// Windows per layer-major batch; 0 = chosen from the budget.
+    batch_windows: u32 = 0,
+    /// Layer-major: while this file exists the capture idles after its current batch.
+    pause_file: []const u8 = "",
 };
 
 pub const ArgError = error{
@@ -55,6 +61,7 @@ pub const ArgError = error{
     MissingOut,
     MissingFixture,
     TeacherMustBeLossless,
+    LayerMajorFlagWithoutLayerMajor,
 };
 
 const ValueFlag = enum {
@@ -73,6 +80,8 @@ const ValueFlag = enum {
     expert_cache_gb,
     expert_pick_tolerance,
     wired_margin_gib,
+    batch_windows,
+    pause_file,
 };
 
 fn valueFlag(name: []const u8) ?ValueFlag {
@@ -92,6 +101,8 @@ fn valueFlag(name: []const u8) ?ValueFlag {
         .{ "--expert-cache-gb", .expert_cache_gb },
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
         .{ "--wired-margin-gib", .wired_margin_gib },
+        .{ "--batch-windows", .batch_windows },
+        .{ "--pause-file", .pause_file },
     };
     for (table) |row| if (std.mem.eql(u8, name, row[0])) return row[1];
     return null;
@@ -125,6 +136,8 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
         } else if (std.mem.eql(u8, a, "--mtp")) {
             o.enable_mtp = true;
             o.mtp_explicit = true;
+        } else if (std.mem.eql(u8, a, "--layer-major")) {
+            o.layer_major = true;
         } else if (valueFlag(a)) |flag| {
             if (i + 1 >= args.len) return error.MissingFlagValue;
             i += 1;
@@ -145,12 +158,15 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .expert_cache_gb => o.expert_cache_bytes = server_mod.parseExpertCacheGb(v) catch return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
+                .batch_windows => o.batch_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
+                .pause_file => o.pause_file = v,
             }
         } else {
             return error.UnknownFlag;
         }
     }
     if (o.tokens == 0) return error.BadFlagValue;
+    if (!o.layer_major and (o.batch_windows != 0 or o.pause_file.len != 0)) return error.LayerMajorFlagWithoutLayerMajor;
     if (o.model_dir.len == 0) return error.MissingModel;
     switch (o.command) {
         .capture => {
@@ -193,6 +209,10 @@ pub const USAGE =
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 2..32)
+    \\  --layer-major         native GLM BF16 teacher, --tokens 1: batches of windows run layer by layer,
+    \\                        each layer's experts read once per batch; resumable by rerunning
+    \\  --batch-windows <n>   windows per layer-major batch (default: from the budget, at most 32)
+    \\  --pause-file <path>   layer-major: idle after the current batch while <path> exists (<path>.ack)
     \\
 ;
 
@@ -1004,8 +1024,8 @@ fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *transform
 /// The prompt forward; with `hidden`, every block boundary of it is appended there.
 fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, hidden: ?*hidden_capture.Writer) !mlx.mlx_array {
     const w = hidden orelse return forwardPrompt(allocator, l, ctx, ids);
-    // Each chunk would replace the previous chunk's captured boundaries.
-    if (l.config.isGlm5() and ids.len > glm_prompt_chunk) return error.GlmHiddenCaptureNeedsOneChunk;
+    // A GLM boundary is all four HC streams; only the native BF16 teacher capture emits them.
+    if (l.config.isGlm5()) return error.GlmHiddenCaptureNeedsNativeTeacher;
     const layers = l.config.num_hidden_layers;
     const layer_ids = try allocator.alloc(u32, layers);
     defer allocator.free(layer_ids);
@@ -1467,6 +1487,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         log.info("[kld] {s}: appending every prompt forward's block boundaries to {s}\n", .{ hidden_capture.ENV_VAR, dir });
     };
     if (try @import("glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
+    if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.wired_margin_bytes > 0) server_mod.wired_limit_margin_bytes = opts.wired_margin_bytes;
     const loaded = try loadModel(io, allocator, opts);
@@ -2007,9 +2028,9 @@ test "kld records the budget that shaped the load, never the raw flag" {
     try testing.expectEqual(@as(u64, 48), capturedSsdBudgetGb(&q4, 48 * GiB));
 }
 
-fn hiddenCaptureWidth(config: *const model_mod.ModelConfig) usize {
+pub fn hiddenCaptureWidth(config: *const model_mod.ModelConfig) usize {
     // Block boundaries precede the final mixer and retain all HC streams.
-    const streams: usize = if (std.mem.eql(u8, config.model_type, "qwen4_exp"))
+    const streams: usize = if (std.mem.eql(u8, config.model_type, "qwen4_exp") or config.isGlm5())
         @max(config.hc_count, 1)
     else
         1;
@@ -2019,8 +2040,10 @@ fn hiddenCaptureWidth(config: *const model_mod.ModelConfig) usize {
 test "kld hidden capture keeps the complete Qwen4 residual stream" {
     const q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .hidden_size = 2560, .hc_count = 4 };
     const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2", .hidden_size = 4096 };
+    const glm = model_mod.ModelConfig{ .model_type = "glm5_next", .hidden_size = 4096, .hc_count = 4 };
     try testing.expectEqual(@as(usize, 10240), hiddenCaptureWidth(&q4));
     try testing.expectEqual(@as(usize, 4096), hiddenCaptureWidth(&mimo));
+    try testing.expectEqual(@as(usize, 16384), hiddenCaptureWidth(&glm));
 }
 
 const TinyMimo = struct {

@@ -18,7 +18,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 - `kld` takes the SERVED weight loader (`model.loadWeightsForConfig`); a second loader once bound a MiMo pack's raw FP8
   QKV and made every pack score the same.
 - Teacher captures run the KV cache dense (`--kv-quant off`); students are scored at kv8 unless the row says so.
-- `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4, including boundary zero.
+- `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4 and GLM (`[tokens, 4, hidden]`), including boundary zero. GLM boundaries come only from the native BF16 teacher capture; the generic path refuses them (`GlmHiddenCaptureNeedsNativeTeacher`).
 - A `--prompts` jsonl line may carry `prompt_ids` (token ids, used as given, no template) instead of `prompt`.
 
 Native GLM capture runs the native forward through `sushi kld capture` with individual BF16 expert streaming,
@@ -35,6 +35,30 @@ prompts in 2048-token chunks, so 128K-token prompts fit and both sides chunk ali
 All requested greedy full-vocabulary rows are captured through EOS, with native logits dtype recorded and exact
 F32 export. Output first stays in `<out>.partial`; only a full capture publishes a completed baseline and native
 identity atomically, without replacing existing output. A one-prompt study is not the standard release verdict.
+
+<a id="layer-major"></a>
+### Layer-major teacher capture (many short windows)
+
+`--layer-major [--batch-windows W] [--pause-file P]` on the native BF16 GLM capture, `--tokens 1` only, runs W
+windows through layer 0, then layer 1, and so on. Each MoE layer's 288 experts are read once per batch into the
+union workspace (`glm5_stream.Stream.pin`), not once per window. Each window still runs its own `[1, t]` forward per
+chunk with the same chunk width, state and kernels, so the order of work is the only difference: its fixture
+(logits, tokens, baseline) and `SUSHI_HIDDEN_OUT` boundaries are byte-identical to the window-major capture. A tiny
+seeded GLM checks this at several W, across chunks and across a resume (`glm5_layer_major.zig`,
+`glm5_kld_capture.zig`).
+- A window carries only its HC residual between layers (32 KiB per token at 4096 hidden): a layer's KDA state,
+  MLA latent and pooled index are dropped once the window has run that layer. Decode would need every layer's state per
+  window, so `--tokens` above 1 is refused (`GlmLayerMajorNeedsOneRow`).
+- Bill (`glm5_stream.layerMajorBudget`): the window-major capture's bill plus W x max tokens x 32 KiB, one cache
+  slot per MoE layer; over budget is `GlmLayerMajorBudgetExceeded`. Without `--batch-windows`, W is the largest that
+  fits, at most 32.
+- Resumable: `<out>.partial/layer-major.json` binds the run (source hashes, prompt ids, chunk, label, hidden
+  directory, engine binary hash); `windows.jsonl` gains a line per window only after its logits and boundary rows
+  are synced. Rerunning the command re-hashes every committed window (inputs, logits, boundary rows, `tokens.bin`),
+  truncates the hidden files to the committed tokens and continues; a changed window or another run is refused
+  (`GlmLayerMajorWindowChanged`, `GlmLayerMajorResumeMismatch`). While P exists the capture idles between batches
+  and writes `P.ack`. A volume without room for every remaining boundary, id and logits row plus 16 GiB is refused
+  before the first batch (`GlmLayerMajorDiskTooSmall`).
 
 ## Bundled four-prompt screen
 

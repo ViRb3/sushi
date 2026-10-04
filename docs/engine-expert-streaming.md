@@ -56,6 +56,10 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 - The native BF16 teacher capture (`glm5_kld_capture`) keeps its own budget (`glm5_stream.captureBudget`): trunk,
   request reserve (at least 8 GiB), the full union slab, bounce buffers and at least one slot per MoE layer, the lazy
   trunk bounded before any tensor is evaluated, one request, chunks of at most 512.
+- Its layer-major mode ([quality-kld](quality-kld.md#layer-major)) pins one layer at a time: `Stream.pin` reads all
+  of a layer's experts into the union workspace once (`prepareHost` over every id) and maps router ids through it
+  for every window of the batch, so a batch reads each MoE layer once (GLM BF16: 14.50 GB per layer, 608.8 GB per
+  batch). Slot position does not change the gather's result, so output stays byte-identical.
 
 ## Budget
 
@@ -170,7 +174,8 @@ tokens x top-k exactly on every layer; the two load-time warmup forwards add a f
 
 - **Hidden capture** (`SUSHI_HIDDEN_OUT=<abs dir>`): `sushi kld capture` (no prefix cache, no warmup) appends every
   prompt token's residual at each block boundary (`boundary-XX.bin`, raw bf16 [tokens, hidden]; 00 = layer 0's input,
-  b = layer b-1's output), then its ids (`tokens.bin`, u32); `forwardMoeWith` only; logits bit-identical.
+  b = layer b-1's output), then its ids (`tokens.bin`, u32); `forwardMoeWith` and the native GLM teacher (all four
+  HC streams, `Request.boundaries`) only; logits bit-identical.
 - Its output files are private: each is created exclusively without following a link, and an existing one is appended
   to only when it is a regular file with one link (a hard-linked or symlinked output is refused, its target untouched).
 
