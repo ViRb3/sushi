@@ -1,6 +1,8 @@
 //! Conservative live scratch bounds for branch-local MLA views.
 const std = @import("std");
 pub const limit_bytes: usize = 256 * 1024 * 1024;
+/// Trees up to this many rows read the committed latent plus an ancestry overlay.
+pub const overlay_rows: usize = 3;
 pub const Plan = struct { branches: usize, common_bytes: usize, per_branch_bytes: usize, live_bytes: usize };
 fn add(a: usize, b: usize) !usize {
     return std.math.add(usize, a, b) catch error.GlmTreeScratchLimit;
@@ -18,8 +20,9 @@ pub fn plan(processed: usize, latent_capacity: usize, pool_capacity: usize, widt
     const pool_needed = needed / 4;
     const latent_rows = @max(latent_capacity, try capacity(needed));
     const pool_rows = @max(pool_capacity, try capacity(pool_needed));
-    // Growth can retain both concatenation storage and the slice-update copy.
-    const latent_copy = try mul(try mul(try mul(latent_rows, width), bytes), if (needed > latent_capacity) 2 else 1);
+    // Growth can retain both concatenation storage and the slice-update copy. Overlay
+    // branches never write the shared latent; their pooled append still copies.
+    const latent_copy = if (rows <= overlay_rows) 0 else try mul(try mul(try mul(latent_rows, width), bytes), if (needed > latent_capacity) 2 else 1);
     const pool_copy = try mul(try mul(try mul(pool_rows, index_width), bytes), if (pool_needed > pool_capacity) 2 else 1);
     const partials = try mul(try mul(try mul(heads, 8), try add(width, 2)), 4);
     const scores = try mul(pool_needed, 12);
@@ -34,6 +37,14 @@ pub fn plan(processed: usize, latent_capacity: usize, pool_capacity: usize, widt
     if (common >= limit_bytes or per_branch > limit_bytes - common) return error.GlmTreeScratchLimit;
     const branches = @min(rows, (limit_bytes - common) / per_branch);
     return .{ .branches = branches, .common_bytes = common, .per_branch_bytes = per_branch, .live_bytes = try add(common, try mul(branches, per_branch)) };
+}
+
+test "GLM DFlash overlay trees keep three branches at a full-context reservation" {
+    // A request without max_tokens reserves its whole context window (946,179 rows here).
+    const full = try plan(7585, 946432, 236608, 512, 128, 64, overlay_rows, 2);
+    try std.testing.expectEqual(@as(usize, overlay_rows), full.branches);
+    try std.testing.expect(full.live_bytes + @import("glm5_attention_decode_batch.zig").scratch_limit <= limit_bytes);
+    try std.testing.expectError(error.GlmTreeScratchLimit, plan(7585, 946432, 236608, 512, 128, 64, overlay_rows + 1, 2));
 }
 
 test "GLM DFlash MLA scratch covers cache copies and batches only what fits" {

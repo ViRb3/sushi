@@ -153,7 +153,7 @@ fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("mo
         defer branch.deinit();
         var path: [16]u32 = undefined;
         const kept = ancestry(parents, row, &path);
-        const overlay = parents.len <= 3;
+        const overlay = parents.len <= @import("glm5_dflash_memory.zig").overlay_rows;
         const tail = if (overlay) try ops.own(try tape.appendIndex(&branch, kept, readable, ops.s)) else blk: {
             try tape.append(&branch, kept, ops.s);
             break :blk Arr{ .ctx = null };
@@ -248,6 +248,15 @@ pub const Verified = struct {
     }
     /// Replays only the accepted KDA prework and rebuilds only its IndexPool path.
     pub fn prepareCommit(self: *const Verified, source: *const forward.Request, budget: usize, eos: []const u32, s: mlx.mlx_stream) !adapter.Verification {
+        return self.prepareCommitImpl(source, null, budget, eos, s);
+    }
+    /// Serving commit: the source hands its MLA buffers to the accepted state, so the
+    /// append writes in place instead of copying the reserved capacity. The source is
+    /// then only valid to be replaced by the result; any later failure marks it failed.
+    pub fn prepareCommitConsuming(self: *const Verified, source: *forward.Request, budget: usize, eos: []const u32, s: mlx.mlx_stream) !adapter.Verification {
+        return self.prepareCommitImpl(source, source, budget, eos, s);
+    }
+    fn prepareCommitImpl(self: *const Verified, source: *const forward.Request, owner: ?*forward.Request, budget: usize, eos: []const u32, s: mlx.mlx_stream) !adapter.Verification {
         if (source.offset != self.offset or source.layers.len != self.layers.len) return error.InvalidGlmDraftOffset;
         const accepted = try tree.accept(self.tokens[0..self.count], self.parents[0..self.count], self.targets[0..self.count], budget, eos);
         const path = accepted.rows[0..accepted.count];
@@ -283,7 +292,15 @@ pub const Verified = struct {
                 try mlx.check(mlx.mlx_vector_array_append_value(arrays, out.*));
             }
         }
-        try mlx.check(mlx.mlx_eval(arrays));
+        if (owner) |held| {
+            errdefer held.failed = true;
+            // The pending appends now hold the only references, so MLX donates the buffers.
+            for (held.layers) |*layer| for ([_]*Arr{ &layer.attention.latent, &layer.attention.latent_scales, &layer.attention.latent_biases, &layer.attention.pooled }) |buffer| if (buffer.ctx != null) {
+                _ = mlx.mlx_array_free(buffer.*);
+                buffer.* = .{ .ctx = null };
+            };
+            try mlx.check(mlx.mlx_eval(arrays));
+        } else try mlx.check(mlx.mlx_eval(arrays));
         next.offset += path.len;
         return result;
     }
@@ -486,4 +503,74 @@ fn verifierCommitCase(latent_bits: u8) !void {
             }
         }
     }
+}
+
+test "GLM consuming commit appends MLA rows in place with the copying commit's bits" {
+    try consumingCommitCase(0);
+}
+
+test "GLM consuming commit appends kv8 MLA rows in place with the copying commit's bits" {
+    try consumingCommitCase(8);
+}
+
+fn consumingCommitCase(latent_bits: u8) !void {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = @import("model.zig").Weights.init(a);
+    defer weights.deinit();
+    const cfg = try forward.completeFixture(&weights);
+    var iterator = weights.map.iterator();
+    var seed: usize = 41;
+    while (iterator.next()) |entry| {
+        const value = entry.value_ptr;
+        const sh = mlx.getShape(value.*);
+        if (sh.len < 2 or mlx.mlx_array_dtype(value.*) != .bfloat16 or std.mem.endsWith(u8, entry.key_ptr.*, ".scales") or std.mem.endsWith(u8, entry.key_ptr.*, ".biases")) continue;
+        const replacement = try @import("dflash.zig").TinyFix.bf16ArrShaped(sh, seed, s);
+        _ = mlx.mlx_array_free(value.*);
+        value.* = replacement;
+        seed += 1;
+    }
+    var target = try forward.Model.load(a, cfg, &weights, s);
+    defer target.deinit();
+    var request = try forward.Request.init(a, target.layers.len);
+    defer request.deinit();
+    try request.setLatentBits(latent_bits);
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &.{ 1, 3 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const logits = try target.forwardLast(&request, ids, true);
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_array_eval(logits));
+    const tokens = [_]u32{ 1, 0, 0 };
+    const parents = [_]i32{ -1, 0, 1 };
+    const taps = [_]u32{ 0, 3 };
+    var computed = try verify(&target, &request, &tokens, &parents, &taps, .serial_rows);
+    defer computed.deinit();
+    var expected = try computed.prepareCommit(&request, 3, &.{}, s);
+    defer expected.deinit();
+    var buffers: [16][3]?[*]const u8 = @splat(@splat(null));
+    var mla_layers: usize = 0;
+    for (request.layers, 0..) |layer, i| if (layer.attention.latent.ctx != null) {
+        for (&buffers[i], [_]Arr{ layer.attention.latent, layer.attention.latent_scales, layer.attention.latent_biases }) |*slot, buffer| {
+            if (buffer.ctx != null) slot.* = mlx.mlx_array_data_uint8(buffer) else try std.testing.expect(latent_bits == 0);
+        }
+        mla_layers += 1;
+    };
+    try std.testing.expect(mla_layers > 0);
+    var actual = try computed.prepareCommitConsuming(&request, 3, &.{}, s);
+    defer actual.deinit();
+    const accepted = try tree.accept(&tokens, &parents, computed.targets[0..computed.count], 3, &.{});
+    const last = accepted.rows[accepted.count - 1];
+    const left = expected.states[last].?;
+    const right = actual.states[last].?;
+    try std.testing.expectEqual(left.offset, right.offset);
+    for (left.layers, right.layers, request.layers, 0..) |x, y, released, i| {
+        for (released.attention.arrays()[0..4]) |buffer| try std.testing.expect(buffer.ctx == null);
+        for (buffers[i], [_]Arr{ y.attention.latent, y.attention.latent_scales, y.attention.latent_biases }) |old, now| {
+            if (old) |pointer| try std.testing.expectEqual(pointer, mlx.mlx_array_data_uint8(now).?);
+        }
+        for (x.attention.arrays(), y.attention.arrays()) |u, v| try expectArrayBits(u, v, s);
+        try expectArrayBits(x.recurrent.conv_state, y.recurrent.conv_state, s);
+        try expectArrayBits(x.recurrent.ssm_state, y.recurrent.ssm_state, s);
+    }
+    try std.testing.expect(!request.failed);
 }

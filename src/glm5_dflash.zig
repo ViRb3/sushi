@@ -268,6 +268,20 @@ fn sameArray(a: Arr, b: Arr, s: mlx.mlx_stream) !void {
     try std.testing.expectEqualSlices(f32, av, bv);
 }
 
+fn sameBits(a: Arr, b: Arr, s: mlx.mlx_stream) !bool {
+    if (a.ctx == null or b.ctx == null) return a.ctx == null and b.ctx == null;
+    if (!std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b)) or mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(b)) return false;
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const x = try ops.contiguous(a);
+    const y = try ops.contiguous(b);
+    try mlx.check(mlx.mlx_array_eval(x));
+    try mlx.check(mlx.mlx_array_eval(y));
+    const n = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+    if (n == 0) return true;
+    return std.mem.eql(u8, (mlx.mlx_array_data_uint8(x) orelse return error.MlxArrayDataNull)[0..n], (mlx.mlx_array_data_uint8(y) orelse return error.MlxArrayDataNull)[0..n]);
+}
+
 fn sameRequest(a: *const forward.Request, b: *const forward.Request, s: mlx.mlx_stream) !void {
     try std.testing.expectEqual(a.offset, b.offset);
     for (a.layers, b.layers) |left, right| {
@@ -409,6 +423,8 @@ test "GLM DFlash actual branch oracle and commit match independent serial states
     try std.testing.expectEqual(ffn_before + 1, @import("glm5_dflash_ffn.zig").batchCount());
     try std.testing.expectEqual(qmm_before, @import("glm5_dflash_qmm.zig").dispatchCount());
     try std.testing.expectEqualSlices(u32, layerwise.targets[0..layerwise.count], affine.targets[0..affine.count]);
+    // Sampled decisions read these logits, so batched rows must equal serial rows bit for bit.
+    try std.testing.expect(try sameBits(layerwise.logits, affine.logits, s));
     var affine_committed = try affine.prepareCommit(&request, 3, &.{}, s);
     defer affine_committed.deinit();
     try sameRequest(&affine_committed.states[3].?, &verified.states[3].?, s);
@@ -616,11 +632,14 @@ pub fn roundTreeLayerwiseWithDecisions(io: std.Io, assistant: *draft.DflashModel
     if (decisions) |hook| try hook.apply(hook.ctx, &layerwise, budget, eos);
     const verify_ns = timer.read();
     timer.reset();
-    var verified = try layerwise.prepareCommit(request, budget, eos, target.s);
+    var verified = try layerwise.prepareCommitConsuming(request, budget, eos, target.s);
     defer verified.deinit();
     const replay_ns = timer.read();
     timer.reset();
-    const kept = try commitVerified(assistant, context, request, &verified, budget, eos);
+    const kept = commitVerified(assistant, context, request, &verified, budget, eos) catch |err| {
+        request.failed = true;
+        return err;
+    };
     var result = RoundResult{ .count = kept.count, .pending = kept.pending, .stopped = kept.stopped, .verified_rows = proposal.count, .accepted_drafts = kept.count - 1, .draft_ns = draft_ns, .verify_ns = verify_ns, .replay_ns = replay_ns, .commit_ns = timer.read(), .verifier = if (mode == .affine_rows_ffn) "layerwise_tree_affine_ffn_tiles" else if (mode == .affine_rows) "layerwise_tree_affine_row_tiles" else "layerwise_tree_serial_projections" };
     for (kept.rows[0..kept.count], 0..) |row, i| result.tokens[i] = proposal.tokens[row];
     return result;

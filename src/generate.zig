@@ -1716,6 +1716,8 @@ pub const Generator = struct {
     dflash_ctx: ?dflash_mod.DflashCtx = null,
     glm_dflash_native: bool = false,
     glm_dflash_reserved: bool = false,
+    /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
+    glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, clamped by --draft-block-size).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
@@ -2230,7 +2232,7 @@ pub const Generator = struct {
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
             // Under the chooser the width varies per round: drafts proposed
             // is the histogram's sum, not attempts x a fixed block.
-            const drafts_proposed: u64 = if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
+            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
@@ -2258,6 +2260,16 @@ pub const Generator = struct {
                     if (self.dflash_chooser) |ch| ch.trial.trials else 0,
                 },
             );
+            if (self.glm_dflash_native) {
+                const rounds: f64 = @floatFromInt(self.dflash_attempted);
+                const r = self.glm_round;
+                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2}\n", .{
+                    @as(f64, @floatFromInt(r.draft_ns)) / rounds / 1e6,
+                    @as(f64, @floatFromInt(r.verify_ns)) / rounds / 1e6,
+                    @as(f64, @floatFromInt(r.replay_ns)) / rounds / 1e6,
+                    @as(f64, @floatFromInt(r.commit_ns)) / rounds / 1e6,
+                });
+            }
             return;
         }
         if (self.drafter != null and self.drafter_attempted > 0) {
@@ -5386,9 +5398,8 @@ pub const Generator = struct {
         const budget = self.max_tokens - self.completion_tokens;
         const sampled = !isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
         const decisions: ?@import("glm5_dflash.zig").DecisionHook = if (sampled) .{ .ctx = self, .apply = sampledGlmDecisions } else null;
-        // Preserve serial projection arithmetic for sampled probabilities.
-        const mode: @import("glm5_dflash_kda.zig").ProjectionMode = if (sampled) .serial_rows else .affine_rows_ffn;
-        const round = try @import("glm5_dflash.zig").roundTreeLayerwiseWithDecisions(self.timer.io, assistant, &self.dflash_ctx.?, target, request, self.next_token_id, @min(@max(self.dflash_block_size, 2) - 1, 2), budget, self.eos_token_ids, mode, 4, decisions);
+        // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
+        const round = try @import("glm5_dflash.zig").roundTreeLayerwiseWithDecisions(self.timer.io, assistant, &self.dflash_ctx.?, target, request, self.next_token_id, @min(@max(self.dflash_block_size, 2) - 1, 2), budget, self.eos_token_ids, .affine_rows_ffn, 4, decisions);
         var emitted = round.count;
         for (round.tokens[1..round.count], 1..) |token, i| {
             if (tokenStops(token, self.eos_token_ids, &self.consecutive_pad)) {
@@ -5407,6 +5418,11 @@ pub const Generator = struct {
         self.dflash_attempted += 1;
         self.dflash_accepted_tokens += round.accepted_drafts;
         self.dflash_round_width = @intCast(round.verified_rows - 1);
+        self.glm_round.drafted += round.verified_rows - 1;
+        self.glm_round.draft_ns += round.draft_ns;
+        self.glm_round.verify_ns += round.verify_ns;
+        self.glm_round.replay_ns += round.replay_ns;
+        self.glm_round.commit_ns += round.commit_ns;
         if (round.stopped) {
             self.done = true;
             self.finish_reason = "stop";

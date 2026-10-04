@@ -115,15 +115,15 @@ pub fn reserve(request: anytype, total_tokens: usize, available_peak_bytes: usiz
     return bill;
 }
 
-test "GLM reserve ledger admits the 128K verifier without changing scratch policy" {
+test "GLM reserve ledger admits the 128K verifier" {
     const scratch = @import("glm5_dflash_memory.zig");
-    try std.testing.expectError(error.GlmTreeScratchLimit, scratch.plan(131072, 131072, 32768, 512, 128, 64, 3, 2));
+    try std.testing.expectError(error.GlmTreeScratchLimit, scratch.plan(131072, 131072, 32768, 512, 128, 64, scratch.overlay_rows + 1, 2));
     const p = try plan(131072, 131072, 32768, 1024, 128, 2, 131072 + 256 + 3);
     try std.testing.expectEqual(@as(usize, 131584), p.latent_capacity);
     try std.testing.expectEqual(@as(usize, 33024), p.pool_capacity);
     try std.testing.expectEqual(@as(usize, 143785984), p.additional_peak_bytes);
     const admitted = try scratch.plan(131328, p.latent_capacity, p.pool_capacity, 512, 128, 64, 3, 2);
-    try std.testing.expectEqual(@as(usize, 1), admitted.branches);
+    try std.testing.expectEqual(@as(usize, 3), admitted.branches);
     try std.testing.expect(admitted.live_bytes <= scratch.limit_bytes);
     try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 3, 1, 1024, 128, 2, 16));
     try std.testing.expectError(error.InvalidGlmReserveShape, plan(4, 4, 1, 1024, 128, 1, 16));

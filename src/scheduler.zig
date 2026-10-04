@@ -11002,9 +11002,11 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/live-test";
     model.prefix_cache = null;
+    model.transformer = null;
     var slot: Slot = undefined;
     // Only the fields the publish path reads: rows are value copies.
     slot.model = &model;
+    slot.legacy_gen = null;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
     slot.ring_cps = .{};
@@ -11085,6 +11087,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/live-test";
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    model.transformer = null;
     defer model.prefix_cache.?.entries.deinit(testing.allocator);
     sch.hot_prefix_cache = &model.prefix_cache.?;
 
@@ -11098,6 +11101,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
 
     var slot: Slot = undefined;
     slot.model = &model;
+    slot.legacy_gen = null;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
     slot.ring_cps = .{ .fork = .{ .entries = &cp_entries, .step = 8, .allocator = testing.allocator, .config = .dense } };

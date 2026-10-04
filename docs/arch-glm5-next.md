@@ -86,12 +86,17 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **Tree**: two draft nodes plus the root, up to four children per node; the verifier runs all rows layerwise.
   KDA replays only the accepted path from a prework tape; IndexPool builds branch-local pools from the committed prefix
   plus each node's ancestry (pooling flattened tree rows would pool siblings together); MLA reads the committed prefix
-  plus the ancestry tail. Commit publishes target state and assistant context together, or neither.
+  plus the ancestry tail. Commit publishes target state and assistant context together; a commit that fails after
+  taking over the request's MLA buffers leaves the request failed.
 - **Decisions**: greedy follows the target argmax; sampled requests draw only the visited target path with the
-  request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included).
+  request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included). Both
+  verify through the same batched rows, whose logits equal per-row serial projections bit for bit.
   Constrained, forced-tool-call, penalized, logprobs or explicitly budgeted-thinking requests decode serially.
 - **Bills**: assistant weights at load; per request the sliding window ×4, captures per prefill row, three recurrent
-  checkpoints, the 256 MiB verification-scratch cap and 64 MiB.
+  checkpoints, the 256 MiB verification-scratch cap and 64 MiB. The MLA reservation is input + max_tokens + 3 rows:
+  a request without max_tokens reserves its whole context window (946K rows: 11.3 GB BF16, 6.3 GB kv8).
+- **No yield gate**: `[spec-stats] gate_min` is the generic DFlash bar (1.80 here) and is never evaluated on the
+  native path. N2 beats a serial step above ~1.1 accepted drafts per round at 1K–30K; measured requests ran 1.31–1.90.
 
 Wider trees lost: N3 with every four-row kernel optimized measured 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`,
 inside 1.46% drift) because verification per round grew 20.6%.

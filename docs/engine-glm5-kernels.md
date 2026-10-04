@@ -99,11 +99,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   aliased on a hit (4 MiB per layer; −25%; 59% hits at 8K, break-even 21%).
 - **MLA**: trees of at most three nodes read the committed buffer plus a ≤3-row ancestry tail instead of a replaced
   latent buffer (1.97× at 32K); query and value projections broadcast the one-row geometry over three rows (exact,
-  −3.6%). Accepted rows append at commit. Live branch scratch is capped at 256 MiB: three branches fit through 64K,
-  one at 128K; branch groups that do not fit settle in turn and B3 falls back to per-node B1.
+  −3.6%). Accepted rows append at commit. Live branch scratch is capped at 256 MiB; overlay trees bill only the branch
+  pooled copy, so three branches fit even at a full-context reservation, while wider trees still bill a latent copy
+  per branch. Branch groups that do not fit settle in turn and B3 falls back to per-node B1.
+- **Commit**: the commit hands the request's latent (kv8: codes, scales, biases) and pooled buffers to the accepted
+  state before evaluating, so MLX appends in place; a buffer the committed request still shares is copied whole,
+  reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,
+  `194351a3`). A failure after the hand-over leaves the request failed.
 - **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order; three-row A6
   QKV hoists coefficient decode out of the row loop (exact, −12.4%); the retained BF16 KDA projections run as column
   GEMVs with rows in the batch grid (exact; stock multi-row `Linear` is not); the router batches up to 16 rows.
+  Sampled rounds use the same batched rows: their logits equal per-row serial projections bit for bit (215 real 8K
+  rounds, every tape and capture too); per-row projections cost 64.2 vs 54.2 ms of verify per round and sampled 8K
+  decode rose 31.15 → 37.25 tok/s (BF16, A4, `11566d93`, ABBA, 2.2% drift).
 - **Assistant**: only draft positions 1–2 reach the vocab head, since N2 visits depths 0–1 (exact, −58% readout);
   the temporary 8-row block attends a read-only slice of the last 2047 context rows (assistant forward 11.4 → 4.6 ms at
   32K; assistant rounding changes, target exact); the next context is cropped to 2047 rows before accepted captures
@@ -150,9 +158,11 @@ Decode and verify:
   chain 6/11, fork slower. Keeping all three T3 endpoints: −1.5% (6/11) for +272 MiB.
 - Retained KDA projections: native NAX batch +5.7%; FA+GA N256 column join +3.7% (N320 changes the GEMV kernel).
 - Head-rebatched three-row MLA value QMM: switches to `qmv_wide`, not exact.
-- In-place accepted latent append: a shared clone blocks MLX donation; at most 2.2 ms per round at 32K.
 - Draft head shortlists (3-bit top-32 over 7 rows; A3 top-32 over 2 rows): −26% readout, decode gain inside drift,
-  +265–278 MiB resident; removed.
+  +265–278 MiB resident; removed. The A4 assistant leaves the premise: the 2-row readout is 1.3 of a 5.3 ms draft,
+  at most 2.2% of an 8K round (BF16, `11566d93`).
+- Narrower trees: N1 (one draft node) loses to N2 at 1K and 30K (37.5–38.4 vs 32.2–33.6 ms per token; BF16, A4,
+  arms rotated every 16 rounds in one request, contended box); N2 beats a serial step above ~1.1 accepted per round.
 - Wider trees: N3 with every T4 kernel optimized 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`, 1.46% drift);
   N4 31.4 vs N2 42.4 tok/s at 512/64. Verify per round grows faster than acceptance.
 - Per-kernel attribution tools: synchronizing verifier markers (halve throughput), xctrace Metal System Trace (no
