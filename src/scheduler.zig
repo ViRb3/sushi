@@ -2389,6 +2389,26 @@ pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
     return padded / @as(f64, @floatFromInt(sum));
 }
 
+/// A group whose longest billed slot is at most this long pads a small tensor, and splitting it sends a slot
+/// through a whole serial forward instead: under the qwen4 gather arm every long slot bills at the indexer
+/// budget, so a short sub-agent beside long streams reads as a 2x pad.
+pub const PAD_FREE_KV: u32 = 4096;
+
+/// The floor only engages once a slot holds this much context: below it the serial forward it saves is cheap.
+pub const PAD_FREE_MIN_CTX: u32 = 131072;
+
+/// `batchedKvKeepCount` for a group whose longest TRUE context is `ctx_max`.
+pub fn groupKeepCount(kv_lens_asc: []const u32, ctx_max: u32) usize {
+    if (kv_lens_asc.len >= 2 and ctx_max >= PAD_FREE_MIN_CTX and kv_lens_asc[kv_lens_asc.len - 1] <= PAD_FREE_KV) return kv_lens_asc.len;
+    return batchedKvKeepCount(kv_lens_asc);
+}
+
+fn groupCtxMax(caches: []const *const KVCache) u32 {
+    var m: usize = 0;
+    for (caches) |c| m = @max(m, c.kvLenForBatching());
+    return @intCast(@min(m, std.math.maxInt(u32)));
+}
+
 /// One source for the length the batched group is sorted and capped by. `cache.step`
 /// advances only on global layer 0, so on a linear-layer-0 trunk (GDN, gated-conv, Mamba2,
 /// KDA) it is 0 forever and the pad-waste cap never fired. `KVCache.kvLenForBatching` reads
@@ -7828,6 +7848,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // how many still fit; the tail decodes serially this tick.
         if (pads and group.len >= 2) {
             var kv_lens: [32]u32 = undefined;
+            var ctx_max: u32 = 0;
             // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
             // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
             if (gate_batch_kv_len) {
@@ -7836,6 +7857,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                     caches_buf[i] = &g.cache;
                 }
                 fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, kv_lens[0..group.len]);
+                ctx_max = groupCtxMax(caches_buf[0..group.len]);
                 // Stable insertion sort, ascending, slots and lengths moving together.
                 var i: usize = 1;
                 while (i < group.len) : (i += 1) {
@@ -7857,7 +7879,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                 }.lt);
                 for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
             }
-            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            const keep = groupKeepCount(kv_lens[0..group.len], ctx_max);
             if (keep < group.len) {
                 if (!kv_skew_split_logged) {
                     kv_skew_split_logged = true;
@@ -9262,6 +9284,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 caches_buf[i] = &g.cache;
             }
             fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, kv_lens[0..group.len]);
+            const ctx_max = groupCtxMax(caches_buf[0..group.len]);
             var i: usize = 1;
             while (i < group.len) : (i += 1) {
                 const slot_i = group[i];
@@ -9274,7 +9297,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 group[j] = slot_i;
                 kv_lens[j] = len_i;
             }
-            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            const keep = groupKeepCount(kv_lens[0..group.len], ctx_max);
             for (group[keep..]) |s| {
                 noteSerial(sch, s, .pad_waste);
                 try runSingleDecodeTick(sch, s);
@@ -10047,6 +10070,54 @@ test "batchedKvKeepCount: padding waste caps the group, and the long slots are t
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{ 1, 200_000 }));
 }
 
+test "groupKeepCount: the small-pad floor keeps a group whole only at long context" {
+    // A long stream billed at the gather arm's 2052-row cap beside two short sub-agents: 3x pad.
+    const billed = [_]u32{ 10, 10, 2052 };
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, PAD_FREE_MIN_CTX - 1));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&billed, PAD_FREE_MIN_CTX));
+    // Past the floor's billed bound the cap holds at any context.
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV + 1 }, 300_000));
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV }, 300_000));
+    // A group of one never batches.
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{2052}, 300_000));
+}
+
+test "a 137k stream beside two fresh sub-agents stays one group on the gather bill" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    var q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .indexer_budget = 2048, .indexer_compress_ratio = 4 };
+    const lens = [_]usize{ 10, 12, 137_000 };
+    var caches: [3]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    var ptrs: [3]*const KVCache = undefined;
+    for (lens, 0..) |len, i| {
+        caches[i] = try KVCache.init(testing.allocator, 32);
+        built += 1;
+        caches[i].entries[3].initialized = true;
+        caches[i].entries[3].offset = len;
+        ptrs[i] = &caches[i];
+    }
+    var billed: [3]u32 = undefined;
+    fillGroupPadWasteKvLens(&ptrs, &q4, 1, &billed);
+    try testing.expectEqual(@as(u32, 2052), billed[2]);
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&billed));
+    try testing.expectEqual(@as(u32, 137_000), groupCtxMax(&ptrs));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&billed, groupCtxMax(&ptrs)));
+    // Below the context floor the serial forward is cheap and the plain cap splits the stream off.
+    caches[2].entries[3].offset = 100_000;
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, groupCtxMax(&ptrs)));
+}
+
 test "the batched group is capped by padding waste before it is dispatched" {
     // Source-scan class guard: the grouping loop must consult the cap. Without
     // it a single long-context stream makes every short neighbour materialize
@@ -10056,7 +10127,7 @@ test "the batched group is capped by padding waste before it is dispatched" {
     const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
     const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
     const body = src[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "groupKeepCount(") != null);
     // ...and the dropped slots must still be ticked, or they never advance.
     try testing.expect(std.mem.indexOf(u8, body, "noteSerial(sch, s, .pad_waste)") != null);
 }

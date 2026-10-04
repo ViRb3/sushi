@@ -18,6 +18,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Qwen attention reads exact values from a K/V view whose base is not 16-byte aligned**: the fused prefill and QSA
   gather kernels decline such a view and the stock attention serves it.
 - **Qwen MTP picks its draft depth from measured acceptance below 8k context**, which speeds up short code and mixed replies; output is unchanged.
+- **A 130k+ token Qwen session decoding beside short requests is no longer split into its own serial forward every
+  tick**: about 59 to 97 tok/s aggregate for one such session beside two short ones.
 - **A GLM-5.3 prompt served without prefix checkpoints no longer hangs its prefill** (prefix cache off, or admission
   shedding every checkpoint at long context).
 - **Qwen3.8 late system notes (hook output, a mid-conversation `developer` turn) stay where they were sent** instead of
