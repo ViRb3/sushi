@@ -1393,6 +1393,8 @@ pub fn nextChunkEnd(
 /// `nextChunkEnd` for a GLM prefill, whose checkpoint grid must be hit exactly: the tail merge never
 /// absorbs a grid point.
 pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
+    // Grid 0 = no checkpoints for this request (prefix cache off, or admission shed them all).
+    if (grid == 0) return nextChunkEnd(pos, prefix_len, default_chunk, false, 0, offset, adaptive_width);
     const next_grid = ((pos + offset) / grid + 1) * grid - offset;
     return @min(nextChunkEnd(pos, prefix_len, default_chunk, true, grid, offset, adaptive_width), next_grid);
 }
@@ -7504,6 +7506,12 @@ pub const Generator = struct {
         return on;
     }
 
+    /// A pre-draft chain is only worth its cost when a later round reads it: a request whose
+    /// budget is spent, or whose pending token ends it, keeps no reader.
+    fn mtpPreDraftOpenAllows(completion_tokens: u32, max_tokens: u32, pending_is_eos: bool) bool {
+        return completion_tokens < max_tokens and !pending_is_eos;
+    }
+
     /// Cross-round pre-draft (round pipelining): at the round's tail — the
     /// accept decision made, trunk committed/rolled back, EV updated,
     /// last_hidden/next_token_id already pointing at the next round — build
@@ -7515,7 +7523,7 @@ pub const Generator = struct {
     /// round's EV update, so it is byte-identical to the one the next
     /// round's entry would compute.
     fn mtpMaybePreDraft(self: *Generator, allocator: std.mem.Allocator) !void {
-        if (self.mtp_planner_owned and (self.completion_tokens >= self.max_tokens or isEosId(self.next_token_id, self.eos_token_ids))) return;
+        if (!mtpPreDraftOpenAllows(self.completion_tokens, self.max_tokens, isEosId(self.next_token_id, self.eos_token_ids))) return;
         if (!mtpPredraftEnabled() or self.spec_disabled_runtime or self.mtp_batch_head or self.mtp_planner_pending) return;
         std.debug.assert(self.mtp_pre_draft == null);
         const plan = self.mtpRoundPlan();
@@ -21159,6 +21167,14 @@ test "MTP commit stops before an accepted EOS and keeps EOS pending" {
     try testing.expectEqual(@as(u32, 4), Generator.mtpStopPrefix(&drafts, 4, &.{}).accepted);
 }
 
+test "mtpPreDraftOpenAllows: a pre-draft needs a later round to read it" {
+    const G = Generator;
+    try testing.expect(G.mtpPreDraftOpenAllows(9, 10, false));
+    try testing.expect(!G.mtpPreDraftOpenAllows(10, 10, false));
+    try testing.expect(!G.mtpPreDraftOpenAllows(11, 10, false));
+    try testing.expect(!G.mtpPreDraftOpenAllows(5, 10, true));
+}
+
 test "selected depth bypasses legacy planning and keeps acceptance private" {
     const previous = group_planner.enabled_override;
     group_planner.enabled_override = true;
@@ -22488,6 +22504,13 @@ test "the GLM capture schedule is what the prefill loop captures: peak, newest a
     // A grid point at a chunk's end is not absorbed by the tail merge that follows it.
     try testing.expectEqual(@as(usize, 2058), nextChunkEnd(0, 2058, 2048, true, 2048, 0, true));
     try testing.expectEqual(@as(usize, 2048), glmChunkEnd(0, 2058, 2048, 2048, 0, true));
+}
+
+test "a GLM prefill without checkpoints chunks like any other prefill" {
+    for ([_]usize{ 0, 4096 }) |pos| for ([_]usize{ 2, 2058, 9000 }) |len| {
+        const end = pos + len;
+        try testing.expectEqual(nextChunkEnd(pos, end, 2048, false, 0, 0, true), glmChunkEnd(pos, end, 2048, 0, 0, true));
+    };
 }
 
 test "the GLM prefill holds as many checkpoints as its schedule says, and ends on the newest" {

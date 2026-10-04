@@ -41,6 +41,8 @@ pub const Entry = struct {
     loaded: bool,
     /// The row's `reasoning_efforts`; null when the server lists none.
     efforts: ?[]const []const u8 = null,
+    /// The row's `default_reasoning_effort`: the word a request naming none runs at.
+    default_effort: ?[]const u8 = null,
 };
 
 /// pi's thinking levels, in its own order.
@@ -97,6 +99,7 @@ pub const AgentKind = enum {
     hermes,
     aider,
     zcode,
+    grok,
 
     pub fn fromName(name: []const u8) ?AgentKind {
         // The codex rebrand: issue #188 asks for `sushi launch chatgpt`.
@@ -107,7 +110,7 @@ pub const AgentKind = enum {
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, codex, hermes, aider, zcode";
+    pub const names = "claude, pi, omp, opencode, codex, hermes, aider, zcode, grok";
 };
 
 pub const zcodeConfigJson = @import("zcode_launch.zig").configJson;
@@ -237,15 +240,19 @@ fn writeOmpThinking(allocator: std.mem.Allocator, out: *std.ArrayList(u8), accep
 /// the JSON must stay single-quote-free.
 /// `limit.output` is the room opencode keeps free before compacting (it
 /// never sends max_tokens), so it carries the reserve, not the response cap.
-pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry) ![]u8 {
+/// opencode 2.x has no `--model` on its default command, so the model rides `model`. A row
+/// listing efforts is a reasoning model: its graded words become the `variants` opencode sends
+/// as `reasoning_effort`, and its `reasoning_content` is carried back.
+pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, entries: []const Entry) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
+    try out.print(allocator, "{{\"$schema\": \"https://opencode.ai/config.json\", \"model\": \"sushi/{s}\", ", .{model});
+    // A long prefill plus a buffered tool call outlasts opencode's 5-minute request and chunk defaults.
     try out.print(allocator,
-        \\"provider": {{"sushi": {{"npm": "@ai-sdk/openai-compatible", "name": "sushi (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
+        \\"provider": {{"sushi": {{"npm": "@ai-sdk/openai-compatible", "name": "sushi (local)", "options": {{"baseURL": "{s}/v1", "timeout": 3600000, "chunkTimeout": 3600000}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
-        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (sushi)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}}}", .{
+        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (sushi)\", \"tool_call\": true,{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}", .{
             if (i == 0) "" else ", ",
             e.id,
             e.id,
@@ -253,8 +260,101 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
             e.budget.context,
             compactionReserve(e.budget.context),
         });
+        if (e.efforts) |words| try writeOpencodeReasoning(allocator, &out, words);
+        try out.append(allocator, '}');
     }
     try out.appendSlice(allocator, "}}}}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeOpencodeReasoning(allocator: std.mem.Allocator, out: *std.ArrayList(u8), words: []const []const u8) !void {
+    try out.appendSlice(allocator, ", \"reasoning\": true, \"interleaved\": {\"field\": \"reasoning_content\"}");
+    var n: usize = 0;
+    for (words) |w| {
+        if (std.mem.eql(u8, w, "on") or std.mem.eql(u8, w, "off")) continue;
+        try out.print(allocator, "{s}\"{s}\": {{\"reasoningEffort\": \"{s}\"}}", .{ if (n == 0) ", \"variants\": {" else ", ", w, w });
+        n += 1;
+    }
+    if (n > 0) try out.append(allocator, '}');
+}
+
+/// An opencode launch needs `--standalone`: 2.x otherwise talks to a background service that
+/// never sees OPENCODE_CONFIG_CONTENT. Flags bind to the subcommand, so it goes after one.
+fn appendOpencodeInvocation(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: []const []const u8) !void {
+    try out.appendSlice(allocator, "opencode");
+    if (extras.len > 0 and extras[0].len > 0 and extras[0][0] != '-') {
+        try out.append(allocator, ' ');
+        try appendQuoted(out, allocator, extras[0]);
+        try out.appendSlice(allocator, " --standalone");
+        return appendExtras(out, allocator, extras[1..]);
+    }
+    try out.appendSlice(allocator, " --standalone");
+    try appendExtras(out, allocator, extras);
+}
+
+/// grok's `[session] auto_compact_threshold_percent` is its only compaction knob: the share of the
+/// window used before it compacts, which leaves `compactionReserve` free.
+pub fn grokCompactPercent(ctx: u64) u64 {
+    if (ctx == 0) return 90;
+    return @max(50, (ctx - compactionReserve(ctx)) * 100 / ctx);
+}
+
+fn appendTomlString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        0...9, 11...31, 127 => try out.print(allocator, "\\u{x:0>4}", .{c}),
+        else => try out.append(allocator, c),
+    };
+    try out.append(allocator, '"');
+}
+
+/// grok `config.toml` under its own GROK_HOME: one `[model.*]` per chat row on the chat
+/// completions wire, a dummy key (grok sends it as the bearer), the row's advertised context
+/// and output budget, and its reasoning words as the effort picker.
+pub fn grokConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "# written by sushi, regenerated at each launch.\n[cli]\nauto_update = false\n\n[features]\ntelemetry = false\nfeedback = false\n\n[models]\ndefault = ");
+    try appendTomlString(&out, allocator, model);
+    try out.print(allocator, "\n\n[session]\nauto_compact_threshold_percent = {d}\n", .{grokCompactPercent(budget.context)});
+    for (entries) |e| {
+        try out.appendSlice(allocator, "\n[model.");
+        try appendTomlString(&out, allocator, e.id);
+        try out.appendSlice(allocator, "]\nmodel = ");
+        try appendTomlString(&out, allocator, e.id);
+        try out.print(allocator, "\nbase_url = \"{s}/v1\"\nname = ", .{base_url});
+        const label = try std.fmt.allocPrint(allocator, "{s} (sushi)", .{e.id});
+        defer allocator.free(label);
+        try appendTomlString(&out, allocator, label);
+        try out.print(allocator,
+            \\
+            \\api_backend = "chat_completions"
+            \\api_key = "sushi"
+            \\context_window = {d}
+            \\max_completion_tokens = {d}
+            \\
+        , .{ e.budget.context, e.budget.output });
+        const words = e.efforts orelse continue;
+        if (words.len == 0) continue;
+        const default = if (e.default_effort) |d| (if (listed(words, d)) d else words[0]) else words[0];
+        try out.appendSlice(allocator, "supports_reasoning_effort = true\nreasoning_effort = ");
+        try appendTomlString(&out, allocator, default);
+        try out.append(allocator, '\n');
+        for (words) |w| {
+            try out.appendSlice(allocator, "\n[[model.");
+            try appendTomlString(&out, allocator, e.id);
+            try out.appendSlice(allocator, ".reasoning_efforts]]\nid = ");
+            try appendTomlString(&out, allocator, w);
+            try out.appendSlice(allocator, "\nvalue = ");
+            try appendTomlString(&out, allocator, w);
+            try out.appendSlice(allocator, "\nlabel = ");
+            try appendTomlString(&out, allocator, w);
+            try out.print(allocator, "\ndefault = {s}\n", .{if (std.mem.eql(u8, w, default)) "true" else "false"});
+        }
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -454,10 +554,19 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             , .{model});
         },
         .opencode => {
-            try out.print(allocator,
-                \\export OPENCODE_CONFIG_CONTENT='{s}'
-                \\opencode --model sushi/{s}
-            , .{ opencode_config.?, model });
+            try out.print(allocator, "export OPENCODE_CONFIG_CONTENT='{s}'\n", .{opencode_config.?});
+            try appendOpencodeInvocation(&out, allocator, extras);
+            try out.append(allocator, '\n');
+            return out.toOwnedSlice(allocator);
+        },
+        .grok => {
+            try out.appendSlice(allocator,
+                \\export GROK_HOME="$HOME/.sushi/grok"
+                \\if ! command -v grok >/dev/null 2>&1; then echo "grok is not installed" >&2; exit 127; fi
+                \\grok --model
+            );
+            try out.append(allocator, ' ');
+            try appendQuoted(&out, allocator, model);
         },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
@@ -616,6 +725,7 @@ fn parseChatEntries(allocator: std.mem.Allocator, body: []const u8) !Models {
             .vision = vision,
             .loaded = loaded,
             .efforts = efforts,
+            .default_effort = if (obj.get("default_reasoning_effort")) |v| (if (v == .string) try a.dupe(u8, v.string) else null) else null,
         });
     }
     return .{ .arena = arena, .entries = try list.toOwnedSlice(a) };
@@ -637,6 +747,11 @@ fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, 
 fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) !void {
     switch (kind) {
         .claude, .opencode => {},
+        .grok => {
+            const toml = try grokConfigToml(allocator, base_url, model, budget, entries);
+            defer allocator.free(toml);
+            try writeAgentFile(allocator, io, "grok", "config.toml", toml);
+        },
         .pi => {
             const json = try piModelsJson(allocator, base_url, entries);
             defer allocator.free(json);
@@ -814,7 +929,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
 
     const oc_config: ?[]u8 = if (parsed.kind == .opencode)
-        try opencodeJson(allocator, base_url, models.entries)
+        try opencodeJson(allocator, base_url, chosen.id, models.entries)
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
@@ -905,7 +1020,7 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
     };
     const pi_json = try piModelsJson(t.allocator, "http://127.0.0.1:12345", &entries);
     defer t.allocator.free(pi_json);
-    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:12345", &entries);
+    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:12345", "m1", &entries);
     defer t.allocator.free(oc_json);
     for ([_][]const u8{ pi_json, oc_json }) |json| {
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
@@ -1044,14 +1159,14 @@ test "opencode config: limit.output is the compaction reserve" {
     const entries = [_]Entry{
         .{ .id = "m1", .budget = budgetForContext(24576), .vision = false, .loaded = true },
     };
-    const v1 = try opencodeJson(t.allocator, "http://127.0.0.1:12345", &entries);
+    const v1 = try opencodeJson(t.allocator, "http://127.0.0.1:12345", "m1", &entries);
     defer t.allocator.free(v1);
     const p1 = try std.json.parseFromSlice(std.json.Value, t.allocator, v1, .{});
     defer p1.deinit();
     const limit = p1.value.object.get("provider").?.object.get("sushi").?.object.get("models").?.object.get("m1").?.object.get("limit").?.object;
     try t.expectEqual(@as(i64, 6144), limit.get("output").?.integer);
     try t.expect(p1.value.object.get("compaction") == null);
-    try t.expect(p1.value.object.get("model") == null);
+    try t.expectEqualStrings("sushi/m1", p1.value.object.get("model").?.string);
 }
 
 test "aider metadata: litellm keys per openai/<id> entry" {
@@ -1173,4 +1288,124 @@ test "zcode exposes only a model's advertised reasoning efforts" {
     try t.expectEqual(@as(usize, 2), levels.len);
     try t.expectEqualStrings("off", levels[0].string);
     try t.expectEqualStrings("max", levels[1].string);
+}
+
+fn glmEntry() Entry {
+    return .{ .id = "GLM-5.3-Flash-Sushi-2.5bpw", .budget = budgetForContext(1048576), .vision = true, .loaded = true, .efforts = &glm5_efforts, .default_effort = "high" };
+}
+
+test "opencode config for GLM: tool calls on, reasoning_content round-trips, variants are only the words GLM accepts" {
+    const entries = [_]Entry{glmEntry()};
+    const json = try opencodeJson(t.allocator, "http://127.0.0.1:12345", entries[0].id, &entries);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try t.expectEqualStrings("sushi/GLM-5.3-Flash-Sushi-2.5bpw", root.get("model").?.string);
+    const sushi = root.get("provider").?.object.get("sushi").?.object;
+    try t.expectEqual(@as(i64, 3600000), sushi.get("options").?.object.get("chunkTimeout").?.integer);
+    const m = sushi.get("models").?.object.get(entries[0].id).?.object;
+    try t.expectEqual(true, m.get("tool_call").?.bool);
+    try t.expectEqual(true, m.get("reasoning").?.bool);
+    try t.expectEqualStrings("reasoning_content", m.get("interleaved").?.object.get("field").?.string);
+    try t.expectEqual(@as(i64, 1048576), m.get("limit").?.object.get("context").?.integer);
+    const variants = m.get("variants").?.object;
+    try t.expectEqual(@as(usize, 3), variants.count());
+    for (glm5_efforts) |w| try t.expectEqualStrings(w, variants.get(w).?.object.get("reasoningEffort").?.string);
+    // GLM refuses `medium`: a default effort option would fail every request.
+    try t.expect(m.get("options") == null);
+}
+
+test "opencode config: a row without efforts is not declared a reasoning model, on/off make no variants" {
+    const plain = [_]Entry{.{ .id = "old", .budget = budgetForContext(65536), .vision = false, .loaded = true }};
+    const a = try opencodeJson(t.allocator, "http://x:1", "old", &plain);
+    defer t.allocator.free(a);
+    try t.expect(std.mem.indexOf(u8, a, "\"reasoning\"") == null);
+    const mimo = [_]Entry{.{ .id = "mimo", .budget = budgetForContext(65536), .vision = false, .loaded = true, .efforts = &mimo_efforts }};
+    const b = try opencodeJson(t.allocator, "http://x:1", "mimo", &mimo);
+    defer t.allocator.free(b);
+    try t.expect(std.mem.indexOf(u8, b, "\"reasoning\": true") != null);
+    try t.expect(std.mem.indexOf(u8, b, "variants") == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, b, .{});
+    parsed.deinit();
+}
+
+test "opencode script: --standalone follows the subcommand, the model rides the config" {
+    // opencode 2.x connects to a background service that never sees this env, refuses --model on its
+    // default command, and refuses a flag placed before a subcommand.
+    const b = budgetForContext(1048576);
+    const tui = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{});
+    defer t.allocator.free(tui);
+    try t.expect(std.mem.indexOf(u8, tui, "\nopencode --standalone\n") != null);
+    try t.expect(std.mem.indexOf(u8, tui, "--model") == null);
+    const run = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{ "run", "read it's" });
+    defer t.allocator.free(run);
+    try t.expect(std.mem.indexOf(u8, run, "\nopencode 'run' --standalone 'read it'\\''s'\n") != null);
+    const flag = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", b, "{}", &.{"--continue"});
+    defer t.allocator.free(flag);
+    try t.expect(std.mem.indexOf(u8, flag, "\nopencode --standalone '--continue'\n") != null);
+}
+
+test "grok names" {
+    try t.expectEqual(AgentKind.grok, AgentKind.fromName("grok").?);
+    try t.expect(std.mem.indexOf(u8, AgentKind.names, "grok") != null);
+}
+
+test "grok compaction threshold leaves the compaction reserve free" {
+    try t.expectEqual(@as(u64, 98), grokCompactPercent(1048576));
+    try t.expectEqual(@as(u64, 75), grokCompactPercent(24576));
+    try t.expectEqual(@as(u64, 50), grokCompactPercent(2048));
+}
+
+test "grok config.toml for GLM: chat completions at the server, advertised budgets, only accepted efforts" {
+    const entries = [_]Entry{glmEntry()};
+    const toml = try grokConfigToml(t.allocator, "http://127.0.0.1:12345", entries[0].id, entries[0].budget, &entries);
+    defer t.allocator.free(toml);
+    for ([_][]const u8{
+        "[models]\ndefault = \"GLM-5.3-Flash-Sushi-2.5bpw\"\n",
+        "[session]\nauto_compact_threshold_percent = 98\n",
+        "[model.\"GLM-5.3-Flash-Sushi-2.5bpw\"]\n",
+        "model = \"GLM-5.3-Flash-Sushi-2.5bpw\"\n",
+        "base_url = \"http://127.0.0.1:12345/v1\"\n",
+        "api_backend = \"chat_completions\"\n",
+        "api_key = \"sushi\"\n",
+        "context_window = 1048576\n",
+        "max_completion_tokens = 65536\n",
+        "supports_reasoning_effort = true\n",
+        "reasoning_effort = \"high\"\n",
+        "[[model.\"GLM-5.3-Flash-Sushi-2.5bpw\".reasoning_efforts]]\nid = \"max\"\nvalue = \"max\"\n",
+    }) |needle| try t.expect(std.mem.indexOf(u8, toml, needle) != null);
+    try t.expect(std.mem.indexOf(u8, toml, "id = \"medium\"") == null);
+    try t.expect(std.mem.indexOf(u8, toml, "id = \"off\"") == null);
+}
+
+test "grok config.toml escapes ids, lists every row, and leaves effort off for a row without any" {
+    const entries = [_]Entry{
+        .{ .id = "org/m\"q", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true },
+        .{ .id = "second", .budget = budgetForContext(65536), .vision = false, .loaded = false, .efforts = &.{ "low", "xhigh" } },
+    };
+    const toml = try grokConfigToml(t.allocator, "http://h:1", entries[0].id, entries[0].budget, &entries);
+    defer t.allocator.free(toml);
+    try t.expect(std.mem.indexOf(u8, toml, "[model.\"org/m\\\"q\"]\n") != null);
+    const second = std.mem.indexOf(u8, toml, "[model.\"second\"]").?;
+    try t.expect(std.mem.indexOf(u8, toml[0..second], "supports_reasoning_effort") == null);
+    // No advertised default: the first listed word.
+    try t.expect(std.mem.indexOf(u8, toml[second..], "reasoning_effort = \"low\"\n") != null);
+}
+
+test "grok script: its own GROK_HOME, the chosen model, extras quoted" {
+    const e = glmEntry();
+    const script = try scriptFor(t.allocator, .grok, "http://x:1", e.id, e.budget, null, &.{ "-p", "read README.md" });
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export GROK_HOME=\"$HOME/.sushi/grok\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, script, "\ngrok --model 'GLM-5.3-Flash-Sushi-2.5bpw' '-p' 'read README.md'\n") != null);
+}
+
+test "parseChatEntries reads default_reasoning_effort" {
+    var models = try parseChatEntries(t.allocator,
+        \\{"data":[{"id":"glm","reasoning_efforts":["low","high","max"],"default_reasoning_effort":"high"},{"id":"old"}]}
+    );
+    defer models.deinit();
+    try t.expectEqualStrings("high", models.entries[0].default_effort.?);
+    try t.expect(models.entries[1].default_effort == null);
 }

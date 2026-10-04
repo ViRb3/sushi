@@ -97,6 +97,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   `scripts/gen-tokenizer-unicode.py` on Python 3.14). Other pre-tokenizer pipelines retain their existing path.
   Exact token IDs matter: decoding back to the same text does **not** prove correct segmentation.
   Guards: hermetic cross-grammar BPE fixtures in `tokenizer.zig` + the format corpus;
-  `tests/test_tokenizer_reference.sh` compares both real tokenizer files to HF on CPU without loading weights.
+  `tests/test_tokenizer_reference.sh` compares the three real tokenizer files to HF on CPU without loading weights.
   Its synthetic inputs are normalized first to isolate Split/BPE: the older missing NFC-normalizer behavior on
   decomposed text is a separate, still-open issue. `TOKENIZER_CASES_JSON` can add an already-normalized prompt pack.
+- The cased `llama3` grammar needs `\p{Lu}` in the Split regex: contractions plus `\p{N}{1,3}` is also GLM's plain
+  Llama-3 pattern, which is the gpt2 path with `.letters` word rules and 3-digit groups. The BPE `ignore_merges` flag
+  (GLM sets it) is honoured in `bpeMerge`. The parity script covers GLM, Qwen and MiMo on code and tool-call text.

@@ -89,6 +89,8 @@ pub const Tokenizer = struct {
     pretok_style: PretokStyle = .gpt2,
     /// Exact supported Split grammar, selected from tokenizer.json, never model name.
     word_rules: WordRules = .legacy,
+    /// HF BPE `ignore_merges`: a word the vocab holds whole is that one token, before any merge.
+    ignore_merges: bool = false,
     /// Decode-only marker aliases (K2-Horizon): the `<ifm|…>` think and tool
     /// markers decode as the canonical `<think>` / GLM tag spellings every
     /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
@@ -668,6 +670,11 @@ pub const Tokenizer = struct {
     /// with no pre-tokenization, so the previous rescan-all-pairs loop was
     /// O(n²) and cost seconds on agent-sized (tens-of-KB) system prompts.
     fn bpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]u32 {
+        if (self.ignore_merges) if (self.vocab.get(input)) |id| {
+            const out = try allocator.alloc(u32, 1);
+            out[0] = id;
+            return out;
+        };
         // Split into individual UTF-8 characters.
         var nodes: std.ArrayList(BpeNode) = .empty;
         defer nodes.deinit(allocator);
@@ -1403,6 +1410,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
         .word_rules = if (root.get("pre_tokenizer")) |pt| wordRulesFromPreTokenizer(pt) else .legacy,
+        .ignore_merges = if (model_obj.get("ignore_merges")) |v| v == .bool and v.bool else false,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
@@ -1467,9 +1475,12 @@ fn splitRegexIsLlama3(node: std.json.Value) bool {
     return llama3StyleFromSplitRegex(rx);
 }
 
+/// Muse's cased grammar only: the plain Llama-3 regex (`\p{L}+`, no case classes) is the gpt2
+/// grammar with 3-digit groups.
 fn llama3StyleFromSplitRegex(rx: []const u8) bool {
     return std.mem.indexOf(u8, rx, "'s|'t|'re|'ve|'m|'ll|'d") != null and
-        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null;
+        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null and
+        std.mem.indexOf(u8, rx, "\\p{Lu}") != null;
 }
 
 fn splitRegexOf(node: std.json.Value) ?[]const u8 {
@@ -2010,6 +2021,40 @@ test "llama3 style detection: muse's combined Split regex selects it, others kee
     try testing.expect(!llama3StyleFromSplitRegex("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}"));
 }
 
+test "llama3 style detection: the plain Llama-3 regex (GLM) is the gpt2 grammar, not muse's cased one" {
+    const plain = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    try testing.expect(!llama3StyleFromSplitRegex(plain));
+}
+
+test "ignore_merges: a word the vocab holds whole is one token, whatever the merges reach" {
+    // HF BPE `ignore_merges` (Llama-3 / GLM): the vocab entry wins over the merge chain.
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    for ([_][]const u8{ "_", "t", "o", "k", "e", "n", "s", "_t", "ok", "ens", "_tokens" }, 0..) |w, i| try vocab.put(w, @intCast(i));
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "_", .right = "t" }, 0);
+    try merge_ranks.put(.{ .left = "o", .right = "k" }, 1);
+    try merge_ranks.put(.{ .left = "e", .right = "n" }, 2);
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    tok.ignore_merges = true;
+    const whole = try tok.bpeMerge(allocator, "_tokens");
+    defer allocator.free(whole);
+    try testing.expectEqualSlices(u32, &[_]u32{10}, whole);
+
+    tok.ignore_merges = false;
+    const merged = try tok.bpeMerge(allocator, "_tokens");
+    defer allocator.free(merged);
+    try testing.expect(merged.len > 1);
+}
+
 test "gpt2PreTokenize: leading space combines with punctuation" {
     // Pattern 4 is ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`.
     try expectPreTokens(testing.allocator, " =", &.{" ="});
@@ -2469,6 +2514,7 @@ test "tokenizer per-model Unicode rules preserve reference token IDs" {
 const splitPrefix = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?";
 const splitTail = "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const lettersSplit = splitPrefix ++ "\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*" ++ splitTail;
+const letters3Split = splitPrefix ++ "\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*" ++ splitTail;
 const marksSplit = splitPrefix ++ "[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*" ++ splitTail;
 
 fn wordRulesFromPreTokenizer(pt: std.json.Value) WordRules {
@@ -2498,7 +2544,7 @@ fn wordRulesFromSplit(node: std.json.Value) WordRules {
     const invert = node.object.get("invert") orelse return .legacy;
     if (behavior != .string or !std.mem.eql(u8, behavior.string, "Isolated") or invert != .bool or invert.bool) return .legacy;
     const rx = splitRegexOf(node) orelse return .legacy;
-    if (std.mem.eql(u8, rx, lettersSplit)) return .letters;
+    if (std.mem.eql(u8, rx, lettersSplit) or std.mem.eql(u8, rx, letters3Split)) return .letters;
     if (std.mem.eql(u8, rx, marksSplit)) return .letters_marks;
     return .legacy;
 }
@@ -2551,9 +2597,10 @@ test "tokenizer per-model selection requires exact supported pipeline" {
     const a = testing.allocator;
     const fixture = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/tokenizer-rules.json"), .{});
     defer fixture.deinit();
-    for (fixture.value.array.items, 0..) |entry, i| {
+    for (fixture.value.array.items) |entry| {
+        const rule = entry.object.get("rule").?.string;
         const pt = entry.object.get("tokenizer").?.object.get("pre_tokenizer").?;
-        const expected: WordRules = if (i == 0) .letters else .letters_marks;
+        const expected: WordRules = if (std.mem.eql(u8, rule, "letters_marks")) .letters_marks else .letters;
         try testing.expectEqual(expected, wordRulesFromPreTokenizer(pt));
         const list = pt.object.get("pretokenizers").?.array.items;
         const split = &list[0].object;

@@ -42,6 +42,38 @@ const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 const stop_sequences = @import("stop_sequences.zig");
 
+test "format corpus: late system notes never vanish, and a template that places them keeps history a prefix" {
+    // `in_place` templates render a late note where it was sent (the stock Qwen ones through the
+    // adapter); the rest fold it into the leading turn, which rewrites earlier bytes by design.
+    const templates = [_]struct { source: []const u8, in_place: bool }{
+        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .in_place = true },
+        .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
+    };
+    for (templates) |template| {
+        const config = chat.ChatConfig{ .chat_template = template.source, .bos_token = "<bos>", .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+        const messages = [_]chat.Message{
+            .{ .role = "system", .content = "stable instructions" },
+            .{ .role = "user", .content = "corpus question marker" },
+            .{ .role = "system", .content = "corpus runtime note marker" },
+            .{ .role = "assistant", .content = "corpus answer marker" },
+            .{ .role = "user", .content = "corpus next question marker" },
+            .{ .role = "system", .content = "corpus newer note marker" },
+        };
+        const first = try chat.renderChatTemplate(testing.allocator, messages[0..3], &config, null, null, true, null, false);
+        defer testing.allocator.free(first);
+        const next = try chat.renderChatTemplate(testing.allocator, &messages, &config, null, null, true, null, false);
+        defer testing.allocator.free(next);
+        const q = std.mem.indexOf(u8, first, "corpus question marker").?;
+        const n = std.mem.indexOf(u8, first, "corpus runtime note marker").?;
+        try testing.expect(std.mem.indexOf(u8, next, "corpus runtime note marker") != null);
+        try testing.expect(std.mem.indexOf(u8, next, "corpus newer note marker") != null);
+        try testing.expectEqual(template.in_place, n > q);
+        if (template.in_place) try testing.expect(std.mem.startsWith(u8, next, first[0 .. n + "corpus runtime note marker".len]));
+    }
+}
+
 test "format corpus: generic ChatML role headers preserve tool messages" {
     const templates = [_][]const u8{
         "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>' }}{% endfor %}",
@@ -2798,13 +2830,14 @@ test "format corpus: every wire shape's media renders its placeholder where it w
 }
 
 test "format corpus: a system turn past index 0 reaches the prompt once, on every template" {
-    // Refusing templates (Qwen3.8's raise) fold it into the leading system; templates that
-    // render it (MiMo's role loop) keep it in place. The fallback render carried it twice.
+    // Refusing templates fold it into the leading system; templates that render it (MiMo's role
+    // loop, and the stock Qwen3.8 ones through the late-system adapter) keep it in place. The
+    // fallback render carried it twice.
     const chatml = "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>' }}{% endfor %}";
     const Case = struct { name: []const u8, tpl: []const u8, system_headers: usize };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .system_headers = 1 },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .system_headers = 1 },
+        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .system_headers = 2 },
+        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "role loop", .tpl = chatml, .system_headers = 2 },
     };

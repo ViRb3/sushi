@@ -551,6 +551,11 @@ pub const Slot = struct {
     /// echo is not published twice (`takeHandoverEcho`).
     handover_token: ?u32 = null,
     cancelled: std.atomic.Value(bool),
+    /// Inference thread only: the request's outcome has been counted in `Metrics`.
+    metrics_recorded: bool = false,
+    /// Set by the connection thread when the request's own stop sequence completed, before it cancels
+    /// the slot: that end is a normal stop, not a disconnect.
+    stop_hit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
     /// the pass reads (`think_bound`, `constraint`) and frees it once `complete` returns.
@@ -864,7 +869,7 @@ pub const Slot = struct {
     /// buffer at completion and is blind to both, which is why the streaming
     /// gap survived: it is invisible to output-equality tests AND to llmprobe,
     /// which probes logprobs non-streaming only.
-    fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
+    pub fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
         if (self.takeHandoverEcho(t)) return;
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -1038,6 +1043,12 @@ pub const Slot = struct {
 
     /// Connection thread: signal cancellation. The inference thread will
     /// drop this slot at the next tick boundary.
+    /// Connection thread: the request's own stop sequence completed; end generation as a normal stop.
+    pub fn cancelOnStop(self: *Slot) void {
+        self.stop_hit.store(true, .release);
+        self.cancel();
+    }
+
     pub fn cancel(self: *Slot) void {
         self.cancelled.store(true, .release);
         self.out_mu.lockUncancelable(self.io);
@@ -1807,6 +1818,15 @@ pub const Scheduler = struct {
         if (self.in_flight > 0) self.in_flight -= 1;
         self.queue_cond.broadcast(self.io); // wake inference thread to drain
         self.submit_cond.broadcast(self.io); // wake any blocked submitter
+        self.queue_mu.unlock(self.io);
+    }
+
+    /// Wait out the inference pass that holds a cancelled slot, so its statistics stop changing.
+    /// The tick filters cancelled slots under `queue_mu`, so no new pass can take it afterwards.
+    pub fn quiesce(self: *Scheduler, slot: *Slot) void {
+        std.debug.assert(slot.cancelled.load(.acquire));
+        self.queue_mu.lockUncancelable(self.io);
+        waitPassesOut(self.io, &self.queue_mu, &slot.in_pass);
         self.queue_mu.unlock(self.io);
     }
 
@@ -3209,6 +3229,95 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+/// Bytes of the MTP head sidecar `mtp.loadMtp` reads beside the trunk shards: 0 when MTP is off, the
+/// head rides the checkpoint (its shards are billed already), none ships, or the arch loads its head
+/// elsewhere (MiMo and GLM never call `loadMtp`).
+fn mtpSidecarBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, mtp_on: bool) u64 {
+    if (!mtp_on or config.isMimo() or config.isGlm5()) return 0;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return 0;
+    defer dir.close(io);
+    const rel = switch (mtp_mod.resolveMtpSource(io, allocator, dir) orelse return 0) {
+        .sidecar_file => |r| r,
+        .in_checkpoint => return 0,
+    };
+    const st = dir.statFile(io, rel, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
+/// The resident weight bill of a load no component-exact bill covers: the shards the index names plus the sidecar head.
+fn plainWeightBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, mtp_on: bool) u64 {
+    return modelDiskBytes(io, model_dir) +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
+}
+
+/// A one-tensor safetensors file: 8-byte LE header length, JSON header, `payload` zero bytes.
+fn writeTestSafetensors(io: std.Io, dir: std.Io.Dir, rel: []const u8, key: []const u8, payload: usize) !u64 {
+    var header_buf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "{{\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[{d}],\"data_offsets\":[0,{d}]}}}}", .{ key, payload / 2, payload });
+    var file: [512]u8 = undefined;
+    std.mem.writeInt(u64, file[0..8], header.len, .little);
+    @memcpy(file[8 .. 8 + header.len], header);
+    const total = 8 + header.len + payload;
+    @memset(file[8 + header.len .. total], 0);
+    if (std.fs.path.dirname(rel)) |d| try dir.createDirPath(io, d);
+    try dir.writeFile(io, .{ .sub_path = rel, .data = file[0..total] });
+    return total;
+}
+
+fn testTmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    return std.fmt.bufPrint(buf, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+}
+
+test "the preflight bills a separately loaded MTP sidecar once, never an in-checkpoint head twice" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try testTmpDirPath(&tmp, &path_buf);
+
+    const shard = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "model.embed_tokens.weight", 8);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.embed_tokens.weight\":\"model.safetensors\"}}" });
+    const plain = ModelConfig{ .model_type = "qwen4_exp" };
+    try testing.expectEqual(shard, plainWeightBytes(io, a, &plain, dir, true));
+
+    const sidecar = try writeTestSafetensors(io, tmp.dir, "mtp/weights.safetensors", "mtp.fc.weight", 16);
+    try testing.expectEqual(shard + sidecar, plainWeightBytes(io, a, &plain, dir, true));
+    // The head is billed only when it will load, and only where `loadMtp` loads it.
+    try testing.expectEqual(shard, plainWeightBytes(io, a, &plain, dir, false));
+    const mimo = ModelConfig{ .model_type = "mimo_v2" };
+    const glm = ModelConfig{ .model_type = "glm5_next" };
+    try testing.expectEqual(@as(u64, 0), mtpSidecarBytes(io, a, &mimo, dir, true));
+    try testing.expectEqual(@as(u64, 0), mtpSidecarBytes(io, a, &glm, dir, true));
+
+    // A head inside the shards is already in the shard sum.
+    try tmp.dir.deleteFile(io, "mtp/weights.safetensors");
+    const with_head = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "mtp.fc.weight", 8);
+    try testing.expectEqual(with_head, plainWeightBytes(io, a, &plain, dir, true));
+}
+
+test "the Sushi resident bill carries a separately loaded MTP sidecar and its coarse rerank copy" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try testTmpDirPath(&tmp, &path_buf);
+
+    _ = try writeTestSafetensors(io, tmp.dir, "model.safetensors", "model.embed_tokens.weight", 8);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.embed_tokens.weight\":\"model.safetensors\"}}" });
+    var config = ModelConfig{ .model_type = "qwen4_exp" };
+    config.vocab_size = 128;
+    config.hidden_size = 64;
+    const without = try sushiResidentLoadBytes(io, a, dir, &config, false, true);
+    const sidecar = try writeTestSafetensors(io, tmp.dir, "mtp/weights.safetensors", "mtp.fc.weight", 16);
+    const with = try sushiResidentLoadBytes(io, a, dir, &config, false, true);
+    try testing.expect(with >= without + sidecar);
+    try testing.expectEqual(without, try sushiResidentLoadBytes(io, a, dir, &config, false, false));
+}
+
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -3294,12 +3403,13 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
 fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
     if (config.isMimo()) return mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
+    const head_bytes = split.mtp +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
     const coarse_bits = mtp_mod.rerankCoarseBits();
-    const coarse = if (mtp_on and split.mtp > 0 and coarse_bits > 0 and mtp_mod.MtpModel.draftRerankMode() != .off)
+    const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0 and mtp_mod.MtpModel.draftRerankMode() != .off)
         mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits)
     else
         0;
-    return split.trunk +| split.mtp +| coarse;
+    return split.trunk +| head_bytes +| coarse;
 }
 
 /// The resident bytes a MiMo source-trunk load holds: trunk and vision tower as stored, the heads
@@ -4130,7 +4240,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!skip_mem_preflight) {
-        const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
+        const weights_bytes = streaming_resident_bytes orelse plainWeightBytes(sch.io, sch.allocator, params.config, params.model_dir, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
         const gpu_limit = mlx.maxRecommendedWorkingSet();
         const Reader = struct {
             io: std.Io,
@@ -4961,6 +5071,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const has_ssm_layers = params.config.has_hybrid_layers or
             params.config.full_attention_interval > 0;
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
+        entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5();
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
             const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
@@ -5032,7 +5143,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.expert_bounce_bytes,
         )
     else
-        residentWeightBytes(streaming_resident_bytes, entry.bytes_on_disk, modelDiskBytes(sch.io, params.model_dir), params.config.num_hidden_layers, params.config.hidden_size);
+        residentWeightBytes(streaming_resident_bytes, entry.bytes_on_disk, plainWeightBytes(sch.io, sch.allocator, params.config, params.model_dir, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on), params.config.num_hidden_layers, params.config.hidden_size);
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);
@@ -5370,6 +5481,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
             }
+            recordSlotCleanup(sch.metrics, s);
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
@@ -6437,6 +6549,52 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
     )});
 }
 
+/// Outcome of a slot that reached `finishSlot`. A latched MLX failure turns the finish into an error.
+fn finishOutcome(reason: []const u8, latched: ?[]const u8) metrics_mod.Outcome {
+    if (latched != null) return .failed;
+    if (std.mem.eql(u8, reason, "cancelled")) return .cancelled;
+    return .success;
+}
+
+/// Outcome of a slot the cleanup drain sees without `finishSlot` having recorded it, read only from
+/// state the inference thread set. `cancelled` is never consulted: `Scheduler.complete` sets it on
+/// every completion, normal ones included.
+fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
+    if (slot.error_code != null) return .failed;
+    if (slot.finished) return finishOutcome(slot.finish_reason, null);
+    if (slot.stop_hit.load(.acquire)) return .success;
+    return .cancelled;
+}
+
+/// Count a slot's outcome once; the first path to reach the slot wins.
+fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) void {
+    const m = metrics orelse return;
+    if (slot.metrics_recorded) return;
+    slot.metrics_recorded = true;
+    m.recordRequest(
+        outcome,
+        slot.first_token_ns,
+        slot.prefill_ns,
+        slot.decode_ns,
+        slot.prompt_tokens,
+        slot.completion_tokens,
+        slot.cached_tokens,
+    );
+}
+
+/// The cleanup drain's count: a slot refused before its first forward is a rejection; anything
+/// `finishSlot` already counted is skipped.
+fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
+    const m = metrics orelse return;
+    if (slot.metrics_recorded) return;
+    if (slot.error_code) |name| if (std.mem.eql(u8, name, "PrefillDoesNotFit")) {
+        slot.metrics_recorded = true;
+        m.recordRejected();
+        return;
+    };
+    recordSlotEnd(m, slot, cleanupOutcome(slot));
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -6468,23 +6626,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         if (slot.model.prefix_cache) |*p| p else null;
     const stream_opt: ?mlx.mlx_stream =
         if (slot.model.transformer) |x| x.s else null;
-    // Record per-request metrics while slot fields are still live (before
-    // markFinished broadcasts — the conn thread may complete()+free the slot
-    // immediately after). Off the per-token path; a null sink (metrics off) is
-    // a single per-request branch. real_ttft = first_token_ns (queue+prefill,
-    // captured exactly at prefill completion); recordRequest derives
-    // e2e = first_token_ns + decode_ns.
-    if (sch.metrics) |m| {
-        m.recordRequest(
-            if (latched != null) "error" else reason,
-            slot.first_token_ns,
-            slot.prefill_ns,
-            slot.decode_ns,
-            slot.prompt_tokens,
-            slot.completion_tokens,
-            slot.cached_tokens,
-        );
-    }
+    // Record per-request metrics while slot fields are still live (before markFinished broadcasts:
+    // the conn thread may complete()+free the slot immediately after). real_ttft = first_token_ns
+    // (queue+prefill, captured at prefill completion); recordRequest derives e2e = first_token_ns + decode_ns.
+    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -8249,7 +8394,7 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // buffers; after deinit they are freed).
     const source = @embedFile("scheduler.zig");
     const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
-    const region = source[drain_start..@min(drain_start + 1600, source.len)];
+    const region = source[drain_start..@min(drain_start + 1800, source.len)];
     const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
     const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
     try testing.expect(commit_pos < deinit_pos);
@@ -10461,6 +10606,179 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }
 
+const OutcomeStub = struct {
+    finished: bool = false,
+    error_code: ?[]const u8 = null,
+    finish_reason: []const u8 = "",
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stop_hit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    metrics_recorded: bool = false,
+    first_token_ns: u64 = 5_000_000,
+    prefill_ns: u64 = 4_000_000,
+    decode_ns: u64 = 20_000_000,
+    prompt_tokens: u32 = 100,
+    completion_tokens: u32 = 10,
+    cached_tokens: u32 = 0,
+
+    /// `finishSlot` on the inference thread: records, then publishes the terminator.
+    fn finish(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
+        recordSlotEnd(m, self, finishOutcome(reason, null));
+        self.finished = true;
+        self.finish_reason = reason;
+    }
+    /// `Slot.markError` mid-decode: no finishSlot follows.
+    fn fail(self: *OutcomeStub, name: []const u8) void {
+        if (self.error_code != null or self.finished) return;
+        self.error_code = name;
+    }
+    /// The connection thread's `Scheduler.complete`: sets `cancelled` on EVERY completion.
+    fn complete(self: *OutcomeStub) void {
+        self.cancelled.store(true, .release);
+    }
+};
+
+fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u64, failed: u64, rejected: u64) !void {
+    try testing.expectEqual(success, m.requests_success_total.load());
+    try testing.expectEqual(cancelled, m.requests_cancelled_total.load());
+    try testing.expectEqual(failed, m.requests_failed_total.load());
+    try testing.expectEqual(rejected, m.requests_rejected_total.load());
+}
+
+test "outcome: a disconnect while the request waits in pending counts cancelled once" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+}
+
+test "outcome: a disconnect during prefill is counted once, not again by the drain" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.complete();
+    s.finish(&m, "cancelled");
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+}
+
+test "outcome: a disconnect during decode never reaches finishSlot and the drain counts it" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.completion_tokens = 7;
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "outcome: a normal completion is success once even though complete() sets cancelled, with its totals" {
+    var m = metrics_mod.Metrics.init();
+    for ([_][]const u8{ "stop", "length" }) |reason| {
+        var s = OutcomeStub{};
+        s.finish(&m, reason);
+        s.complete();
+        recordSlotCleanup(&m, &s);
+    }
+    try expectOutcomes(&m, 2, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 20), m.generation_tokens_total.load());
+    try testing.expectEqual(@as(u64, 200), m.prompt_tokens_total.load());
+    try testing.expectEqual(@as(u64, 2), m.e2e_latency_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 50_000_000), m.e2e_latency_ns.sum.load(.monotonic));
+}
+
+test "outcome: a mid-decode generation error counts failed and leaves the histograms alone" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("MlxFailure");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.e2e_latency_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "outcome: a finish over a latched MLX failure counts failed, not success" {
+    try testing.expectEqual(metrics_mod.Outcome.failed, finishOutcome("stop", "OutOfMemory"));
+    try testing.expectEqual(metrics_mod.Outcome.success, finishOutcome("stop", null));
+    try testing.expectEqual(metrics_mod.Outcome.cancelled, finishOutcome("cancelled", null));
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    recordSlotEnd(&m, &s, finishOutcome("stop", "OutOfMemory"));
+    s.fail("OutOfMemory");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+}
+
+test "outcome: an error followed by a client disconnect is one failure, never two outcomes" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("MlxFailure");
+    recordSlotCleanup(&m, &s);
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+}
+
+test "outcome: a slot refused by admission before its first forward is a rejection, not a failure" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("PrefillDoesNotFit");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 0, 1);
+}
+
+test "outcome: metrics off does no work and leaves the slot untouched" {
+    var s = OutcomeStub{};
+    s.complete();
+    recordSlotCleanup(null, &s);
+    s.finish(null, "stop");
+    try testing.expect(!s.metrics_recorded);
+}
+
+test "outcome: a request ended by its own stop sequence is a success, a disconnect stays cancelled" {
+    var m = metrics_mod.Metrics.init();
+    var stopped = OutcomeStub{};
+    stopped.stop_hit.store(true, .release);
+    stopped.complete();
+    recordSlotCleanup(&m, &stopped);
+    try expectOutcomes(&m, 1, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 10), m.generation_tokens_total.load());
+
+    var gone = OutcomeStub{};
+    gone.complete();
+    recordSlotCleanup(&m, &gone);
+    try expectOutcomes(&m, 1, 1, 0, 0);
+
+    var stop_then_error = OutcomeStub{};
+    stop_then_error.stop_hit.store(true, .release);
+    stop_then_error.fail("MlxFailure");
+    recordSlotCleanup(&m, &stop_then_error);
+    try expectOutcomes(&m, 1, 1, 1, 0);
+}
+
+test "outcome: a real Slot's fields satisfy the recorder, and a cancelled GLM slot counts once" {
+    var m = metrics_mod.Metrics.init();
+    var slot: Slot = undefined;
+    slot.metrics_recorded = false;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.stop_hit = .init(false);
+    slot.first_token_ns = 1;
+    slot.prefill_ns = 1;
+    slot.decode_ns = 1;
+    slot.prompt_tokens = 4;
+    slot.completion_tokens = 2;
+    slot.cached_tokens = 0;
+    slot.finish_reason = "";
+    recordSlotCleanup(&m, &slot);
+    recordSlotCleanup(&m, &slot);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+}
+
 test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {
     // A loop guard is an intentional server stop, not exhaustion of the
     // requested output budget. Reporting "length" makes clients such as pi
@@ -11357,7 +11675,8 @@ test "every real streamed pack and source on this box plans a streamed load" {
         try t.expectEqual(case.tower, seen.split.vision);
         try t.expectEqual(plan.split.trunk, seen.split.trunk);
         try t.expectEqual(seen.vision.slots_with.?, seen.cache.slots_per_layer);
-        try t.expect(seen.cache.slots_per_layer < plan.cache.slots_per_layer);
+        // Slots are whole per layer: a tower smaller than one slot across the layers, or a pack that fits in full, costs none.
+        try t.expect(seen.cache.slots_per_layer <= plan.cache.slots_per_layer);
     }
 }
 
