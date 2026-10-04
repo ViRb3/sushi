@@ -5360,6 +5360,11 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // Runs on the inference thread — the sole mlx caller — which is
             // what makes the refcount-sharing snapshot legal here.
             if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+                // Streams end this way on a stop sequence or a client that leaves: finishSlot's line is theirs too.
+                if (s.legacy_gen) |*g| {
+                    g.logSpecStats();
+                    g.logQsaArms();
+                }
                 commitSlotIfApplicable(sch, s);
                 if (s.model.prefix_cache) |*hc| {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);

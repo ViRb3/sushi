@@ -196,6 +196,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   layers read every key. On one `32k+` cell MiMo dropped nearly every 64k-256k round as implausible against 32k cells.
 - **`[spec-stats] … stalls=N/max_ms`** counts this request's rounds slower than twice the median round at their width
   (`round_cost.RoundLog`), so an info-level log shows a hiccup the table dropped quietly; smooth reads `stalls=0/0`.
+- **One `[spec-stats]` per request**: `finishSlot` writes it for a finished slot, the cleanup drain for one cancelled
+  mid-decode (a streamed stop-sequence cut, a client that left), so streamed rounds are timeable from the log.
 - **The regime gate** compares the two round SHAPES at one base depth: two-chunk (draft m_lo, sync on the chain's
   confidence, maybe extend to m_hi) against single-chunk at m_lo, each as round wall over tokens. A round emits 1..m+1
   tokens, so each shape is judged on the running mean of `MTP_REGIME_MIN_SAMPLES` rounds or more; a verdict on one
