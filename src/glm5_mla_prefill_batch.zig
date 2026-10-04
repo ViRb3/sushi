@@ -7,7 +7,7 @@ pub const Direction = enum { query, value };
 pub const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
 
 pub fn transientBudget(chunk: usize, pending_layers: usize) !usize {
-    if (chunk < 128 or chunk > 2048) return 0;
+    if (chunk < 128 or chunk > 2048 or !@import("glm5_model.zig").naxArms()) return 0;
     // Input/output permutation copies total64H*(256+512+512+256)*2 bytes/row.
     return std.math.mul(usize, try std.math.mul(usize, chunk, 196608), pending_layers);
 }
@@ -18,7 +18,7 @@ fn geometry(xs: []const c_int, ws: []const c_int, ss: []const c_int, bs: []const
     return std.mem.eql(c_int, &.{ 64, 256, 96 }, ws) and std.mem.eql(c_int, &.{ 64, 256, 4 }, ss) and std.mem.eql(c_int, ss, bs);
 }
 pub fn run(ops: *Ops, input: Input, dir: Direction) !?Arr {
-    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
+    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_model.zig").naxArms()) return null;
     for ([_]Arr{ input.x, input.w, input.scales, input.biases }) |v| if (v.ctx == null) return null;
     if (!geometry(mlx.getShape(input.x), mlx.getShape(input.w), mlx.getShape(input.scales), mlx.getShape(input.biases), mlx.mlx_array_dtype(input.x), dir) or
         mlx.mlx_array_dtype(input.w) != .uint32 or mlx.mlx_array_dtype(input.scales) != .bfloat16 or mlx.mlx_array_dtype(input.biases) != .bfloat16) return null;
@@ -38,6 +38,7 @@ test "GLM MLA headbatch prefill geometry guards original banks" {
 }
 
 test "GLM MLA headbatch prefill transient bill" {
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     try std.testing.expectEqual(@as(usize, 402653184), try transientBudget(2048, 1));
     try std.testing.expectEqual(@as(usize, 805306368), try transientBudget(2048, 2));
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(32, 2));

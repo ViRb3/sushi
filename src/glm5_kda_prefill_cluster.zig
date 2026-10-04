@@ -7,7 +7,7 @@ pub const weight_bytes: usize = 320 * 4096 * 2;
 pub const transient_bytes: usize = 2048 * 320 * 2;
 var calls: usize = 0;
 pub fn enabled() bool {
-    return !native.reference_numerics;
+    return !native.reference_numerics and native.naxArms();
 }
 pub fn resetDispatchCount() void {
     calls = 0;

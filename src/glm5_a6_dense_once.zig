@@ -22,7 +22,7 @@ fn geometry(xs: []const c_int, ws: []const c_int, ss: []const c_int, bs: []const
         std.mem.eql(mlx.mlx_dtype, &.{ .bfloat16, .uint32, .bfloat16, .bfloat16 }, &dtypes);
 }
 pub fn tryPrefill(ops: *Ops, x: Arr, w: Arr, scales: Arr, biases: Arr) !?Arr {
-    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
+    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_model.zig").naxArms()) return null;
     const arrays = [_]Arr{ x, w, scales, biases };
     for (arrays) |v| if (v.ctx == null) return null;
     var dtypes: [4]mlx.mlx_dtype = undefined;
@@ -37,7 +37,7 @@ fn bill(pending_layers: usize) !usize {
     return std.math.mul(usize, expanded_weight_bytes * 4, pending_layers);
 }
 pub fn transientBudget(chunk: usize, pending_layers: usize) !usize {
-    return if (chunk == 2048) bill(pending_layers) else 0;
+    return if (chunk == 2048 and @import("glm5_model.zig").naxArms()) bill(pending_layers) else 0;
 }
 
 const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
@@ -86,7 +86,7 @@ test "GLM A6 dense once transient bill covers pending four projection layers" {
 }
 
 test "GLM A6 dense once Linear keeps native bits and declines decode rows" {
-    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     for ([_]c_int{ 4096, 8192 }, 0..) |k, shape| {
         var ops = Ops{ .s = s };

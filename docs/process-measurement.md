@@ -61,6 +61,9 @@ Processes spawned from an agent harness inherit background QoS (priority 4 vs 31
 timed jobs with `taskpolicy -a <cmd>` (or restore the running PID), and state the QoS used beside the number. A number
 2-4x worse than a terminal run points at QoS before anything else.
 
+`taskpolicy` is SIP-protected, so `DYLD_*` in its own environment never reaches the job it launches: write
+`taskpolicy -a env DYLD_LIBRARY_PATH=<stage> <bin>`, and prove the stage with `DYLD_PRINT_LIBRARIES=1` in the log.
+
 ## 4b. Cool the box before a bench
 
 The M5 Max throttles hard: a 1M ladder read 1358 tok/s prefill at 2k right after hours of GPU work, and 1678 after a cooled

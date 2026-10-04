@@ -154,10 +154,10 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
     var scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(rows.latent));
     if (native_mode) {
         const limit = @import("glm5_dflash_memory.zig").limit_bytes;
-        if (scratch.common_bytes >= limit - native.scratch_limit) return error.GlmTreeScratchLimit;
-        scratch.branches = @min(parents.len, (limit - scratch.common_bytes - native.scratch_limit) / scratch.per_branch_bytes);
+        if (scratch.common_bytes >= limit - native.scratchLimit()) return error.GlmTreeScratchLimit;
+        scratch.branches = @min(parents.len, (limit - scratch.common_bytes - native.scratchLimit()) / scratch.per_branch_bytes);
         if (scratch.branches == 0) return error.GlmTreeScratchLimit;
-        scratch.live_bytes = scratch.common_bytes + scratch.branches * scratch.per_branch_bytes + native.scratch_limit;
+        scratch.live_bytes = scratch.common_bytes + scratch.branches * scratch.per_branch_bytes + native.scratchLimit();
     }
     mla_scratch_bound = @max(mla_scratch_bound, scratch.live_bytes);
     const latent = try ops.slice(rows.latent, 0, begin, end);

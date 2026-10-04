@@ -127,6 +127,35 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - The reserve's ledger is the sequential peak (grown buffers keep their growth; the one in flight holds old rows, new
   buffer and padding), checked against the request's admission bill less what it holds, never live headroom.
 
+<a id="without-nax"></a>
+## Without NAX (M1–M4)
+
+- One decision: `glm5_model.naxArms()` is `verifyQmmNaxAvailable()`, the Qwen/MiMo gate; `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
+  turns it off on an M5. The load line `[glm] NAX arms on|off` names the result.
+- MLX has no fused D512 SDPA without NAX and `force_fused` throws there, so the fused arms may never run on a wrong
+  gate. Off NAX the packed sparse tiles and B1/B3 send the same gathered bank through FP32 GEMMs and a precise
+  softmax (`[glm-attn] FP32 composite sparse|B1/B3 ... engaged`), held per element to an FP64 oracle no worse than
+  the scalar arm plus a store flip and 2^-11 of max|V|. At 16K: 0.628 vs 1.845 ms per 8-row tile, 0.505 vs 1.045 ms
+  per decode row against the scalar latent attention, the same error ([perf-baselines](perf-baselines.md#glm-nonnax)).
+- Packed tiles take eight rows (67 MB, inside the 128 MiB tile bill). B3 runs its three rows as three B1 GEMMs:
+  MLX picks GEMM tiles and split-K by batch size, so a batched B3 differed from B1 in the last bit. Off NAX B1/B3
+  bill 32 MiB per pending layer (8 MiB on NAX).
+- MLX runs FP32 GEMMs as TF32 on a NAX GPU (`MLX_ENABLE_TF32` defaults on), so the composite rehearsed on the stock
+  libmlx is looser than on an M1–M4; its tests widen the bar only when a probe GEMM shows TF32.
+- The scalar latent attention stays the teacher's arm and serves every shape the native arms decline
+  (`[glm-attn] scalar dense|sparse latent attention engaged`).
+- Also off: NAX index scores (scalar scorer), the KDA cluster (three GEMMs), A6 dense-once and MLA head/verify batches
+  (affine QMM). Their transient bills drop with the gate.
+- The KDA body, prework, post and FP32 router are plain SIMD kernels whose unary variants are probed against MLX on the
+  device; they run on every GPU. The 1024-thread KDA body compiles to 24 GPRs for G13/G14 (`metal-tt`), inside M1/M2's
+  1024-thread cap; every other GLM kernel dispatches at most 256 threads.
+- Routed experts: the T2048 grid declines off NAX and the sorted chain takes the simdgroup-matrix body
+  (`[exl3-gemm] simdgroup-matrix body engaged`); decode lanes and group2 rows are SIMD already.
+- The cold MLA D256 `force_fused` SDPA has a non-NAX steel kernel (256 threads); vision uses stock D64 attention.
+- MLX picks its own NAX kernels from the device, so the env lever covers only Sushi's arms. A full M1–M4 rehearsal on
+  an M5 also loads a NAX-less libmlx (the same pins built at deployment target 26.0, so `MLX_METAL_NO_NAX`) through
+  `DYLD_LIBRARY_PATH`. Every GLM unit test passes on both.
+
 ## Ruled out
 
 Prefill attention and index:

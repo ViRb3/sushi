@@ -350,7 +350,6 @@ fn expectBits(a: Arr, b: Arr) !void {
 test "GLM KDA prework exact raw outputs and compact tails across token boundaries" {
     const Ops = @import("glm5_model.zig").Ops;
     const s = mlx.gpuStream();
-    if (!unary.hardwareSupported()) return error.SkipZigTest;
     for ([_]c_int{ 1, 3, 64 }) |heads| {
         for ([_]c_int{ 1, 2, 3, 4, 17, 128, 512 }) |rows| {
             for ([_]bool{ false, true }) |hot| {
@@ -433,7 +432,6 @@ test "GLM KDA prework geometry guards every uint32 shader offset" {
 test "GLM KDA tree prework follows raw-bit serial ancestor windows" {
     const Ops = @import("glm5_model.zig").Ops;
     const s = mlx.gpuStream();
-    if (!unary.hardwareSupported()) return error.SkipZigTest;
     for ([_]c_int{ 1, 3, 64 }) |heads| {
         for ([_]usize{ 1, 3, 16 }) |rows| {
             for (0..3) |topology| {

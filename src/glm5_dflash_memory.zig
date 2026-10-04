@@ -43,7 +43,7 @@ test "GLM DFlash overlay trees keep three branches at a full-context reservation
     // A request without max_tokens reserves its whole context window (946,179 rows here).
     const full = try plan(7585, 946432, 236608, 512, 128, 64, overlay_rows, 2);
     try std.testing.expectEqual(@as(usize, overlay_rows), full.branches);
-    try std.testing.expect(full.live_bytes + @import("glm5_attention_decode_batch.zig").scratch_limit <= limit_bytes);
+    try std.testing.expect(full.live_bytes + @import("glm5_attention_decode_batch.zig").scratchLimit() <= limit_bytes);
     try std.testing.expectError(error.GlmTreeScratchLimit, plan(7585, 946432, 236608, 512, 128, 64, overlay_rows + 1, 2));
 }
 

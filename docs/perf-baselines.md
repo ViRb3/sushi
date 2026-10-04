@@ -422,6 +422,43 @@ reads ~26%), so MTP nets ~1.1-1.35x here. ms per forward at 1 / 2 / 4 / 7 rows, 
 - The sampled shader profiler misattributes decode (HC read 13% of sampled time at 7 rows, ~2.5 ms of ~130 by ablation);
   attribute by stand-in or ablation, never by samples.
 
+<a id="glm-nonnax"></a>
+## GLM-5.3 Sushi-2.3bpw without NAX, rehearsed on the M5 Max
+
+The M1–M4 path on this box: the NAX-less libmlx (the pinned mlx/mlx-c built at deployment target 26.0, zero `_nax`
+kernels) loaded through `taskpolicy -a env DYLD_LIBRARY_PATH=…`, plus `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`. It runs the
+M1–M4 kernels on M5 clocks and bandwidth, so the numbers order arms; they are not an M1–M4's speed. 2026-10-04,
+`taskpolicy -a`, lock per run, contended box (other workers queued), not quiet.
+
+Sparse latent attention at 16K history (`SUSHI_GLM_ATTN_UBENCH=1`, one process, arms interleaved, median of 12,
+`4f174096`); error is row 0 against an FP64 oracle:
+
+| rows | stage | scalar | FP32 composite | fused NAX | max abs error (scalar / composite / NAX) |
+|---|---|---:|---:|---:|---|
+| 1 | NAX-less | 1.045 ms | 0.505 ms | – | 7.58e-3 / 7.58e-3 |
+| 8 | NAX-less | 1.845 ms | 0.628 ms | – | 7.75e-3 / 7.75e-3 |
+| 1 | stock (TF32) | 1.054 ms | 0.549 ms | 1.366 ms | 7.58e-3 / 8.05e-3 / 7.58e-3 |
+| 8 | stock (TF32) | 1.699 ms | 0.487 ms | 0.464 ms | 7.75e-3 / 7.75e-3 / 7.75e-3 |
+
+NAX-shaped arms on MLX's non-NAX kernels (`SUSHI_GLM_ARMS_UBENCH=1`, NAX-less stage, median of 10, `4f174096`): A6
+dense-once T2048 4096→8192 10.38 → 9.52 ms and KDA cluster 0.667 → 0.623 ms, both bit-exact; MLA three-row verify
+batch 0.179 = 0.179 ms, exact; MLA head batch query 14.15 → 3.64 ms and value 20.14 → 3.85 ms, rel L2 2.6e-3 / 3.2e-3
+(a numerics change). All stay NAX-only: none has passed the model gate or the drift screen off NAX.
+
+End to end, one request per cell (not a bench), `sushi serve` defaults (kv8, A4 DFlash2 in the pack), greedy,
+reasoning `low`, server timers; DFlash2 and `--no-drafter` boots of `6d0d2a0f` gave byte-identical answers on all five
+requests (Paris, 391, the image's red quadrant, a 10,211-token needle, a 336-token story):
+
+| cell | DFlash2 | serial | scalar decode attention (`4f174096`) DFlash2 / serial |
+|---|---:|---:|---|
+| prefill, 10,211-token needle | 272.1 tok/s | 252.3 tok/s | 212.9 / 225.9 |
+| decode, 336-token story | 33.5 tok/s | 31.8 tok/s | 30.0 / 29.6 (317 tokens) |
+
+`sushi kld compare --limit 1` against the 4x512 BF16 teacher (code prompt, 512 positions): stock path 0.044647 KLD,
+top-1 489/512, NLL 0.18532 (`4f174096`); NAX-less path 0.045709, 489/512, 0.18865 (`6d0d2a0f`, +2.4%); the non-NAX
+arms on the stock libmlx 0.042636, 490/512, 0.18473 (`6d0d2a0f`); with the scalar decode attention 0.047833, 485/512,
+0.19311 (`4f174096`). One prompt spreads ±5% across kernel sets: rounding flips, not a quality step.
+
 <a id="ngram-arm"></a>
 ## The n-gram gather arm is measured per load (feb9ed7d)
 

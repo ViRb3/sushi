@@ -1,24 +1,27 @@
-//! Mode-matched B1/B3 native decode attention.
+//! Mode-matched B1/B3 native decode attention; FP32 GEMMs over the same bank without NAX.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const latent_store = @import("glm5_latent.zig");
+const packed_attention = @import("glm5_attention_nax_packed.zig");
 const Latent = latent_store.Latent;
 const Arr = mlx.mlx_array;
-pub const scratch_limit: usize = 8 * 1024 * 1024;
 var b1_calls: usize = 0;
 var b3_calls: usize = 0;
 pub fn enabled() bool {
     return !@import("glm5_model.zig").reference_numerics;
 }
+/// Per pending layer: the fused NAX arm's bank, or the FP32 composite's three-row planes.
+pub fn scratchLimit() usize {
+    return if (@import("glm5_model.zig").naxArms()) 8 * 1024 * 1024 else 32 * 1024 * 1024;
+}
 pub fn supportedConfig(cfg: *const @import("model.zig").ModelConfig, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) bool {
     return cfg.num_attention_heads == 64 and cfg.mla_kv_lora_rank == 512 and cfg.mla_qk_nope_head_dim == 256 and
-        cfg.indexer_n_heads == 32 and cfg.indexer_head_dim == 128 and dtype == .bfloat16 and
-        mlx.streamIsGpu(s) and @import("glm5_kda_fused.zig").hardwareSupported();
+        cfg.indexer_n_heads == 32 and cfg.indexer_head_dim == 128 and dtype == .bfloat16 and mlx.streamIsGpu(s);
 }
 pub fn supportedQuery(shape: []const c_int, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) bool {
     return shape.len == 3 and shape[0] > 0 and shape[0] <= 8 and shape[1] == 64 and shape[2] == 512 and
-        dtype == .bfloat16 and mlx.streamIsGpu(s) and @import("glm5_kda_fused.zig").hardwareSupported();
+        dtype == .bfloat16 and mlx.streamIsGpu(s);
 }
 pub fn b1Calls() usize {
     return b1_calls;
@@ -37,11 +40,11 @@ pub const Branch = struct {
 };
 pub fn temporaryBytes(batch: usize) !usize {
     if (batch != 1 and batch != 3) return error.UnsupportedGlmDecodeBatch;
-    return @import("glm5_attention_nax_packed.zig").temporaryBytes(batch);
+    return if (@import("glm5_model.zig").naxArms()) packed_attention.temporaryBytes(batch) else packed_attention.compositeBytes(batch);
 }
 pub fn transientBudget(pending_layers: usize) !usize {
     if (!enabled()) return 0;
-    return std.math.mul(usize, scratch_limit, pending_layers);
+    return std.math.mul(usize, scratchLimit(), pending_layers);
 }
 fn geometry(q: []const c_int, prefix: []const c_int, prefix_rows: usize, tape: []const c_int, ids: []const c_int, branches: []const Branch) bool {
     if (q.len != 3 or (q[0] != 1 and q[0] != 3) or q[1] != 64 or q[2] != 512 or branches.len != q[0] or
@@ -73,7 +76,7 @@ const gather_source: [:0]const u8 =
 var gather_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var configs: [2]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, branches: []const Branch, selected: Arr, scale: f32) !?Arr {
-    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported() or !std.math.isFinite(scale) or scale <= 0) return null;
+    if (!mlx.streamIsGpu(ops.s) or !std.math.isFinite(scale) or scale <= 0) return null;
     for ([_]Arr{ q, prefix.data, tape, selected }) |a| if (a.ctx == null) return null;
     if (!prefix.rowMajor() or prefix.dtype() != .bfloat16) return null;
     for ([_]Arr{ q, tape }) |a| if (mlx.mlx_array_dtype(a) != .bfloat16) return null;
@@ -83,7 +86,7 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
     const qs = mlx.mlx_array_strides(q);
     if (qs[1] != 512 or qs[2] != 1) return null;
     const batch: c_int = @intCast(branches.len);
-    if (try temporaryBytes(branches.len) > scratch_limit) return error.GlmDecodeBatchScratchBudget;
+    if (try temporaryBytes(branches.len) > scratchLimit()) return error.GlmDecodeBatchScratchBudget;
     var offsets: [3]u32 = undefined;
     var lengths: [3]u32 = undefined;
     var paths: [9]u32 = undefined;
@@ -140,15 +143,27 @@ pub fn run(ops: *Ops, q: Arr, prefix: Latent, prefix_rows: usize, tape: Arr, bra
     const mask = try ops.slot();
     try mlx.check(mlx.mlx_vector_array_get(bank, outputs, 0));
     try mlx.check(mlx.mlx_vector_array_get(mask, outputs, 1));
-    const queries = try ops.reshape(try ops.contiguous(q), &.{ batch, 1, 64, 512 });
-    const kv = try ops.reshape(bank.*, &.{ batch, 1, 2051, 512 });
-    const masked = try ops.reshape(mask.*, &.{ batch, 1, 1, 2051 });
-    const out = try ops.slot();
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(out, queries, kv, kv, scale, "array", masked, .{ .ctx = null }, true, ops.s));
+    const out = if (@import("glm5_model.zig").naxArms()) blk: {
+        const queries = try ops.reshape(try ops.contiguous(q), &.{ batch, 1, 64, 512 });
+        const kv = try ops.reshape(bank.*, &.{ batch, 1, 2051, 512 });
+        const masked = try ops.reshape(mask.*, &.{ batch, 1, 1, 2051 });
+        const attended = try ops.slot();
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(attended, queries, kv, kv, scale, "array", masked, .{ .ctx = null }, true, ops.s));
+        break :blk attended.*;
+    } else blk: {
+        if (b1_calls + b3_calls == 0) @import("log.zig").info("[glm-attn] FP32 composite B1/B3 decode attention engaged\n", .{});
+        // Row by row: MLX picks GEMM tiles and split-K by batch size, and B3 must equal three B1.
+        var rows: [3]Arr = undefined;
+        for (rows[0..branches.len], 0..) |*row, r| {
+            const at: c_int = @intCast(r);
+            row.* = try packed_attention.composite(ops, try ops.slice(q, 0, at, at + 1), try ops.slice(bank.*, 0, at, at + 1), try ops.slice(mask.*, 0, at, at + 1), scale);
+        }
+        break :blk if (branches.len == 1) rows[0] else try ops.concat(rows[0..branches.len], 0);
+    };
     const populated = try ops.slot();
     try mlx.check(mlx.mlx_any_axes(populated, mask.*, &.{1}, 1, true, ops.s));
     const safe = try ops.slot();
-    try mlx.check(mlx.mlx_where(safe, try ops.reshape(populated.*, &.{ batch, 1, 1, 1 }), out.*, try ops.scalar(0, .bfloat16), ops.s));
+    try mlx.check(mlx.mlx_where(safe, try ops.reshape(populated.*, &.{ batch, 1, 1, 1 }), out, try ops.scalar(0, .bfloat16), ops.s));
     const result = try ops.reshape(safe.*, &.{ batch, 64, 512 });
     if (batch == 1) b1_calls += 1 else b3_calls += 1;
     return result;
@@ -167,8 +182,8 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
     bad = branches;
     bad[2].path = .{ 0, 0, 0 };
     try std.testing.expect(!geometry(&.{ 3, 64, 512 }, &.{ 16384, 512 }, 16381, &.{ 3, 512 }, &.{ 3, 2051 }, &bad));
-    try std.testing.expect(try temporaryBytes(3) <= scratch_limit);
-    try std.testing.expectEqual(scratch_limit * 4, try transientBudget(4));
+    try std.testing.expect(try temporaryBytes(3) <= scratchLimit());
+    try std.testing.expectEqual(scratchLimit() * 4, try transientBudget(4));
     try std.testing.expectError(error.Overflow, transientBudget(std.math.maxInt(usize)));
     const model = @import("glm5_model.zig");
     model.reference_numerics = true;
@@ -177,7 +192,6 @@ test "GLM decode batch geometry ancestry and conservative scratch" {
 }
 
 test "GLM kv8 B1 and B3 decode gathers match BF16 over the round-tripped prefix" {
-    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var ops = Ops{ .s = s };
     defer ops.deinit();

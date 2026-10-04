@@ -6,7 +6,7 @@ const Arr = mlx.mlx_array;
 pub const Direction = enum { query, value };
 pub const Input = struct { x: Arr, w: Arr, scales: Arr, biases: Arr };
 pub fn run(ops: *Ops, in: Input, dir: Direction) !?Arr {
-    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
+    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_model.zig").naxArms()) return null;
     for ([_]Arr{ in.x, in.w, in.scales, in.biases }) |a| if (a.ctx == null) return null;
     const xs = mlx.getShape(in.x);
     if (!std.mem.eql(c_int, &.{ 3, 64, 1, if (dir == .query) @as(c_int, 256) else 512 }, xs) or

@@ -300,12 +300,10 @@ fn modes(s: mlx.mlx_stream) !?Modes {
 }
 
 pub fn unaryModes(s: mlx.mlx_stream) !?Modes {
-    if (!hardwareSupported()) return null;
     return modes(s);
 }
 
 pub fn sigmoidFloatMode(s: mlx.mlx_stream) !?bool {
-    if (!hardwareSupported()) return null;
     const found = (try modes(s)) orelse return null;
     return found.sig_f;
 }
@@ -335,11 +333,6 @@ pub const Result = struct {
         _ = mlx.mlx_array_free(self.state);
     }
 };
-var hardware_cached: ?bool = null;
-pub fn hardwareSupported() bool {
-    if (hardware_cached == null) hardware_cached = std.mem.startsWith(u8, @import("transformer.zig").naxStatus(), "on");
-    return hardware_cached.?;
-}
 const Config = struct { value: mlx.mlx_fast_metal_kernel_config, cached: bool };
 const ConfigEntry = struct { heads: c_int, value: mlx.mlx_fast_metal_kernel_config };
 var configs: [8]?ConfigEntry = @splat(null);
@@ -379,7 +372,6 @@ pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
         !std.mem.eql(c_int, &.{128}, mlx.getShape(in.norm)) or mlx.mlx_array_dtype(in.norm) != .bfloat16 or
         !std.mem.eql(c_int, &.{ 1, 3, d * 3 }, mlx.getShape(in.conv_state)) or mlx.mlx_array_dtype(in.conv_state) != .bfloat16 or
         !std.mem.eql(c_int, &.{ 1, in.heads, 128, 128 }, mlx.getShape(in.state)) or mlx.mlx_array_dtype(in.state) != .float32) return null;
-    if (!hardwareSupported()) return null;
     const mode = (try modes(s)) orelse return null;
     var projection = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(projection);
@@ -403,6 +395,7 @@ pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
     try mlx.check(mlx.mlx_vector_array_get(&result.conv, outputs, 1));
     try mlx.check(mlx.mlx_vector_array_get(&result.state, outputs, 2));
     calls += 1;
+    if (calls == 1) @import("log.zig").info("[glm-kda] fused one-token body engaged\n", .{});
     return result;
 }
 
@@ -421,7 +414,7 @@ fn postGeometryFits(tokens: c_int, heads: c_int) bool {
 }
 
 pub fn post(s: mlx.mlx_stream, y: Arr, gate: Arr, norm: Arr, epsilon: f32) !?Arr {
-    if (!mlx.streamIsGpu(s) or !hardwareSupported() or y.ctx == null or gate.ctx == null or norm.ctx == null or !std.math.isFinite(epsilon) or epsilon <= 0) return null;
+    if (!mlx.streamIsGpu(s) or y.ctx == null or gate.ctx == null or norm.ctx == null or !std.math.isFinite(epsilon) or epsilon <= 0) return null;
     const sh = mlx.getShape(y);
     if (sh.len != 4 or sh[0] != 1 or sh[1] <= 0 or sh[2] <= 0 or sh[3] != 128 or
         !std.mem.eql(c_int, sh, mlx.getShape(gate)) or !std.mem.eql(c_int, &.{128}, mlx.getShape(norm)) or
@@ -547,4 +540,41 @@ test "GLM KDA post geometry guards every uint32 shader offset" {
     try std.testing.expect(!postGeometryFits(0, 64));
     try std.testing.expect(!postGeometryFits(1, 0));
     try std.testing.expect(!postGeometryFits(std.math.maxInt(c_int), std.math.maxInt(c_int)));
+}
+
+test "GLM SIMD KDA, prework and router arms serve GPUs without NAX" {
+    const transformer = @import("transformer.zig");
+    const saved = transformer.vqmm_nax_probe_override;
+    defer transformer.vqmm_nax_probe_override = saved;
+    transformer.vqmm_nax_probe_override = false;
+    const s = mlx.gpuStream();
+    var ops = @import("glm5_model.zig").Ops{ .s = s };
+    defer ops.deinit();
+    try std.testing.expect((try unaryModes(s)) != null);
+    try std.testing.expect((try sigmoidFloatMode(s)) != null);
+    const d = 128;
+    const conv = try ops.zeros(&.{ 3 * d, 4, 1 }, .bfloat16);
+    const exp_a = try ops.ones(&.{1}, .float32);
+    const dt_bias = try ops.zeros(&.{d}, .float32);
+    const body = (try step(s, .{
+        .qkv = try ops.zeros(&.{ 1, 1, 3 * d }, .bfloat16), .beta = try ops.zeros(&.{ 1, 1, 1 }, .bfloat16),
+        .a = try ops.zeros(&.{ 1, 1, d }, .bfloat16),       .gate = try ops.zeros(&.{ 1, 1, d }, .bfloat16),
+        .conv_weight = conv,                                .exp_a = exp_a,
+        .dt_bias = dt_bias,                                 .norm = try ops.ones(&.{128}, .bfloat16),
+        .conv_state = try ops.zeros(&.{ 1, 3, 3 * d }, .bfloat16), .state = try ops.zeros(&.{ 1, 1, 128, 128 }, .float32),
+        .heads = 1,                                         .norm_eps = 1e-5,
+        .lower = -5,
+    })) orelse return error.TestExpectedFusedKda;
+    body.deinit();
+    const y = try ops.zeros(&.{ 1, 2, 1, 128 }, .bfloat16);
+    _ = try ops.own((try post(s, y, y, try ops.ones(&.{128}, .bfloat16), 1e-5)) orelse return error.TestExpectedFusedPost);
+    const prework = @import("glm5_kda_prework.zig");
+    const in = prework.Inputs{ .qkv = try ops.zeros(&.{ 1, 2, 3 * d }, .bfloat16), .a = try ops.zeros(&.{ 1, 2, d }, .bfloat16), .beta = try ops.zeros(&.{ 1, 2, 1 }, .bfloat16), .conv_weight = conv, .exp_a = exp_a, .dt_bias = dt_bias, .heads = 1 };
+    (try prework.apply(s, in) orelse return error.TestExpectedPrework).deinit();
+    (try prework.applyTree(s, in, &.{ -1, 0 }) orelse return error.TestExpectedPrework).deinit();
+    const weights: [16 * 128]f32 = @splat(0.01);
+    const bias: [16]f32 = @splat(0);
+    const routed = (try @import("glm5_router.zig").route(s, try ops.zeros(&.{ 1, 1, 128 }, .bfloat16), try ops.own(mlx.mlx_array_new_data(&weights, &.{ 16, 128 }, 2, .float32)), try ops.own(mlx.mlx_array_new_data(&bias, &.{16}, 1, .float32)), 2, 2.5, true)) orelse return error.TestExpectedRouter;
+    _ = try ops.own(routed.indices);
+    _ = try ops.own(routed.scores);
 }

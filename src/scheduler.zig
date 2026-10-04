@@ -3996,6 +3996,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const latent_bits: u64 = if (kv_quant_config.isQuant()) kv_quant_config.bits else 16;
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (kv_quant_config.isQuant()) "kv8" else "BF16", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] native vision {s}\n", .{if (params.config.expert_streaming) "off (expert streaming)" else if (params.load_vision and params.config.glm5_vision) "enabled (included in resident weight bill)" else "off (--no-vision or absent tower)"});
+        log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
         if (params.prefix_cache_capacity > 0) log.warn("[glm] native recurrent state has no prefix-cache restore yet; RAM/disk prefix reuse off\n", .{});
     }
@@ -10472,12 +10473,15 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     slot.enable_pld = false;
     slot.finished = false;
     slot.error_code = null;
+    defer if (slot.error_code) |code| testing.allocator.free(code);
     slot.cancelled = std.atomic.Value(bool).init(false);
     slot.completion_tokens = 0;
     var sch: Scheduler = undefined;
     sch.force_batched = false;
     sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
     var active = [_]*Slot{&slot};
+    // The tick's decode checkpoint consumes any MLX error latched before it and errors the slot instead.
+    try testing.expect(!mlx.errorPending());
     try testing.expectError(error.SpecDecodeUnsupported, runDecodeTick(&sch, &active));
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);

@@ -15,6 +15,8 @@ const pool_budget = 512;
 const selected_width = pool_size * pool_budget + pool_size - 1;
 pub const score_scratch_bytes: usize = 2 * 1024 * 1024;
 pub const attention_scratch_bytes: usize = 8 * 1024 * 1024;
+/// Scalar latent-attention dispatches, [dense, sparse].
+pub var scalar_calls: [2]usize = .{ 0, 0 };
 /// Paired packed tiles keep a second tile live beside the first.
 pub fn packedCadenceTransientBudget(chunk: usize, pending_layers: usize) !usize {
     if (!packed_nax.enabled() or chunk <= packed_nax.wide_rows) return 0;
@@ -399,6 +401,9 @@ fn attentionChunk(scope: *Scope, state: *const State, q: Arr, selected: ?Arr, of
             return scope.own(try ops.result(out));
         }
     }
+    const kind = @intFromBool(selected != null);
+    scalar_calls[kind] += 1;
+    if (scalar_calls[kind] == 1) @import("log.zig").info("[glm-attn] scalar {s} latent attention engaged\n", .{if (selected != null) "sparse" else "dense"});
     const sh = mlx.getShape(q);
     const rows = sh[0];
     const heads = sh[1];
@@ -559,8 +564,8 @@ fn attendImpl(state: *const State, q: Arr, index_q: ?Arr, weights: ?Arr, offset:
     const per_row = try std.math.mul(usize, @intCast(sh[1]), try std.math.mul(usize, @intCast(splits), (@as(usize, @intCast(sh[2])) + 2) * 4));
     const pool_bytes = @max(@as(usize, 4), state.processed / 4 * 4);
     if (per_row > attention_scratch_bytes or (sparse and pool_bytes > score_scratch_bytes)) return error.GlmAttentionScratchBudget;
-    const wide_chunk = headpack and sh[0] >= 32;
-    const packed_rows = if (wide_chunk) packed_nax.wide_rows else packed_nax.max_rows;
+    const wide_chunk = headpack and sh[0] >= 32 and @import("glm5_model.zig").naxArms();
+    const packed_rows = if (wide_chunk) packed_nax.wide_rows else packed_nax.tileRows();
     const max_rows = @max(@as(usize, 1), @min(@min(attention_scratch_bytes / per_row, if (sparse) score_scratch_bytes / pool_bytes else std.math.maxInt(usize)), if (headpack) packed_rows else 128));
     if (headpack and (@as(usize, @intCast(sh[0])) > max_rows or (wide_chunk and max_rows == 32)))
         return attendPackedPairs(state, q, index_q.?, weights.?, offset, scale, max_rows, s);
@@ -1012,7 +1017,6 @@ test "GLM kv8 scalar latent attention matches BF16 attention over the round-trip
 }
 
 test "GLM kv8 native decode and packed prefill attention match BF16 over the round-tripped rows" {
-    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
     const native = @import("glm5_attention_decode_batch.zig");
     const s = mlx.gpuStream();
     var scope = Scope{ .s = s };
@@ -1032,5 +1036,244 @@ test "GLM kv8 native decode and packed prefill attention match BF16 over the rou
         try expectSameBits(want, got);
     }
     try std.testing.expectEqual(@as(usize, 2 * (1 + 3)), native.b1Calls());
-    try std.testing.expectEqual(@as(usize, 2 * 2), packed_nax.dispatchCount());
+    try std.testing.expectEqual(@as(usize, if (@import("glm5_model.zig").naxArms()) 2 * 2 else 2 * (2 + 4)), packed_nax.dispatchCount());
+}
+
+fn bf16Values(a: Arr, out: []f32) !void {
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const x = try ops.contiguous(try ops.cast(a, .float32));
+    try mlx.check(mlx.mlx_array_eval(x));
+    @memcpy(out, mlx.mlx_array_data_float32(x).?[0..out.len]);
+}
+
+/// FP64 attention over explicit latent ids: the ground truth the latent arms are held to.
+fn attentionOracle(a: std.mem.Allocator, latent: []const f32, q: []const f32, ids: []const i32, rows: usize, scale: f64) ![]f64 {
+    const out = try a.alloc(f64, rows * 64 * 512);
+    @memset(out, 0);
+    const p = try a.alloc(f64, 2051);
+    defer a.free(p);
+    for (0..rows) |r| for (0..64) |h| {
+        const row = ids[r * 2051 ..][0..2051];
+        const qh = q[(r * 64 + h) * 512 ..][0..512];
+        var top = -std.math.inf(f64);
+        for (row, p) |id, *v| {
+            v.* = -std.math.inf(f64);
+            if (id < 0) continue;
+            var dot: f64 = 0;
+            for (qh, latent[@as(usize, @intCast(id)) * 512 ..][0..512]) |x, k| dot += @as(f64, x) * k;
+            v.* = dot * scale;
+            top = @max(top, v.*);
+        }
+        if (top == -std.math.inf(f64)) continue;
+        var den: f64 = 0;
+        for (p) |*v| {
+            v.* = @exp(v.* - top);
+            den += v.*;
+        }
+        const o = out[(r * 64 + h) * 512 ..][0..512];
+        for (row, p) |id, w| if (id >= 0) for (o, latent[@as(usize, @intCast(id)) * 512 ..][0..512]) |*acc, x| {
+            acc.* += w * x;
+        };
+        for (o) |*acc| acc.* /= den;
+    };
+    return out;
+}
+
+/// MLX runs FP32 GEMMs as TF32 on NAX GPUs unless MLX_ENABLE_TF32=0; elsewhere they are full FP32.
+fn fp32GemmExact(s: mlx.mlx_stream) !bool {
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const one_plus: f32 = 1 + 1.0 / 4096.0;
+    const filled: [16]f32 = @splat(one_plus);
+    const identity = [_]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    const x = try ops.binary(.mm, try ops.own(mlx.mlx_array_new_data(&filled, &.{ 4, 4 }, 2, .float32)), try ops.own(mlx.mlx_array_new_data(&identity, &.{ 4, 4 }, 2, .float32)));
+    try mlx.check(mlx.mlx_array_eval(x));
+    return mlx.mlx_array_data_float32(x).?[0] == one_plus;
+}
+
+test "GLM decode attention without NAX: the FP32 composite B3 is three B1, held to an FP64 oracle" {
+    const transformer = @import("transformer.zig");
+    const native = @import("glm5_attention_decode_batch.zig");
+    const saved = transformer.vqmm_nax_probe_override;
+    defer transformer.vqmm_nax_probe_override = saved;
+    transformer.vqmm_nax_probe_override = false;
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const prefix_rows = 3000;
+    const prefix = Latent{ .data = try normal(&scope, &.{ prefix_rows, 512 }, 30, 1) };
+    const tape = try normal(&scope, &.{ 3, 512 }, 31, 1);
+    const branches = [_]native.Branch{
+        .{ .offset = prefix_rows, .length = prefix_rows + 1, .path = .{ 0, 0, 0 } },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 1, 0 } },
+        .{ .offset = prefix_rows + 1, .length = prefix_rows + 2, .path = .{ 0, 2, 0 } },
+    };
+    var ids: [3 * 2051]i32 = undefined;
+    for (branches, 0..) |branch, row| for (0..2051) |k| {
+        ids[row * 2051 + k] = if (k % 41 == 7) -1 else @intCast(branch.length - 2051 + k);
+    };
+    const selected = try scope.own(mlx.mlx_array_new_data(&ids, &.{ 3, 2051 }, 2, .int32));
+    const q = try normal(&scope, &.{ 3, 64, 512 }, 32, 2);
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    native.resetCalls();
+    const b3 = (try native.run(&ops, q, prefix, prefix_rows, tape, &branches, selected, 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+    var b1: [3]Arr = undefined;
+    for (0..3) |r| {
+        const at: c_int = @intCast(r);
+        b1[r] = (try native.run(&ops, try ops.slice(q, 0, at, at + 1), prefix, prefix_rows, tape, branches[r .. r + 1], try ops.slice(selected, 0, at, at + 1), 1.0 / 16.0)) orelse return error.ExpectedNativeDecode;
+        try expectSameBits(b1[r], try ops.slice(b3, 0, at, at + 1));
+    }
+    try std.testing.expectEqual(@as(usize, 1), native.b3Calls());
+    try std.testing.expectEqual(@as(usize, 3), native.b1Calls());
+    const rows = try a.alloc(f32, (prefix_rows + 3) * 512);
+    defer a.free(rows);
+    try bf16Values(prefix.data, rows[0 .. prefix_rows * 512]);
+    var tape_rows: [3 * 512]f32 = undefined;
+    try bf16Values(tape, &tape_rows);
+    var peak: f32 = 0;
+    for (rows[0 .. prefix_rows * 512]) |x| peak = @max(peak, @abs(x));
+    const fraction: f64 = if (try fp32GemmExact(s)) 1.0 / 2048.0 else 1.0 / 64.0;
+    var qv: [64 * 512]f32 = undefined;
+    var got: [64 * 512]f32 = undefined;
+    for (branches, 0..) |branch, r| {
+        for (0..3) |t| @memcpy(rows[(prefix_rows + t) * 512 ..][0..512], tape_rows[branch.path[t] * 512 ..][0..512]);
+        const at: c_int = @intCast(r);
+        try bf16Values(try ops.slice(q, 0, at, at + 1), &qv);
+        try bf16Values(b1[r], &got);
+        const want = try attentionOracle(a, rows, &qv, ids[r * 2051 ..][0..2051], 1, 1.0 / 16.0);
+        defer a.free(want);
+        for (got, want) |c, o| try std.testing.expect(std.math.isFinite(c) and @abs(c - o) <= @abs(o) / 128 + peak * fraction);
+    }
+}
+
+test "GLM sparse prefill without NAX takes the FP32 composite, no worse than the scalar arm" {
+    const transformer = @import("transformer.zig");
+    const saved = transformer.vqmm_nax_probe_override;
+    defer transformer.vqmm_nax_probe_override = saved;
+    transformer.vqmm_nax_probe_override = false;
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    const n = 2100;
+    const rows = packed_nax.composite_rows;
+    const offset = n - rows;
+    var state = State{ .processed = n };
+    defer state.deinit();
+    state.latent = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&state.latent, try normal(&scope, &.{ n, 512 }, 20, 1)));
+    var ids: [rows * 2051]i32 = undefined;
+    for (0..rows) |r| for (0..2051) |k| {
+        ids[r * 2051 + k] = if (r == rows - 1 or k % 37 == 5) -1 else @intCast(offset + r - 2050 + k);
+    };
+    const selected = try scope.own(mlx.mlx_array_new_data(&ids, &.{ rows, 2051 }, 2, .int32));
+    const q = try normal(&scope, &.{ rows, 64, 512 }, 22, 2);
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    const before = packed_nax.compositeCount();
+    const composite = (try packed_nax.run(&ops, q, state.latentView(), selected, offset, n, 1.0 / 16.0)) orelse return error.ExpectedComposite;
+    try std.testing.expectEqual(before + 1, packed_nax.compositeCount());
+    const scalar = try attentionChunk(&scope, &state, q, selected, offset, 1.0 / 16.0, 1, false, null);
+    const latent = try a.alloc(f32, n * 512);
+    defer a.free(latent);
+    try bf16Values(state.latent, latent);
+    const qv = try a.alloc(f32, rows * 64 * 512);
+    defer a.free(qv);
+    try bf16Values(q, qv);
+    const want = try attentionOracle(a, latent, qv, &ids, rows, 1.0 / 16.0);
+    defer a.free(want);
+    var peak: f32 = 0;
+    for (latent) |x| peak = @max(peak, @abs(x));
+    const got = try a.alloc(f32, want.len);
+    defer a.free(got);
+    const ref = try a.alloc(f32, want.len);
+    defer a.free(ref);
+    try bf16Values(composite, got);
+    try bf16Values(scalar, ref);
+    // A store rounding flip plus 2^-11 of max|V| (TF32 scores widen it to 2^-6 on a NAX GPU's MLX).
+    const fraction: f64 = if (try fp32GemmExact(s)) 1.0 / 2048.0 else 1.0 / 64.0;
+    const slack = peak * fraction;
+    for (got, ref, want) |c, r, o| {
+        try std.testing.expect(std.math.isFinite(c));
+        try std.testing.expect(@abs(c - o) <= @abs(r - o) + @abs(o) / 128 + slack);
+    }
+    for (got[(rows - 1) * 64 * 512 ..]) |c| try std.testing.expectEqual(@as(f32, 0), c);
+}
+
+test "GLM sparse attention arms per chunk (SUSHI_GLM_ATTN_UBENCH)" {
+    if (!@import("transformer.zig").diagEnvOn("SUSHI_GLM_ATTN_UBENCH")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const history: usize = 16384;
+    var scope = Scope{ .s = s };
+    defer scope.deinit();
+    var state = State{ .processed = history };
+    defer state.deinit();
+    state.latent = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&state.latent, try normal(&scope, &.{ @intCast(history), 512 }, 71, 1)));
+    try mlx.check(mlx.mlx_array_eval(state.latent));
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const transformer = @import("transformer.zig");
+    const saved = transformer.vqmm_nax_probe_override;
+    defer transformer.vqmm_nax_probe_override = saved;
+    const nax = @import("glm5_model.zig").naxArms();
+    for ([_]c_int{ 1, 8 }) |rows| {
+        const offset = history - @as(usize, @intCast(rows));
+        const ids = try a.alloc(i32, @as(usize, @intCast(rows)) * 2051);
+        defer a.free(ids);
+        for (0..@intCast(rows)) |r| for (0..2051) |k| {
+            ids[r * 2051 + k] = if (k % 37 == 5) -1 else @intCast(offset + r - 2050 + k);
+        };
+        const selected = try scope.own(mlx.mlx_array_new_data(ids.ptr, &.{ rows, 2051 }, 2, .int32));
+        const q = try normal(&scope, &.{ rows, 64, 512 }, 72 + @as(u64, @intCast(rows)), 2);
+        try mlx.check(mlx.mlx_array_eval(q));
+        var outs: [3]Arr = .{ nil, nil, nil };
+        var times: [3][12]f64 = undefined;
+        for (0..14) |rep| for (0..3) |arm| {
+            if (arm == 2 and !nax) continue;
+            var arm_scope = Scope{ .s = s };
+            defer arm_scope.deinit();
+            var ops = Ops{ .s = s };
+            defer ops.deinit();
+            transformer.vqmm_nax_probe_override = if (arm == 1) false else saved;
+            const sw = @import("io_util.zig").Stopwatch.init(io);
+            const out = if (arm == 0)
+                try attentionChunk(&arm_scope, &state, q, selected, offset, 1.0 / 16.0, if (rows == 1) 8 else 1, false, null)
+            else
+                (try packed_nax.run(&ops, q, state.latentView(), selected, offset, history, 1.0 / 16.0)).?;
+            try mlx.check(mlx.mlx_array_eval(out));
+            if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6;
+            if (rep == 0) outs[arm] = try scope.own(try arm_scope.result(out));
+        };
+        const n: usize = @intCast(64 * 512);
+        const want = blk: {
+            const lat = try a.alloc(f32, history * 512);
+            defer a.free(lat);
+            try bf16Values(state.latent, lat);
+            const qv = try a.alloc(f32, n);
+            defer a.free(qv);
+            try bf16Values(try scope.cut(q, 0, 1), qv);
+            break :blk try attentionOracle(a, lat, qv, ids[0..2051], 1, 1.0 / 16.0);
+        };
+        defer a.free(want);
+        const got = try a.alloc(f32, n);
+        defer a.free(got);
+        for (0..3) |arm| {
+            if (arm == 2 and !nax) continue;
+            try bf16Values(try scope.cut(outs[arm], 0, 1), got);
+            var worst: f64 = 0;
+            var peak: f64 = 0;
+            var sq: f64 = 0;
+            for (got, want) |g, w| {
+                worst = @max(worst, @abs(g - w));
+                peak = @max(peak, @abs(w));
+                sq += (g - w) * (g - w);
+            }
+            std.mem.sort(f64, &times[arm], {}, std.sort.asc(f64));
+            std.debug.print("[glm-attn-ubench] rows={d} arm={s} median {d:.3} ms min {d:.3} ms | row0 vs f64: max abs {e:.3} rms {e:.3} peak {d:.3}\n", .{ rows, ([_][]const u8{ "scalar", "composite", "nax" })[arm], times[arm][6], times[arm][0], worst, @sqrt(sq / @as(f64, @floatFromInt(n))), peak });
+        }
+    }
 }

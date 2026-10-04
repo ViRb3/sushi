@@ -1090,7 +1090,6 @@ test "GLM post-layer capture and shared draft projections retain their contracts
 test "GLM fused router matches FP32 scores and selected order at production width" {
     const a = std.testing.allocator;
     const stream = mlx.gpuStream();
-    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
     var random = std.Random.DefaultPrng.init(58289);
     const rnd = random.random();
     const matrix = try a.alloc(f32, 288 * 4096);

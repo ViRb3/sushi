@@ -33,6 +33,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A swallowed failure must DROP the latch it raised (`dropLatchedErrorUnless(had_error)`, passing the
   `errorPending()` read BEFORE the op). Guard: `tests/test_mlx_error_recovery.sh`.
 - A client-supplied PATH is proven on OUR side of the mlx boundary (stat → 400; an MLX error there latches).
+- In the unit-test binary a failing test's MLX error stays latched for the next test: a decode tick consumes it and
+  errors its slot. A test that runs a tick asserts `!mlx.errorPending()` first.
 
 ## Dtypes
 

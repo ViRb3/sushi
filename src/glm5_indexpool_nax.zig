@@ -9,7 +9,7 @@ pub const max_rows: usize = 16;
 pub const transient_bytes: usize = 8 * 1024 * 1024;
 var calls: usize = 0;
 pub fn enabled() bool {
-    return !@import("glm5_model.zig").reference_numerics;
+    return !@import("glm5_model.zig").reference_numerics and @import("glm5_model.zig").naxArms();
 }
 pub fn resetDispatchCount() void { calls = 0; }
 pub fn dispatchCount() usize { return calls; }
@@ -70,7 +70,7 @@ fn geometry(q: []const c_int, keys: []const c_int, weights: []const c_int, offse
 /// Only the measured long-history prefill geometry is eligible. Decode/verify
 /// and mixed precision retain the original scalar scorer.
 pub fn tryScores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: mlx.mlx_stream) !?Arr {
-    if (!enabled() or !mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported() or pools < 3584) return null;
+    if (!enabled() or !mlx.streamIsGpu(s) or pools < 3584) return null;
     for ([_]Arr{ q, keys, weights }) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return null;
     const sh = mlx.getShape(q);
     if (!geometry(sh, mlx.getShape(keys), mlx.getShape(weights), offset, pools) or sh[0] <= 8) return null;
@@ -81,7 +81,7 @@ pub fn tryScores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s
 /// Existing BF16 caches/queries/weights; returned FP32 scores contain rounded
 /// BF16 values and -infinity for future pools, as in the original SCORE kernel.
 pub fn scores(q: Arr, keys: Arr, weights: Arr, offset: usize, pools: usize, s: mlx.mlx_stream) !Arr {
-    if (!mlx.streamIsGpu(s) or !@import("glm5_kda_fused.zig").hardwareSupported()) return error.UnsupportedGlmIndexNax;
+    if (!mlx.streamIsGpu(s) or !@import("glm5_model.zig").naxArms()) return error.UnsupportedGlmIndexNax;
     for ([_]Arr{ q, keys, weights }) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return error.UnsupportedGlmIndexNax;
     if (!geometry(mlx.getShape(q), mlx.getShape(keys), mlx.getShape(weights), offset, pools)) return error.UnsupportedGlmIndexNax;
     const rows = mlx.getShape(q)[0];
@@ -124,6 +124,7 @@ test "GLM IndexPool NAX dot plane remains within original bound" {
     try std.testing.expect(!geometry(&.{ 17, 32, 128 }, &.{ 8192, 128 }, &.{ 17, 32 }, 32751, 8192));
 }
 test "GLM IndexPool NAX reserves transient copies per pending layer" {
+    if (!@import("glm5_model.zig").naxArms()) return error.SkipZigTest;
     try std.testing.expectEqual(transient_bytes * 2, try transientBudget(2048, 2));
     try std.testing.expectEqual(@as(usize, 0), try transientBudget(8, 2));
     try std.testing.expectError(error.Overflow, transientBudget(2048, std.math.maxInt(usize)));

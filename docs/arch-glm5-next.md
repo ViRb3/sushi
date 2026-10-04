@@ -19,6 +19,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-memory-admission](
   template defaults to `max`); thinking off is refused. The effort words impose no token cap.
 - Image and video input through the native tower, on when present; `--no-vision` drops its weights and buffers.
 - DFlash2 speculation when an assistant is found ([below](#dflash2)), for greedy and sampled requests.
+- M1–M4 GPUs (no NAX) run the same model with the arms in
+  [engine-glm5-kernels](engine-glm5-kernels.md#without-nax); `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses them.
 
 ## Checkpoint geometry
 
@@ -134,7 +136,8 @@ inside 1.46% drift) because verification per round grew 20.6%.
   and FP32 KDA state (147,619,840 bytes), plus native kernel transients at two pending layers: A6 expansion 512 MiB,
   head-batched MLA copies 768 MiB, packed attention with its second tile and B32 512 MiB, index scores 8 MiB per
   pending layer, B1/B3 decode attention 32 MiB, KDA cluster 1.25 MiB per pending layer; kv8 adds its dense-prefill
-  dequantization (≤ 2051 rows) and one chunk's quantizer output, 6.1 MiB.
+  dequantization (≤ 2051 rows) and one chunk's quantizer output, 6.1 MiB. Without NAX the packed tiles (the
+  FP32 composite) keep their 512 MiB, B1/B3 rise to 128 MiB, and the A6, MLA, index and cluster terms drop.
 - `max_safe_context` = (ceiling − active − transients) × 0.8 × 0.8 / per-token bill. The kv8 default drops the bill
   44%: Sushi-2.5bpw + vision + A4 assistant boots at 104.32 GB active with `max_safe_context` 1,048,576 (the position
   cap; about 1.36M by the bill), against 758,793 at `--kv-quant 16` (976a0dbb, auto context, margin 4 GiB).
@@ -172,6 +175,8 @@ A pack is scored with `sushi kld compare --model <pack> --fixture <teacher>` aga
 Sushi-2.3bpw 0.0930, Sushi-2.4bpw 0.0915, Sushi-2.45bpw 0.0913 mean KLD (code ~0.045, prose ~0.139); Sushi-2.5bpw
 (K2.5 experts, A6 trunk) 0.0721. Not yet the 16x512
 release reading; table and settings in [quality-kld](quality-kld.md#glm-53-flash-native-bf16-teacher-4x512-2026-10-04).
+The M1–M4 path rehearsed on the M5 scores the first prompt at 0.0457 against the stock path's 0.0446, top-1 equal
+([perf-baselines](perf-baselines.md#glm-nonnax)).
 
 ## Lessons
 

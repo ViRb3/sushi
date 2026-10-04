@@ -10,6 +10,12 @@ const fp8_block = @import("fp8_block.zig");
 /// Set by the BF16 teacher capture: every GLM fast kernel defers to its reference arm.
 pub var reference_numerics = false;
 
+/// The one device decision for GLM arms built on MLX's NAX kernels (fused D512 SDPA, NAX GEMM/QMM
+/// tiles). Qwen's and MiMo's gate, so `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses an M1–M4.
+pub fn naxArms() bool {
+    return @import("transformer.zig").verifyQmmNaxAvailable();
+}
+
 pub const Ops = struct {
     s: mlx.mlx_stream,
     values: [768]Arr = undefined,
@@ -447,7 +453,7 @@ pub const KdaLayer = struct {
     pub fn preparePrefillCluster(self: *KdaLayer, stream: mlx.mlx_stream) !void {
         const cluster = @import("glm5_kda_prefill_cluster.zig");
         if (self.prepared_cluster.ctx != null or !cluster.enabled() or !mlx.streamIsGpu(stream) or
-            !@import("glm5_kda_fused.zig").hardwareSupported() or !cluster.eligible(.{ self.fa, self.ga, self.beta })) return;
+            !cluster.eligible(.{ self.fa, self.ga, self.beta })) return;
         var ops = Ops{ .s = stream };
         defer ops.deinit();
         const bank = try cluster.prepare(&ops, .{ self.fa, self.ga, self.beta });
@@ -514,7 +520,7 @@ pub const KdaLayer = struct {
 
     pub fn applyFused(self: KdaLayer, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, state: *@import("transformer.zig").SSMCacheEntry) !?Arr {
         const sh = mlx.getShape(x);
-        if (sh.len != 3 or sh[0] != 1 or sh[1] != 1 or mlx.mlx_array_dtype(x) != .bfloat16 or cfg.linear_key_head_dim != 128 or cfg.linear_conv_kernel_dim != 4 or cfg.kda_gate_lower_bound != -5 or self.prepared_conv.ctx == null or self.prepared_decay.ctx == null or !@import("glm5_kda_fused.zig").hardwareSupported()) return null;
+        if (sh.len != 3 or sh[0] != 1 or sh[1] != 1 or mlx.mlx_array_dtype(x) != .bfloat16 or cfg.linear_key_head_dim != 128 or cfg.linear_conv_kernel_dim != 4 or cfg.kda_gate_lower_bound != -5 or self.prepared_conv.ctx == null or self.prepared_decay.ctx == null) return null;
         const heads: c_int = @intCast(cfg.linear_num_value_heads);
         const width = heads * 128;
         const joined = try self.projectQkv(ops, x);
@@ -861,7 +867,6 @@ fn expectLayerBits(actual: Arr, expected: Arr) !void {
 }
 
 test "GLM fused KDA decode preserves output and FP32 state exactly" {
-    if (!@import("glm5_kda_fused.zig").hardwareSupported()) return error.SkipZigTest;
     for ([_]u32{ 1, 3, 64 }) |heads| {
         var fixture = try loadLayerFixture();
         defer fixture.deinit();
@@ -1073,5 +1078,133 @@ test "GLM FP8 projection follows MiMo source arithmetic at decode and prefill wi
         };
         try std.testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(linear.w));
         try std.testing.expectEqual(@as(u64, n * k + scales.len * 4), @import("glm5_diagnostic.zig").storedBytes(&weights));
+    }
+}
+
+test "GLM NAX arms and their bills follow the one NAX gate" {
+    const transformer = @import("transformer.zig");
+    const saved = transformer.vqmm_nax_probe_override;
+    defer transformer.vqmm_nax_probe_override = saved;
+    const s = mlx.gpuStream();
+    const packed_nax = @import("glm5_attention_nax_packed.zig");
+    const index_nax = @import("glm5_indexpool_nax.zig");
+    const decode_batch = @import("glm5_attention_decode_batch.zig");
+    const cluster = @import("glm5_kda_prefill_cluster.zig");
+    const dense_once = @import("glm5_a6_dense_once.zig");
+    const mla_prefill = @import("glm5_mla_prefill_batch.zig");
+    const mla_verify = @import("glm5_mla_verify_batch.zig");
+    for ([_]?bool{ saved, false }) |gate| {
+        transformer.vqmm_nax_probe_override = gate;
+        const on = naxArms();
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const latent = @import("glm5_latent.zig").Latent{ .data = try ops.zeros(&.{ 4, 512 }, .bfloat16) };
+        const none: [2051]i32 = @splat(-1);
+        const selected = try ops.own(mlx.mlx_array_new_data(&none, &.{ 1, 2051 }, 2, .int32));
+        const composites = packed_nax.compositeCount();
+        try std.testing.expect((try packed_nax.run(&ops, try ops.zeros(&.{ 1, 64, 512 }, .bfloat16), latent, selected, 3, 4, 1.0 / 16.0)) != null);
+        try std.testing.expectEqual(!on, packed_nax.compositeCount() > composites);
+        try std.testing.expectEqual(@as(usize, if (on) 8 else 32) * 1024 * 1024, decode_batch.scratchLimit());
+        const scores = try index_nax.tryScores(try ops.zeros(&.{ 16, 32, 128 }, .bfloat16), try ops.zeros(&.{ 3584, 128 }, .bfloat16), try ops.zeros(&.{ 16, 32 }, .bfloat16), 3584 * 4 - 16, 3584, s);
+        if (scores) |value| _ = try ops.own(value);
+        try std.testing.expectEqual(on, scores != null);
+        const a6 = [_]Arr{ try ops.zeros(&.{ 1, 2048, 4096 }, .bfloat16), try ops.zeros(&.{ 8192, 768 }, .uint32), try ops.zeros(&.{ 8192, 32 }, .bfloat16) };
+        try std.testing.expectEqual(on, (try dense_once.tryPrefill(&ops, a6[0], a6[1], a6[2], a6[2])) != null);
+        const bank = [_]Arr{ try ops.zeros(&.{ 64, 256, 96 }, .uint32), try ops.zeros(&.{ 64, 256, 4 }, .bfloat16) };
+        try std.testing.expectEqual(on, (try mla_prefill.run(&ops, .{ .x = try ops.zeros(&.{ 128, 64, 1, 256 }, .bfloat16), .w = bank[0], .scales = bank[1], .biases = bank[1] }, .query)) != null);
+        try std.testing.expectEqual(on, (try mla_verify.run(&ops, .{ .x = try ops.zeros(&.{ 3, 64, 1, 256 }, .bfloat16), .w = bank[0], .scales = bank[1], .biases = bank[1] }, .query)) != null);
+        try std.testing.expectEqual(on, cluster.enabled());
+        const bills = [_]usize{
+            try index_nax.transientBudget(2048, 2),
+            try cluster.transientBudget(2048, 2),    try dense_once.transientBudget(2048, 2),
+            try mla_prefill.transientBudget(2048, 2),
+        };
+        for (bills) |bill| try std.testing.expectEqual(on, bill > 0);
+        try std.testing.expect(try packed_nax.compositeBytes(packed_nax.composite_rows) <= packed_nax.scratch_limit);
+    }
+}
+
+fn ubenchArray(ops: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype, seed: u64, low: f32, high: f32) !Arr {
+    const key = try ops.slot();
+    try mlx.check(mlx.mlx_random_key(key, seed));
+    const out = try ops.slot();
+    if (dtype == .uint32)
+        try mlx.check(mlx.mlx_random_bits(out, shape.ptr, shape.len, 4, key.*, ops.s))
+    else
+        try mlx.check(mlx.mlx_random_uniform(out, try ops.scalar(low, dtype), try ops.scalar(high, dtype), shape.ptr, shape.len, dtype, key.*, ops.s));
+    try mlx.check(mlx.mlx_array_eval(out.*));
+    return out.*;
+}
+
+test "GLM NAX-shaped arms on this GPU's MLX kernels (SUSHI_GLM_ARMS_UBENCH)" {
+    const transformer = @import("transformer.zig");
+    if (!transformer.diagEnvOn("SUSHI_GLM_ARMS_UBENCH")) return error.SkipZigTest;
+    const saved = transformer.vqmm_nax_probe_override;
+    defer transformer.vqmm_nax_probe_override = saved;
+    const s = mlx.gpuStream();
+    var fx = Ops{ .s = s };
+    defer fx.deinit();
+    const x = try ubenchArray(&fx, &.{ 1, 2048, 4096 }, .bfloat16, 1, -2, 2);
+    const a6 = [_]Arr{ try ubenchArray(&fx, &.{ 8192, 768 }, .uint32, 2, 0, 0), try ubenchArray(&fx, &.{ 8192, 32 }, .bfloat16, 3, 0.001, 0.01), try ubenchArray(&fx, &.{ 8192, 32 }, .bfloat16, 4, -0.3, 0.1) };
+    const head = [_]Arr{ try ubenchArray(&fx, &.{ 64, 256, 96 }, .uint32, 5, 0, 0), try ubenchArray(&fx, &.{ 64, 256, 4 }, .bfloat16, 6, 0.001, 0.01), try ubenchArray(&fx, &.{ 64, 256, 4 }, .bfloat16, 7, -0.3, 0.1) };
+    const q = try ubenchArray(&fx, &.{ 2048, 64, 1, 256 }, .bfloat16, 8, -1, 1);
+    const v = try ubenchArray(&fx, &.{ 2048, 64, 1, 512 }, .bfloat16, 9, -1, 1);
+    const cluster_w = try ubenchArray(&fx, &.{ 320, 4096 }, .bfloat16, 10, -0.05, 0.05);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const names = [_][]const u8{ "a6-dense-once T2048 4096->8192", "mla-query head batch T2048", "mla-value head batch T2048", "mla-query verify batch T3", "kda-cluster T2048" };
+    for (names, 0..) |name, case| {
+        var times: [2][10]f64 = undefined;
+        var outs: [2]Arr = .{ .{ .ctx = null }, .{ .ctx = null } };
+        defer for (outs) |o| if (o.ctx != null) {
+            _ = mlx.mlx_array_free(o);
+        };
+        for (0..12) |rep| for (0..2) |arm| {
+            transformer.vqmm_nax_probe_override = arm == 1;
+            var ops = Ops{ .s = s };
+            defer ops.deinit();
+            const sw = @import("io_util.zig").Stopwatch.init(io);
+            const out = switch (case) {
+                0 => if (arm == 1) (try @import("glm5_a6_dense_once.zig").tryPrefill(&ops, x, a6[0], a6[1], a6[2])).? else try ops.qmm(x, a6[0], a6[1], a6[2], true),
+                1 => if (arm == 1) (try @import("glm5_mla_prefill_batch.zig").run(&ops, .{ .x = q, .w = head[0], .scales = head[1], .biases = head[2] }, .query)).? else try ops.qmm(q, head[0], head[1], head[2], false),
+                2 => if (arm == 1) (try @import("glm5_mla_prefill_batch.zig").run(&ops, .{ .x = v, .w = head[0], .scales = head[1], .biases = head[2] }, .value)).? else try ops.qmm(v, head[0], head[1], head[2], true),
+                3 => blk: {
+                    const rows = try ops.slice(q, 0, 0, 3);
+                    if (arm == 1) break :blk (try @import("glm5_mla_verify_batch.zig").run(&ops, .{ .x = rows, .w = head[0], .scales = head[1], .biases = head[2] }, .query)).?;
+                    var parts: [3]Arr = undefined;
+                    for (0..3) |r| parts[r] = try ops.qmm(try ops.slice(rows, 0, @intCast(r), @intCast(r + 1)), head[0], head[1], head[2], false);
+                    break :blk try ops.concat(&parts, 0);
+                },
+                else => blk: {
+                    if (arm == 1) {
+                        const banks = try @import("glm5_kda_prefill_cluster.zig").project(&ops, cluster_w, x);
+                        break :blk try ops.concat(&banks, -1);
+                    }
+                    var parts: [3]Arr = undefined;
+                    var at: c_int = 0;
+                    for (@import("glm5_kda_prefill_cluster.zig").widths, 0..) |n, i| {
+                        parts[i] = try ops.binary(.mm, x, try ops.transpose(try ops.slice(cluster_w, 0, at, at + n), &.{ 1, 0 }));
+                        at += n;
+                    }
+                    break :blk try ops.concat(&parts, -1);
+                },
+            };
+            try mlx.check(mlx.mlx_array_eval(out));
+            if (rep >= 2) times[arm][rep - 2] = @as(f64, @floatFromInt(sw.read())) / 1e6;
+            if (rep == 0) outs[arm] = try ops.result(try ops.contiguous(try ops.cast(out, .float32)));
+        };
+        for (outs) |o| try mlx.check(mlx.mlx_array_eval(o));
+        const n = mlx.mlx_array_size(outs[0]);
+        const ref = mlx.mlx_array_data_float32(outs[0]).?[0..n];
+        const got = mlx.mlx_array_data_float32(outs[1]).?[0..n];
+        var differ: usize = 0;
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (ref, got) |r, g| {
+            if (@as(u32, @bitCast(r)) != @as(u32, @bitCast(g))) differ += 1;
+            num += (g - r) * (g - r);
+            den += r * r;
+        }
+        for (&times) |*t| std.mem.sort(f64, t, {}, std.sort.asc(f64));
+        std.debug.print("[glm-arms-ubench] {s}: staged median {d:.3} ms, arm median {d:.3} ms; {d}/{d} values differ, rel L2 {e:.3}\n", .{ name, times[0][5], times[1][5], differ, n, @sqrt(num / den) });
     }
 }

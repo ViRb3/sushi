@@ -1,4 +1,4 @@
-//! Sparse head-packed native NAX SDPA with bounded query batches.
+//! Sparse head-packed native NAX SDPA with bounded query batches; FP32 GEMMs without NAX.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Ops = @import("glm5_model.zig").Ops;
@@ -7,11 +7,21 @@ const Latent = latent_store.Latent;
 const Arr = mlx.mlx_array;
 pub const max_rows: usize = 16;
 pub const wide_rows: usize = 32;
+/// The FP32 composite's bank and score planes fit `scratch_limit` at this many rows.
+pub const composite_rows: usize = 8;
 /// Bounds one tile of either width; a pending layer holds at most one.
 pub const scratch_limit: usize = 128 * 1024 * 1024;
 var calls: usize = 0;
+var composite_calls: usize = 0;
 pub fn enabled() bool {
     return !@import("glm5_model.zig").reference_numerics;
+}
+/// Rows per tile on this GPU; only the fused NAX arm takes `wide_rows`.
+pub fn tileRows() usize {
+    return if (@import("glm5_model.zig").naxArms()) max_rows else composite_rows;
+}
+pub fn compositeCount() usize {
+    return composite_calls;
 }
 pub fn resetDispatchCount() void {
     calls = 0;
@@ -28,6 +38,11 @@ pub fn temporaryBytes(rows: usize) !usize {
     // One gathered BF16 KV bank shared by K/V; query, result, zeroing and contiguity
     // copies; the bool mask and index bookkeeping. No [Q,H,K] floating score tensor.
     return std.math.mul(usize, rows, 2051 * 512 * 2 + 64 * 512 * 2 * 4 + 64 * 2051 + 2051 * 9 + 16);
+}
+/// BF16 and FP32 banks, the mask, FP32 and scaled queries, three FP32 score planes, the FP32/BF16 results.
+pub fn compositeBytes(rows: usize) !usize {
+    if (rows == 0 or rows > composite_rows) return error.UnsupportedGlmPackedAttention;
+    return std.math.mul(usize, rows, 2051 * 512 * 6 + 2051 + 64 * 512 * 4 * 3 + 64 * 2051 * 4 * 3 + 64 * 512 * 2 * 2);
 }
 const gather_source: [:0]const u8 =
     \\const uint i=thread_position_in_grid.x;
@@ -91,9 +106,20 @@ fn geometry(q: []const c_int, cache: []const c_int, ids: []const c_int, offset: 
         cache.len == 2 and cache[0] >= history and cache[1] == 512 and ids.len == 2 and ids[0] == q[0] and ids[1] == 2051 and
         history > 0 and history <= 1048576 and offset <= history and q[0] <= history - offset;
 }
+/// Attention of q [R,64,512] over its own gathered bank [R,2051,512] in FP32 GEMMs and a precise
+/// softmax, as [R,1,64,512] BF16. Off NAX MLX has no fused D512 SDPA.
+pub fn composite(ops: *Ops, q: Arr, kv_bank: Arr, mask: Arr, scale: f32) !Arr {
+    const rows = mlx.getShape(q)[0];
+    const kv = try ops.cast(kv_bank, .float32);
+    const queries = try ops.binary(.mul, try ops.cast(q, .float32), try ops.scalar(scale, .float32));
+    const masked = try ops.slot();
+    try mlx.check(mlx.mlx_where(masked, try ops.reshape(mask, &.{ rows, 1, 2051 }), try ops.binary(.mm, queries, try ops.transpose(kv, &.{ 0, 2, 1 })), try ops.scalar(-std.math.inf(f32), .float32), ops.s));
+    return ops.reshape(try ops.cast(try ops.binary(.mm, try ops.softmax(masked.*, -1), kv), .bfloat16), &.{ rows, 1, 64, 512 });
+}
 /// Valid IDs must be unique per real query, as guaranteed by IndexPool selection.
 pub fn run(ops: *Ops, q: Arr, cache: Latent, selected: Arr, offset: usize, history: usize, scale: f32) !?Arr {
-    if (!mlx.streamIsGpu(ops.s) or !@import("glm5_kda_fused.zig").hardwareSupported() or !std.math.isFinite(scale) or scale <= 0) return null;
+    const fused = @import("glm5_model.zig").naxArms();
+    if (!mlx.streamIsGpu(ops.s) or !std.math.isFinite(scale) or scale <= 0) return null;
     for ([_]Arr{ q, cache.data, selected }) |a| if (a.ctx == null) return null;
     // Refuse a cache that would require the generic gather wrapper to copy
     // full history; actual State latent buffers have these contiguous strides.
@@ -101,21 +127,28 @@ pub fn run(ops: *Ops, q: Arr, cache: Latent, selected: Arr, offset: usize, histo
     if (mlx.mlx_array_dtype(q) != .bfloat16 or cache.dtype() != .bfloat16 or mlx.mlx_array_dtype(selected) != .int32 or
         !geometry(mlx.getShape(q), &.{ cache.rows(), cache.width() }, mlx.getShape(selected), offset, history)) return null;
     const rows = mlx.getShape(q)[0];
-    if (try temporaryBytes(@intCast(rows)) > scratch_limit) return error.GlmPackedAttentionScratchBudget;
+    if (try (if (fused) temporaryBytes(@intCast(rows)) else compositeBytes(@intCast(rows))) > scratch_limit) return error.GlmPackedAttentionScratchBudget;
     const is = mlx.mlx_array_strides(selected);
     const ids = if (is[0] == 2051 and is[1] == 1) selected else try ops.contiguous(selected);
     const bank = try gather(ops, cache, ids, offset, history);
-    const queries = try ops.reshape(q, &.{ rows, 1, 64, 512 });
-    const kv = try ops.reshape(bank.kv, &.{ rows, 1, 2051, 512 });
-    const mask = try ops.reshape(bank.mask, &.{ rows, 1, 1, 2051 });
-    const out = try ops.slot();
-    // Fake Q positions are original heads; array mode has no position bias.
-    // Q64/GQA1 selects native full D512 NAX, and force_fused forbids fallback.
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(out, queries, kv, kv, scale, "array", mask, .{ .ctx = null }, true, ops.s));
+    const out = if (fused) blk: {
+        const queries = try ops.reshape(q, &.{ rows, 1, 64, 512 });
+        const kv = try ops.reshape(bank.kv, &.{ rows, 1, 2051, 512 });
+        const mask = try ops.reshape(bank.mask, &.{ rows, 1, 1, 2051 });
+        const attended = try ops.slot();
+        // Fake Q positions are original heads; array mode has no position bias.
+        // Q64/GQA1 selects native full D512 NAX, and force_fused forbids fallback.
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(attended, queries, kv, kv, scale, "array", mask, .{ .ctx = null }, true, ops.s));
+        break :blk attended.*;
+    } else blk: {
+        composite_calls += 1;
+        if (composite_calls == 1) @import("log.zig").info("[glm-attn] FP32 composite sparse attention engaged\n", .{});
+        break :blk try composite(ops, q, bank.kv, bank.mask, scale);
+    };
     const populated = try ops.slot();
     try mlx.check(mlx.mlx_any_axes(populated, bank.mask, &.{1}, 1, true, ops.s));
     const safe = try ops.slot();
-    try mlx.check(mlx.mlx_where(safe, try ops.reshape(populated.*, &.{ rows, 1, 1, 1 }), out.*, try ops.scalar(0, .bfloat16), ops.s));
+    try mlx.check(mlx.mlx_where(safe, try ops.reshape(populated.*, &.{ rows, 1, 1, 1 }), out, try ops.scalar(0, .bfloat16), ops.s));
     const result = try ops.reshape(safe.*, &.{ rows, 64, 512 });
     calls += 1;
     return result;
