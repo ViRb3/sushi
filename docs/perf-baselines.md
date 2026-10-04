@@ -1231,3 +1231,51 @@ tests, `taskpolicy -a`, GPU lock per boot, 2026-10-04: 2048-row chunks prefilled
 4096-row chunks (the old `--no-drafter` auto pin) at 451-592 tok/s (three boots). GLM's auto chunk is now capped at
 2048 for numerics
 ([engine-glm5-kernels](engine-glm5-kernels.md#prefill-chunk-2048-two-layers-pending)); a quiet-box A/B is owed.
+
+<a id="glm-longctx"></a>
+## GLM-5.3-Flash: long-context profile and the exact index-scoring wins (contended)
+
+Sushi-2.5bpw at release defaults (kv8 latent, A4 g64 DFlash2, vision, auto context), one request per cell: a
+three-sentence summary of repository source, 256 outputs, T=0, server timers. `taskpolicy -a`, GPU lock, fans at
+max (die 84-86 °C), box contended by other workers' builds, 2026-10-04. Absolute tok/s waits for the release bench.
+
+Baseline, main `a28b15de`, which prefilled at 512 rows (the quarter-share rule; fixed in `7324d263`):
+
+| context | prefill tok/s | DFlash2 decode tok/s | serial decode ms/token | verify ms/round | accepted/round |
+|---|---:|---:|---:|---:|---:|
+| 2K | 487 | 33.3 | 34.8 | 59.5 | 1.28 |
+| 8K | 588 | 33.6 | 36.3 | 57.9 | 1.19 |
+| 32K | 476 | 30.4 | 35.5 | 60.3 | 1.08 |
+| 128K | 292 | 25.0 | 38.0 | 70.4 | 0.97 |
+
+Inside the 128K prefill: 556 tok/s at 0-8K, 454 at 24-32K, 317 at 56-64K, 193 at 120-128K, the scalar index scorer
+(one MLA layer at 128K: scores 553 of 634 ms per 2048-row chunk). At 128K DFlash2 (25.0) lost to serial (26.3).
+
+Component meter, quiet box (load 0.94), lock, `SUSHI_GLM_LONGCTX_UBENCH`: one MLA layer on a synthetic kv8 state, whole
+sparse attention per 2048-row chunk, arms interleaved in one process (cumulative; `641a9300` carries all four):
+
+| context | main | + tree scorer | + B32 tiles | + ranked top-512 | + lazy NAX tiles |
+|---|---:|---:|---:|---:|---:|
+| 8K | 80.8 ms | 57.5 | 57.5 | 58.1 | 57.8 |
+| 16K | 107.3 | 107.0 | 107.3 | 101.8 | 56.0 |
+| 32K | 155.3 | 154.8 | 155.9 | 148.8 | 61.0 |
+| 64K | 332.5 | 115.0 | 114.9 | 104.7 | 104.5 |
+| 128K | 633.7 | 196.9 | 175.9 | 158.8 | 158.7 |
+
+A decode row's attention per MLA layer: 0.82 → 0.55 ms at 128K, 0.55 → 0.50 at 32K. Appending a chunk to the latent and
+pooled buffers costs 0.4 ms per layer at 8K and 1.8 ms at 128K (no reservation lever there).
+
+Model level, one boot of main `223f5f48` + `b4a2b6c4` with per-request arm switches, 2048-row prefill, arm 0 = main's
+index path, arm 4 = `641a9300`'s; greedy text equal in every cell, logits hashes equal at every forward (273/273 at
+32K serial, 321/321 at 128K serial):
+
+| cell | prefill tok/s arm 0 → 4 | decode tok/s arm 0 → 4 |
+|---|---|---|
+| 32K DFlash2 (0,4,4,0) | 658 / 646 → 794 / 789 | 30.6 / 31.7 → 32.7 / 32.6 |
+| 32K serial | 650 → 799 | 30.0 → 30.5 |
+| 128K serial | 363 → 637 | 28.0 → 28.6 |
+| 128K DFlash2 (4,0) | 329 → 604 | 27.8 → 31.0 |
+
+Verify per round at 128K: 69.1 → 61.5 ms, so DFlash2 again beats serial there (31.0 vs 28.6). The 2048-row prefill
+peaked 2.14 GB above active at 32K and 2.80 GB at 128K (bill 4,984 MiB). A 2K prompt prefilled at 669 tok/s at 512
+rows and 853 at 2048 (one request each).
