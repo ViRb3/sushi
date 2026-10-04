@@ -1185,3 +1185,12 @@ pick code), `taskpolicy -a`, GPU lock per boot, fans max + 10 s, 2026-10-01:
 The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per token the exact arm spends ~85 ms waiting
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
+
+<a id="glm-prefill-chunk"></a>
+## GLM-5.3-Flash: prefill chunk 2048 against 4096 (observation, not a recorded number)
+
+Sushi-2.3bpw, BF16 and kv8 latent, 30,065-ID prompt, separate boots on a box contended by other workers' builds and
+tests, `taskpolicy -a`, GPU lock per boot, 2026-10-04: 2048-row chunks prefilled at 520-676 tok/s (eight boots),
+4096-row chunks (the old `--no-drafter` auto pin) at 451-592 tok/s (three boots). GLM's auto chunk is now capped at
+2048 for numerics
+([engine-glm5-kernels](engine-glm5-kernels.md#prefill-chunk-2048-two-layers-pending)); a quiet-box A/B is owed.

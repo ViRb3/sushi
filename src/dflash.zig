@@ -685,7 +685,7 @@ pub const DflashModel = struct {
     layers: []DflashLayer,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (`SUSHI_DFLASH_DRAFT_HEAD_BITS`, default 3, 0 disables).
+    /// bind time (`SUSHI_DFLASH_DRAFT_HEAD_BITS`; `DEFAULT_DRAFT_HEAD_BITS` is 0, off).
     /// Only the block's draft argmax projects through it — VERIFICATION is a
     /// trunk forward and never touches it, so the emitted distribution is
     /// untouched; drafts just read ~⅓ of the bytes of a full-vocab head.

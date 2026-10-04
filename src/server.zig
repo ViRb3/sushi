@@ -3529,6 +3529,8 @@ pub fn resolvePrefillChunk(
 ) u32 {
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
+        // A wider GLM rung would make output depend on free memory and on whether an assistant loaded.
+        if (config.isGlm5() and chunk > @import("glm5_forward.zig").prefill_chunk) continue;
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
     // Nothing fits the share — the model barely fits at all. Take the narrowest
@@ -3862,6 +3864,8 @@ pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pin
         return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d} (SUSHI_PREFILL_CHUNK_PER_REQUEST=0)\n", .{ widest, pinned }) catch null;
     }
     if (pinned >= launch) return null;
+    if (config.isGlm5() and pinned == @import("glm5_forward.zig").prefill_chunk)
+        return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (GLM's numerics width; --prefill-chunk overrides)\n", .{pinned}) catch null;
     return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ pinned, launch }) catch null;
 }
 
@@ -26087,6 +26091,15 @@ test "thinking policy HTTP: Qwen and GLM accept their own words, MiMo takes ever
     }
     for ([_][]const u8{ "off", "none" }) |w| try std.testing.expect(!(try reasoningEffortFromWord(w, -1, true, mimo)).enable);
     try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", -1, true, mimo));
+}
+
+test "GLM prefill chunk never widens past the width its numerics are built for" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    const roomy: u64 = 1 << 40;
+    for ([_]bool{ false, true }) |assistant| {
+        cfg.glm_dflash_loaded = assistant;
+        for ([_]u64{ 16, 8 }) |kv_bits| try std.testing.expectEqual(@as(u32, 2048), resolvePrefillChunk(&cfg, kv_bits, roomy, 0, 0, 0));
+    }
 }
 
 test "GLM serving DFlash2 bill includes the bounded window captures replay and scratch" {

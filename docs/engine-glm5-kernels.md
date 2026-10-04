@@ -54,6 +54,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 
 ## Prefill (chunk 2048, two layers pending)
 
+- **Chunk**: GLM output depends on the prefill chunk width, so the auto chunk is capped at 2048
+  (`glm5_forward.prefill_chunk`, shared with KLD) and arms compared for identity must prefill at the same chunk.
+
 - **Cold MLA** (BF16, more than 8 rows, ending at or before token 2051): latent expanded through the per-head K/V banks
   (64 MiB each at T2048) into native causal SDPA D256, `force_fused`.
 - **Absorbed MLA projections**: query absorption (256→512) and value unembed (512→256) run head-batched (`[64,T,D]`)

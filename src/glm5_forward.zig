@@ -10,6 +10,10 @@ const Ops = base.Ops;
 const Linear = base.Linear;
 const Stream = @import("glm5_stream.zig").Stream;
 
+/// Prompt rows per prefill forward. The chunk is part of GLM's numerics: the exact-2048 native paths,
+/// the dense/sparse attention boundary and the KLD gate all assume it, so serving never widens past it.
+pub const prefill_chunk: u32 = 2048;
+
 pub const Routed = struct { indices: Arr, scores: Arr };
 
 fn route(ops: *Ops, x: Arr, weight: Arr, correction: Arr, top: c_int, scale: f32, normalize: bool) !Routed {

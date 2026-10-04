@@ -975,7 +975,7 @@ fn renderPrompt(allocator: std.mem.Allocator, l: *Loaded, opts: Options, p: Prom
 
 /// GLM prefills in serving-width chunks, identically at capture and compare: the chunk width is
 /// part of GLM's numerics, and a 128K-token prompt does not fit one forward.
-const glm_prompt_chunk: usize = 2048;
+const glm_prompt_chunk: usize = @import("glm5_forward.zig").prefill_chunk;
 
 fn forwardPrompt(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !mlx.mlx_array {
     return forwardPromptChunks(allocator, l, ctx, ids, if (l.config.isGlm5()) glm_prompt_chunk else ids.len);
