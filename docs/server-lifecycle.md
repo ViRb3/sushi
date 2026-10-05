@@ -141,10 +141,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - `src/scheduler.zig`: slots, inference thread (sole MLX caller), queues, batching, admission, spec wiring, hot-cache
   budget revise.
-- Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A
-  batched group is capped by PADDING WASTE (`batchedKvKeepCount`, `MAX_PAD_WASTE` 1.5 < 2.0), not slot count.
-  `groupKeepCount` lifts the cap for a group billed <= 4096 rows whose longest true context is >= 131072
-  ([engine-qsa-long-context](engine-qsa-long-context.md#small-sparse-groups-at-long-context)).
+- Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A resident
+  `qwen4_exp` decodes plain slots as rows of one forward (`forwardQwen4DecodeRows`, up to eight, no padding, no cap):
+  each row's recurrence, attention, PLE and KV append run as the slot's solo tick runs them, and the ops that read the
+  same weights for every row (hyper-connection reads, projections, routed experts, lm_head) share one pass through
+  kernels whose per-row arithmetic is the single-row one, so a slot's output does not depend on who shares its tick.
+  A STREAMED load and the other GDN trunks keep the padded batch, capped by PADDING WASTE (`batchedKvKeepCount`,
+  `MAX_PAD_WASTE` 1.5 < 2.0); the grouped MTP verify keeps both cap functions (`groupKeepCount` lifts the cap for a group
+  billed <= 4096 rows whose longest true context is >= 131072,
+  [engine-qsa-long-context](engine-qsa-long-context.md#small-sparse-groups-at-long-context)).
   Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
   ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)); resident GLM does the same through `verifyGroups`, and a
   drafting GLM slot joins as a plain row when its model has company ([arch-glm5-next](arch-glm5-next.md#concurrency)).

@@ -35,6 +35,7 @@ planner gate keeps the plain cap). Under the gather arm every long slot bills at
 short sub-agent beside a long session read as a 2x pad and sent a slot through a whole serial forward every tick. Below
 131072 tokens that serial forward is cheap and the plain cap still splits. The group runs the batched path that
 already ships, so its output differs from the serial one only by the documented batched-versus-solo Qwen tolerance.
+This floor now serves the grouped MTP verify and a streamed load only: a resident plain decode batch pads nothing.
 
 - Measured (this change on d3c65fc6, Sushi-2.6bpw, kv8, one ~134k-token session beside two ~200-token requests, 256
   tokens each, decode-only tok/s of the aggregate, `taskpolicy -a`, GPU lock held, boot-interleaved old/new arms): `--no-mtp

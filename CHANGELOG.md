@@ -11,6 +11,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **GLM decode, two-row tails and four-row lookup run the parallel HC coefficient kernel the three-row verify already had**: about 6% faster per serial token, same bytes.
 - **GLM full-chunk prefill transposes the expert grid at every admitted packed rate**, so the 2.5bpw pack prefills faster, same bytes.
 - **GLM DFlash2 verification reuses expert weight reads at every even packed rate 32–64**, so the 2.5bpw pack gets the speed-up the 2.25bpw pack already had, same bytes.
+- **Concurrent Qwen requests decode as one forward of per-slot rows**, so a request's greedy output no longer depends on which
+  other requests share its batch and no slot is padded to another's context.
 - **Qwen decode folds the shared-expert gate into the router kernel**, one fewer pair of launches per layer, same bytes.
 - **SSD-streamed Qwen3.8-Flash-Next packs now decode with MTP by default**: the head and its own routed experts load
   resident and are billed in the budget, verify rows run on the streamed decode path, and the n-gram window rolls back

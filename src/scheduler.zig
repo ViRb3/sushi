@@ -2330,8 +2330,10 @@ pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
     return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode() or cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows();
 }
 
-/// MiMo and GLM batching are certified (and GLM measured) for up to four independent slots.
+/// MiMo and GLM batching are certified (and GLM measured) for up to four independent slots; qwen4 rows
+/// share kernels up to the joined hyper-connection and expert width of eight.
 pub fn batchGroupCap(cfg: *const model_mod.ModelConfig) usize {
+    if (cfg.supportsBatchedQwen4Rows()) return 8;
     return if (cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows()) 4 else MAX_BATCH_GROUP;
 }
 
@@ -7860,7 +7862,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
         const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
         // Per-row attention reads each slot's own cache: nothing pads.
-        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() and !t.supportsBatchedGlmRows() else true;
+        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() and !t.supportsBatchedGlmRows() and !t.supportsBatchedQwen4Rows() else true;
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
@@ -9831,6 +9833,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
     const use_mimo = xfm_ptr.supportsBatchedMimoDecode();
     const use_glm = xfm_ptr.supportsBatchedGlmRows();
+    const use_qwen4_rows = use_gdn and xfm_ptr.supportsBatchedQwen4Rows();
     // Position source is per PATH: a GDN trunk positions from the slot's
     // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
     // linear layer there, so it reads 0 forever and every batched token was
@@ -9861,6 +9864,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     };
     const logits_arr = if (use_glm)
         try glmRowsForward(sch, allocator, xfm_ptr, &batch, next_tokens)
+    else if (use_qwen4_rows)
+        try xfm_ptr.forwardQwen4DecodeRows(next_tokens, ctxs, if (want_hidden) &hidden_rows else null)
     else if (use_gdn)
         try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else if (use_mimo)
@@ -9887,7 +9892,9 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // The batched forward advances only its scratch offset; each slot's own
     // position moves here so a slot leaving the batch resumes serial from
     // the right place (qwen4's QSA reads it for kv length + tail rule).
-    for (batch) |slot| slot.moe_seq_offset += 1;
+    if (!use_qwen4_rows) {
+        for (batch) |slot| slot.moe_seq_offset += 1;
+    }
 
     // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
     // the initWithOptions chokepoint and carries the model's
@@ -10025,6 +10032,16 @@ test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical w
     try testing.expectEqual(@as(usize, 4), batchGroupCap(&cfg));
     cfg.expert_streaming = true;
     try testing.expect(!configBatchesDecode(&cfg));
+    try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
+}
+
+test "a resident qwen4_exp decodes rows of one forward without padding; a streamed one keeps the padded batch" {
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "qwen4_exp";
+    try testing.expect(cfg.supportsBatchedQwen4Rows());
+    try testing.expectEqual(@as(usize, 8), batchGroupCap(&cfg));
+    cfg.expert_streaming = true;
+    try testing.expect(!cfg.supportsBatchedQwen4Rows());
     try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
 }
 

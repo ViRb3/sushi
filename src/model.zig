@@ -1253,6 +1253,12 @@ pub const ModelConfig = struct {
         return self.isGlm5() and !self.expert_streaming;
     }
 
+    /// Qwen3.8-Flash-Next decodes concurrent slots as per-row decode ticks of one forward
+    /// (`forwardQwen4DecodeRows`); a streamed load keeps the padded batch.
+    pub fn supportsBatchedQwen4Rows(self: *const ModelConfig) bool {
+        return self.isQwen4() and !self.expert_streaming;
+    }
+
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h

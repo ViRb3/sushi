@@ -96,11 +96,12 @@ run_request() {
     local label="$1" force_flag="$2" payload="${3:-$JSON_PAYLOAD}"
     echo "  starting server ($label)..." >&2
     local logfile
+    # --no-mtp: an MTP slot runs speculative rounds and never reaches the plain batched tick under test.
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -131,7 +132,7 @@ run_request() {
     local body
     body=$(echo "$payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions")
     # Engagement is only observable AFTER a decode has run.
-    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
+    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -qE "gdn batched decode engaged|qwen4 per-row decode engaged" "$logfile"; then
         echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel —" >&2
         echo "    this comparison would be serial-vs-serial and pass for free." >&2
         tail -20 "$logfile" >&2
@@ -151,9 +152,9 @@ run_and_tokenize() {
     local logfile
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -177,7 +178,7 @@ run_and_tokenize() {
     completion=$(echo "$body" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
     local tok_payload
     tok_payload=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$completion")
-    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
+    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -qE "gdn batched decode engaged|qwen4 per-row decode engaged" "$logfile"; then
         echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel (long arm)" >&2
         tail -20 "$logfile" >&2
         kill $pid 2>/dev/null || true
@@ -297,7 +298,7 @@ echo "== real N=2 concurrency (batch != 1) =="
 # first-N-tokens bar against the serial answer.
 sleep 2
 CONC_LOG=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --max-concurrent 4 > "$CONC_LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$CONC_LOG" 2>&1 &
 CONC_PID=$!
 up=0
 for i in $(seq 1 60); do
@@ -319,12 +320,15 @@ wait $CA; wait $CB
 # Engagement: output equality alone cannot tell a batched run from two serial
 # ones, and two concurrent requests are not guaranteed to overlap. The log line
 # is the only proof the batched path ran at N>1.
-if ! grep -qE "\[batched\] (gdn batched decode|batched decode) engaged \(slots=[2-9]" "$CONC_LOG"; then
+if ! grep -qE "\[batched\] (gdn batched decode|batched decode|qwen4 per-row decode) engaged \(slots=[2-9]" "$CONC_LOG"; then
     echo -e "  ${YELLOW}NOT RUN${NC} the two requests never overlapped into a batch of >= 2"
     grep "\[batched\]" "$CONC_LOG" | head -3 | sed 's/^/    /'
     CONC_SKIPPED=1
 fi
 
+# qwen4_exp decodes each row as its solo tick: the whole answer is byte-identical, no near-tie tolerance.
+ROW_EXACT=0
+if grep -q "\[batched\] qwen4 per-row decode engaged" "$CONC_LOG"; then ROW_EXACT=1; fi
 if [ -z "${CONC_SKIPPED:-}" ]; then
     CONC_FAIL=0
     for f in "$CONC_A" "$CONC_B"; do
@@ -335,10 +339,15 @@ if [ -z "${CONC_SKIPPED:-}" ]; then
         toks=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$txt" |
             curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/tokenize" |
             python3 -c "import sys,json; print(','.join(str(t) for t in json.load(sys.stdin)['tokens']))")
-        verdict=$(python3 - "$LONG_SINGLE_TOKS" "$toks" "$FIRST_N_TOKENS" <<'PYEOF'
+        CMP_N=$FIRST_N_TOKENS
+        if [ "$ROW_EXACT" = "1" ]; then CMP_N=1000000; fi
+        verdict=$(python3 - "$LONG_SINGLE_TOKS" "$toks" "$CMP_N" <<'PYEOF'
 import sys
 a = sys.argv[1].split(",") if sys.argv[1] else []
 b = sys.argv[2].split(",") if sys.argv[2] else []
+if int(sys.argv[3]) > 1000 and len(a) != len(b):
+    print(f"DIFF at index {min(len(a), len(b))}: length single={len(a)} concurrent={len(b)}")
+    sys.exit(0)
 n = min(int(sys.argv[3]), len(a), len(b))
 for i in range(n):
     if a[i] != b[i]:
@@ -348,6 +357,10 @@ else:
     print("OK" if n > 0 else "EMPTY")
 PYEOF
 )
+        if [ "$verdict" != "OK" ] && [ "$ROW_EXACT" = "1" ]; then
+            echo -e "${RED}FAIL${NC} per-row concurrent stream is not the serial answer: $verdict"
+            CONC_FAIL=1; break
+        fi
         if [ "$verdict" != "OK" ]; then
             # A batch of >= 2 is not bit-identical to serial (B=2 matmul /
             # recurrence tiles accumulate in a different order; a hybrid's
@@ -373,7 +386,11 @@ t=c[i]['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],4))" "$idx" 
         tail -20 "$CONC_LOG"
         kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"; exit 1
     fi
-    echo -e "${GREEN}PASS${NC} both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2; near-ties acquitted)"
+    if [ "$ROW_EXACT" = "1" ]; then
+        echo -e "${GREEN}PASS${NC} both concurrent streams are the serial answer byte for byte (per-row batch >= 2)"
+    else
+        echo -e "${GREEN}PASS${NC} both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2; near-ties acquitted)"
+    fi
 fi
 
 # Observability: the verdict a user reads without the log. /props and
@@ -415,7 +432,7 @@ echo "== batched-kernel x kv-quant crash guard =="
 
 sleep 2
 KVQ_LOG=$(mktemp)
-SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --kv-quant 8 > "$KVQ_LOG" 2>&1 &
+SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --kv-quant 8 > "$KVQ_LOG" 2>&1 &
 KVQ_PID=$!
 up=0
 for i in $(seq 1 60); do
@@ -512,7 +529,7 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(body("64k", 50000, 600)))
 pathlib.Path(sys.argv[3]).write_text(json.dumps(body("1k", 800, 400)))
 PW_PYEOF
 
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --max-concurrent 4 > "$PW_LOG" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$PW_LOG" 2>&1 &
     PW_PID=$!
     up=0
     for i in $(seq 1 90); do
@@ -548,6 +565,16 @@ PW_PYEOF
     wait $PW_A 2>/dev/null || true
 
     PW_FAIL=0
+    if grep -q "\[batched\] qwen4 per-row decode engaged" "$PW_LOG"; then
+        # Per-row decode pads nothing: the pair batches and no cap applies.
+        if grep -q "pad-waste cap" "$PW_LOG"; then
+            echo -e "${RED}FAIL${NC} per-row decode hit the pad-waste cap"; PW_FAIL=1
+        fi
+        if [ "$PW_FAIL" != "0" ]; then tail -20 "$PW_LOG"; cleanup_padwaste; exit 1; fi
+        echo -e "${GREEN}PASS${NC} per-row decode batched the 1k+64k pair without a pad-waste cap"
+        cleanup_padwaste
+        exit 0
+    fi
     # (a) the cap must have fired on the pair, naming the waste it compared.
     if ! grep -qE "\[batched\] pad-waste cap: kept [0-9]+ of [0-9]+ slots \(waste " "$PW_LOG"; then
         echo -e "${RED}FAIL${NC} the 1k+64k pair never hit the pad-waste cap —"
