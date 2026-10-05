@@ -2,7 +2,9 @@
 
 # SUSHI
 
-A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) masterpiece, focused only on serving selected models on Apple Silicon with custom sushi quants. Sushi mixes EXL3 and affine formats tailored for M5 Pro/Max-class chips. M1-M4 chips still run well. While Sushi works as a stand alone engine, it aims to stay within mlx-serve as a guest engine.
+A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) that serves a few selected models on Apple
+Silicon with custom Sushi quants: EXL3 experts and affine trunks tuned for M5 Pro/Max, still good on M1-M4. Sushi runs
+stand-alone and also as a guest engine inside mlx-serve.
 
 ## Model support list
 
@@ -11,7 +13,7 @@ A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) mas
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
-* GLM-5.3-Flash (`glm5_next`), text, image, and video input with native affine or raw FP8 trunk weights and EXL3 experts. Vision loads by default when present; `--no-vision` excludes its weights and buffers.
+* GLM-5.3-Flash (`glm5_next`): text, image and video input; its Sushi pack is not published yet
 
 ## Install
 
@@ -42,33 +44,13 @@ mkdir -p ~/.local/bin && ln -s "$PWD/zig-out/bin/sushi" ~/.local/bin/sushi   # o
 To update a source checkout, pull with `git pull --recurse-submodules` (or run `git submodule update --init` after a
 plain pull) before `./scripts/build-mlx.sh`: the script refuses a submodule left at an older pin.
 
-The server listens on `127.0.0.1:12345`, the model's own MTP draft head and the 8-bit KV cache are on by default.
+The server listens on `127.0.0.1:12345`. The model's own draft head (MTP for Qwen and MiMo, a DFlash2 assistant for
+GLM) and the 8-bit KV cache are on by default.
 
-GLM-5.3 stores its compressed MLA latent at 8 bits by default, like every model: 6,688 bytes per token
-(`--kv-quant 16` keeps it BF16: 11,264 latent plus 704 pooled-index bytes, 11,968 bytes).
-KDA recurrent state adds about 141 MiB independently of context length. `--think low`,
-`--think high`, and `--think max` select the checkpoint's reasoning instruction;
-they do not impose a thinking-token cap. Omitted effort uses Sushi's high default (the HF template itself defaults to max).
-GLM serving currently runs one request at a time, with MTP and RAM/disk prefix reuse off.
-A valid `dflash2/` folder inside a GLM pack loads automatically (legacy `drafter/`
-is also recognized). `--drafter /path/to/GLM-5.3-Flash-DFlash2` overrides that folder;
-`--no-drafter` disables it. If only the shipped `GLM-5.3-Flash-DFlash2/` BF16
-assistant exists, `serve` and `run` prepare a local A4/group-64 copy in `dflash2/`
-on first load and print a preparation/wait message. The original stays unchanged.
-Later loads reuse the cache; no disk space or write permission falls back to the
-original BF16 assistant with its full memory bill. Generated caches are local-only.
-Native DFlash2 supports greedy and sampled requests;
-constrained, penalized or explicitly bounded thinking requests decode serially. Original BF16 and stored
-A4/A6/A8 assistants keep their precision. The assistant weights join the load bill;
-its BF16 sliding window, target reservation, captures and verification scratch join
-the request bill.
-Raw FP8 packs use MiMo's block-128 kernels: E4M3FN bytes and FP32 scales stay resident,
-decode uses direct FP32 accumulation, and wider prefill expands projections into temporary BF16
-scratch. The default two-layer evaluation window bills up to 576 MiB of that scratch.
-Startup bills text weights, enabled vision and the selected assistant plus warmup.
-Native GLM vision is enabled unless `--no-vision` is given; its preprocessing and tower
-scratch are checked before image/video encoding. Request admission checks context
-storage, capacity growth and native kernel scratch. Unused MTP prediction layers stay on disk.
+**GLM-5.3-Flash notes.** `--kv-quant 16` keeps the MLA latent at BF16 instead of 8 bits. A `dflash2/` folder in the
+pack loads the DFlash2 assistant (`--drafter <dir>` overrides it, `--no-drafter` turns it off); a pack that ships only
+the BF16 assistant gets a 4-bit copy prepared on first load. Vision loads by default (`--no-vision` leaves it out).
+`--think low|high|max` picks the reasoning instruction (default high). Details: [docs/arch-glm5-next.md](docs/arch-glm5-next.md).
 
 ## Memory
 
@@ -196,13 +178,13 @@ MTP and the 8-bit KV cache are on by default for MiMo, and thinking is on by def
 
 ## Coding agents
 
-With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, codex, hermes or aider against it:
+With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, codex, grok, hermes or aider against it:
 
 ```bash
 sushi launch omp
 ```
 
-pi, omp, codex and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched and
+pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched and
 the session does not see your other providers, settings or history; claude, opencode and aider reach the server
 through environment variables. `--print` writes the config and prints the launch script instead of running it.
 
