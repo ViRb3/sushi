@@ -175,6 +175,8 @@ Ruled out for GLM experts (each exact unless noted; "component" = an isolated re
   before tile k's MMA (+27%), 256- or 64-thread groups (+12% at 2048 rows); on the branch-free body: a threadgroup
   LUT decode of the w12 codebook (+32%), a per-k-step threadgroup barrier (+9%), unroll 4 (+20% over unroll 2),
   64-row windows again (+9-13% on gate/up). The kernel is register/occupancy bound: added live state loses.
+- Dead for prefill routing: a counting sort (histogram, scan, stable scatter) in place of the argsort, exact with
+  ties: -0.03 to -0.16 ms per MoE layer as a component, yet Qwen 2.6bpw prefill 5-10% slower in an A B B A (de867e94 era).
 - **The SwiGLU chain is f32**: gate, up, sigmoid, SiLU and their product stay in f32 registers through the multiply
   by the down suh. In f16, MiMo's activations put gate and up near 400 each and the product past 65504, so a whole
   routed row became inf. The next ceiling is the f16 down inner plane (about 2x above the measured peak).
