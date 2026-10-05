@@ -2768,6 +2768,8 @@ pub const DiskTier = struct {
         const cps = cps_opt orelse return kept;
         const src = DiskTier.newestQsaCheckpoint(cps) orelse return kept;
         const rows: u32 = @intCast(DiskTier.qsaHistoryRowsOf(src));
+        // An owned bank already covering the newcomer stays: retained checkpoints may need its extra rows.
+        if (!inherited and held_bytes > 0 and rows <= inherited_rows) return kept;
         if (inherited and rows > 0 and rows <= inherited_rows and rows <= prefix_rows) {
             return .{ .inherited = true, .rows = @min(inherited_rows, prefix_rows), .bytes = 0 };
         }
@@ -4791,6 +4793,70 @@ test "DiskTier: QSA history bytes are O(rows), not O(checkpoints x rows)" {
     try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
     try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
     try testing.expectEqual(@as(c_int, 32), mlx.getShape(dst[2].qsa_pooled)[1]);
+}
+
+test "DiskTier: a shorter pooled bank never replaces the longer one an entry's checkpoints need" {
+    // An image turn persists only the text before its media: a short prefix of an existing entry.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 2048, 8, 0.0, .float32);
+    var tokens: [2048]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    var long = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&long);
+    long[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    long[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 500, 8 }, 800.0);
+    long[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &long, 1024, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &long, 2000, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &long, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    try testing.expectEqual(@as(u32, 2000), tier.entries.items[0].qsa_history_rows);
+
+    // The image turn: 600 text tokens, a checkpoint at 512, a bank of 512 rows.
+    var short = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&short);
+    short[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    short[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 128, 8 }, 800.0);
+    short[2].qsa_ratio = 4;
+    var cps2 = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &short, 512, s)};
+    defer for (&cps2) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps2, &short, s);
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, &cps2, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(usize, 3), tier.entries.items[0].ssm_positions.len);
+    try testing.expectEqual(@as(u32, 2000), tier.entries.items[0].qsa_history_rows);
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
+    defer tier2.deinit();
+    for ([_]u32{ 1024, 2000 }) |pos| {
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(pos, try tier2.restoreIntoHybrid(&cache2, &dst, 0, pos, s));
+        try testing.expectEqual(@as(c_int, @intCast(pos)), dst[2].qsa_hist_rows);
+        try testing.expectEqual(@as(f32, 800.0), ssmArrVal(dst[2].qsa_pooled, 0, s));
+    }
 }
 
 test "DiskTier: a mid-block checkpoint restore overlays the pooled bank onto its own leftover" {
