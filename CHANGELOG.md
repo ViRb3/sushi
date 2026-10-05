@@ -6,172 +6,24 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
-- **`--mtp-depth` is replaced by `--mtp-min-depth` / `--mtp-max-depth`**: every depth the MTP planner picks stays inside the
-  range so each machine can calibrate its own, equal values pin one depth, and `SUSHI_MTP_FORCE_DEPTH` is gone.
-- **`--no-mtp-lookup` turns off prompt-lookup drafts in MTP rounds and GLM DFlash2**, replacing the `SUSHI_MTP_LOOKUP` and `SUSHI_GLM_NO_LOOKUP` env switches; `--no-pld` still governs standalone PLD only.
-- **Sushi-2.6bpw decodes 12-15% faster per forward again**: the EXL3 decode reader no longer branches around its
-  third weight word, a slowdown since v1.1.0; output is unchanged.
-- **The browser chat page opens on the logo and title only**: the subtitle, privacy note and canned prompts are gone.
-- **`sushi run` opens a chat on GLM-5.3-Flash**: the chat preflight no longer refuses `glm5_next` as an unsupported model.
-- **GLM decode, two-row tails and four-row lookup run the parallel HC coefficient kernel the three-row verify already had**: about 6% faster per serial token, same bytes.
-- **GLM full-chunk prefill transposes the expert grid at every admitted packed rate**, so the 2.5bpw pack prefills faster, same bytes.
-- **GLM DFlash2 verification reuses expert weight reads at every even packed rate 32–64**, so the 2.5bpw pack gets the speed-up the 2.25bpw pack already had, same bytes.
-- **Concurrent Qwen requests decode as one forward of per-slot rows**, so a request's greedy output no longer depends on which
-  other requests share its batch and no slot is padded to another's context.
-- **Qwen decode folds the shared-expert gate into the router kernel**, one fewer pair of launches per layer, same bytes.
-- **SSD-streamed Qwen3.8-Flash-Next packs now decode with MTP by default**: the head and its own routed experts load
-  resident and are billed in the budget, verify rows run on the streamed decode path, and the n-gram window rolls back
-  after a partially accepted round, so a greedy reply equals the resident and the serial one. `--no-mtp` turns it off.
-  Thanks @gomezvd for the port (#21).
-- **GLM-5.3-Flash prompts tokenize exactly like Hugging Face**: the plain Llama-3 pre-tokenizer no longer takes Muse's
-  case-splitting grammar (`iPhone`, `McDonald`, `//!`, `½`), and the BPE `ignore_merges` flag is honoured.
-- **The load memory check counts an MTP head shipped as a separate `mtp/` file**, so a model that loads it beside a nearly
-  full memory is refused up front instead of failing during the load.
-- **`/metrics` and `/metrics.json` count every request outcome exactly once**: a client that disconnects mid-decode shows in
-  `request_cancelled_total`, generation errors in the new `sushi:request_failed_total`, and requests refused before they
-  start in `sushi:request_rejected_total`.
-- **A finished request no longer stalls decoding to probe disk free space for prefixes the SSD cache already holds.**
-- **The SSD cache can no longer restore another conversation's KV after its size limit evicts an entry mid-save.**
-- **Qwen attention reads exact values from a K/V view whose base is not 16-byte aligned**: the fused prefill and QSA
-  gather kernels decline such a view and the stock attention serves it.
-- **A 130k+ token Qwen session decoding beside short requests is no longer split into its own serial forward every
-  tick**: about 59 to 97 tok/s aggregate for one such session beside two short ones.
-- **A GLM-5.3 prompt served without prefix checkpoints no longer hangs its prefill** (prefix cache off, or admission
-  shedding every checkpoint at long context).
-- **Qwen3.8 late system notes (hook output, a mid-conversation `developer` turn) stay where they were sent** instead of
-  being folded into the first system message, so a tool round's prompt stays a prefix of the next turn's and the
-  prefix cache keeps hitting; prompts without a late note are unchanged.
-- **A turn with a screenshot now saves its text before the first image to the SSD cache**, so a restart or RAM
-  eviction no longer loses the long text prefix of image-heavy agent sessions.
-- **GLM-5.3-Flash tool results render in GLM's own chat format**: the chat-template engine now reads `x.0` as `x[0]`,
-  so every request with a tool message no longer falls back to the generic format; `/props.template_fallbacks`
-  counts any render that still does.
-- **`sushi launch grok` runs the Grok CLI against the local server, and `sushi launch opencode` works again with opencode 2.x** (it
-  now runs standalone with the model in its config, tool calls on, and the model's own reasoning efforts as variants), both ready for GLM-5.3.
-
-- **Non-streaming requests with `stop` sequences now stop generating when the stop completes**, instead of running to
-  `max_tokens` or end of text and trimming afterwards; the returned text and finish reason are unchanged.
-- **A non-streaming request cut by a `stop` sequence reports the tokens it returned and settled timings**, never a
-  zero or partial count read while the last decode step was still being accounted.
-- **GLM-5.3 requests that omit `max_tokens` are served again with DFlash2 at the full auto context** instead of failing at prefill with HTTP 500.
-- **GLM-5.3 prefix-cache commits no longer overrun memory on long generations**: a finished request copies only the
-  MLA rows its checkpoints can restore and its cache tier will keep, and admission bills that copy and the checkpoints a prefill really takes.
-- **Cancelling a GLM-5.3 request while it decodes no longer races the scheduler's list of running requests**, and its
-  prefix is committed exactly once.
-- **A GLM-5.3 prefix-cache commit that runs out of memory no longer leaks the request's KDA checkpoints.**
-- **A crash during an SSD cache commit can no longer restore a newer assistant window under older positions**; the
-  draft-side snapshot is declined and the trunk still restores.
-- **GLM-5.3 DFlash2 rounds no longer copy the request's reserved index-key buffer** for every draft branch, so a
-  request with a large output budget verifies as fast as one with a small budget.
-- **Concurrent GLM-5.3 requests no longer leak a verifier result per tick** when one of them runs a DFlash2 draft tree
-  beside the others.
-- **A streamed answer that ends in the middle of a character delivers it** like the non-streaming answer does, on chat,
-  Anthropic, Responses and completions.
-- **Faster MiMo short prefills**: on M5-class GPUs the FP8 trunk runs forwards of 9-128 rows on the matrix units, so a
-  follow-up turn after a prefix hit prefills faster; `kld capture` keeps the reference arithmetic.
-- **Unloading a model waits for every finished request to be torn down**, a submission that fails after its slot is
-  built frees its media on the inference thread, and an error whose name cannot be copied still ends its request.
-- **GLM-5.3 DFlash2 no longer fails a request that ends within a few positions of the context limit**, and a request
-  cancelled just after its prefill releases its GLM state at once.
-- **`/v1/completions` honours a per-request `kv_quant`** instead of always running at the process default, and a hybrid
-  model's prefix checkpoint keeps the sign of negative zero.
-- **Source builds use the Zig 0.17.0 release** instead of a 0.17 nightly; `scripts/fetch-zig.sh` checks its sha256.
-- **Concurrent GLM-5.3 requests no longer over-admit or publish EOS**: a later request now waits while earlier ones
-  still owe cache growth, and a DFlash2 request that sampled EOS first finishes without emitting it beside others.
-- **GLM-5.3-Flash's FP8 release streams its experts from SSD** as stored FP8 codes and block scales, in `serve`, `run`
-  and `kld compare`; `kld capture` refuses it, since the BF16 source stays the teacher. Verified by hermetic tests only.
-- **GLM-5.3 reuses prompt prefixes across turns, in RAM, on SSD and SSD-only** (`--no-prefix-cache-ram`): a turn
-  that appends to the conversation restores the previous prompt's state instead of prefilling it again, and a restore
-  on the prefill chunk grid is bit-identical to a cold prefill. Its RAM tier defaults to 1 GiB and gives way to a long
-  prompt, so the full 1M context stays available; add `--prefix-cache-disk` for long sessions.
-- **GLM-5.3-Flash on M1–M4 Macs is faster**: it keeps its fused KDA, prework and router kernels, runs sparse prefill
-  and decode attention as FP32 GEMMs instead of the scalar kernel, and bills no NAX-only scratch;
-  `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` now rehearses that path on an M5.
-- **`sushi kld capture --layer-major` captures many short GLM-5.3 windows from the BF16 source** with each layer's
-  experts read once per batch of windows, byte-identical to the one-window-at-a-time capture, resumable by rerunning
-  the command; `SUSHI_HIDDEN_OUT` now records the native GLM teacher's block boundaries (all four HC streams).
-- **`--vision` loads the vision tower on an SSD-streamed load** (GLM-5.3, MiMo, Qwen3.8), billed in the
-  `--ssd-budget-gb` budget; without it a streamed load serves text and says what the tower would cost. Thanks
-  @sanasol for raising it (#18).
-- **`scripts/build-mlx.sh` refuses MLX submodules left at an older pin** and prints the `git submodule update` command,
-  instead of failing to compile mlx-c after a plain `git pull`.
-- **Concurrent GLM-5.3 requests decode together instead of queueing**: each keeps its own native state, and up to
-  four decode as rows of one forward; a request decoding alone keeps DFlash2 speculation, and in company the request
-  whose drafts land best keeps drafting in the forward's spare rows.
-- **GLM-5.3 copies long verbatim spans four tokens per round**: when the output repeats its context, DFlash2 verifies
-  the context's continuation instead of the assistant's drafts.
-- **GLM-5.3 now stores its MLA latent at 8 bits by default**, like every model: 6,688 instead of 11,968 bytes per
-  token. `--kv-quant 16` (or a request's `kv_quant: 16`) keeps it BF16; `16` is accepted for every model.
-- **GLM-5.3-Flash streams its experts from SSD** under `--ssd-budget-gb`/`--expert-cache-gb`, for Sushi packs and the
-  BF16 source checkpoint alike, in `serve`, `run` and `kld compare`; streamed output is identical to resident,
-  without the DFlash2 assistant.
-- **`sushi kld` plans a streamed load exactly as `serve` does**: rate-group packs are refused by name and a streamed
-  MiMo bills its coarse lm_head.
-- **A streamed Qwen's load admission counts its QSA history** beside the KV cache, as the context sizer already did.
-- **GLM's first load prepares its DFlash2 assistant as A4/group-64** (was A6/group-128), 0.24 GB smaller with identical
-  output; an existing A6 cache is rebuilt once.
-- **`--wired-margin-gib` defaults to 4 GiB (was 8)**, so a raised `iogpu.wired_limit_mb` admits 4 GiB more weights
-  and context.
-- **MiMo takes every thinking effort word** (`minimal` through `max`) as thinking on instead of answering 400, on
-  chat, Responses and Anthropic requests, `--think` and the REPL's `/think` alike; `off` and `none` still turn
-  thinking off.
-- **`--think` binds only the `--model` model**: another model loaded on demand that lacks the word now keeps its own
-  default instead of failing to load.
-- **`sushi launch pi`, `omp` and `zcode` give MiMo thinking on** for every thinking level they offer.
-- **The chat page's effort menu lists exactly the selected model's words and starts on its real default**, which
-  `/v1/models` now reports as `default_reasoning_effort`; every message sends the shown effort.
-
-- **`sushi launch omp` lets local buffered tool calls finish without the default five-minute retry**; the generated
-  Sushi provider disables its model-progress deadline while preserving explicit user timeout overrides.
-
-- **Long-context MiMo requests switch to serial decode when their MTP rounds lose on measured cost**, while
-  workloads that benefit from speculation keep it.
-- **Experimental token logit biases**: load scoped penalties and rewards from JSON/CSV with `--logit-bias-file`,
-  or send an OpenAI `logit_bias` map per request; the optional think-penalty preset remains off by default.
-
-- **Faster MiMo 2.3bpw**: the prefill's expert GEMMs, the MTP verify rows (whose global layers share one walk of a
-  long cache), the draft heads and long-prompt attention do less work per token; output is byte-identical.
-- **Faster Qwen3.8-Flash-Next prefill**: the expert routing table is built on the GPU and the expert outputs are
-  reduced in place, with no host round trip or un-sort copy per layer; output is byte-identical.
-- **MiMo echoes and edits of a file in context decode faster**: prompt lookup now runs inside MiMo's MTP rounds, and a
-  lookup or PLD round verifies up to seven drafts; output is byte-identical.
-- **`sushi run mimo-v2.6-flash`** (and `sushi pull`) fetches and serves the MiMo 2.3bpw pack by its short name.
-- **Greedy MiMo decode reads the vocabulary head through a coarse top-32 shortlist** re-scored on the full head,
-  with or without MTP, and on a streamed MiMo too; sampled, logprob, penalty and grammar requests keep the full head.
-- **`--gpu-warm-secs <n>`** (default 60, 0 = off): the server keeps the GPU awake for this long after a request, so
-  the next request no longer starts with a GPU wake-up delay.
-- **With MTP, the first token streams when prefill ends** instead of after the first speculative round (when that
-  token is visible: a template-opened thought or thinking off).
-- **Faster SSD streaming**: a streamed decode layer queues its experts from a GPU copy of the expert cache map
-  before the host reads the router ids, and verifies them one layer later; Sushi-2bpw at a 20 GB budget on an M1 Max
-  decodes 10.3 -> 19.6 tok/s (llmprobe, 512 context) with byte-identical output.
-- **`--expert-pick-tolerance <n>`** (0 to 0.6, default off): a streamed pack may serve a cached expert in place of a
-  missed one when the router rates it at least `1 - n` as likely; lossy, trading a little accuracy for fewer SSD reads (KLD in `docs/quality-kld.md`; 22.3 tok/s greedy at 0.2 on the same
-  M1 Max); on a streamed MiMo it compares the sigmoid router's probabilities (5.8 -> 10.5 tok/s at 0.2 with a 60 GB
-  budget on an M5 Max).
-- **A reply cut short while thinking streams the reasoning the non-streamed reply returns**: no lone `<think>` as
-  reasoning (MiMo at `max_tokens: 1`), no empty Anthropic thinking block, and no dropped thought of a few characters.
-- **The MiMo pack loads on demand on a 128 GB Mac at default flags** (the app's path): the automatic resident-memory
-  cap now limits only models sharing memory, and a model loading alone is judged by the load's own memory check; an
-  explicit `--max-resident-mem` still applies.
-- **`presence_penalty`, `frequency_penalty` and `repeat_penalty` take effect**: the default decode path and MTP
-  ignored them; a penalised request now decodes serially, so it is slower than an unpenalised one.
-- **A request that names a pack by its path is answered by that pack or refused**: an unregistered path is a 404
-  instead of an answer from the default model; unknown model names still fall back to the default.
-- **A new MiMo session that shares only another's system prompt and tools reuses them from the prefix cache**
-  instead of prefilling them again (a subagent, a second chat).
-- **MiMo prefills long prompts in 2048-token chunks by default** (`--prefill-chunk 4096` raises it back), and the
-  load line now says each request picks its own chunk width, with the load-time width only a fallback.
-- **`ignore_eos: true`** on a `/v1/completions` request decodes past the end-of-sequence token up to `max_tokens`,
-  as in vLLM; a chat request that sets it gets a 400 naming the field.
-- **A reasoning budget closes the thought on time when several requests decode at once**; batched, a thought could
-  run thousands of tokens past it.
-- **A Flash-Next turn restored from the SSD prompt cache is no longer billed as if its restored prefix were new**,
-  so a long session after a restart is admitted where that bill refused it.
-- **A malformed `config.json` is refused by name** (a wrong field type, a negative or oversized number) instead of
-  loading undefined values; model discovery skips one whose top level is not an object.
-- **Concurrent MiMo requests decode together** in one forward of up to four streams; crowded MTP requests retain
-  their head state and resume solo rounds, with the same output as each alone.
+- **GLM-5.3-Flash joins Qwen3.8 and MiMo**: serve it, chat with `sushi run`, or drive it from the coding-agent
+  launchers. Up to four requests decode together, DFlash2 drafting copies long verbatim spans four tokens per round,
+  prompts are reused across turns in RAM and on SSD, and image/video input works. The 2.5bpw Sushi pack targets 128 GB
+  Macs (KLD 0.07 against the BF16 model); M1–M4 Macs keep its fused kernels.
+- **Stream any model's experts from SSD**: GLM-5.3, MiMo and Qwen3.8 run on smaller Macs with `--ssd-budget-gb`,
+  including vision. Streamed Qwen packs now decode with MTP by default — thanks @gomezvd.
+- **Concurrent requests decode together on every model**: MiMo and GLM batch up to four streams, and concurrent Qwen
+  requests decode as one forward whose answers are byte-identical to running each alone.
+- **Faster**: MiMo 2.3bpw decodes about 12% and prefills about 15% faster, Qwen3.8-Flash-Next prefills faster, and
+  Sushi-2.6bpw decodes 12–15% faster per forward than v1.1.1 (a regression that shipped in v1.1.1 is fixed).
+- **Better agent and API behaviour**: `sushi launch grok` is new and opencode 2.x works again; stop sequences end
+  generation as soon as they complete; streamed and non-streamed answers match byte for byte; presence, frequency and
+  repeat penalties take effect; `ignore_eos` works on `/v1/completions`; experimental logit biases load from a file.
+- **New and changed flags**: `--mtp-min-depth`/`--mtp-max-depth` bound the MTP planner so each Mac can calibrate its
+  own range (they replace `--mtp-depth`), `--no-mtp-lookup` turns off prompt-lookup drafts inside MTP rounds,
+  `--gpu-warm-secs` keeps the GPU awake between requests, and `--wired-margin-gib` now defaults to 4 GiB.
+- **More reliable under memory pressure and restarts**: memory admission, the SSD prompt cache and request metrics
+  were hardened across the board, and long GLM sessions no longer hang, leak or overrun memory.
 
 ---
 
