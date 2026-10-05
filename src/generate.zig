@@ -9744,8 +9744,6 @@ pub const Generator = struct {
         table: ?*const round_cost.Table = null,
         bucket: usize = 0,
         scale: f32 = 0,
-        /// False = the table prices round TIME only and tokens come from the acceptance EMAs.
-        table_tokens: bool = true,
 
         pub fn init(costs: MtpEvCosts, kv_len: u32, table: ?*const round_cost.Table) MtpCostSource {
             var src = MtpCostSource{ .costs = costs, .kv_len = kv_len, .table = table };
@@ -9769,7 +9767,7 @@ pub const Generator = struct {
         /// 6.0 — the 6th draft's rejections cost a rollback the model cannot
         /// see, and the table can.
         pub fn measuredTokens(self: MtpCostSource, m: u32) ?f32 {
-            if (self.scale <= 0 or !self.table_tokens) return null;
+            if (self.scale <= 0) return null;
             return self.table.?.measuredTok(m, self.bucket);
         }
 
@@ -9790,9 +9788,8 @@ pub const Generator = struct {
                         while (k <= m) : (k += 1) {
                             c += @max(slope, mtpEvMarginalCostAt(self.costs, k, self.kv_len));
                             // One sample is evidence for WORSE, never for
-                            // cheaper: an untrusted cell floors the cost. Round TIME alone is
-                            // stable to a few percent, so with no token column read the sample prices its width.
-                            if (t.rawMs(k, self.bucket)) |raw| c = if (self.table_tokens) @max(c, raw * self.scale) else raw * self.scale;
+                            // cheaper: an untrusted cell floors the cost.
+                            if (t.rawMs(k, self.bucket)) |raw| c = @max(c, raw * self.scale);
                         }
                         return c + sync;
                     }
@@ -9808,29 +9805,6 @@ pub const Generator = struct {
             return mtpEvMarginalCostAt(self.costs, k, self.kv_len);
         }
     };
-
-    /// How the base depth is chosen. `.accept`: expected tokens come from the acceptance EMAs and
-    /// the table prices round TIME only, in ONE chunk, so no round reads confidences mid-round.
-    /// `.legacy`: the table's realized tokens where measured, plus the confidence-gated chunk B.
-    pub const MtpDepthPolicy = enum { accept, legacy };
-    /// From this KV length the verify forward dominates and a shallow base + chunk B undercuts
-    /// every single-chunk depth, so `.accept` stops.
-    pub const MTP_ACCEPT_MAX_KV: u32 = 8192;
-
-    pub fn mtpDepthPolicyFor(kv_len: u32, is_mimo: bool) MtpDepthPolicy {
-        return if (kv_len >= MTP_ACCEPT_MAX_KV or is_mimo) .legacy else .accept;
-    }
-
-    pub fn mtpBasePlan(policy: MtpDepthPolicy, a: []const f32, cap: u32, src_in: MtpCostSource, m_lo_max: u32) MtpRoundPlan {
-        var src = src_in;
-        src.table_tokens = policy == .legacy;
-        var plan = mtpEvPlanSrc(a, cap, src, m_lo_max);
-        if (policy == .accept) {
-            plan.m_hi = plan.m_lo;
-            plan.tau_ln = 0.0;
-        }
-        return plan;
-    }
 
     pub fn mtpEvPlanSrc(a: []const f32, cap_in: u32, src: MtpCostSource, m_lo_max: u32) MtpRoundPlan {
         const cap: u32 = @intCast(@min(@as(usize, @max(1, cap_in)), a.len));
@@ -11203,8 +11177,7 @@ pub const Generator = struct {
         // above the row — that reopens the regime gate on ties the row had
         // closed), and the width trial may reach one past that to measure.
         if (src.fromTable()) cap = @min(cap_free, @max(cap_row, self.xfm.round_cost.widestMeasured(src.bucket) orelse cap_row));
-        const policy = mtpDepthPolicyFor(kv_len, self.xfm.config.isMimo());
-        var plan = mtpBasePlan(policy, self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1);
+        var plan = mtpEvPlanSrc(self.mtp_ev_accept[0..cap], cap, src, self.mtp_ev_m_lo_prev + 1);
         if (plan.m_lo == self.mtp_ev_m_lo_prev) self.mtp_m_lo_streak +|= 1 else self.mtp_m_lo_streak = 0;
         self.mtp_ev_m_lo_prev = plan.m_lo;
         // Live-cost lever: shorten dry exploration bursts when the MEASURED
@@ -11240,12 +11213,7 @@ pub const Generator = struct {
         if (mtpCostTableEnabled() and self.spec_cost_solo and self.mtp_ev_rounds >= self.mtp_regime.trial_end) {
             const base_settled = self.mtp_m_lo_streak >= 2;
             if (mtpWidthTrialTarget(&self.xfm.round_cost, kv_len, plan, cap_free, base_settled)) |target| {
-                // A next width nobody has timed is priced from the prior: learn it now, not a period from now.
-                if (policy == .accept and self.xfm.round_cost.rawMs(target, src.bucket) == null) self.mtp_width_trial.startAt(self.mtp_ev_rounds);
-                const period = if (policy == .accept)
-                    mtpProbePeriod(&self.mtp_ev_accept, src, plan.m_lo)
-                else
-                    mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
+                const period = mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
                 const reread = round_cost.schedulePeriodReread(self.xfm.round_cost.layout);
                 if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period, reread)) {
                     plan = mtpWidthTrialPlan(target);
@@ -11317,22 +11285,6 @@ pub const Generator = struct {
         // at one sample).
         if (t.msPerTok(m_lo + 1, b) == null and !t.clearlyWorse(m_lo + 1, m_lo, b)) return round_cost.EXPLORE_PERIOD_COLD;
         return round_cost.trialPeriod(t.msPerTok(m_lo, b), t.rawMsPerTok(m_lo + 1, b));
-    }
-
-    /// Probe period when the plan's tokens come from the acceptance EMAs: the same drag rule,
-    /// over the EV rates of m_lo and m_lo+1. The probe is what refreshes `a[m_lo]`, so a stale
-    /// estimate shortens its own period as soon as the shallower indices move.
-    pub fn mtpProbePeriod(a: []const f32, src: MtpCostSource, m_lo: u32) u32 {
-        const t = src.table orelse return round_cost.EXPLORE_PERIOD_COLD;
-        if (!src.fromTable()) return round_cost.EXPLORE_PERIOD_COLD;
-        if (t.measuredMs(m_lo + 1, src.bucket) == null) {
-            // One sample at a verify-width cliff is enough to stop asking at the cold period.
-            if (!t.clearlyWorse(m_lo + 1, m_lo, src.bucket)) return round_cost.EXPLORE_PERIOD_COLD;
-            return round_cost.trialPeriod(t.msPerTok(m_lo, src.bucket), t.rawMsPerTok(m_lo + 1, src.bucket));
-        }
-        const here = src.roundCost(m_lo, false) / mtpEvExpectedTokens(a, m_lo);
-        const up = src.roundCost(m_lo + 1, false) / mtpEvExpectedTokens(a, m_lo + 1);
-        return round_cost.trialPeriod(here, up);
     }
 
     /// Track the only evidence that can justify sticky-disable: whether the
@@ -22645,58 +22597,47 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
     try testing.expectEqual(cold.next_token_id, warm.next_token_id);
 }
 
-test "mtpBasePlan: the accept policy plans one chunk from the acceptance EMAs, whatever the table's token column says" {
-    // Round TIME favours depth 3; the w3 cell's token count froze pessimistic (one bad trial).
-    var t = round_cost.Table{};
+test "a Qwen round below 8192 KV prices widths by the table's realized tokens and keeps the confidence-gated chunk B" {
+    // The acceptance EMAs promise deep rounds; the table measured that a wider round realizes fewer tokens per ms.
+    // The base follows the table at every KV and only a confident round extends past it.
+    var xfm: Transformer = undefined;
+    xfm.config.model_type = "qwen4_exp";
+    xfm.round_cost = .{ .layout = .long, .first_use_logged = true };
     for (0..round_cost.MIN_SAMPLES) |_| {
-        _ = t.observe(2, 1000, 42.0, 3.0, true, false);
-        _ = t.observe(3, 1000, 48.0, 2.2, true, false);
-        _ = t.observe(4, 1000, 56.0, 3.9, true, false);
+        _ = xfm.round_cost.observe(2, 1000, 29.0, 2.6, true, false);
+        _ = xfm.round_cost.observe(3, 1000, 31.0, 2.9, true, false);
+        _ = xfm.round_cost.observe(4, 1000, 36.0, 3.1, true, false);
+        _ = xfm.round_cost.observe(5, 1000, 42.0, 3.5, true, false);
     }
-    const a = [_]f32{ 0.9, 0.85, 0.8, 0.6, 0.5, 0.5 };
-    const src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, &t);
-    const legacy = Generator.mtpBasePlan(.legacy, &a, 6, src, 6);
-    try testing.expect(legacy.m_lo != 3);
-    const plan = Generator.mtpBasePlan(.accept, &a, 6, src, 6);
+    var prompt: [1000]u32 = @splat(0);
+    var gen = Generator{
+        .xfm = &xfm,
+        .ctx = undefined,
+        .tok = undefined,
+        .next_token_id = 0,
+        .step = 0,
+        .max_tokens = 1,
+        .sampling = .{ .temperature = 0 },
+        .prompt_tokens = 0,
+        .completion_tokens = 0,
+        .finish_reason = "length",
+        .done = false,
+        .eos_token_ids = &.{},
+        .generated_ids = .empty,
+        .timeout_ns = 0,
+        .timer = io_util.Stopwatch.init(testing.io),
+        .last_hidden = .{ .ctx = null },
+        .has_last_hidden = false,
+        .prompt_ids_owned = &prompt,
+        .mtp_depth = 6,
+        .mtp_depth_free = 6,
+        .mtp_ev_rounds = 64,
+        .mtp_ev_accept = .{ 0.92, 0.9, 0.88, 0.86, 0.84, 0.8, 0.8, 0.8 },
+        .mtp_ev_m_lo_prev = 4,
+        .spec_cost_solo = false,
+    };
+    const plan = gen.mtpRoundPlan();
     try testing.expectEqual(@as(u32, 3), plan.m_lo);
-    try testing.expectEqual(plan.m_lo, plan.m_hi);
-    try testing.expectEqual(@as(f32, 0.0), plan.tau_ln);
-}
-
-test "mtpDepthPolicyFor: long context keeps the legacy planner; MiMo never leaves it" {
-    try testing.expectEqual(Generator.MtpDepthPolicy.accept, Generator.mtpDepthPolicyFor(8191, false));
-    try testing.expectEqual(Generator.MtpDepthPolicy.legacy, Generator.mtpDepthPolicyFor(8192, false));
-    try testing.expectEqual(Generator.MtpDepthPolicy.legacy, Generator.mtpDepthPolicyFor(100, true));
-}
-
-test "MtpCostSource: under the accept policy one clean time sample prices an unmeasured width" {
-    var t = round_cost.Table{};
-    for (0..round_cost.MIN_SAMPLES) |_| {
-        _ = t.observe(3, 1000, 45.0, 4.0, true, false);
-        _ = t.observe(4, 1000, 51.0, 5.0, true, false);
-    }
-    _ = t.observe(5, 1000, 57.0, 6.0, true, false);
-    var src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, &t);
-    const guarded = src.roundCost(5, false) / src.scale;
-    try testing.expect(guarded > 58.0);
-    src.table_tokens = false;
-    try testing.expectApproxEqAbs(@as(f32, 57.0), src.roundCost(5, false) / src.scale, 1e-3);
-}
-
-test "mtpProbePeriod: the probe date follows the acceptance EMAs, and one clearly worse sample still backs it off" {
-    var t = round_cost.Table{};
-    for (0..round_cost.MIN_SAMPLES) |_| {
-        _ = t.observe(2, 1000, 42.0, 3.0, true, false);
-        _ = t.observe(3, 1000, 48.0, 3.5, true, false);
-    }
-    const src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 1000, &t);
-    const cold = [_]f32{ 0.7, 0.6, 0.2, 0.5, 0.5, 0.5 };
-    const far = Generator.mtpProbePeriod(&cold, src, 2);
-    try testing.expect(far >= 48);
-    // The shallow indices saturate: the stale a[2] no longer holds the probe off.
-    const echo = [_]f32{ 1.0, 1.0, 0.2, 0.5, 0.5, 0.5 };
-    try testing.expect(Generator.mtpProbePeriod(&echo, src, 2) < far);
-    try testing.expectEqual(round_cost.EXPLORE_PERIOD_COLD, Generator.mtpProbePeriod(&echo, src, 3));
-    _ = t.observe(4, 1000, 70.0, 2.0, true, false);
-    try testing.expect(Generator.mtpProbePeriod(&echo, src, 3) >= 100);
+    try testing.expect(plan.m_hi > plan.m_lo);
+    try testing.expect(plan.tau_ln < 0.0);
 }

@@ -202,11 +202,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   confidence, maybe extend to m_hi) against single-chunk at m_lo, each as round wall over tokens. A round emits 1..m+1
   tokens, so each shape is judged on the running mean of `MTP_REGIME_MIN_SAMPLES` rounds or more; a verdict on one
   round per shape judged acceptance luck (the 40-70 ms/tok first verdicts on Flash-Next, then 128 rounds throttled).
-- **Below 8192 KV (Qwen) the base depth plans from the acceptance EMAs** (`MtpDepthPolicy.accept`): the table prices
-  round TIME only, the plan is ONE chunk (no confidence read mid-round), and an untimed next width is probed at once.
-  Long context and MiMo keep the table-token planner with chunk B. Greedy bytes are unchanged. Sushi-2.6bpw kv8,
-  solo, A B B A across four boots: about +2% average, code +4%, mixed +5%, prose/echo flat, within ~5% boot drift
-  ([perf-baselines](perf-baselines.md#mtp-depth-policy)).
+- **The base plan reads the table's realized tokens and keeps the confidence-gated chunk B at every KV.** One chunk
+  planned from the acceptance EMAs below 8192 KV (never shipped, reverted) ran depth ~5 rounds on 4bpw's llmprobe decode
+  for -11% and won 6% on its 2k rung: a wash ([perf-baselines](perf-baselines.md#mtp-depth-policy)).
 - Persistence is OPT-IN (`SUSHI_ROUND_COST_PERSIST=1`); an A/B with the table live measures the TABLE, so set
   `=0` on BOTH arms. A round's wall is between round ENDS, so an interleaved prefill chunk drops the round clock too.
 - **The EV seed lives on `Qwen4Mtp`** (`ev_seed_accept`/`ev_seed_m_lo`), per loaded model; publish AND consume

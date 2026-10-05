@@ -1395,16 +1395,34 @@ per step). Four concurrent requests decode 44 tok/s in aggregate against ~34 alo
 the `4fcb541e` table in [arch-glm5-next](arch-glm5-next.md#recorded-performance).
 
 <a id="mtp-depth-policy"></a>
-## MTP depth policy (acceptance EMAs below 8k KV)
+## MTP depth policy: one chunk from acceptance EMAs below 8k KV (reverted)
 
-Commit 81c36bb5, Sushi-2.6bpw, kv8, ctx 32768, solo greedy 256 tokens, 5 reps per prompt, `taskpolicy -a`, lock
-`qport-mtp`, shared box. A = accept policy, B = the previous planner (a pre-removal env switch, `SUSHI_MTP_DEPTH_POLICY=legacy`), boots A B B A, median tok/s:
+c3f29b8e planned a Qwen round below 8192 KV as ONE chunk priced from the acceptance EMAs, with no chunk B; it landed on
+a +2% average from solo 256-token prompts on Sushi-2.6bpw (ctx 32768), within the ~5% drift of its own boots. It never
+shipped and is reverted.
 
-| prompt | A1 | B1 | B2 | A2 |
+Its parent 1193f72f against it on Sushi-4bpw (settings below), decode cell median of 7, A B B A: 87.4 / 82.3 against
+77.4 / 73.3. The EMAs drove depth ~5 rounds (m_avg 5.06, no extension) at 48.3 ms per round, against m_avg 2.42 with
+chunk B at 31.8 ms. With the depth pinned at 3 (`SUSHI_MTP_FORCE_DEPTH=3`), 06a3187b matched v1.1.1 711572e9: decode
+93.8 / 94.3 against 92.4 / 90.6, round 33 ms on both.
+
+The revert against main, 26ef54dc against this change, both ReleaseFast, `--mtp --ctx-size 131072` kv8, llmprobe 0.6.12
+`--bench-only --rungs 2k,16k --runs 3`, `SUSHI_MTP_TRACE=1` on every arm, `taskpolicy -a`, lock per boot, fans max,
+quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
+
+| pack, cell | main | revert | revert | main |
 |---|---|---|---|---|
-| code | 83.4 | 78.2 | 75.6 | 76.5 |
-| prose | 62.0 | 62.9 | 61.0 | 61.6 |
-| echo | 93.6 | 96.2 | 90.6 | 92.5 |
-| mixed | 71.8 | 66.6 | 66.7 | 68.6 |
+| Sushi-4bpw, decode | 87.9 | 87.1 | 91.2 | 77.3 |
+| Sushi-4bpw, 2k rung | 85.2 | 80.0 | 75.0 | 79.0 |
+| Sushi-4bpw, 16k rung | 82.3 | 80.4 | 79.7 | 79.6 |
+| Sushi-2.6bpw, decode | 90.8 | 85.2 | 76.4 | 83.4 |
+| Sushi-2.6bpw, 2k rung | 81.7 | 84.4 | 82.4 | 82.1 |
+| Sushi-2.6bpw, 16k rung | 82.3 | 77.9 | 81.0 | 82.9 |
 
-Output hashes are identical in all four boots. A logs `ext_rounds=0`, B extends. About +2% average, code +4%, mixed +5%, prose/echo flat, within ~5% boot drift.
+- On 4bpw's decode prompt main's rounds run m_avg 5.11 / 4.43 at 43.0 / 45.0 ms with no extension, the revert's
+  m_avg 2.64 / 3.13 at 32.3 / 36.6 ms with extensions on 13-15% of rounds.
+- On 4bpw's 2k rung the one-chunk plan accepts more per round at a similar round time (2.70 / 2.31 against 1.75 /
+  2.48), so it wins there.
+- On 2.6bpw it does not go deep (m_avg 3.2) and tokens per ms are equal.
+- Above 8192 KV both arms run the same planner. Against v1.1.1 on 4bpw in other boots that day (decode 80.8-89.4,
+  2k rung 76.1-82.5; llmprobe 0.6.12 and 0.6.13) the revert is at parity.
