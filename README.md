@@ -23,32 +23,11 @@ MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%) against 
 
 ## Install
 
-With Homebrew (adds the `beamivalice/tap` tap and installs sushi in one command):
 ```bash
 brew install beamivalice/tap/sushi
 ```
 
-Update with `brew upgrade sushi`
-
-With Tarball.
-```bash
-curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz | tar xz
-./sushi-macos-arm64/sushi --version
-```
-
-Update with `sushi update` (or the button in the chat page).
-
-Build from source (needs Xcode 26.2+ with its Metal toolchain; `brew bundle` installs cmake and webp):
-```bash
-git clone --recurse-submodules https://github.com/beamivalice/sushi && cd sushi
-brew bundle
-./scripts/fetch-zig.sh && ./scripts/build-mlx.sh
-.zig-toolchain/zig build -Doptimize=ReleaseFast
-mkdir -p ~/.local/bin && ln -s "$PWD/zig-out/bin/sushi" ~/.local/bin/sushi   # or any directory on your PATH
-```
-
-To update a source checkout, pull with `git pull --recurse-submodules` (or run `git submodule update --init` after a
-plain pull) before `./scripts/build-mlx.sh`: the script refuses a submodule left at an older pin.
+Update with `brew upgrade sushi`.
 
 The server listens on `127.0.0.1:12345`. The model's own draft head (MTP for Qwen and MiMo, a DFlash2 assistant for
 GLM) and the 8-bit KV cache are on by default.
