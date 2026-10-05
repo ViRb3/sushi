@@ -2652,21 +2652,6 @@ fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
     sch.load_failed.store(true, .release);
 }
 
-/// Heap-allocate `T`, run `init_fn`, return owning pointer. On `init_fn`
-/// failure, the heap slot is freed before the error propagates so the
-/// scheduler never holds a half-initialized struct.
-fn boxInit(
-    allocator: std.mem.Allocator,
-    comptime T: type,
-    init_fn: anytype,
-    args: anytype,
-) !*T {
-    const ptr = try allocator.create(T);
-    errdefer allocator.destroy(ptr);
-    ptr.* = try @call(.auto, init_fn, args);
-    return ptr;
-}
-
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
 pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {

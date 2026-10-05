@@ -13599,62 +13599,6 @@ fn qsaSourceHoldsRowsAt(src: *const SSMCheckpoint, pos: c_int, want: c_int) bool
     return any;
 }
 
-/// One QSA layer's history onto `dst_aux`/`dst_pooled`, sliced to `take` rows
-/// (pooled to `take/ratio` blocks). `materialize` = a fresh buffer (a trim must free the snap
-/// it drops); false = refcount-share the source (a full-length share is the same handle, a
-/// sliced one an `mlx_slice` view). `take <= 0` leaves the destination empty.
-fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src_aux: mlx.mlx_array, src_pooled: mlx.mlx_array, ratio: c_int, src_hist: c_int, take: c_int, materialize: bool, s: mlx.mlx_stream) !void {
-    if (dst_aux.ctx != null) _ = mlx.mlx_array_free(dst_aux.*);
-    dst_aux.* = .{ .ctx = null };
-    if (dst_pooled.ctx != null) _ = mlx.mlx_array_free(dst_pooled.*);
-    dst_pooled.* = .{ .ctx = null };
-    if (take <= 0) return;
-    if (src_pooled.ctx != null) {
-        if (materialize) {
-            dst_pooled.* = try materializedOwnedCopy(s, src_pooled);
-        } else {
-            dst_pooled.* = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(dst_pooled, src_pooled));
-        }
-        try truncatePooled(dst_pooled, take, ratio, s, materialize);
-    }
-    if (src_aux.ctx == null) return;
-    const ks = mlx.getShape(src_aux);
-    if (ks.len < 2) return;
-    const src_ring: c_int = ks[1];
-    const hist: c_int = if (src_hist > 0) src_hist else src_ring;
-    const dest_take: c_int = @min(take, hist);
-    const src_start: c_int = hist - src_ring;
-    const want_start: c_int = if (dest_take > QSA_RING_ROWS) dest_take - QSA_RING_ROWS else 0;
-    const ov_start = @max(src_start, want_start);
-    const ov_end = @min(hist, dest_take);
-    if (ov_end <= ov_start) return;
-    const phys_from = ov_start - src_start;
-    const phys_to = ov_end - src_start;
-    const full = phys_from == 0 and phys_to == src_ring;
-    if (full and !materialize) {
-        dst_aux.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(dst_aux, src_aux));
-    } else if (full) {
-        dst_aux.* = try materializedOwnedCopy(s, src_aux);
-    } else {
-        const start = [_]c_int{ 0, phys_from, 0 };
-        const stop = [_]c_int{ ks[0], phys_to, ks[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        var view = mlx.mlx_array_new();
-        mlx.check(mlx.mlx_slice(&view, src_aux, &start, 3, &stop, 3, &strides, 3, s)) catch |err| {
-            _ = mlx.mlx_array_free(view);
-            return err;
-        };
-        if (materialize) {
-            defer _ = mlx.mlx_array_free(view);
-            dst_aux.* = try materializedOwnedCopy(s, view);
-        } else {
-            dst_aux.* = view;
-        }
-    }
-}
-
 /// Copy QSA aux/pooled from the live entries onto the LATEST checkpoint —
 /// ONE materialized copy, sliced to that checkpoint's position (a cancel
 /// handoff attaches while the live history is ahead of the last stride
@@ -22465,21 +22409,6 @@ pub const Transformer = struct {
         }
     }
 
-    /// Index `i` of `arr` along `axis` as an owned view handle (the axis keeps size 1).
-    fn axisView(s: mlx.mlx_stream, arr: mlx.mlx_array, axis: usize, i: usize) !mlx.mlx_array {
-        const shape = mlx.getShape(arr);
-        var start: [8]c_int = @splat(0);
-        var stop: [8]c_int = @splat(0);
-        const strides: [8]c_int = @splat(1);
-        for (0..shape.len) |d| stop[d] = shape[d];
-        start[axis] = @intCast(i);
-        stop[axis] = @intCast(i + 1);
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_slice(&out, arr, &start, @intCast(shape.len), &stop, @intCast(shape.len), &strides, @intCast(shape.len), s));
-        return out;
-    }
-
     /// Can these slots take ONE batched GDN decode tick? Every slot must
     /// already carry initialized state for every linear layer — that is true
     /// after any prefill, and false for a slot that has not run one, whose
@@ -22501,12 +22430,6 @@ pub const Transformer = struct {
         return true;
     }
 
-    /// Does this transformer support `forwardMoeBatchedDecode`? The GDN trunk
-    /// shape only — the archs that share `forwardMoeWith` but add per-layer
-    /// state or routing of their own (inkling short-convs, laguna, MLA,
-    /// gemma4 MoE) are NOT covered and must keep the serial path. Asked by
-    /// the scheduler's batching gate, so a new arch on this forward defaults
-    /// to serial instead of silently riding a path that never modelled it.
     pub fn supportsBatchedGlmRows(self: *const Transformer) bool {
         const glm = self.glm5 orelse return false;
         return self.config.supportsBatchedGlmRows() and glm.expert_stream == null;
@@ -22524,24 +22447,11 @@ pub const Transformer = struct {
     }
 
     pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
-        // Arch question: ONE predicate, shared with server.zig's
-        // --max-concurrent clamp so the two cannot disagree about whether
-        // this model batches.
+        // Share the architecture gate with the server's concurrency clamp.
         if (!self.config.supportsBatchedGdnDecode()) return false;
-        // Built-state question: this path reads `moe_layers` and the GDN
-        // ssm entries, so the trunk must actually be that shape.
+        // The loaded trunk must supply MoE layers and per-slot GDN state.
         if (self.moe_layers == null) return false;
         if (self.hybrid_layers != null or self.dsv4 != null or self.glm5 != null) return false;
-        // Every layer must be one of the two shapes this path handles.
-        for (self.moe_layers.?) |*lw| {
-            switch (lw.mlp) {
-                .dense => {},
-                // Routed experts are row-generic (`moeMLP` sorts B*S rows); the
-                // config predicate already named which MoE trunks' per-slot state
-                // this path merges.
-                .moe => {},
-            }
-        }
         return true;
     }
 
@@ -36726,19 +36636,12 @@ fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
     cache.* = v;
     return v;
 }
-/// The diagnostic-switch decision, split from the `getenv` so it is testable.
+/// Diagnostic switches are off for empty values and values beginning with `0`.
 pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
     return v[0] != 0 and v[0] != '0';
 }
-/// Diagnostic env switch: set to a value that is neither empty nor `0`. A
-/// harness exporting `FOO=0` or `FOO=` must never arm a sync profiler (the
-/// qwen4 MTP verify once measured 70 ms).
-
-/// SUSHI_MOE_DUMP=<dir>: one forward's MoE tensors, per layer, as raw f32
-/// with the shape in the file name. Off by default; the dir is read once. Two
-/// packs that share a trunk must agree at the first MoE layer, so this is the
-/// only way to say WHERE two loads of the same model start to differ.
+/// SUSHI_MOE_DUMP=<dir> writes one forward's MoE tensors as raw f32, with shapes in filenames.
 var moe_dump_dir: ?[]const u8 = null;
 var moe_dump_asked: bool = false;
 var moe_dump_layer: u32 = 0;
@@ -43394,34 +43297,6 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
     prefill_dq_gemm_engaged += 1;
     return out;
-}
-
-/// Extract timestep t from a [B, T, H, D] tensor → [B, H, D]
-fn sliceTimestep4(arr: mlx.mlx_array, batch: c_int, heads: c_int, dim: c_int, t: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const start = [_]c_int{ 0, t, 0, 0 };
-    const stop = [_]c_int{ batch, t + 1, heads, dim };
-    const strides = [_]c_int{ 1, 1, 1, 1 };
-    var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
-    try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 4, &stop, 4, &strides, 4, s));
-    const out_shape = [_]c_int{ batch, heads, dim };
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 3, s));
-    return result;
-}
-
-/// Extract timestep t from a [B, T, H] tensor → [B, H]
-fn sliceTimestep3(arr: mlx.mlx_array, batch: c_int, heads: c_int, t: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const start = [_]c_int{ 0, t, 0 };
-    const stop = [_]c_int{ batch, t + 1, heads };
-    const strides = [_]c_int{ 1, 1, 1 };
-    var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
-    try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 3, &stop, 3, &strides, 3, s));
-    const out_shape = [_]c_int{ batch, heads };
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 2, s));
-    return result;
 }
 
 fn getWeightFmt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const u8, prefix: []const u8) error{MissingWeight}!mlx.mlx_array {

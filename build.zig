@@ -13,11 +13,7 @@ comptime {
 }
 
 pub fn build(b: *std.Build) void {
-    // Pin LC_BUILD_VERSION minos to macOS 26.2 — the honest floor: the linked
-    // libmlx is built at deployment target 26.2 (NAX kernels, scripts/
-    // build-mlx.sh), so on older macOS the binary can't run anyway; failing at
-    // the binary with a clear dyld version error beats "loading" and dying on
-    // the dylib. Guard: tests/test_mlx_staged_nax.sh (binary minos check).
+    // Match libmlx's macOS 26.2 deployment target, required by its NAX kernels.
     const target = b.standardTargetOptions(.{
         .default_target = .{
             .os_version_min = .{ .semver = .{ .major = 26, .minor = 2, .patch = 0 } },
@@ -55,12 +51,7 @@ pub fn build(b: *std.Build) void {
         std.process.exit(1);
     };
 
-    // Engine-version pins surfaced by `sushi --version` (the macOS app spawns
-    // it and parses the output — see src/version.zig). These are the versions
-    // that have NO runtime query API (MLX reports itself at runtime):
-    //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
-    //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
-    // The mlx submodule commit rides along for `sushi --guest-manifest`.
+    // MLX reports its version at runtime; mlx-c and the guest manifest need build-time pins.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxPin(b, "mlxc=") orelse "unknown";
     const mlx_sha = readMlxPin(b, "mlx=") orelse "";
 
@@ -85,8 +76,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Jinja2 template engine (wangzhaode/jinja.cpp + nlohmann/json; see NOTICE).
-    // Pre-compiled as a static library with system clang++ (C++17 requires system libc++).
-    // Rebuild with: cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o
+    // Precompiled with system clang++ for C++17's system libc++; rebuild instructions in CLAUDE.md.
     mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
@@ -95,16 +85,9 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
     mod.addIncludePath(b.path("lib"));
 
-    // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
-    // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
-    // returns unavailable on machines/OSes without it) + the per-layer MLP
-    // MIL program builder. See lib/ane/ + src/ane.zig; provenance in NOTICE.
     addAneSources(b, mod);
 
-    // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
-    // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
-    // enabled (the Homebrew bottle ships without them). MUST come before the
-    // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
+    // The staged MLX library path must precede Homebrew's.
     addMlxLib(b, mod);
     _ = addExl3Module(b, mod, target, optimize);
     // webp include/lib paths (homebrew)
@@ -209,9 +192,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(exl3_tests).step);
 }
 
-/// Translates a single C header into an importable module (`@import("name")`
-/// at the call site) via `addTranslateC`, replacing an inline `@cImport` —
-/// removed as a language builtin in 0.17.
 fn addCHeaderModule(
     b: *std.Build,
     header_path: std.Build.LazyPath,
@@ -228,9 +208,7 @@ fn addCHeaderModule(
     return translate.createModule();
 }
 
-/// ANE prefill offload sources (lib/ane): the private-framework bridge and
-/// the per-layer MLP program builder, both ARC objc. Runtime-probed —
-/// compiling them in costs nothing on machines without the framework.
+/// ARC bridge to AppleNeuralEngine, dlopen'd and checked for availability at runtime.
 fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     const objc_flags = &[_][]const u8{
         "-O3",
@@ -261,34 +239,19 @@ fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.Resol
     return exl3;
 }
 
-/// Link the self-built mlx + mlx-c staged in lib/mlx by scripts/build-mlx.sh
-/// (pinned submodules lib/mlx-src + lib/mlxc-src, deployment target 26.2 so
-/// MLX's NAX kernels are compiled in — the Homebrew bottle ships without them
-/// and hard-wires is_nax_available() false even on M5). Install names are
-/// @rpath/...; the build-tree rpath resolves them in dev, release.yml
-/// rewrites them to @executable_path and re-signs for the release tarball.
-/// Guard test: tests/test_mlx_staged_nax.sh.
+/// Link the NAX-enabled libraries staged by scripts/build-mlx.sh.
+/// Release packaging rewrites their @rpath install names to @executable_path.
 fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("lib/mlx/include"));
     module.addLibraryPath(b.path("lib/mlx/lib"));
-    // use_pkg_config = .no: a leftover Homebrew mlx-c ships an mlx-c.pc that
-    // would otherwise hijack this link — we want exactly the staged
-    // NAX-enabled pair.
+    // Prevent Homebrew's mlx-c.pc from overriding the staged libraries.
     module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
-    // @loader_path resolves against the BINARY's own location at launch, not
-    // the launching process's cwd, so this stays correct from any launch cwd
-    // and survives copying the whole zig-out + lib tree elsewhere. Two entries
-    // because the installed exe (zig-out/bin/) and the `zig build test` binary
-    // (.zig-cache/o/<hash>/) sit at different depths under the build root; dyld
-    // tries every LC_RPATH in order and skips the one that does not resolve.
+    // Binary-relative paths cover zig-out/bin and .zig-cache/o/<hash> respectively.
     module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/mlx/lib" });
     module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/mlx/lib" });
 }
 
-/// Configure-time check that scripts/build-mlx.sh has staged the pinned
-/// mlx/mlx-c build. Mirrors verifyBrewDeps: fail loudly with the fix, never
-/// let the linker produce a confusing -lmlxc error (or silently pick up a
-/// leftover brew copy from /opt/homebrew/lib).
+/// Fail before linking if the local MLX stage is missing.
 fn verifyMlxStage(b: *std.Build) void {
     const stage_ok = blk: {
         buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlxc.dylib", .{}) catch break :blk false;
@@ -326,8 +289,6 @@ fn readMlxPin(b: *std.Build, key: []const u8) ?[]const u8 {
 const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
 
 const required_brew_deps = [_]BrewDep{
-    // mlx + mlx-c are NOT brew deps anymore: they are pinned submodules built
-    // by scripts/build-mlx.sh (see addMlxLib) so the NAX kernels ship enabled.
     .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };
 

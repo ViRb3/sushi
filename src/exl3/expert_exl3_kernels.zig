@@ -3066,31 +3066,6 @@ fn repeatRows(s: mlx.mlx_stream, x: mlx.mlx_array, rows: c_int, topk: c_int) !ml
     return out;
 }
 
-fn projectSorted(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, slots: mlx.mlx_array) !mlx.mlx_array {
-    var order = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(order);
-    try mlx.check(mlx.mlx_argsort_axis(&order, slots, 0, s));
-    var sorted_slots = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted_slots);
-    try mlx.check(mlx.mlx_take_axis(&sorted_slots, slots, order, 0, s));
-    var sorted_x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted_x);
-    try mlx.check(mlx.mlx_take_axis(&sorted_x, x, order, 0, s));
-    const prepared = try prepareIndexed(s, sorted_x, suh, sorted_slots);
-    defer _ = mlx.mlx_array_free(prepared);
-    const inner = try innerGemmSorted(s, prepared, trellis, sorted_slots);
-    defer _ = mlx.mlx_array_free(inner);
-    const finished = try finishIndexed(s, inner, svh, sorted_slots);
-    defer _ = mlx.mlx_array_free(finished);
-    var inv = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(inv);
-    try mlx.check(mlx.mlx_argsort_axis(&inv, order, 0, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_take_axis(&out, finished, inv, 0, s));
-    return out;
-}
-
 fn projectSortedWithRuns(
     s: mlx.mlx_stream,
     x_sorted: mlx.mlx_array,

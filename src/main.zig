@@ -1712,14 +1712,6 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     return @as(u64, max_rec) * 4 / 5;
 }
 
-fn dirBasename(path: []const u8) []const u8 {
-    var p = path;
-    while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-    if (p.len == 0) return p;
-    if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| return p[i + 1 ..];
-    return p;
-}
-
 /// Headless serve mode: start with NO primary model. The registry holds all
 /// discovery stubs; chat AND media models load on demand via `/v1/load-model`
 /// (or a request targeting a discovered id), coexisting under one memory

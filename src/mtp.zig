@@ -1229,19 +1229,6 @@ pub fn shortlistArgmax(s: mlx.mlx_stream, sl: Shortlist) !mlx.mlx_array {
     return out;
 }
 
-fn rerankRescoreRow(
-    s: mlx.mlx_stream,
-    target: *Transformer,
-    coarse: *?RerankCoarse,
-    flat: mlx.mlx_array,
-    rows: c_int,
-    x_row: mlx.mlx_array,
-) !?mlx.mlx_array {
-    var sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x_row)) orelse return null;
-    defer sl.deinit();
-    return try shortlistArgmax(s, sl);
-}
-
 /// The coarse full-vocab readout of one row as a flat `[rows]` array, reserved
 /// ids already at `-inf` — the front half every rerank draft shares.
 fn rerankCoarseFlat(
