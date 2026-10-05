@@ -1426,3 +1426,7 @@ quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
 - On 2.6bpw it does not go deep (m_avg 3.2) and tokens per ms are equal.
 - Above 8192 KV both arms run the same planner. Against v1.1.1 on 4bpw in other boots that day (decode 80.8-89.4,
   2k rung 76.1-82.5; llmprobe 0.6.12 and 0.6.13) the revert is at parity.
+
+## v1.2.0-dev release context ladder
+
+[Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

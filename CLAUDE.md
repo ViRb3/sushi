@@ -47,6 +47,7 @@ doc for the area before changing it, and update it in the same landing.
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, ownership, media |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, `__metadata__` stamp, window, g-scale in `suh`, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | roofline, recorded tok/s tables with binaries and settings, ruled-out levers |
+| [docs/bench/v1.2.0-dev/summary.md](docs/bench/v1.2.0-dev/summary.md) | version-pinned release context ladder and individual model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, KLD of every served pack |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
