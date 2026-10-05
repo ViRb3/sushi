@@ -15,6 +15,12 @@ stand-alone and also as a guest engine inside mlx-serve.
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
 * GLM-5.3-Flash (`glm5_next`): text, image and video input; its Sushi pack is not published yet
 
+## Quality
+
+<p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
+
+MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%) against the original MOPD checkpoint.
+
 ## Install
 
 With Homebrew (adds the `beamivalice/tap` tap and installs sushi in one command):
@@ -46,11 +52,6 @@ plain pull) before `./scripts/build-mlx.sh`: the script refuses a submodule left
 
 The server listens on `127.0.0.1:12345`. The model's own draft head (MTP for Qwen and MiMo, a DFlash2 assistant for
 GLM) and the 8-bit KV cache are on by default.
-
-**GLM-5.3-Flash notes.** `--kv-quant 16` keeps the MLA latent at BF16 instead of 8 bits. A `dflash2/` folder in the
-pack loads the DFlash2 assistant (`--drafter <dir>` overrides it, `--no-drafter` turns it off); a pack that ships only
-the BF16 assistant gets a 4-bit copy prepared on first load. Vision loads by default (`--no-vision` leaves it out).
-`--think low|high|max` picks the reasoning instruction (default high). Details: [docs/arch-glm5-next.md](docs/arch-glm5-next.md).
 
 ## Memory
 
@@ -187,17 +188,6 @@ sushi launch omp
 pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched and
 the session does not see your other providers, settings or history; claude, opencode and aider reach the server
 through environment variables. `--print` writes the config and prints the launch script instead of running it.
-
-## Quality
-
-<p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
-
-KLD against the bf16 model: 16 prompts x 512 tokens scored to the first EOS, kv8, every pack scored by sushi (Sushi-2bpw
-with a bf16 KV cache). Each pack is plotted with the n-gram table it ships: bf16 in Sushi-4bpw, 4-bit in Sushi-2bpw,
-Sushi-2.6bpw and Sushi-3bpw; either table works with any pack. Numbers: [docs/quality-kld.md](docs/quality-kld.md).
-
-MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%) against the original MOPD checkpoint, same
-method.
 
 ## Speed
 
