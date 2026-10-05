@@ -141,7 +141,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,
   `194351a3`). A failure after the hand-over leaves the request failed.
 - **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order; three-row A6
-  QKV hoists coefficient decode out of the row loop (exact, −12.4%); the retained BF16 KDA projections run as column
+  projections hoist coefficient decode out of the row loop (QKV component −12.4%; extending to the other supported
+  projections cuts whole verification by about 2%, [measurement](perf-baselines.md#glm-three-row-a6)); the retained BF16 KDA projections run as column
   GEMVs with rows in the batch grid (exact; stock multi-row `Linear` is not); the router batches up to 16 rows.
   Sampled rounds use the same batched rows: their logits equal per-row serial projections bit for bit (215 real 8K
   rounds, every tape and capture too); per-row projections cost 64.2 vs 54.2 ms of verify per round and sampled 8K

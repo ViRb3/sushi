@@ -105,7 +105,6 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     const sh = mlx.getShape(x);
     const ws = mlx.getShape(linear.w);
     if (sh.len != 3 or sh[0] != 1 or sh[1] != 3 or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0) return null;
-    if (sh[2] != 4096 or ws[0] != 8192) return null;
     const bits: c_int = if (ws[1] == @divExact(sh[2], 4)) 8 else if (@as(i64, ws[1]) * 16 == @as(i64, sh[2]) * 3) 6 else return null;
     if (bits != 6) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(linear.w) != .uint32 or !(try rowMajorReady(linear.w))) return null;
