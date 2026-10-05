@@ -6362,7 +6362,10 @@ pub fn glmDflashRequestBytes(config: *const model_mod.ModelConfig, chunk: u64) u
 /// What a GLM DFlash2 request may still allocate when it reserves its verifier capacity right after
 /// prefill: its admission bill at the narrowest width (no width bills less) less what it holds.
 pub fn glmDflashReserveBudget(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, held: u64) u64 {
-    return prefillNeededAtChunk(config, seq, max_tokens, kv_bits, 1, .{}) -| held;
+    // `max_tokens` is already clamped to admission's context; the caller's config copy is not pinned to it.
+    var sized = config.*;
+    sized.pinned_context = @intCast(@min(seq +| max_tokens, std.math.maxInt(u32)));
+    return prefillNeededAtChunk(&sized, seq, max_tokens, kv_bits, 1, .{}) -| held;
 }
 
 /// A native GLM request's latent and pooled-index capacity at its eventual length.
@@ -7171,6 +7174,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         else
             try allocator.dupe(u8, base);
         defer allocator.free(msg);
+        countRejected();
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -9471,6 +9475,7 @@ fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -9756,6 +9761,7 @@ fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -10043,6 +10049,7 @@ fn handleStreamingCompletion(
         defer allocator.free(token_text);
 
         stopped = stop_gate.matched != null;
+        if (stopped) slot_handle.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             if (stopped) break;
             continue;
@@ -10206,10 +10213,18 @@ fn drainSlotTokens(slot: anytype, conn: ?*Conn, allocator: std.mem.Allocator, ou
             }
         }
         if (early) |e| if (try e.observe(allocator, output_ids.items)) {
-            slot.cancel();
+            slot.cancelOnStop();
             return .stopped;
         };
     }
+}
+
+/// `drainSlotTokens`, then, after an early stop, wait out the inference pass still publishing and accounting
+/// the cancelled slot: its statistics are plain fields that only a quiet slot lets the caller read.
+fn drainSettled(sch: *scheduler_mod.Scheduler, slot: *scheduler_mod.Slot, conn: ?*Conn, allocator: std.mem.Allocator, output_ids: *std.ArrayList(u32), early: ?*EarlyStop) !DrainEnd {
+    const end = try drainSlotTokens(slot, conn, allocator, output_ids, early);
+    if (end == .stopped) sch.quiesce(slot);
+    return end;
 }
 
 /// Run a non-streaming generation through the scheduler. Returns the same
@@ -10297,7 +10312,7 @@ fn nonStreamingViaScheduler(
         .strip_leading = tok.tok_type == .sentencepiece_bpe and (sampling.constraint == null or sampling.constraint.?.proto == null),
     } else null;
     defer if (early) |*e| e.gate.deinit(allocator);
-    const end = try drainSlotTokens(slot, conn, allocator, &output_ids, if (early) |*e| e else null);
+    const end = try drainSettled(sch, slot, conn, allocator, &output_ids, if (early) |*e| e else null);
     if (end == .failed) return slotFailure(slot);
     const client_gone = end == .client_gone;
 
@@ -10347,7 +10362,8 @@ fn nonStreamingViaScheduler(
         .text = text,
         .token_ids = token_ids,
         .prompt_tokens = slot.prompt_tokens,
-        .completion_tokens = slot.completion_tokens,
+        // An early stop reports the tokens it returned, not the ones decoded past the stop.
+        .completion_tokens = if (end == .stopped) @intCast(token_ids.len) else slot.completion_tokens,
         .finish_reason = nonStreamFinishReason(client_gone, slot.finish_reason),
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
@@ -11354,6 +11370,7 @@ fn handleStreamingGeneration(
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
         stopped = stop_gate.matched != null;
+        if (stopped) slot_handle.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             allocator.free(token_text);
             if (stopped) break;
@@ -13248,6 +13265,11 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
         }
     }
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+}
+
+/// A request refused before it owned a slot. A null sink (metrics off) is one branch.
+fn countRejected() void {
+    if (g_metrics) |m| m.recordRejected();
 }
 
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
@@ -16300,6 +16322,7 @@ fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -16858,6 +16881,7 @@ fn handleAnthropicStreaming(
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
         stopped = stop_gate.matched != null;
+        if (stopped) slot_handle.?.stop_hit.store(true, .release);
         if (token_text.len == 0) {
             allocator.free(token_text);
             if (stopped) break;
@@ -17994,6 +18018,7 @@ fn handleResponsesInner(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -18332,6 +18357,7 @@ fn handleResponsesInner(
             defer allocator.free(token_text);
 
             stopped = stop_gate.matched != null;
+            if (stopped) slot_handle.?.stop_hit.store(true, .release);
             if (token_text.len == 0) {
                 if (stopped) break;
                 continue;
@@ -25795,7 +25821,8 @@ test "a late system turn keeps each turn's prompt a prefix of the next where the
     const Template = struct { tpl: []const u8, places_late_system: bool };
     const templates = [_]Template{
         .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .places_late_system = true },
-        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .places_late_system = false },
+        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .places_late_system = true },
+        .{ .tpl = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .places_late_system = false },
     };
     for (templates) |t| {
         inline for (.{ .{ .responses, responses_n, responses_next, "approvals: never" }, .{ .messages, messages_n, messages_next, "hook: started" } }) |c| {
@@ -26451,6 +26478,31 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
     }
 }
 
+test "GLM DFlash2 reserve fits the admission bill when max_tokens fills the advertised context" {
+    const reserve = @import("glm5_dflash_reserve.zig");
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
+    cfg.glm_dflash_loaded = true;
+    var mla_layers: usize = 0;
+    for (0..cfg.num_hidden_layers) |l| mla_layers += @intFromBool(!cfg.isLinearLayer(@intCast(l)));
+    const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
+    for ([_]struct { bits: u64, ctx: u32 }{ .{ .bits = 8, .ctx = 1048576 }, .{ .bits = 16, .ctx = 524288 } }) |arm| {
+        cfg.pinned_context = arm.ctx;
+        const latent_row: usize = if (arm.bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
+        for ([_]usize{ 16, 2008, 100000 }) |seq| {
+            const max_tokens: u32 = @intCast(arm.ctx - seq);
+            const lc = try reserve.capacity(seq);
+            const pc = try reserve.capacity(seq / 4);
+            const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+            const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
+            const peak = try reserve.statesPeak(mla_layers, p);
+            // The generator's config copy is never pinned: it resolves its own, smaller context.
+            var unpinned = cfg;
+            unpinned.pinned_context = arm.ctx / 4;
+            try std.testing.expect(peak <= glmDflashReserveBudget(&unpinned, seq, max_tokens, arm.bits, held));
+        }
+    }
+}
+
 test "GLM vision serving processor carries image and video token budgets without M-RoPE" {
     const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const processor = visionPreprocFromConfig(&cfg);
@@ -26756,10 +26808,86 @@ test "a request refused after its media was encoded hands the embeddings to the 
     }
 }
 
+/// Plays the inference thread's decode tick: publishes `n` tokens, then accounts them one by one
+/// with `gap_ms` between steps, all inside one `in_pass`.
+const TickPlayer = struct {
+    slot: *scheduler_mod.Slot,
+    n: u32,
+    gap_ms: i64,
+
+    fn run(self: *TickPlayer) void {
+        const io = self.slot.io;
+        var i: u32 = 0;
+        while (i < self.n) : (i += 1) self.slot.pushTokenWithLogprob(i + 1, null);
+        std.Io.sleep(io, .fromMilliseconds(self.gap_ms), .real) catch {};
+        i = 0;
+        while (i < self.n) : (i += 1) {
+            self.slot.completion_tokens += 1;
+            std.Io.sleep(io, .fromMilliseconds(self.gap_ms), .real) catch {};
+        }
+        self.slot.decode_ns +|= 777;
+        _ = self.slot.in_pass.fetchSub(1, .acq_rel);
+    }
+};
+
+fn expectSettledAfterEarlyStop(published: u32) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    try tok.id_to_token.put(1, "S");
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.io = io;
+    sch.queue_mu = .init;
+    var slot: scheduler_mod.Slot = undefined;
+    slot.io = io;
+    slot.allocator = a;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.out_buf = .empty;
+    defer slot.out_buf.deinit(a);
+    slot.logprobs_buf = .empty;
+    slot.out_idx = 0;
+    slot.handover_token = null;
+    slot.cancelled = .init(false);
+    slot.finished = false;
+    slot.error_code = null;
+    slot.completion_tokens = 0;
+    slot.decode_ns = 0;
+    slot.in_pass = .init(1);
+
+    var player = TickPlayer{ .slot = &slot, .n = published, .gap_ms = 20 };
+    const t = try std.Thread.spawn(.{}, TickPlayer.run, .{&player});
+    const stops = [_][]const u8{"S"};
+    var early = EarlyStop{ .tok = &tok, .gate = .{ .stops = &stops }, .completion_skip_special = null, .strip_leading = false };
+    defer early.gate.deinit(a);
+    var out = std.ArrayList(u32).empty;
+    defer out.deinit(a);
+    const end = try drainSettled(&sch, &slot, null, a, &out, &early);
+    // Read exactly as the result builder does, before the player is joined.
+    const settled_tokens = slot.completion_tokens;
+    const settled_ns = slot.decode_ns;
+    t.join();
+    try std.testing.expectEqual(DrainEnd.stopped, end);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(published, settled_tokens);
+    try std.testing.expectEqual(@as(u64, 777), settled_ns);
+}
+
+test "a non-stream early stop reads usage and timing only after the tick that published its token settles" {
+    try expectSettledAfterEarlyStop(1);
+}
+
+test "a non-stream early stop inside a speculative block settles the whole block's accounting" {
+    try expectSettledAfterEarlyStop(4);
+}
+
 const FakeSlot = struct {
     tokens: []const u32,
     next: usize = 0,
     cancelled: bool = false,
+    stop_hit: bool = false,
 
     fn waitNextTimeout(self: *FakeSlot, _: i64) ?scheduler_mod.NextResult {
         if (self.cancelled or self.next == self.tokens.len) return .{ .done = {} };
@@ -26769,6 +26897,11 @@ const FakeSlot = struct {
 
     fn cancel(self: *FakeSlot) void {
         self.cancelled = true;
+    }
+
+    fn cancelOnStop(self: *FakeSlot) void {
+        self.stop_hit = true;
+        self.cancel();
     }
 };
 
@@ -26791,6 +26924,7 @@ fn expectNonStreamStopsAt(stop: []const u8, pieces: []const []const u8, stop_tok
     try std.testing.expectEqual(DrainEnd.stopped, end);
     try std.testing.expectEqual(stop_token, out.items.len);
     try std.testing.expect(slot.cancelled);
+    try std.testing.expect(slot.stop_hit);
 }
 
 test "a non-stream generation ends on the token that completes a stop" {
@@ -26812,4 +26946,19 @@ test "a non-stream generation without a stop in its text runs to the end" {
     defer out.deinit(a);
     try std.testing.expectEqual(DrainEnd.done, try drainSlotTokens(&slot, null, a, &out, &early));
     try std.testing.expectEqual(@as(usize, 3), out.items.len);
+}
+
+test "countRejected moves only the rejected counter, and does nothing with metrics off" {
+    const saved = g_metrics;
+    defer g_metrics = saved;
+
+    g_metrics = null;
+    countRejected();
+
+    var m = instr.Metrics.init();
+    g_metrics = &m;
+    countRejected();
+    try std.testing.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
+    try std.testing.expectEqual(@as(u64, 0), m.requests_failed_total.load());
+    try std.testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
 }

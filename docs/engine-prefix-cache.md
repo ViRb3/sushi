@@ -146,12 +146,21 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
   discarding RAM); writes ride `kv_disk_writer.zig` (FIFO, `meta.json` last, epoch fence at the ONE removal site);
   per-chunk write-through; a diverging turn hard-links the donor's LANDED chunks; a full-prefix hit CHECKS the entry
   OUT so the first append donates.
+- **The free-space probe runs only before an actual store** (after the superseded check): the idle spill commits every
+  idle entry at each request finish, so a copy already on disk must cost no probe; below the store floor it still
+  counts as persisted. The probe's budget GC swap-removes entries, so the extend/SSM-only candidate is selected
+  AGAIN after it (`selectStoreTarget`); an index held across a probe names another entry.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
   below every refusal; `releaseCheckout` hands an undonated entry back intact).
 - **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's
   admission pass): a full-entry hit is checked out on demand and billed as donated. The tradeoff: a request that
   fails after donating loses the entry. Disk checkpoints come off the TOP of
   the flush budget; the disk tier serves the pre-media text prefix only.
+- **A media commit persists its text to the SSD tier, never a media row** (`diskTextLen`): the record stops at the
+  first item (none when the boundary is unknown), a hybrid at its last checkpoint at or below it (`hybrid`, set at
+  load; the QSA bank is sliced onto that checkpoint), a ringed cache only where a ring checkpoint sits at or below
+  it. Spec snapshots (DFlash window, MTP history) are not persisted with a cut record. Idle spill still skips media
+  entries: the commit already wrote their text.
 - **"Free disk" is what the OS will GRANT** (`sushi_volume_free_for_use`, statfs fallback): purgeable space is released
   on demand. The `volumeSpace` test must not race the OS's purgeable answer.
 

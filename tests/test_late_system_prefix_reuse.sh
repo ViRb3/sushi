@@ -9,10 +9,10 @@
 #
 #   1. turn 1 answers; turn 2 = turn 1 + its reply + a NEW late system/developer turn
 #      + a user turn
-#   2. MiMo: turn 2 reads at least 90% of turn 1's prompt from the cache
+#   2. MiMo and Qwen3.8: turn 2 reads at least 90% of turn 1's prompt from the cache
 #      (`input_tokens_details.cached_tokens`, `cache_read_input_tokens`)
-#   3. Qwen3.8 (its template refuses a late system turn, so the render folds it): both
-#      turns answer; the cached count is printed, not asserted
+#   3. Qwen3.8 (the stock template refuses a late system turn; the late-system adapter renders
+#      it in place): the same 90% bar, which assumes a pack that ships the stock template
 #
 # Usage: ./tests/test_late_system_prefix_reuse.sh [pack_dir ...]
 # Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), QWEN_MODEL, MIMO_MODEL,
@@ -71,7 +71,7 @@ for PACK in "${PACKS[@]}"; do
 import json, sys, urllib.request
 
 BASE, MODEL_TYPE = sys.argv[1], sys.argv[2]
-places_late_system = MODEL_TYPE == "mimo_v2"
+places_late_system = MODEL_TYPE in ("mimo_v2", "qwen4_exp")
 passed = failed = 0
 
 def check(label, ok, detail=""):

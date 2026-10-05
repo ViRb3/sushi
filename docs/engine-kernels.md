@@ -147,6 +147,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   255). The JIT probe declines only kernels that build. Compile a new source offline first: wrap it in MLX's
   custom-kernel template (inputs, their `_strides`, the attribute arguments, one instantiation per template set) and
   run `xcrun -sdk macosx metal -std=metal4.0 -c -I lib/mlx/include`. That is CPU only and needs no GPU lock.
+- **A `uint4` K/V staging load needs a 16-byte aligned BASE, not only aligned strides**: a last-axis slice of a padded
+  cache (`[3,259)` of 264) passes the stride gates and reads wrong values. `attn256Base16Aligned` declines it before the
+  p256 and QSA gather kernels; a lazy array has no address and passes.
 - MSL takes no arrays of cooperative tensors ("cannot declare array of non-constant size type"). Name one per row:
   `sushi_qkv_mpp_rows` expands a macro per row.
 - `matmul2d::run` and a cooperative tensor's `store` take lvalue tensors: bind a `slice<...>(...)` to a name before

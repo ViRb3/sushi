@@ -6,11 +6,36 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3-Flash prompts tokenize exactly like Hugging Face**: the plain Llama-3 pre-tokenizer no longer takes Muse's
+  case-splitting grammar (`iPhone`, `McDonald`, `//!`, `½`), and the BPE `ignore_merges` flag is honoured.
+- **The load memory check counts an MTP head shipped as a separate `mtp/` file**, so a model that loads it beside a nearly
+  full memory is refused up front instead of failing during the load.
+- **`/metrics` and `/metrics.json` count every request outcome exactly once**: a client that disconnects mid-decode shows in
+  `request_cancelled_total`, generation errors in the new `sushi:request_failed_total`, and requests refused before they
+  start in `sushi:request_rejected_total`.
+- **A finished request no longer stalls decoding to probe disk free space for prefixes the SSD cache already holds.**
+- **The SSD cache can no longer restore another conversation's KV after its size limit evicts an entry mid-save.**
+- **Qwen attention reads exact values from a K/V view whose base is not 16-byte aligned**: the fused prefill and QSA
+  gather kernels decline such a view and the stock attention serves it.
+- **Qwen MTP picks its draft depth from measured acceptance below 8k context**, which speeds up short code and mixed replies; output is unchanged.
+- **A GLM-5.3 prompt served without prefix checkpoints no longer hangs its prefill** (prefix cache off, or admission
+  shedding every checkpoint at long context).
+- **Qwen3.8 late system notes (hook output, a mid-conversation `developer` turn) stay where they were sent** instead of
+  being folded into the first system message, so a tool round's prompt stays a prefix of the next turn's and the
+  prefix cache keeps hitting; prompts without a late note are unchanged.
+- **A turn with a screenshot now saves its text before the first image to the SSD cache**, so a restart or RAM
+  eviction no longer loses the long text prefix of image-heavy agent sessions.
 - **GLM-5.3-Flash tool results render in GLM's own chat format**: the chat-template engine now reads `x.0` as `x[0]`,
   so every request with a tool message no longer falls back to the generic format; `/props.template_fallbacks`
   counts any render that still does.
+- **`sushi launch grok` runs the Grok CLI against the local server, and `sushi launch opencode` works again with opencode 2.x** (it
+  now runs standalone with the model in its config, tool calls on, and the model's own reasoning efforts as variants), both ready for GLM-5.3.
+
 - **Non-streaming requests with `stop` sequences now stop generating when the stop completes**, instead of running to
   `max_tokens` or end of text and trimming afterwards; the returned text and finish reason are unchanged.
+- **A non-streaming request cut by a `stop` sequence reports the tokens it returned and settled timings**, never a
+  zero or partial count read while the last decode step was still being accounted.
+- **GLM-5.3 requests that omit `max_tokens` are served again with DFlash2 at the full auto context** instead of failing at prefill with HTTP 500.
 - **GLM-5.3 prefix-cache commits no longer overrun memory on long generations**: a finished request copies only the
   MLA rows its checkpoints can restore and its cache tier will keep, and admission bills that copy and the checkpoints a prefill really takes.
 - **Cancelling a GLM-5.3 request while it decodes no longer races the scheduler's list of running requests**, and its

@@ -72,6 +72,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   non-stream answer.
   A non-stream surface also feeds the gate per token (`EarlyStop`) and cancels the slot when a stop completes, only if
   the whole decoded text holds it too, so the answer bytes stay `earliest`'s and generation ends within one token.
+  The cancelled slot is quiesced (`Scheduler.quiesce`, waits out `in_pass`) BEFORE its statistics are read, and usage
+  counts the tokens returned, not the ones a speculative block decoded past the stop.
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
@@ -189,6 +191,11 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 - `--api-key`: loopback exempt, `/health` + OPTIONS + `GET` of the chat page open, `constTimeEql`.
 - `--metrics`: zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`.
+- **A request outcome is counted exactly once** (`Slot.metrics_recorded`, inference thread): `finishSlot` or the cleanup drain,
+  whichever sees the slot first (`recordSlotEnd`/`recordSlotCleanup`). The outcome comes from the slot's finish state, never
+  from `Slot.cancelled` (`complete` sets it on every completion): success feeds the histograms; `sushi:request_cancelled_total`
+  (a disconnect mid-decode; a request ended by its own stop sequence sets `Slot.stop_hit` first and counts as success), `sushi:request_failed_total` and a refusal before a slot
+  (`sushi:request_rejected_total`: context overflow, memory preflight, `PrefillDoesNotFit`) move only their counter.
 - `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
   by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
   `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),
@@ -247,7 +254,7 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 ## Agent launcher (`sushi launch <agent>`)
 
-- `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider): reads `/v1/models`, writes agent configs into
+- `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long
   prefill plus a long think tripped them, and each fallback re-sent the whole prompt, then timed out and retried.
@@ -261,6 +268,17 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 - omp (a pi fork) has no off entry in its maps: off rides the qwen dialect (`enable_thinking: false`), `whenThinking`
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.
+- opencode 2.x talks to a background service that never sees `OPENCODE_CONFIG_CONTENT` and refuses `--model` on its
+  default command: the launcher passes `--standalone` (after a subcommand, flags bind to it), carries the model as
+  `model`, and marks a row with efforts `reasoning` + `interleaved: reasoning_content` + one `variants` entry per graded
+  word (GLM: low/high/max; on/off make none, and a default effort option would send words GLM refuses).
+- opencode sends no `max_tokens`, and GLM reserves a request's whole window without one (1M rows): serve GLM with
+  `--max-tokens N` for opencode (live: a 12k-token agent prompt hit `GlmReserveMemoryLimit` with 16 GB free). grok
+  sends its configured `max_completion_tokens`.
+- `sushi launch grok` writes `~/.sushi/grok/config.toml` and sets `GROK_HOME` there (the owner's `~/.grok` stays
+  untouched): one `[model."<id>"]` per chat row on `api_backend = "chat_completions"`, dummy `api_key`, advertised
+  `context_window`, `max_completion_tokens` from `budgetForContext`, the row's efforts as `reasoning_efforts`, and
+  `[session] auto_compact_threshold_percent` = share of the window that leaves `compactionReserve` free (min 50).
 - `sushi launch zcode [--url U] --model ID [--print] [-- zcode args]` writes schema-1
   `~/.sushi/zcode/provider_config.json` and points `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR` and
   `ZCODE_STORAGE_DIR` into `~/.sushi/zcode`; ZCode's own source and project config stay untouched. `--model` must be
