@@ -68,6 +68,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   `simd_sum`'s order, an xor butterfly over 1, 2, 4, 8, 16 lanes, i.e. balanced pairs in lane order (200000/200000
   probe sums). Exact against that scorer at real magnitudes, every NAX and non-NAX GPU; 16 rows × 32768 pools 4.4 →
   0.93 ms, a decode row at 32768 pools 0.42 → 0.20 ms.
+  The shared NAX gate bounds row subgroups per threadgroup: 8 (256 threads) without NAX, 16 (512) with it.
 - **Index scores, NAX window** (9–16 query rows, 3584–8192 completed pools): Q `[T·32,128]` × pooled-key tiles of at
   most 2048 pools, scalar epilogue kept (BF16 dot, BF16 ReLU·weight, sequential FP32 32-head sum, BF16 total, −inf
   for future pools). 0/7/6 of 16K/65K/131K scores differ, every 512-pool set kept. The tiles stay lazy until the packed

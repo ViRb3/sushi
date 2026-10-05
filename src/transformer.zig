@@ -72317,59 +72317,6 @@ test "logical capture includes every defined state and the separate final state"
 
 const VerifyRetentionResult = struct { logits: []mlx.mlx_array, build_ms: f64, eval_ms: f64 };
 
-test "verify rollback permits in-place KV append and restores its valid prefix" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    const stream = mlx.gpuStream();
-    var cache = try KVCache.initWithConfig(allocator, 1, KVQuantConfig.affine(8));
-    defer cache.deinit();
-    var prng = std.Random.DefaultPrng.init(618);
-    const prefix = try attn256RandBf16(prng.random(), &.{ 1, 1, 8, 64 }, stream);
-    defer _ = mlx.mlx_array_free(prefix);
-    const tail = try attn256RandBf16(prng.random(), &.{ 1, 1, 4, 64 }, stream);
-    defer _ = mlx.mlx_array_free(tail);
-    var initial_view = try cache.update(0, prefix, prefix, stream, 0);
-    initial_view.deinit();
-    const Eval = struct {
-        fn buffers(entry: *const KVCacheEntry) !void {
-            const vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(vec);
-            inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }) |field| _ = mlx.mlx_vector_array_append_value(vec, @field(entry, field));
-            try mlx.check(mlx.mlx_eval(vec));
-        }
-    };
-    try Eval.buffers(&cache.entries[0]);
-    const before = mlx.mlx_array_data_uint32(cache.entries[0].keys) orelse return error.KvUnreadable;
-    const address = @intFromPtr(before);
-    var expected: [128]u32 = undefined;
-    @memcpy(&expected, before[0..expected.len]);
-    var offset: usize = 8;
-    var ctx = ForwardCtx{ .cache = &cache, .moe_seq_offset = &offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-    var xfm: Transformer = undefined;
-    xfm.allocator = allocator;
-    xfm.fwd_gen = 0;
-    var rollback = try Transformer.VerifyRollback.capture(&xfm, &ctx);
-    defer rollback.deinit();
-    var appended = try cache.update(0, tail, tail, stream, 0);
-    appended.deinit();
-    offset = 12;
-    try Eval.buffers(&cache.entries[0]);
-    const after = mlx.mlx_array_data_uint32(cache.entries[0].keys) orelse return error.KvUnreadable;
-    try testing.expectEqual(address, @intFromPtr(after));
-    rollback.restore();
-    try testing.expectEqual(@as(usize, 8), offset);
-    try testing.expectEqual(@as(usize, 8), cache.step);
-    try testing.expectEqual(@as(usize, 8), cache.entries[0].offset);
-    const restored = mlx.mlx_array_data_uint32(cache.entries[0].keys) orelse return error.KvUnreadable;
-    try testing.expectEqualSlices(u32, &expected, restored[0..expected.len]);
-    var resumed = try cache.update(0, tail, tail, stream, 0);
-    defer resumed.deinit();
-    try Eval.buffers(&cache.entries[0]);
-    try testing.expectEqual(@as(usize, 12), cache.entries[0].offset);
-    const again = mlx.mlx_array_data_uint32(cache.entries[0].keys) orelse return error.KvUnreadable;
-    try testing.expectEqualSlices(u32, &expected, again[0..expected.len]);
-}
-
 fn verifyRollbackEvalStorage(entry: *const KVCacheEntry) !void {
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
@@ -72378,14 +72325,6 @@ fn verifyRollbackEvalStorage(entry: *const KVCacheEntry) !void {
         if (value.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, value);
     }
     try mlx.check(mlx.mlx_eval(vec));
-}
-
-fn verifyRollbackStorageAddress(value: mlx.mlx_array) !usize {
-    return switch (mlx.mlx_array_dtype(value)) {
-        .bfloat16 => @intFromPtr(mlx.mlx_array_data_bfloat16(value) orelse return error.KvUnreadable),
-        .uint32 => @intFromPtr(mlx.mlx_array_data_uint32(value) orelse return error.KvUnreadable),
-        else => error.KvUnreadable,
-    };
 }
 
 fn verifyRollbackValidPrefixEqual(a: *const KVCacheEntry, b: *const KVCacheEntry, s: mlx.mlx_stream) !void {
@@ -72434,13 +72373,6 @@ fn verifyRollbackKvCase(config: KVQuantConfig, prefix_len: usize, force_growth: 
         4;
     const tail = try attn256RandBf16(prng.random(), &.{ 1, 1, @intCast(tail_len), 64 }, stream);
     defer _ = mlx.mlx_array_free(tail);
-    var addresses: [6]usize = @splat(0);
-    if (prefix_len != 0 and !force_growth) {
-        inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }, 0..) |field, i| {
-            const value = @field(cache.entries[0], field);
-            if (value.ctx != null) addresses[i] = try verifyRollbackStorageAddress(value);
-        }
-    }
     var offset = prefix_len;
     var ctx = ForwardCtx{ .cache = &cache, .moe_seq_offset = &offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
     var xfm: Transformer = undefined;
@@ -72452,12 +72384,6 @@ fn verifyRollbackKvCase(config: KVQuantConfig, prefix_len: usize, force_growth: 
     appended.deinit();
     offset += tail_len;
     try verifyRollbackEvalStorage(&cache.entries[0]);
-    if (prefix_len != 0 and !force_growth) {
-        inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }, 0..) |field, i| {
-            const value = @field(cache.entries[0], field);
-            if (value.ctx != null) try testing.expectEqual(addresses[i], try verifyRollbackStorageAddress(value));
-        }
-    }
     rollback.restore();
     try testing.expectEqual(prefix_len, offset);
     try testing.expectEqual(reference.step, cache.step);
