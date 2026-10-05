@@ -14,6 +14,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
+- **A served arch must be in `model_discovery.supported_model_types`**: `run` refuses what `classifyModelPath` calls non-chat
+  (guard test: every `model.served_model_types` entry classifies chat).
 - **An arg loop with no else branch is a silent flag eater** (`cli.classifyUnparsedArg`): every `--flag` any script
   passes must be in main.zig's match list. Removed flags are rejected by name, never eaten.
 - **`--parent-pid <pid>`** is for a host that runs sushi as its engine (`src/parent_watch.zig`): a thread polls the pid
