@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The browser chat page opens on the logo and title only**: the subtitle, privacy note and canned prompts are gone.
 - **`sushi run` opens a chat on GLM-5.3-Flash**: the chat preflight no longer refuses `glm5_next` as an unsupported model.
 - **GLM decode, two-row tails and four-row lookup run the parallel HC coefficient kernel the three-row verify already had**: about 6% faster per serial token, same bytes.
 - **GLM full-chunk prefill transposes the expert grid at every admitted packed rate**, so the 2.5bpw pack prefills faster, same bytes.

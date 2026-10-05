@@ -333,38 +333,12 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  gap: 12px;
   text-align: center;
-  padding: 8vh 24px 40px;
+  padding: 14vh 24px 40px;
 }
-#chatEmpty .mark { width: 72px; height: 72px; border-radius: 18px; box-shadow: var(--shadow); }
-#chatEmpty h2 { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
-#chatEmpty p { margin: 0; color: var(--text-2); font-size: 14.5px; max-width: 440px; }
-.privacy-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: var(--shadow);
-  padding: 10px 16px;
-  font-size: 13px;
-  color: var(--text-2);
-  margin-top: 8px;
-}
-.privacy-chip svg { width: 15px; height: 15px; color: var(--ok); flex: none; }
-.suggestions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 10px; }
-.suggestions button {
-  border: 1px solid var(--border-strong);
-  background: var(--surface);
-  border-radius: 999px;
-  padding: 7px 14px;
-  font-size: 13px;
-  color: var(--text-2);
-  cursor: pointer;
-}
-.suggestions button:hover { background: var(--surface-2); border-color: var(--accent); color: var(--text); }
+#chatEmpty .mark { width: 56px; height: 56px; border-radius: 14px; box-shadow: var(--shadow); }
+#chatEmpty h2 { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
 
 .msg { display: flex; flex-direction: column; margin-bottom: 22px; position: relative; }
 .msg.user { align-items: flex-end; }
@@ -774,9 +748,6 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
         <div id="chatEmpty">
           <img class="mark" alt="" />
           <h2>Chat with sushi</h2>
-          <p>Talk to the model this Mac is serving.</p>
-          <div class="privacy-chip"><svg><use href="#i-shield"/></svg>Chat runs on this machine. Optional web tools access public sites.</div>
-          <div class="suggestions" id="chatSuggestions"></div>
         </div>
         <div id="chatMessages" aria-live="polite"></div>
       </div>
@@ -2410,19 +2381,6 @@ $("promptInput").addEventListener("keydown", (event) => {
   }
 });
 $("promptInput").addEventListener("input", autosizePrompt);
-for (const suggestion of [
-  "Explain how attention works in transformers",
-  "Write a haiku about Apple Silicon",
-  "What should I check before quantizing a model?",
-]) {
-  const button = el("button", null, suggestion);
-  button.onclick = () => {
-    $("promptInput").value = suggestion;
-    autosizePrompt();
-    $("promptInput").focus();
-  };
-  $("chatSuggestions").appendChild(button);
-}
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeChatDrawersOnMobile();
 });
