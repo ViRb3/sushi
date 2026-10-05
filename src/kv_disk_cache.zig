@@ -1411,38 +1411,18 @@ pub const DiskTier = struct {
         // pending SSM checkpoints (byte-capped across turns), which take a
         // dedicated SSM-only append path (the KV chunks are all present, so
         // the extend machinery would pointlessly rewrite the tail chunk).
-        var extend_idx: ?usize = null;
-        var ssm_only_idx: ?usize = null;
-        for (self.entries.items, 0..) |*e, i| {
-            if (e.poisoned) continue; // dead: never superseded, never extended
-            if (e.has_tools != has_tools) continue;
-            if (!std.meta.eql(e.quant, config)) continue;
-            if (e.tokens.len >= tokens.len) {
-                if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
-                    if (e.kv_len >= kv_target) {
-                        if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
-                            !specWorkPending(e, dflash_snap, mtp_snap) and
-                            !self.ringWorkPending(e, ring_srcs))
-                        {
-                            // Superseded: the tier already holds this prefix in full.
-                            e.last_used = self.bump();
-                            return .persisted;
-                        }
-                        ssm_only_idx = i;
-                        break;
-                    }
-                    // Same token record, SHORTER persisted KV — a byte-capped
-                    // incremental flush in progress. Resume into its dir.
-                    extend_idx = i;
-                }
-            } else if (std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
-                // This commit extends `e` — reuse its directory and chunks.
-                extend_idx = i;
-            }
-        }
+        var target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+        if (target.superseded) return .persisted;
         // Re-derive the budget before every store, and only a store: the probe is slow and the idle
         // spill reaches this point once per idle entry. It also gates the SSM-only append.
-        if (self.ssd_first) self.refreshDiskBudget();
+        if (self.ssd_first) {
+            self.refreshDiskBudget();
+            // Its eviction swap-removes: indices picked above may now name other entries.
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            if (target.superseded) return .persisted;
+        }
+        const extend_idx = target.extend_idx;
+        const ssm_only_idx = target.ssm_only_idx;
         if (self.store_declined) return .skipped;
         if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs, s);
 
@@ -2370,6 +2350,52 @@ pub const DiskTier = struct {
             _ = set.orderedRemove(transformer_mod.positionDropIndex(set.items, self.cp_thin));
         }
         return set.toOwnedSlice(self.allocator);
+    }
+
+    const StoreTarget = struct { superseded: bool = false, extend_idx: ?usize = null, ssm_only_idx: ?usize = null };
+
+    /// Which resident entry a commit of `tokens` supersedes, extends or tops up. Indices are valid
+    /// only until the next eviction.
+    fn selectStoreTarget(
+        self: *DiskTier,
+        tokens: []const u32,
+        kv_target: u32,
+        has_tools: bool,
+        config: kv_quant.KVQuantConfig,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        dflash_snap: ?SpecCommit,
+        mtp_snap: ?SpecCommit,
+        ring_srcs: []const RingSource,
+    ) StoreTarget {
+        var t: StoreTarget = .{};
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.poisoned) continue; // dead: never superseded, never extended
+            if (e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant, config)) continue;
+            if (e.tokens.len >= tokens.len) {
+                if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
+                    if (e.kv_len >= kv_target) {
+                        if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
+                            !specWorkPending(e, dflash_snap, mtp_snap) and
+                            !self.ringWorkPending(e, ring_srcs))
+                        {
+                            // Superseded: the tier already holds this prefix in full.
+                            e.last_used = self.bump();
+                            return .{ .superseded = true };
+                        }
+                        t.ssm_only_idx = i;
+                        break;
+                    }
+                    // Same token record, SHORTER persisted KV — a byte-capped
+                    // incremental flush in progress. Resume into its dir.
+                    t.extend_idx = i;
+                }
+            } else if (std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
+                // This commit extends `e` — reuse its directory and chunks.
+                t.extend_idx = i;
+            }
+        }
+        return t;
     }
 
     /// Would persisting `cps` add or drop any file for entry `e`? Drives the
@@ -6858,6 +6884,93 @@ test "DiskTier: the free-space probe runs only before a store, never for a copy 
     for (&other, 0..) |*t, i| t.* = @intCast(i + 90_000);
     try testing.expectEqual(PersistOutcome.skipped, try tier.appendCommit(cache.entries, 640, cache.config, &other, false, null, s));
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
+}
+
+var test_evict_tier: ?*DiskTier = null;
+var test_evict_id: ?u64 = null;
+
+// Stands in for the budget refresh evicting an entry while a store is in flight.
+fn evictingSpaceProbe(path: []const u8) ?VolumeSpace {
+    if (test_evict_id) |id| {
+        test_evict_id = null;
+        const t = test_evict_tier.?;
+        for (t.entries.items, 0..) |e, i| if (e.id == id) {
+            t.removeAt(i);
+            break;
+        };
+    }
+    return testSpaceProbe(path);
+}
+
+fn evictionDuringStoreRound(selected: usize, evicted: usize, ssm_only: bool) !void {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-evict", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    const roomy: u64 = 1024 * 1024 * 1024 * 1024;
+    tier.armTestSpace(roomy, 2 * roomy);
+
+    const seeds = [3]f64{ 0.0, 100_000.0, 200_000.0 };
+    var toks: [3][640]u32 = undefined;
+    for (&toks, 0..) |*t, k| for (t, 0..) |*v, i| {
+        v.* = @intCast(i + 7 + k * 100_000);
+    };
+    for (0..3) |k| {
+        var c = try KVCache.init(testing.allocator, 2);
+        defer c.deinit();
+        try fillCache(&c, s, 2, 600, 8, seeds[k], .float32);
+        _ = try tier.appendCommit(c.entries, c.step, c.config, toks[k][0..600], false, null, s);
+        tier.drainWriter();
+    }
+    try testing.expectEqual(@as(usize, 3), tier.entryCount());
+    for (0..3) |k| try testing.expectEqualSlices(u32, toks[k][0..600], tier.entries.items[k].tokens);
+
+    // Commit entry `selected`, extended to 640 tokens or with a spec sidecar, while the probe evicts `evicted`.
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, seeds[selected], .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    const snap: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    test_evict_tier = &tier;
+    test_evict_id = tier.entries.items[evicted].id;
+    tier.space_probe = evictingSpaceProbe;
+    const len: usize = if (ssm_only) 600 else 640;
+    _ = try tier.appendCommitWithSpec(cache.entries, len, cache.config, toks[selected][0..len], false, null, null, if (ssm_only) snap else null, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(?u64, null), test_evict_id);
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-evict", 0, 128);
+    defer tier2.deinit();
+    for (0..3) |k| {
+        if (k == evicted and k != selected) continue;
+        const m = tier2.bestMatch(&toks[k], false, kv_quant.KVQuantConfig.dense).?;
+        const want: u32 = if (k == selected and !ssm_only) 640 else 600;
+        try testing.expectEqual(want, m.usable);
+        var restored = try KVCache.init(testing.allocator, 2);
+        defer restored.deinit();
+        _ = try tier2.restoreInto(&restored, m.idx, s);
+        try testing.expectEqual(seeds[k], try cacheValueAt(&restored, 0, 0, 0, s));
+        try testing.expectEqual(seeds[k] + 8.0 * @as(f64, @floatFromInt(want - 1)), try cacheValueAt(&restored, 0, want - 1, 0, s));
+        // The sidecar belongs to the committed entry alone.
+        const sidecar = tier2.entries.items[m.idx].spec_bytes > 0;
+        try testing.expectEqual(ssm_only and k == selected, sidecar);
+    }
+}
+
+test "DiskTier: a budget refresh that evicts mid-commit cannot redirect the store to another entry" {
+    // swapRemove moves the LAST entry into the hole: a saved index then names another entry or none.
+    try evictionDuringStoreRound(0, 0, false);
+    try evictionDuringStoreRound(2, 0, false);
+    try evictionDuringStoreRound(0, 0, true);
+    try evictionDuringStoreRound(2, 1, true);
 }
 
 test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-first itself bumps no manifest)" {
