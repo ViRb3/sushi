@@ -140,6 +140,28 @@ pub const MlaRows = struct {
         return out;
     }
 
+    /// Rows [0, len) of the request's own buffers, shared rather than copied, for the SSD flush.
+    /// The share keeps the request's whole reservation alive and makes a later write to it copy,
+    /// so it lives from the commit to the flush after the response, while the request is done.
+    pub fn shareLive(allocator: std.mem.Allocator, request: *const forward.Request, len: usize, s: mlx.mlx_stream) !MlaRows {
+        if (request.failed) return error.GlmRequestNeedsReset;
+        if (len % pool_size != 0 or len > request.offset or len == 0) return error.GlmCheckpointOffPool;
+        var out = try empty(allocator, request.layers.len, len, request.latent_bits);
+        errdefer out.deinit();
+        for (request.layers, out.layers) |*src, *dst| {
+            const st = &src.attention;
+            if (st.processed == 0) continue;
+            if (st.processed != request.offset) return error.InvalidGlmAttentionShape;
+            const sources = [_]Arr{ st.latent, st.latent_scales, st.latent_biases, st.pooled };
+            const rows = [_]usize{ len, len, len, len / pool_size };
+            for (sources, rows, dst.arrays()[0..4]) |source, n, field| {
+                if (source.ctx == null or n == 0) continue;
+                field.* = try rowsView(source, 0, n, s);
+            }
+        }
+        return out;
+    }
+
     fn empty(allocator: std.mem.Allocator, count: usize, len: usize, bits: u8) !MlaRows {
         const layers = try allocator.alloc(Layer, count);
         @memset(layers, .{});
@@ -323,9 +345,16 @@ fn bitsOwnedCopy(x: Arr, s: mlx.mlx_stream) !Arr {
 
 /// An owned copy of rows [from, to) on axis 0.
 fn rowsOwned(x: Arr, from: usize, to: usize, s: mlx.mlx_stream) !Arr {
+    const sliced = try rowsView(x, from, to, s);
+    defer _ = mlx.mlx_array_free(sliced);
+    return bitsOwnedCopy(sliced, s);
+}
+
+/// Rows [from, to) on axis 0, a view of `x`'s buffer.
+fn rowsView(x: Arr, from: usize, to: usize, s: mlx.mlx_stream) !Arr {
     const sh = mlx.getShape(x);
     var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
+    errdefer _ = mlx.mlx_array_free(sliced);
     var start: [4]c_int = @splat(0);
     var stop: [4]c_int = @splat(0);
     const strides: [4]c_int = @splat(1);
@@ -333,7 +362,7 @@ fn rowsOwned(x: Arr, from: usize, to: usize, s: mlx.mlx_stream) !Arr {
     start[0] = @intCast(from);
     stop[0] = @intCast(to);
     try mlx.check(mlx.mlx_slice(&sliced, x, &start, sh.len, &stop, sh.len, &strides, sh.len, s));
-    return bitsOwnedCopy(sliced, s);
+    return sliced;
 }
 
 const testing = std.testing;
@@ -475,6 +504,46 @@ test "GLM prefix rows bill exactly their rows and trim to a pool boundary" {
         try testing.expectError(error.GlmCheckpointOffPool, restore(&target, &short, &kda));
         try restore(&target, &rows, &kda);
         try testing.expectEqual(@as(usize, 12), target.offset);
+    }
+}
+
+test "GLM live rows for the SSD flush share the request's buffers and outlive its reset" {
+    var weights = model.Weights.init(testing.allocator);
+    defer weights.deinit();
+    const cfg = try forward.nonzeroDecodeFixture(&weights);
+    var net = try forward.Model.load(testing.allocator, cfg, &weights, mlx.gpuStream());
+    defer net.deinit();
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0 };
+    for ([_]u8{ 0, 8 }) |bits| {
+        var req = try servedRequest(bits);
+        defer req.deinit();
+        _ = mlx.mlx_array_free(try prefill(&net, &req, &tokens, &.{ 16, 3 }));
+        try testing.expectError(error.GlmCheckpointOffPool, MlaRows.shareLive(testing.allocator, &req, 18, s));
+        var want = try MlaRows.capture(testing.allocator, &req, 16, s);
+        defer want.deinit();
+        try mlx.check(mlx.mlx_synchronize(s));
+        var before: usize = 0;
+        _ = mlx.mlx_get_active_memory(&before);
+        var live = try MlaRows.shareLive(testing.allocator, &req, 16, s);
+        defer live.deinit();
+        for (live.layers) |*layer| for (layer.arrays()[0..4]) |a| if (a.ctx != null) {
+            try mlx.check(mlx.mlx_array_eval(a.*));
+        };
+        // Views of buffers that already existed: nothing was copied.
+        var after: usize = 0;
+        _ = mlx.mlx_get_active_memory(&after);
+        try testing.expectEqual(before, after);
+        req.reset();
+        try testing.expectEqual(want.bytes(), live.bytes());
+        for (want.layers, live.layers) |*a, *b| {
+            var x = a.*;
+            var y = b.*;
+            for (x.arrays()[0..4], y.arrays()[0..4]) |p, q| {
+                try testing.expectEqual(p.ctx == null, q.ctx == null);
+                if (p.ctx != null) try forward.expectArrayBits(p.*, q.*);
+            }
+        }
     }
 }
 

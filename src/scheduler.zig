@@ -5155,9 +5155,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk != null,
             ram_prefix_cache,
         );
+        // Every tier writes off the inference thread, so a commit lands whole after the response.
+        if (entry.prefix_cache.?.disk) |*d| d.enableBackgroundWriter();
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
-            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
             // Startup sweep of strays + root-wide LRU across sibling fingerprints.
             entry.prefix_cache.?.disk.?.sweepSiblings();
         }
@@ -6368,31 +6369,50 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     _ = finish_st;
 }
 
-/// GLM: the request's MLA rows through the newest checkpoint its destination tier keeps serve every
-/// KDA checkpoint at or below it; without one nothing restores. Ownership of `cps` passes to the cache.
+/// GLM: the request's MLA rows through the newest checkpoint a tier keeps serve every KDA checkpoint
+/// at or below it; without one nothing restores. The RAM tier copies the rows its budget keeps; the
+/// SSD tier shares every row through the newest checkpoint, read by the flush after the response.
+/// Ownership of `cps` passes to the cache.
 fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request: *const glm5_forward_mod.Request, tokens: []const u32, cps_opt: ?[]transformer_mod.SSMCheckpoint, dflash: ?prefix_cache_mod.DflashCommit, prompt_len: usize) void {
     const cps_all = cps_opt orelse return;
     const glm5_prefix = @import("glm5_prefix.zig");
-    // The rows are chosen before the copy: only what the destination tier keeps, never a full copy followed by a trim.
+    const s = slot.model.transformer.?.s;
+    // The rows are chosen before the copy: only what the RAM tier keeps, never a full copy followed by a trim.
     const window: u64 = if (dflash) |d| prefix_cache_mod.HotPrefixCache.liveCacheBytes(d.cache) else 0;
-    const len = hc.glmCommitLen(cps_all, request.offset, glm5_prefix.rowBytesOf(request), window) orelse {
-        log.debug("[hot-cache] GLM commit keeps no rows within its destination's budget; not committed\n", .{});
+    const row_bytes = glm5_prefix.rowBytesOf(request);
+    const ram_len = hc.glmCommitLen(cps_all, request.offset, row_bytes, window);
+    const disk_len = hc.glmDiskLen(cps_all, request.offset, row_bytes, window);
+    const len = @max(ram_len orelse 0, disk_len orelse 0);
+    if (len == 0) {
+        log.debug("[hot-cache] GLM commit keeps no rows within either tier's budget; not committed\n", .{});
         for (cps_all) |*cp| cp.deinit(hc.allocator);
         hc.allocator.free(cps_all);
         return;
-    };
+    }
     const cps = glm5_prefix.keepThrough(hc.allocator, cps_all, len);
-    const rows = glm5_prefix.MlaRows.capture(hc.allocator, request, len, slot.model.transformer.?.s) catch |err| {
-        log.warn("[hot-cache] GLM MLA rows not captured: {s}; not committed\n", .{@errorName(err)});
+    const ram_rows: ?glm5_prefix.MlaRows = if (ram_len) |n| glm5_prefix.MlaRows.capture(hc.allocator, request, n, s) catch |err| blk: {
+        log.warn("[hot-cache] GLM MLA rows not captured: {s}; the RAM tier keeps nothing\n", .{@errorName(err)});
+        break :blk null;
+    } else null;
+    const disk_rows: ?glm5_prefix.MlaRows = if (disk_len) |n| glm5_prefix.MlaRows.shareLive(hc.allocator, request, n, s) catch |err| blk: {
+        log.warn("[disk-cache] GLM MLA rows not shared: {s}; the SSD tier gets the RAM tier's rows\n", .{@errorName(err)});
+        break :blk null;
+    } else null;
+    if (ram_rows == null and disk_rows == null) {
         for (cps) |*cp| cp.deinit(hc.allocator);
         hc.allocator.free(cps);
         return;
-    };
-    const st = hc.commitGlm(&slot.cache, tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, cps, rows, dflash, prompt_len) catch |err| {
+    }
+    const n_cps = cps.len;
+    const st = hc.commitGlmTiers(&slot.cache, tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, cps, ram_rows, disk_rows, dflash, prompt_len) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         return;
     };
-    if (st == .ok) log.info("[hot-cache] committed {d}/{d} GLM tokens ({d} KDA checkpoints)\n", .{ st.ok, tokens.len, cps.len });
+    switch (st) {
+        .ok => |n| log.info("[hot-cache] committed {d}/{d} GLM tokens ({d} KDA checkpoints)\n", .{ n, tokens.len, n_cps }),
+        .disk_only => log.info("[disk-cache] captured {d}/{d} GLM tokens for the SSD tier ({d} KDA checkpoints)\n", .{ disk_len orelse 0, tokens.len, n_cps }),
+        else => {},
+    }
 }
 
 /// Logical committed length for a cancelled-prefill commit: the tokens

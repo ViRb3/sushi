@@ -6233,24 +6233,29 @@ fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureS
 /// most `warm.checkpoints`, plus the copy taken before each thin) and the assistant window it keeps from prefill end.
 fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix) u64 {
     if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, prefix_cache_disk_bytes) == 0) return 0;
-    // SSD-first stages the previous request's flush as host bytes, up to the writer's permit.
-    const staged: u64 = if (prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
+    const staged = ssdWriterStagedBytes();
     if (warm.checkpoints == 0) return staged;
     const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
     const held = @as(u64, glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints).peak) * config.ssmCheckpointBytes();
     return held +| window +| staged;
 }
 
+/// Host bytes the SSD writer may still hold from the previous request's flush: its permit, on any
+/// disk tier (the writer stages every tier's files).
+fn ssdWriterStagedBytes() u64 {
+    return if (prefix_cache_capacity > 0 and prefix_cache_disk_bytes > 0) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
+}
+
 /// What the finished request holds while its commit runs, beside its live cache: the MLA rows copied, the
-/// checkpoints, the window and the SSD writer's staged flush. The rows are what the destination keeps
-/// (`HotPrefixCache.glmCommitLen`): at most the RAM tier's budget, or one SSD flush.
+/// checkpoints, the window and the SSD writer's staged flush. Only the RAM tier copies rows, at most its
+/// budget (`HotPrefixCache.glmCommitLen`); the SSD flush reads the request's own (`glmDiskLen`).
 fn glmCommitStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix, kv_bits: u64) u64 {
-    const staged: u64 = if (prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
+    const staged = ssdWriterStagedBytes();
     if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, prefix_cache_disk_bytes) == 0 or warm.checkpoints == 0) return staged;
     const sched = glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints);
     const rows = @as(u64, sched.newest) * sessionBytesPerToken(config, kv_bits);
-    const bound: u64 = if (prefix_cache_ram_enabled) resolvedPrefixCacheMem() else @min(prefix_cache_disk_bytes, kv_disk_cache.SSD_FIRST_READBACK_BYTES);
-    const copied = if (bound == 0 and prefix_cache_ram_enabled) rows else @min(rows, bound);
+    const bound = resolvedPrefixCacheMem();
+    const copied: u64 = if (!prefix_cache_ram_enabled) 0 else if (bound == 0) rows else @min(rows, bound);
     const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
     const kept = @as(u64, @min(sched.events, warm.checkpoints)) * config.ssmCheckpointBytes();
     return copied +| kept +| window +| staged;
@@ -26643,10 +26648,12 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
     const per_cp = cfg.ssmCheckpointBytes();
     const row_bytes = sessionBytesPerToken(&cfg, 8);
     const cap = glm5_prefix.checkpointMax(16);
-    for ([_]bool{ true, false }) |ram| {
+    const Arm = struct { ram: bool, disk: u64 };
+    for ([_]Arm{ .{ .ram = true, .disk = 0 }, .{ .ram = false, .disk = 12 << 30 }, .{ .ram = true, .disk = 12 << 30 } }) |arm| {
+        const ram = arm.ram;
         prefix_cache_ram_enabled = ram;
-        prefix_cache_disk_bytes = if (ram) 0 else 12 << 30;
-        const staged: u64 = if (ram) 0 else kv_disk_writer.DEFAULT_PERMIT_BYTES;
+        prefix_cache_disk_bytes = arm.disk;
+        const staged: u64 = if (arm.disk > 0) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
         for ([_]u64{ 64, 131_072, 900_000, 1_040_000 }) |seq| {
             const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
             const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, cap, 0, seq, 2048);
@@ -26655,11 +26662,12 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
             const bytes: [8]u64 = @splat(per_cp);
             for (&positions, 1..) |*p, i| p.* = if (i == 8) oracle.newest else @max(oracle.newest * i / 8 / 2048 * 2048, 4);
             const kept: usize = @min(@as(usize, oracle.events), 8);
-            // What the commit copies: its destination's own bound, chosen before the copy.
-            const copied_len = prefix_cache_mod.HotPrefixCache.glmCommitLenFor(
+            // What the commit copies: the RAM tier's rows within its budget, chosen before the copy.
+            // The SSD tier copies none: its flush reads the request's own rows.
+            const copied_len = if (!ram) 0 else prefix_cache_mod.HotPrefixCache.glmCommitLenFor(
                 .min_span_recency,
-                if (ram) resolvedPrefixCacheMem() else @min(prefix_cache_disk_bytes, kv_disk_cache.SSD_FIRST_READBACK_BYTES),
-                !ram,
+                resolvedPrefixCacheMem(),
+                false,
                 oracle.newest,
                 row_bytes,
                 cfg.glm_dflash_window_bytes,
@@ -26675,6 +26683,15 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
             // A long prompt's checkpoints are priced by its prefill alone: the copy is smaller than its transient.
             const warm = WarmPrefix{ .checkpoints = cap };
             try std.testing.expect(glmCommitStateBytes(&cfg, seq, warm, 8) <= glm5TransientBytes(&cfg, seq, 2048, 8) +| glmPrefixStateBytes(&cfg, seq, warm));
+            // SSD-only: checkpoints, window and the writer's staged bytes, no rows at any length.
+            if (!ram) try std.testing.expectEqual(@as(u64, @min(oracle.events, cap)) * per_cp + cfg.glm_dflash_window_bytes + staged, glmCommitStateBytes(&cfg, seq, warm, 8));
+            // Both tiers: the RAM tier's copy plus the writer's staged bytes.
+            if (ram and arm.disk > 0) {
+                prefix_cache_disk_bytes = 0;
+                const ram_only = glmCommitStateBytes(&cfg, seq, warm, 8);
+                prefix_cache_disk_bytes = arm.disk;
+                try std.testing.expectEqual(ram_only + staged, glmCommitStateBytes(&cfg, seq, warm, 8));
+            }
         }
     }
 }

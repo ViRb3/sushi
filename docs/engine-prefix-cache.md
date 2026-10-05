@@ -135,6 +135,87 @@ are unchanged. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; 
 
 Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
 
+<a id="ssd-flush"></a>
+## The SSD flush
+
+- **A commit lands whole on disk after its response, whatever the RAM tier keeps.** Every disk tier arms the
+  background writer. A commit records the live state before the RAM budget trims it (`pending_disk`: the rows, every
+  restore point, the drafter window, the MTP history), and the flush after the response writes it in
+  `FLUSH_PIECE_BYTES` (2 GiB) pieces until it is whole (`DiskTier.appendCommitWhole`). A piece's checkpoints and
+  ring files ride outside its byte bound. Nothing is written on the response path: a RAM decline, a checked-out
+  resident's included, rides the same record.
+  - Before, a RAM-on tier that was not SSD-first (GLM, MiMo) flushed the entry its RAM budget had trimmed,
+    synchronously, one 512 MB piece per turn: 58K of a 147K GLM prompt per turn, from a RAM entry trimmed to 117K.
+  - An SSD-first flush stopped at 2 GiB with its checkpoints counted, so turn 1 of the same prompt in SSD-only mode
+    ended 1.4K tokens short of its prompt-end checkpoint.
+  - A tier whose writer failed to start writes the record whole synchronously when it is SSD-first (its source, a
+    finished request's buffers, is gone after the flush), and otherwise keeps the legacy path: the RAM entry, one
+    piece per turn, a declined candidate spilled synchronously.
+- **The record carries the restore points the RAM entry inherits**: a donor's SSM or ring checkpoints below the
+  shared prefix (`bestCheckpointDonor`, `bestRingDonor`), taken before the RAM tier sheds any. Chunk sharing links a
+  fork's chunks, never its donor's checkpoint or ring files, so without them a fork restored only above the fork
+  once the donor left the SSD tier.
+- **A second commit before the flush flushes the first** (`capturePendingDisk`): the cull pass commits every
+  cancelled GLM slot before any flush, and the second capture used to discard the first.
+- **A sole entry never outgrows the tier** (`DiskTier.budgetTarget`): a record whose chunks, checkpoints, ring files
+  and sidecar would pass the byte budget alone is cut to the highest checkpoint or ring restore point that fits (any
+  length on plain attention), without its spec state; nothing fits, nothing is written. GLM picks its SSD rows the
+  same way (`glmDiskLen` prices every checkpoint at or below them): a 1 GiB tier and 131K rows with eight checkpoints
+  is 1.9 GiB, which used to land whole.
+- **The writer's permit bounds the staged host bytes** (`Writer.waitForRoom` runs before a blob's buffer exists, and
+  a file larger than half the permit goes in parts that append to one `tmp`, the last renaming it). A file's header
+  and the manifest (a few KB) are built before their room is reserved. At most 1 GiB beside the GPU, billed on every
+  disk tier. A flush that outruns the writer waits on it after the response, which delays the next request and any
+  concurrent decode, not this one.
+- **The spec sidecar is written once per commit**, by the piece that completes the rows, and staged like any file;
+  an earlier piece keeps what the entry had. Each piece used to rewrite it synchronously.
+- **Nothing is fsynced.** A file lands as `tmp` + `rename` and the manifest last, so a crash of the process leaves
+  whole entries; a power loss can leave a manifest naming bytes the disk never kept. A failed restore cold-prefills.
+- **GLM hands the SSD tier the request's own rows** (`MlaRows.shareLive`, `HotPrefixCache.glmDiskLen`): every row
+  through the newest checkpoint that fits the tier's budget, never copied. The share holds the request's buffers
+  from its commit to the flush, when nothing writes them. The RAM tier copies only what its budget keeps.
+- **A writer-armed tier hard-links a diverging turn's whole shared chunks** (`chunkShareDonor`), as SSD-first did, so
+  each turn of a RAM+SSD conversation writes its new rows, not the conversation again.
+- **The longer tier restores.** A lookup takes the SSD entry when its restorable position beats the RAM entry's by
+  `MIN_DISK_ADVANTAGE_TOKENS` (256), else the RAM one.
+- **A flush costs the inference thread its readback alone**: 2,054 MB in 207-225 ms with 0 ms waiting on the
+  writer, whose `write` lands in the page cache faster than the readback fills it (`[disk-cache] persisted ...
+  ms waiting on the writer`).
+- **Measured** (GLM-5.3-Flash-Sushi-2.5bpw, kv8, a 146,795-token prompt of source files, `/v1/chat/completions`,
+  greedy, 16 tokens, `reasoning_effort` low; streamed TTFT with wall in brackets, cached tokens after; `taskpolicy -a`,
+  a lock per boot, busy box, 2026-10-05). Before is de867e94, non-streamed wall; after is this change on 42504add
+  before its review fixes (binary stamp 625fe7e8); those add inherited checkpoints to a fork's record and write
+  the spec sidecar once, and leave the lookup and restore path these TTFTs time unchanged.
+  The cold turn (245-297 s) runs the same code in every arm.
+
+  | arm | turn 1 on disk | repeat | append | append 2 | after a restart |
+  |---|---|---|---|---|---|
+  | SSD-only, before | 145,408 | [3.80 s] 145,408 | [1.23 s] 146,764 | [1.15 s] 146,768 | |
+  | SSD-only, after | 146,764 | 0.51 s [0.84] 146,764 | 0.77 s [1.16] 146,764 | 0.61 s [1.12] 146,768 | 2.36 s [2.87] 146,772 |
+  | 1 GiB RAM + SSD, before | 58,368 | [61.4 s] 116,736 | [30.1 s] 131,072 | [30.2 s] 131,072 | |
+  | 1 GiB RAM + SSD, after | 146,764 | 0.49 s [0.83] 146,764 | 0.77 s [1.17] 146,764 | 0.59 s [1.05] 146,768 | 3.11 s [3.62] 146,772 |
+  | 2 GB RAM, no SSD, before | | [0.68 s] 146,764 | [1.06 s] 146,764 | [0.93 s] 146,768 | |
+  | 2 GB RAM + SSD, after | 146,764 | 0.34 s [0.66] 146,764 | 0.61 s [1.02] 146,764 | 0.43 s [0.93] 146,768 | |
+
+  - With 1 GiB of RAM the RAM tier keeps 116,736 tokens and one checkpoint, so every warm turn restores from SSD in
+    147-165 ms; at 2 GB it keeps the whole prompt and restores from RAM.
+  - The first restore after a restart took 382 ms and 1,215 ms against 121-165 ms warm. It allocates every restored
+    buffer anew beside a busy box: the files themselves read at 7.8 GB/s with the page cache dropped, and read-ahead
+    advice made no difference. The first forward after a boot adds about 1.5 s.
+- **Qwen3.8-Flash-Next-Sushi-2.6bpw**, a 157,678-token prompt, same driver and conditions:
+  - SSD-only on 42504add: cold 82.9 s; repeat, append and append 2 0.43 / 0.58 / 0.52 s TTFT, 157,647-157,652 reused
+    from SSD; after a restart 2.40 s, 157,656 restored in 666 ms. Its prefill write-through already landed every turn
+    whole.
+  - The default RAM tier plus SSD, this change: cold 105 s; 0.19 / 0.40 / 0.28 s from RAM. Turn 1's write-through
+    banked one chunk per prefill chunk (39,936 tokens), and the flush after the response landed the rest in one piece
+    (1,523 MB, 202 ms, 19 ms waiting on the writer). After a restart 2.46 s, 157,656 restored from SSD in 707 ms.
+- **MiMo-V2.6-Flash-Sushi-2.3bpw**, a 148,898-token prompt, same driver and conditions:
+  - SSD-only on 42504add: cold 260 s; turn 1 whole on disk in one 1,771 MB flush; repeat, append and append 2 0.43 /
+    0.46 / 0.45 s TTFT from SSD (ring restore points); after a restart 0.85 s, 148,902 restored in 506 ms.
+  - The default RAM tier (6.3 GB) plus SSD, this change: turn 1 whole on disk after the response (1,771 MB, 139 ms,
+    0 ms waiting), where it used to persist one synchronous 512 MB piece per turn; 0.28 / 0.32 / 0.29 s from RAM;
+    each later turn hard-links 145 chunks and writes one. After a restart 0.87 s, 148,902 restored from SSD in 524 ms.
+
 ## SSD-first
 
 - Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed.
@@ -223,11 +304,12 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
   - At kv8 it keeps a 30K session at its prompt end with 5 of 8 checkpoints, a 60K one with 4, and trims a 140K one
     to its checkpoint near 121K with 1. Each case keeps the assistant window.
   - For long reuse add `--prefix-cache-disk`, or run SSD-only (`--no-prefix-cache-ram --prefix-cache-disk 12GB`).
-- **Rows are a real copy at commit**, through the newest checkpoint the destination keeps
+- **The RAM tier's rows are a real copy at commit**, through the newest checkpoint it keeps
   (`HotPrefixCache.glmCommitLen`, chosen before the copy; a restore resumes from a checkpoint, so later rows are never
-  read). The RAM tier keeps rows, checkpoints and window within its budget, SSD-only one flush (2 GiB), and the
-  checkpoints above the chosen row are freed first, so there is no full copy followed by a trim. A share would keep
-  the request's reservation (up to the whole context) alive while billing only the rows.
+  read). It keeps rows, checkpoints and window within its budget, and the checkpoints above the chosen row are freed
+  first, so there is no full copy followed by a trim. A share would keep the request's reservation (up to the whole
+  context) alive while billing only the rows. The SSD tier takes a share instead, only until its flush
+  ([SSD flush](#ssd-flush)).
   - Billed in `kv_bytes` beside the checkpoints: 6,688 bytes per row at kv8, 11,968 at BF16.
   - A budget trim lands on a checkpoint (`MlaRows.trimmedCopy`), sheds interior checkpoints and keeps the window.
 - **A restore shares the rows; the first append copies them.** A checkout releases them, so that append donates.
@@ -242,10 +324,9 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
     `d.pos`/`m.pos` = `base:step` stamp; a load that finds it absent or different declines the spec (trunk restores).
   - A restore reads only its own checkpoint file (`DiskTier.restoreIntoKda`); the QSA check that rereads the
     newest one is Qwen's.
-  - GLM is never SSD-first while RAM retention is on. Under SSD-only storage it is: the commit captures the rows,
-    checkpoints and window into the pending flush, keeps no idle RAM entry, and the background writer persists them
-    after the response. There is no prefill write-through; a flush is bounded by the 2 GB readback, and a later
-    turn's commit extends a partial entry.
+  - GLM is never SSD-first while RAM retention is on. Under SSD-only storage it is, and keeps no idle RAM entry.
+    Either way the commit captures every row through the newest checkpoint, the checkpoints and the window into the
+    pending flush, which lands whole after the response ([SSD flush](#ssd-flush)). There is no prefill write-through.
 - **A decode-phase cancel commits in `cullDecoding`**, before `releaseNativeState` resets the request that the
   cleanup drain's commit would otherwise read. The drop decision is taken once per slot under `queue_mu`; the commit
   and the release run outside it on the dropped slots, so a late cancel waits for the next tick.
@@ -254,10 +335,11 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
   prompt-end checkpoint, pool alignment, cold/warm backoff, the cap). The configured stride never enters, and
   `glmChunkEnd` keeps the tail merge from absorbing a grid point, so the billed count is the captured count.
 - **Bills.** A GLM request holds up to 9 checkpoints during prefill (the cap plus the copy taken before each thin)
-  and one assistant window. The commit moment is billed beside the live cache (`glmCommitStateBytes`): the row copy
-  (at most the RAM budget, or one SSD flush), the checkpoints and the window, whichever of that and the prefill's
-  transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. SSD-only adds the writer's 1 GiB permit (the previous request's staged flush) and
-  reserves no idle cache.
+  and one assistant window. The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
+  tier's row copy (at most its budget; the SSD tier copies none), the checkpoints and the window, whichever of that
+  and the prefill's transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. Any disk tier
+  adds the writer's 1 GiB permit (`ssdWriterStagedBytes`: the previous request's staged flush); SSD-only reserves no
+  idle cache.
   - Only the inference thread's admission pass bills the checkpoints (`WarmPrefix.checkpoints`). The connection
     thread, the context sizer and the cache clamp bill none, so the advertised context is the cache-off one.
   - The pass evicts RAM entries LRU first, sparing the one it restored from. If the request still does not fit, it
@@ -269,4 +351,5 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
 
 `tests/test_prefix_cache_*.sh` (budget revisit, disk, hot, mem, workloads), `tests/test_hybrid_reuse_equivalence.sh`,
 `tests/test_mimo_ring_reuse.sh`, `tests/test_mimo_ring_fork_ssd.sh`, `tests/test_qwen4_mtp_head_persist.sh`,
-`tests/test_glm_prefix_reuse.sh`. Grep the log for `[cache]`, `[hot-cache]`, `[disk-cache]`.
+`tests/test_glm_prefix_reuse.sh`, `tests/test_prefix_cache_tiers.sh`. Grep the log for `[cache]`, `[hot-cache]`,
+`[disk-cache]`.

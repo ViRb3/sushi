@@ -43,8 +43,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   explicit-context reduction where applicable. Native GLM has its separate BF16 load and serving bill.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
-  from the capture schedule the generator runs), one assistant window and the commit's row copy, and keeps fewer where
-  they do not fit, never refusing for them
+  from the capture schedule the generator runs), one assistant window, the RAM tier's row copy and, with a disk
+  tier, the SSD writer's 1 GiB permit, and keeps fewer checkpoints where they do not fit, never refusing for them
   ([engine-prefix-cache](engine-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).

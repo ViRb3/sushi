@@ -23,7 +23,8 @@ earlier history is mlx-serve's, in that project's changelog.
   own range (they replace `--mtp-depth`), `--no-mtp-lookup` turns off prompt-lookup drafts inside MTP rounds,
   `--gpu-warm-secs` keeps the GPU awake between requests, and `--wired-margin-gib` now defaults to 4 GiB.
 - **More reliable under memory pressure and restarts**: memory admission, the SSD prompt cache and request metrics
-  were hardened across the board, and long GLM sessions no longer hang, leak or overrun memory.
+  were hardened across the board, long GLM sessions no longer hang, leak or overrun memory, and the SSD prompt cache
+  saves a long prompt whole on its first turn, so the next turn restores all of it.
 
 ---
 

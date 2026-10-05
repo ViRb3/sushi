@@ -451,6 +451,12 @@ pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool, ram_
     return has_disk and ssdFirstEnabled() and (config.ssdFirstCapable() or !ram_enabled);
 }
 
+/// A GLM commit's MLA rows for each tier; null for any other arch.
+const GlmTierRows = struct {
+    ram: ?glm5_prefix.MlaRows = null,
+    disk: ?glm5_prefix.MlaRows = null,
+};
+
 /// What the live cache held at commit time, captured before the RAM byte-budget trim: the
 /// disk tier gets the full prefix even when RAM keeps a trimmed one. Refcount-shared.
 const PendingDiskFlush = struct {
@@ -1111,11 +1117,12 @@ pub const HotPrefixCache = struct {
 
     /// The MLA rows (a checkpoint position) a GLM commit keeps, chosen before anything is copied.
     /// `budget` 0 keeps every row. A RAM tier keeps the rows, its checkpoints and the window within
-    /// `budget`, as `commitImpl`'s trim does; `rows_only` (the SSD tier) bounds the rows alone.
+    /// `budget`, as `commitImpl`'s trim does, shedding checkpoints to fit; the SSD tier (`disk`)
+    /// keeps every checkpoint at or below the rows, so it prices all of them.
     pub fn glmCommitLenFor(
         policy: transformer_mod.ThinPolicy,
         budget: u64,
-        rows_only: bool,
+        disk: bool,
         newest: usize,
         row_bytes: u64,
         window_bytes: u64,
@@ -1123,24 +1130,47 @@ pub const HotPrefixCache = struct {
         cp_bytes: []const u64,
     ) ?usize {
         if (newest == 0) return null;
-        if (budget == 0 and !rows_only) return newest;
-        var cps_total: u64 = 0;
-        if (!rows_only) for (cp_bytes) |b| {
-            cps_total += b;
-        };
-        if (@as(u64, newest) * row_bytes + cps_total + (if (rows_only) 0 else window_bytes) <= budget) return newest;
-        if (!rows_only) return trimLenForBudgetPure(budget -| window_bytes, newest, row_bytes, positions, cp_bytes, policy, null);
+        if (budget == 0) return newest;
+        if (!disk) {
+            var cps_total: u64 = 0;
+            for (cp_bytes) |b| cps_total += b;
+            if (@as(u64, newest) * row_bytes + cps_total + window_bytes <= budget) return newest;
+            return trimLenForBudgetPure(budget -| window_bytes, newest, row_bytes, positions, cp_bytes, policy, null);
+        }
+        const price = struct {
+            fn at(p: usize, rb: u64, win: u64, pos: []const usize, bytes: []const u64) u64 {
+                var total: u64 = @as(u64, p) * rb + win;
+                for (pos, bytes) |q, b| {
+                    if (q <= p) total += b;
+                }
+                return total;
+            }
+        }.at;
+        if (price(newest, row_bytes, window_bytes, positions, cp_bytes) <= budget) return newest;
         var k = positions.len;
         while (k > 0) {
             k -= 1;
-            if (positions[k] <= newest and @as(u64, positions[k]) * row_bytes <= budget) return positions[k];
+            if (positions[k] < newest and price(positions[k], row_bytes, 0, positions, cp_bytes) <= budget) return positions[k];
         }
         return null;
     }
 
-    /// `glmCommitLenFor` for this cache's destination: its RAM budget, else the SSD tier's one flush.
-    /// Null = nothing to keep, so nothing is copied.
+    /// The rows a GLM commit copies into the RAM tier (`glmCommitLenFor` at its budget); null with
+    /// RAM retention off or nothing that fits.
     pub fn glmCommitLen(self: *const HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, row_bytes: u64, window_bytes: u64) ?usize {
+        if (!self.ram_enabled) return null;
+        return self.glmLenFor(cps, offset, self.max_kv_bytes, false, row_bytes, window_bytes);
+    }
+
+    /// The rows a GLM commit hands the SSD tier: through the newest checkpoint whose rows, every
+    /// checkpoint at or below and the window fit the tier's byte budget. The flush reads them from
+    /// the request's own buffers, piece by piece.
+    pub fn glmDiskLen(self: *const HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, row_bytes: u64, window_bytes: u64) ?usize {
+        const d = if (self.disk) |*dd| dd else return null;
+        return self.glmLenFor(cps, offset, d.max_bytes, true, row_bytes, window_bytes);
+    }
+
+    fn glmLenFor(self: *const HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, budget: u64, disk: bool, row_bytes: u64, window_bytes: u64) ?usize {
         if (cps.len > SHED_SIM_MAX) return null;
         var pos_buf: [SHED_SIM_MAX]usize = undefined;
         var byte_buf: [SHED_SIM_MAX]u64 = undefined;
@@ -1149,11 +1179,7 @@ pub const HotPrefixCache = struct {
             byte_buf[i] = ssmCheckpointBytes(cp);
         }
         const newest = glm5_prefix.commitRows(cps, offset);
-        const positions = pos_buf[0..cps.len];
-        const bytes = byte_buf[0..cps.len];
-        if (self.ram_enabled) return glmCommitLenFor(self.cp_thin, self.max_kv_bytes, false, newest, row_bytes, window_bytes, positions, bytes);
-        const d = if (self.disk) |*dd| dd else return null;
-        return glmCommitLenFor(self.cp_thin, @min(d.max_bytes, d.max_flush_bytes), true, newest, row_bytes, window_bytes, positions, bytes);
+        return glmCommitLenFor(self.cp_thin, budget, disk, newest, row_bytes, window_bytes, pos_buf[0..cps.len], byte_buf[0..cps.len]);
     }
 
     /// Which arm `trimLenForBudget` bills a list of this length with (for the log).
@@ -2062,11 +2088,11 @@ pub const HotPrefixCache = struct {
         prompt_len: usize,
         ring_cps: SlotRingCps,
     ) !CommitStatus {
-        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, ssm_cps, dflash, mtp, prompt_len, ring_cps, null);
+        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, ssm_cps, dflash, mtp, prompt_len, ring_cps, .{});
     }
 
-    /// A GLM commit: `cps` are its KDA checkpoints and `rows` the MLA rows below them; ownership of
-    /// both transfers to the cache on every outcome.
+    /// A GLM commit: `cps` are its KDA checkpoints and `rows` the MLA rows below them, for both
+    /// tiers; ownership of both transfers to the cache on every outcome.
     pub fn commitGlm(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
@@ -2080,7 +2106,27 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         prompt_len: usize,
     ) !CommitStatus {
-        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, rows);
+        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = rows });
+    }
+
+    /// `commitGlm` with each tier's own rows: `ram_rows` within the RAM budget (`glmCommitLen`),
+    /// `disk_rows` through the newest checkpoint the SSD tier keeps (`glmDiskLen`). Either may be
+    /// null; `cps` cover the longer.
+    pub fn commitGlmTiers(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        cache_key: u64,
+        media_start: ?usize,
+        cps: []SSMCheckpoint,
+        ram_rows: ?glm5_prefix.MlaRows,
+        disk_rows: ?glm5_prefix.MlaRows,
+        dflash: ?DflashCommit,
+        prompt_len: usize,
+    ) !CommitStatus {
+        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = ram_rows, .disk = disk_rows });
     }
 
     fn commitImpl(
@@ -2091,27 +2137,34 @@ pub const HotPrefixCache = struct {
         vision_key: u64,
         cache_key: u64,
         media_start: ?usize,
-        ssm_cps: ?[]SSMCheckpoint,
+        all_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
         prompt_len: usize,
         ring_cps: SlotRingCps,
-        glm: ?glm5_prefix.MlaRows,
+        glm: GlmTierRows,
     ) !CommitStatus {
         // Freed on every path that does not move it into an entry.
         var new_rings = ownRingCps(self.allocator, ring_cps);
         defer if (new_rings) |r| freeRingCps(self.allocator, r);
         var new_ring_bytes = ringCpsBytes(new_rings);
-        var new_glm = glm;
+        var new_glm = glm.ram;
         defer if (new_glm) |*rows| rows.deinit();
+        var disk_glm = glm.disk;
+        defer if (disk_glm) |*rows| rows.deinit();
         var new_glm_bytes: u64 = if (new_glm) |*rows| rows.bytes() else 0;
         const quant_config = source_cache.config;
+        var ssm_cps = all_cps;
 
         // Taken before the budget trim can drop the first item.
         const disk_len = self.diskTextLen(tokens.len, vision_key, media_start, ssm_cps);
-        // Record what the live cache holds now, before any byte-budget trim.
-        if (self.ssd_first and self.disk != null and disk_len > 0) {
-            self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, ssm_cps, dflash, mtp, new_rings, if (new_glm) |*rows| rows else null);
+        // Record what the live cache holds now, before any byte-budget trim: the SSD tier gets the
+        // whole entry whatever the RAM tier keeps.
+        if (self.capturesLiveForDisk() and disk_len > 0) {
+            const rows: ?*const glm5_prefix.MlaRows = if (disk_glm) |*r| r else if (new_glm) |*r| r else null;
+            self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, vision_key, media_start, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
+            // Whatever the RAM tier then does with the candidate, the record is flushed.
+            if (self.pending_disk != null) self.disk_dirty = true;
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
@@ -2120,7 +2173,8 @@ pub const HotPrefixCache = struct {
             self.pending_disk = null;
         };
 
-        if (!self.ram_enabled) {
+        // A GLM entry with no rows within the RAM budget keeps nothing in RAM.
+        if (!self.ram_enabled or (glm.disk != null and new_glm == null)) {
             if (ssm_cps) |cps| {
                 for (cps) |*cp| cp.deinit(self.allocator);
                 self.allocator.free(cps);
@@ -2129,6 +2183,10 @@ pub const HotPrefixCache = struct {
             self.disk_dirty = true;
             return .{ .disk_only = tokens.len };
         }
+        // The RAM entry keeps only the checkpoints its own rows restore.
+        if (new_glm) |*rows| if (ssm_cps) |cps| {
+            ssm_cps = glm5_prefix.keepThrough(self.allocator, cps, rows.len);
+        };
 
         // An entry's pixel key applies only to rows it actually covers. When
         // the committed range ends before the request's first media row — a
@@ -2711,9 +2769,9 @@ pub const HotPrefixCache = struct {
         const text = self.textCheckpoints(all_cps, text_len, all_tokens.len) orelse return;
         defer text.deinit(self.allocator);
         const cps = text.list;
-        // SSD-first captured the live state as `pending_disk` before the trim; the
-        // normal flush lands it under the writer's own readback bound.
-        if (self.ssd_first) {
+        // The live state was captured as `pending_disk` before the trim; the flush after the
+        // response lands it whole.
+        if (self.capturesLiveForDisk()) {
             if (self.pending_disk != null) self.disk_dirty = true;
             return;
         }
@@ -2727,7 +2785,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = (if (glm) |rows| persistGlm(d, rows, tokens, has_tools, cps, null, mlx.gpuStream()) else d.appendCommitWithRing(snap.entries, snap.step, snap.config, tokens, has_tools, cps, null, null, ringCommitOf(snap, ring_cps), mlx.gpuStream())) catch |err| {
+        const outcome = (if (glm) |rows| persistGlm(d, rows, tokens, has_tools, cps, null, false, mlx.gpuStream()) else d.appendCommitWithRing(snap.entries, snap.step, snap.config, tokens, has_tools, cps, null, null, ringCommitOf(snap, ring_cps), mlx.gpuStream())) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2739,14 +2797,18 @@ pub const HotPrefixCache = struct {
         log.info("  [disk-cache] declined RAM candidate spilled to SSD ({d} tokens, {s})\n", .{ tokens.len, note });
     }
 
-    /// Snapshot the live cache (refcount-shared but for a ring's retained rows) plus the full token record and this turn's
-    /// checkpoints. Best effort; the caller still owns `ssm_cps`/`dflash`/`mtp`.
+    /// Snapshot the live cache (refcount-shared but for a ring's retained rows) plus the full token
+    /// record, this turn's checkpoints and those a RAM donor below the shared prefix holds, as the
+    /// RAM entry would inherit them. Best effort; the caller still owns `ssm_cps`/`dflash`/`mtp`.
     fn capturePendingDisk(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
         all_tokens: []const u32,
         text_len: usize,
         has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        prompt_len: usize,
         ssm_cps: ?[]SSMCheckpoint,
         all_dflash: ?DflashCommit,
         all_mtp: ?DflashCommit,
@@ -2758,9 +2820,9 @@ pub const HotPrefixCache = struct {
         const cut = text_len < all_tokens.len;
         const dflash = if (cut) null else all_dflash;
         const mtp = if (cut) null else all_mtp;
-        if (self.pending_disk) |*old| {
-            old.deinit(self.allocator);
-            self.pending_disk = null;
+        // An earlier commit not flushed yet (two cancels culled in one pass) lands first.
+        if (self.pending_disk != null) {
+            if (self.disk) |*d| self.flushPendingRecord(d, mlx.gpuStream());
         }
         var snap = source_cache.snapshotRetained(mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] live snapshot failed: {s} — flushing the RAM entry instead\n", .{@errorName(err)});
@@ -2781,6 +2843,17 @@ pub const HotPrefixCache = struct {
         };
         if (ssm_cps) |cps| {
             rec.ssm_cps = cloneCheckpointsWithBank(self.allocator, cps, text_len, null) catch null;
+        }
+        const quant = source_cache.config;
+        const cap = @min(if (prompt_len == 0) text_len else prompt_len, text_len);
+        if (self.bestCheckpointDonor(tokens, has_tools, vision_key, media_start, quant)) |donor| inherit: {
+            const limit = @min(donor.shared, cap);
+            const inherited = (cloneCheckpointsUpTo(self.allocator, self.entries.items[donor.idx].ssm_checkpoints.?, limit, null) catch break :inherit) orelse break :inherit;
+            rec.ssm_cps = mergeDiskCheckpoints(self.allocator, inherited, rec.ssm_cps) catch null;
+        }
+        if (self.bestRingDonor(tokens, has_tools, vision_key, media_start, quant, cap)) |donor| inherit: {
+            const inherited = (shareRingCpsUpTo(self.allocator, self.entries.items[donor.idx].ring_cps.?, donor.limit, null) catch break :inherit) orelse break :inherit;
+            rec.ring_cps = mergeRingCps(self.allocator, inherited, rec.ring_cps) catch null;
         }
         if (dflash) |d| {
             if (d.cache.snapshot()) |ds| {
@@ -2963,10 +3036,50 @@ pub const HotPrefixCache = struct {
     /// the inference thread. Snapshot arrays are refcount-shared with the RAM
     /// entry, so slicing them here reads the same buffers the commit captured.
     /// A GLM entry goes to disk as its MLA rows in the dense disk layout beside its KDA checkpoints.
-    fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const glm5_prefix.MlaRows, tokens: []const u32, has_tools: bool, cps: ?[]SSMCheckpoint, dflash: ?kv_disk_cache.SpecCommit, s: mlx.mlx_stream) !kv_disk_cache.PersistOutcome {
+    /// `whole` writes every piece now, writer or not (`DiskTier.appendCommitWhole`).
+    fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const glm5_prefix.MlaRows, tokens: []const u32, has_tools: bool, cps: ?[]SSMCheckpoint, dflash: ?kv_disk_cache.SpecCommit, whole: bool, s: mlx.mlx_stream) !kv_disk_cache.PersistOutcome {
         const entries = try glm5_prefix.diskEntries(d.allocator, rows);
         defer glm5_prefix.freeDiskEntries(d.allocator, entries);
-        return d.appendCommitWithSpec(entries, rows.len, glm5_prefix.diskQuant(rows.latent_bits), tokens, has_tools, cps, dflash, null, s);
+        const quant = glm5_prefix.diskQuant(rows.latent_bits);
+        if (whole) return d.appendCommitWhole(entries, rows.len, quant, tokens, has_tools, cps, dflash, null, null, s);
+        return d.appendCommitWithSpec(entries, rows.len, quant, tokens, has_tools, cps, dflash, null, s);
+    }
+
+    /// Write the pending record whole and release it: its rows may be a finished request's own
+    /// buffers, which nothing could read again to resume a partial entry.
+    fn flushPendingRecord(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, s: mlx.mlx_stream) void {
+        var pending = self.pending_disk orelse return;
+        self.pending_disk = null;
+        defer pending.deinit(self.allocator);
+        const p_dflash: ?kv_disk_cache.SpecCommit = if (pending.dflash) |*df| .{
+            .entries = df.snapshot.entries,
+            .step = df.snapshot.step,
+            .config = df.snapshot.config,
+            .base_pos = df.base_pos,
+        } else null;
+        const p_mtp: ?kv_disk_cache.SpecCommit = if (pending.mtp) |*mm| .{
+            .entries = mm.snapshot.entries,
+            .step = mm.snapshot.step,
+            .config = mm.snapshot.config,
+            .base_pos = mm.base_pos,
+            .head_aux = if (mm.head_aux) |*a| a else null,
+            .head_pos_base = mm.head_pos_base,
+            .head_marks = mm.head_marks.slice(),
+        } else null;
+        _ = (if (pending.glm) |*rows| persistGlm(d, rows, pending.tokens, pending.has_tools, pending.ssm_cps, p_dflash, true, s) else d.appendCommitWhole(
+            pending.snapshot.entries,
+            pending.snapshot.step,
+            pending.snapshot.config,
+            pending.tokens,
+            pending.has_tools,
+            pending.ssm_cps,
+            p_dflash,
+            p_mtp,
+            ringCommitOf(&pending.snapshot, pending.ring_cps),
+            s,
+        )) catch |err| {
+            log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
+        };
     }
 
     pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
@@ -2974,45 +3087,7 @@ pub const HotPrefixCache = struct {
         self.disk_dirty = false;
         const d = if (self.disk) |*dd| dd else return;
         // Flush the live state captured at commit, not what the RAM entry retained after its trim.
-        if (self.pending_disk) |*pending| {
-            defer {
-                pending.deinit(self.allocator);
-                self.pending_disk = null;
-            }
-            const p_dflash: ?kv_disk_cache.SpecCommit = if (pending.dflash) |*df| .{
-                .entries = df.snapshot.entries,
-                .step = df.snapshot.step,
-                .config = df.snapshot.config,
-                .base_pos = df.base_pos,
-            } else null;
-            const p_mtp: ?kv_disk_cache.SpecCommit = if (pending.mtp) |*mm| .{
-                .entries = mm.snapshot.entries,
-                .step = mm.snapshot.step,
-                .config = mm.snapshot.config,
-                .base_pos = mm.base_pos,
-                .head_aux = if (mm.head_aux) |*a| a else null,
-                .head_pos_base = mm.head_pos_base,
-                .head_marks = mm.head_marks.slice(),
-            } else null;
-            const ok = (if (pending.glm) |*rows| persistGlm(d, rows, pending.tokens, pending.has_tools, pending.ssm_cps, p_dflash, s) else d.appendCommitWithRing(
-                pending.snapshot.entries,
-                pending.snapshot.step,
-                pending.snapshot.config,
-                pending.tokens,
-                pending.has_tools,
-                pending.ssm_cps,
-                p_dflash,
-                p_mtp,
-                ringCommitOf(&pending.snapshot, pending.ring_cps),
-                s,
-            )) catch |err| {
-                log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
-                return;
-            };
-            // `.partial` is the only outcome with more to write.
-            if (!ok.nothingPending()) self.disk_dirty = true;
-            return;
-        }
+        if (self.pending_disk != null) return self.flushPendingRecord(d, s);
         if (self.entries.items.len == 0) return;
         var newest: *Entry = &self.entries.items[0];
         for (self.entries.items[1..]) |*e| {
@@ -3034,7 +3109,7 @@ pub const HotPrefixCache = struct {
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
         if (newest.glm) |*rows| {
-            const done = persistGlm(d, rows, tokens, newest.has_tools, text.list, dflash_spec, s) catch |err| {
+            const done = persistGlm(d, rows, tokens, newest.has_tools, text.list, dflash_spec, false, s) catch |err| {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
                 return;
             };
@@ -3156,6 +3231,41 @@ pub const HotPrefixCache = struct {
         // history: keep one.
         keepOnlyLatestQsaHistory(owned);
         return self.takeCpsIfQsaBank(owned);
+    }
+
+    /// The pending flush's checkpoints: `inherited` and `own` in one ascending list, `own`'s kept at
+    /// a tie. Unthinned: the SSD tier thins its own set. Consumes both on every path.
+    fn mergeDiskCheckpoints(allocator: std.mem.Allocator, inherited: []SSMCheckpoint, own_opt: ?[]SSMCheckpoint) ![]SSMCheckpoint {
+        const own = own_opt orelse return inherited;
+        defer {
+            allocator.free(inherited);
+            allocator.free(own);
+        }
+        var ties: usize = 0;
+        for (inherited) |a| {
+            for (own) |b| ties += @intFromBool(a.pos == b.pos);
+        }
+        const out = allocator.alloc(SSMCheckpoint, inherited.len + own.len - ties) catch |err| {
+            for (inherited) |*c| c.deinit(allocator);
+            for (own) |*c| c.deinit(allocator);
+            return err;
+        };
+        var i: usize = 0;
+        var j: usize = 0;
+        for (out) |*o| {
+            if (j == own.len or (i < inherited.len and inherited[i].pos < own[j].pos)) {
+                o.* = inherited[i];
+                i += 1;
+                continue;
+            }
+            if (i < inherited.len and inherited[i].pos == own[j].pos) {
+                inherited[i].deinit(allocator);
+                i += 1;
+            }
+            o.* = own[j];
+            j += 1;
+        }
+        return out;
     }
 
     fn takeCpsIfQsaBank(self: *HotPrefixCache, cps: []SSMCheckpoint) ?[]SSMCheckpoint {
@@ -3646,6 +3756,13 @@ pub const HotPrefixCache = struct {
                 reason, key, tokens_len, kv_mb,
             });
         }
+    }
+
+    /// Does a commit record the live state for the SSD tier (`pending_disk`)? Wherever the flush
+    /// lands it whole: SSD-first, or a tier with the background writer.
+    fn capturesLiveForDisk(self: *const HotPrefixCache) bool {
+        const d = if (self.disk) |*dd| dd else return false;
+        return self.ssd_first or d.writer != null;
     }
 
     /// Bytes the cache currently holds resident. A hint for the connection thread's admission
@@ -6243,6 +6360,200 @@ test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
         try testing.expect(res.full_match);
         try testing.expectEqual(@as(usize, 599), res.matched);
     }
+}
+
+test "HotPrefixCache: with RAM retention on, the SSD tier gets the whole entry the RAM budget trims, after the response" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 40 * 1024);
+        defer hc.deinit();
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ram-trim", 0, 128);
+        hc.disk.?.enableBackgroundWriter();
+        hc.disk.?.max_flush_bytes = 1; // one chunk per piece
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        const st = try hc.commit(&cache, &tokens, false);
+        try testing.expect(st == .ok and st.ok < 600);
+        // Nothing is written on the response path.
+        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expect(!hc.disk_dirty);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+    }
+    // A fresh process restores the whole prompt from the SSD tier.
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc2.deinit();
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ram-trim", 0, 128);
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    var moe: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe, null, s, &tokens, false, 0, null, null);
+    try testing.expect(res.full_match);
+    try testing.expectEqual(@as(usize, 599), res.matched);
+}
+
+test "HotPrefixCache: a commit that checked-out residents decline still reaches the SSD tier" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const big: u64 = 1 << 30;
+    // The count cap, then the byte cap, held by an entry a live slot checked out.
+    const Cap = struct { entries: u32, bytes: u64, fp: []const u8 };
+    for ([_]Cap{ .{ .entries = 1, .bytes = 0, .fp = "fp-held-count" }, .{ .entries = 8, .bytes = big, .fp = "fp-held-bytes" } }) |cap| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, cap.entries, cap.bytes);
+        defer hc.deinit();
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, cap.fp, 0, 128);
+        hc.disk.?.enableBackgroundWriter();
+        try pcAppendCheckedOut(&hc, &.{ 1, 2 }, cap.bytes, 1);
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        try testing.expect(try hc.commit(&cache, &tokens, false) == .declined);
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expect(hc.pending_disk == null);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+    }
+}
+
+test "HotPrefixCache: a fork's SSD entry keeps the checkpoints it inherits in RAM" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var prompt: [600]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 1);
+    const a_tokens = prompt ++ [_]u32{ 200, 201 };
+    const b_tokens = prompt ++ [_]u32{ 210, 211 };
+    var srcs: [4][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    hc.ssm_checkpoint_max = 8;
+    defer hc.deinit();
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-fork-cps", 0, 128);
+    hc.disk.?.enableBackgroundWriter();
+
+    // A: checkpoints at 256 and 512 inside the shared prompt, 601 inside its own reply.
+    var a_cache = try KVCache.init(testing.allocator, 3);
+    defer a_cache.deinit();
+    try testFillCache(&a_cache, s, 3, a_tokens.len);
+    const a_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
+    a_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 256, s);
+    a_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 512, s);
+    a_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[2], 601, s);
+    _ = try hc.commitWithState(&a_cache, &a_tokens, false, 0, a_cps, null, null);
+    hc.flushPendingDisk(s);
+
+    // B restored A's prompt and checkpointed only its own prompt end.
+    var b_cache = try KVCache.init(testing.allocator, 3);
+    defer b_cache.deinit();
+    try testFillCache(&b_cache, s, 3, b_tokens.len);
+    const b_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    b_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[3], 600, s);
+    _ = try hc.commitWithState(&b_cache, &b_tokens, false, 0, b_cps, null, null);
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+
+    const d = &hc.disk.?;
+    const b_disk = for (d.entries.items) |*e| {
+        if (e.tokens.len > 600 and e.tokens[600] == 210) break e;
+    } else return error.TestExpectedForkEntry;
+    try testing.expectEqualSlices(u32, &.{ 256, 512, 600 }, b_disk.ssm_positions);
+}
+
+test "a fork's SSD entry keeps its donor's ring checkpoint, so a restart restores there with the donor gone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    const tail: u32 = 100;
+    const reminder: u32 = 330;
+    const fork_prompt = prompt + tail + reminder;
+
+    var toks: [fork_prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var donor_toks: [prompt + reply]u32 = undefined;
+    @memcpy(donor_toks[0..prompt], toks[0..prompt]);
+    for (donor_toks[prompt..], 0..) |*t, i| t.* = @intCast(700_000 + i);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+        defer hc.deinit();
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-fork-disk", 0, 128);
+        hc.disk.?.enableBackgroundWriter();
+        var donor = try KVCache.init(testing.allocator, n_layers);
+        defer donor.deinit();
+        const donor_cp = try ringTurn(&donor, s, n_layers, window, prompt, reply);
+        _ = try hc.commitWithRing(&donor, &donor_toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = donor_cp });
+        hc.flushPendingDisk(s);
+
+        var fork = try KVCache.init(testing.allocator, n_layers);
+        defer fork.deinit();
+        fork.setSwaRing(window);
+        var moe_off: usize = 0;
+        const fork_hit = try hc.lookupAndRestore(&fork, &moe_off, null, s, toks[0..fork_prompt], false, 0, null, null);
+        try testing.expectEqual(@as(usize, prompt), fork_hit.matched);
+        try ringFill(&fork, s, n_layers, window, prompt, fork_prompt, 64);
+        var fork_cp = try fork.ringCheckpoint(fork_prompt, s);
+        errdefer if (fork_cp) |*c| c.deinit();
+        try ringFill(&fork, s, n_layers, window, fork_prompt, fork_prompt + reply, 16);
+        const moved_cp = fork_cp;
+        fork_cp = null;
+        _ = try hc.commitWithRing(&fork, &toks, false, 0, 0, null, null, null, null, fork_prompt, .{ .prompt_end = moved_cp });
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+    }
+    // The donor's SSD entry goes; the fork's linked chunks outlive it.
+    try tmp.dir.deleteTree(io, "fp-ring-fork-disk/e1");
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc2.deinit();
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-ring-fork-disk", 0, 128);
+    try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+    var next: [prompt + tail + 40]u32 = undefined;
+    @memcpy(next[0 .. prompt + tail], toks[0 .. prompt + tail]);
+    for (next[prompt + tail ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc2.lookupAndRestore(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, prompt), hit.matched);
+    try expectRingContinuesCold(&restored, s, n_layers, window, prompt, next.len);
 }
 
 test "HotPrefixCache: a decline-spill is not bounded by the per-flush byte cap" {
@@ -9824,6 +10135,15 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
     }
 }
 
+/// A commit whose SSD flush never ran, so `spillIdleEntries` is the tier's only writer.
+fn commitUnflushed(hc: *HotPrefixCache, cache: *const KVCache, tokens: []const u32) !CommitStatus {
+    const r = try hc.commit(cache, tokens, false);
+    if (hc.pending_disk) |*p| p.deinit(hc.allocator);
+    hc.pending_disk = null;
+    hc.disk_dirty = false;
+    return r;
+}
+
 test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays resident" {
     // Every silent skip used to read as "the SSD holds this session" and evicted the RAM copy.
     // Four skip reasons, each asserting both halves: the tier holds nothing, RAM still holds the entry.
@@ -9853,8 +10173,8 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         hc.disk.?.ssd_first = true;
         hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
 
-        _ = try hc.commit(&cache, &tokens_a, false);
-        _ = try hc.commit(&cache, &tokens_b, false);
+        _ = try commitUnflushed(&hc, &cache, &tokens_a);
+        _ = try commitUnflushed(&hc, &cache, &tokens_b);
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
@@ -9875,8 +10195,8 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-short", 0, 128);
         defer hc.deinit();
         hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
-        _ = try hc.commit(&cache, tokens_a[0..400], false);
-        _ = try hc.commit(&cache, tokens_b[0..400], false);
+        _ = try commitUnflushed(&hc, &cache, tokens_a[0..400]);
+        _ = try commitUnflushed(&hc, &cache, tokens_b[0..400]);
         hc.spillIdleEntries(s);
         try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
@@ -9897,8 +10217,8 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-offset", 0, 128);
         defer hc.deinit();
         hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
-        _ = try hc.commit(&cache, &tokens_a, false);
-        _ = try hc.commit(&cache, &tokens_b, false);
+        _ = try commitUnflushed(&hc, &cache, &tokens_a);
+        _ = try commitUnflushed(&hc, &cache, &tokens_b);
         for (hc.entries.items) |*e| {
             if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.entries[1].offset = 300;
         }
@@ -9934,8 +10254,8 @@ test "SSD-first: a PARTIAL copy is not a copy — the idle entry stays resident"
     // One byte: the loop writes chunk 0 and stops.
     hc.disk.?.max_flush_bytes = 1;
 
-    _ = try hc.commit(&cache, &tokens_a, false);
-    _ = try hc.commit(&cache, &tokens_b, false);
+    _ = try commitUnflushed(&hc, &cache, &tokens_a);
+    _ = try commitUnflushed(&hc, &cache, &tokens_b);
     hc.spillIdleEntries(s);
     hc.disk.?.drainWriter();
     try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
@@ -10850,8 +11170,8 @@ test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry �
     hc.disk.?.enableBackgroundWriter();
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
-    _ = try hc.commit(&cache, &tok_a, false);
-    _ = try hc.commit(&cache, &tok_b, false);
+    _ = try commitUnflushed(&hc, &cache, &tok_a);
+    _ = try commitUnflushed(&hc, &cache, &tok_b);
 
     // Pass N: the writer is held, so A's files stay staged.
     hc.disk.?.writer.?.setPaused(true);
@@ -10929,8 +11249,8 @@ test "SSD-first: a write failure inside the SAME pass still keeps the entry resi
     hc.disk.?.enableBackgroundWriter();
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
-    _ = try hc.commit(&cache, &tok_a, false);
-    _ = try hc.commit(&cache, &tok_b, false);
+    _ = try commitUnflushed(&hc, &cache, &tok_a);
+    _ = try commitUnflushed(&hc, &cache, &tok_b);
     hc.disk.?.writer.?.injectFailure("c000002", .submit);
     hc.spillIdleEntries(s);
     hc.disk.?.drainWriter();
@@ -11785,6 +12105,165 @@ test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart 
     }
 }
 
+test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps, and the longer tier restores" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+    var next: [750]u32 = undefined;
+    @memcpy(next[0..650], first[0..650]);
+    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
+    const Arm = struct { ram: bool, fp: []const u8 };
+    for ([_]u8{ 0, 8 }) |bits| for ([_]Arm{ .{ .ram = true, .fp = "glm-tiers-both" }, .{ .ram = false, .fp = "glm-tiers-ssd" } }) |arm| {
+        var fp_buf: [32]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fp_buf, "{s}-{d}", .{ arm.fp, bits });
+        var hc = if (arm.ram) HotPrefixCache.initWithMem(testing.allocator, 4, 0) else try glmSsdOnlyCache(io, base, fp, 0, false);
+        defer hc.deinit();
+        if (arm.ram) {
+            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+            hc.disk.?.enableBackgroundWriter();
+        }
+        hc.disk.?.max_flush_bytes = 1; // one chunk per piece
+        var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
+        defer turn.cache.deinit();
+        // The RAM tier keeps the rows through the first checkpoint; the SSD tier gets them all.
+        const ram_rows: ?glm5_prefix.MlaRows = if (arm.ram) try turn.rows.trimmedCopy(256, s) else null;
+        const status = try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, ram_rows, turn.rows, null, first.len);
+        if (arm.ram) {
+            try testing.expectEqual(CommitStatus{ .ok = first.len }, status);
+            try testing.expectEqual(@as(usize, 256), hc.entries.items[0].glm.?.len);
+            try testing.expectEqual(@as(usize, 1), hc.entries.items[0].ssm_checkpoints.?.len);
+        } else {
+            try testing.expectEqual(CommitStatus{ .disk_only = first.len }, status);
+            try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        }
+        hc.flushPendingDisk(s);
+        hc.disk.?.drainWriter();
+        try testing.expect(!hc.disk_dirty);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        const on_disk = &hc.disk.?.entries.items[0];
+        try testing.expectEqual(@as(u32, 700), on_disk.kv_len);
+        try testing.expectEqualSlices(u32, &.{ 256, 512 }, on_disk.ssm_positions);
+
+        // The SSD tier's checkpoint at 512 beats the RAM entry's at 256.
+        var warm = try glm5_prefix.servedRequest(bits);
+        defer warm.deinit();
+        const res = try glmLookup(&hc, &warm, bits, &next, 0, null, &.{});
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        try testing.expect(res.ownsRestoredRows());
+        const got = try glm5_prefix.prefill(&fx.net, &warm, next[512..], &.{238});
+        defer _ = mlx.mlx_array_free(got);
+        var cold = try glm5_prefix.servedRequest(bits);
+        defer cold.deinit();
+        const want = try glm5_prefix.prefill(&fx.net, &cold, &next, &.{ 256, 256, 238 });
+        defer _ = mlx.mlx_array_free(want);
+        try glm5_forward.expectArrayBits(want, got);
+        try glm5_prefix.expectSameLogicalState(&cold, &warm);
+    };
+}
+
+test "GLM SSD-only: two commits before one flush (two cancels culled in one pass) both reach disk" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var prompts: [2][600]u32 = undefined;
+    for (&prompts, 0..) |*p, k| for (p, 0..) |*t, i| {
+        t.* = @intCast((i * (k + 3) + k + i / 7) % 4);
+    };
+    var hc = try glmSsdOnlyCache(io, base, "glm-two-cancels", 0, false);
+    defer hc.deinit();
+    for (&prompts) |*p| {
+        var turn = try GlmTurn.run(&fx.net, 8, p, &.{ 512, 88 }, &.{0});
+        try testing.expectEqual(CommitStatus{ .disk_only = p.len }, try turn.commit(&hc, p, 0, null));
+    }
+    hc.flushPendingDisk(s);
+    hc.disk.?.drainWriter();
+    try testing.expect(hc.pending_disk == null);
+    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+    var warm = try glm5_prefix.servedRequest(8);
+    defer warm.deinit();
+    for (&prompts) |*p| {
+        const again = p.* ++ [_]u32{1};
+        try testing.expectEqual(@as(usize, 512), (try glmLookup(&hc, &warm, 8, &again, 0, null, &.{})).matched);
+    }
+}
+
+test "GLM SSD-only without the writer: one flush finishes the whole entry before its source goes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var fx: GlmNet = undefined;
+    try fx.load();
+    defer fx.deinit();
+    var first: [700]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+    defer hc.deinit();
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "glm-no-writer", 0, 128);
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
+    hc.disk.?.max_flush_bytes = 1; // one chunk per synchronous piece
+    try testing.expect(hc.disk.?.writer == null);
+    var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
+    try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try turn.commit(&hc, &first, 0, null));
+    hc.flushPendingDisk(s);
+    try testing.expect(hc.pending_disk == null);
+    const e = &hc.disk.?.entries.items[0];
+    try testing.expectEqual(@as(u32, 700), e.kv_len);
+    try testing.expectEqualSlices(u32, &.{ 256, 512 }, e.ssm_positions);
+    try testing.expect(hc.disk.?.entryWholeOnDisk(e.id));
+}
+
+test "a GLM commit hands the SSD tier every row through its newest checkpoint, past any one flush" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const cp = struct {
+        fn at(pos: usize) SSMCheckpoint {
+            return .{ .pos = pos, .layers = &.{} };
+        }
+    }.at;
+    const cps = [_]SSMCheckpoint{ cp(2048), cp(524_288), cp(1_040_000) };
+    const row: u64 = 6688;
+    {
+        var hc = try glmSsdOnlyCache(io, base, "glm-len-ssd", 20 << 30, false);
+        defer hc.deinit();
+        try testing.expectEqual(@as(?usize, null), hc.glmCommitLen(&cps, 1_040_003, row, 0));
+        try testing.expectEqual(@as(?usize, 1_040_000), hc.glmDiskLen(&cps, 1_040_003, row, 0));
+    }
+    {
+        // Both tiers: the RAM tier keeps what its 1 GiB holds, the SSD tier every row.
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 1 << 30);
+        defer hc.deinit();
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "glm-len-both", 20 << 30, 128);
+        try testing.expectEqual(@as(?usize, 2048), hc.glmCommitLen(&cps, 1_040_003, row, 0));
+        try testing.expectEqual(@as(?usize, 1_040_000), hc.glmDiskLen(&cps, 1_040_003, row, 0));
+    }
+}
+
 test "GLM SSD-only: the disk budget evicts the least recently used conversation" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const io = std.testing.io;
@@ -11867,9 +12346,20 @@ test "a GLM commit copies only the rows its destination tier keeps, chosen befor
     try t.expect(@as(u64, ram) * row + cp <= gib);
     // The window comes out of the budget first.
     try t.expectEqual(@as(?usize, 2048), HotPrefixCache.glmCommitLenFor(policy, gib, false, 1_040_000, row, 200 << 20, &positions, &bytes));
-    // The SSD tier's one flush bounds the rows alone.
-    try t.expectEqual(@as(?usize, 262144), HotPrefixCache.glmCommitLenFor(policy, 2 * gib, true, 1_040_000, row, 0, &positions, &bytes));
-    try t.expectEqual(@as(?usize, null), HotPrefixCache.glmCommitLenFor(policy, 0, true, 1_040_000, row, 0, &positions, &bytes));
+    // The SSD tier keeps every row through the newest checkpoint; only its own byte budget bounds
+    // them, priced with every checkpoint it keeps at or below.
+    try t.expectEqual(@as(?usize, 1_040_000), HotPrefixCache.glmCommitLenFor(policy, 0, true, 1_040_000, row, 0, &positions, &bytes));
+    try t.expectEqual(@as(?usize, 1_040_000), HotPrefixCache.glmCommitLenFor(policy, 20 * gib, true, 1_040_000, row, 0, &positions, &bytes));
+    // 262,144 rows (1.75 GB) fit 2 GiB alone; with their three checkpoints (0.44 GB) they do not.
+    try t.expectEqual(@as(?usize, 131072), HotPrefixCache.glmCommitLenFor(policy, 2 * gib, true, 1_040_000, row, 0, &positions, &bytes));
+    // A 1 GiB tier and ~131K rows with eight checkpoints: 0.82 GiB of rows, 1.92 GiB in all.
+    const eight = [_]usize{ 2048, 18432, 43008, 69632, 92160, 116736, 126976, 131040 };
+    const eight_bytes: [8]u64 = @splat(cp);
+    const kept = HotPrefixCache.glmCommitLenFor(policy, gib, true, 131040, row, 0, &eight, &eight_bytes).?;
+    var priced: u64 = @as(u64, kept) * row;
+    for (eight) |p| priced += if (p <= kept) cp else 0;
+    try t.expect(priced <= gib);
+    try t.expect(kept < 131040);
     try t.expectEqual(@as(?usize, null), HotPrefixCache.glmCommitLenFor(policy, gib, false, 0, row, 0, &.{}, &.{}));
 }
 
