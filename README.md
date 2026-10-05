@@ -13,7 +13,7 @@ stand-alone and also as a guest engine inside mlx-serve.
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
-* GLM-5.3-Flash (`glm5_next`): text, image and video input; its Sushi pack is not published yet
+* GLM-5.3-Flash - coming soon!
 
 ## Quality
 
