@@ -46,6 +46,7 @@ chunk with the same chunk width, state and kernels, so the order of work is the 
 (logits, tokens, baseline) and `SUSHI_HIDDEN_OUT` boundaries are byte-identical to the window-major capture. A tiny
 seeded GLM checks this at several W, across chunks and across a resume (`glm5_layer_major.zig`,
 `glm5_kld_capture.zig`).
+- The tiny capture tests use a 1 GiB ledger and 128 MiB reserve floor; the CLI keeps its 8 GiB floor and Metal working-set check.
 - Measured (binary `65a5904b`, 16 real 500-token tune windows, W=8, `--ssd-budget-gb 100`, `taskpolicy -a`, GPU lock):
   33.1 tok/s against 4.2 window-major (608.8 GB read per batch in ~48 s, ~9 s compute per window); byte-identical
   to window-major on 14 windows (131 files).

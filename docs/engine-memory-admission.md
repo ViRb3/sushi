@@ -124,6 +124,7 @@ architectures need their own measured envelope. These runs do not simulate a 64 
 - An explicit `--ctx-size` outranks auto-context and `model-settings.json` `ctx_size`.
 - Disconnect cancellation takes effect at the next prefill chunk boundary; a wall-time cancellation test must bound
   its chunk size rather than assume the auto-sized chunk fits a fixed deadline.
+- Admission-bill tests pin synthetic contexts and use request shapes that fit them, never the test host's auto-context.
 
 <a id="recipe-64gb"></a>
 ### The 48 GB and 64 GB recipe contexts

@@ -636,7 +636,8 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
         max_tokens = @max(max_tokens, capacity);
     }
     const chunk = @min(@as(usize, 512), max_tokens);
-    const reserve = @max(@as(u64, 8) << 30, try streaming.minimumReserve(cfg, max_tokens, chunk));
+    const reserve_floor: u64 = if (@import("builtin").is_test) reserve_floor_for_test else 8 << 30;
+    const reserve = @max(reserve_floor, try streaming.minimumReserve(cfg, max_tokens, chunk));
     const config_sha = try metadataHash(a, io, opts.model_dir, "config.json");
     const index_sha = try metadataHash(a, io, opts.model_dir, "model.safetensors.index.json");
     const tokenizer_sha = try metadataHash(a, io, opts.model_dir, "tokenizer.json");
@@ -973,6 +974,7 @@ test "GLM layer-major capture CPU flags: one row per window, native teacher only
 
 /// Test-only: the number of boundary appends a layer-major capture makes before it fails as if killed.
 var interrupt_boundaries_for_test: ?usize = null;
+var reserve_floor_for_test: u64 = 8 << 30;
 
 /// A tiny GLM BF16 checkpoint and seven token-id windows of different lengths, under one temporary root.
 const TinyCapture = struct {
@@ -1018,7 +1020,7 @@ const TinyCapture = struct {
             .hidden_out = try std.fmt.allocPrint(arena, "{s}/{s}-hidden", .{ self.root, name }),
             .tokens = 1,
             .no_template = true,
-            .ssd_budget_bytes = 10 << 30,
+            .ssd_budget_bytes = 1 << 30,
             .label = "tiny",
             .layer_major = batch != 0,
             .batch_windows = batch,
@@ -1028,6 +1030,10 @@ const TinyCapture = struct {
         _ = self;
         var out = kld.Out{ .silent = true };
         defer @import("glm5_model.zig").reference_numerics = false;
+        // The tiny checkpoint needs no production-sized floor; all computed bills and Metal limits still apply.
+        const prior = reserve_floor_for_test;
+        reserve_floor_for_test = 128 << 20;
+        defer reserve_floor_for_test = prior;
         if (!try tryRun(a, std.testing.io, opts_value, &out)) return error.NativeGlmCaptureNotTaken;
     }
     fn read(self: *TinyCapture, sub: []const u8) ![]u8 {
@@ -1054,6 +1060,18 @@ const TinyCapture = struct {
         try std.testing.expectEqualStrings(lines[0].items, lines[1].items);
     }
 };
+
+test "GLM native teacher refuses a budget above Metal's recommended working set" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    var opts = try tiny.opts("above-wired", 0);
+    opts.ssd_budget_bytes = @max(@as(u64, 10) << 30, @as(u64, mlx.maxRecommendedWorkingSet()) + 1);
+    var out = kld.Out{ .silent = true };
+    defer @import("glm5_model.zig").reference_numerics = false;
+    try std.testing.expectError(error.InvalidGlmWiredLimit, tryRun(a, std.testing.io, opts, &out));
+}
 
 test "GLM layer-major capture writes window-major's fixture and boundaries byte for byte, across batches and a resume" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;

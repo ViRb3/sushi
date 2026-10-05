@@ -26738,20 +26738,23 @@ test "GLM DFlash2 reserve at prefill end fits the admission bill at every reques
     const reserve = @import("glm5_dflash_reserve.zig");
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     cfg.glm_dflash_loaded = true;
-    const ctx: u64 = getEffectiveContextLength(&cfg);
     const mla_layers: usize = cfg.num_hidden_layers / cfg.full_attention_interval;
     const pool_row: usize = @as(usize, cfg.indexer_head_dim) * 2;
     const shapes = [_][2]u64{ .{ 16, std.math.maxInt(u32) }, .{ 18, 32 }, .{ 100, 920 }, .{ 1000, 24 }, .{ 1022, 2 }, .{ 2008, 2400 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 2008, std.math.maxInt(u32) }, .{ 500000, std.math.maxInt(u32) } };
-    for ([_]u64{ 16, 8 }) |kv_bits| {
-        const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
-        for (shapes) |shape| {
-            const seq: usize = @intCast(shape[0]);
-            const max_tokens: u32 = @intCast(@min(shape[1], ctx - seq));
-            const lc = try reserve.capacity(seq);
-            const pc = try reserve.capacity(seq / 4);
-            const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
-            const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
-            try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= glmDflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
+    for ([_]u32{ 1024, 8192, 65536, 1048576 }) |ctx| {
+        cfg.pinned_context = ctx;
+        for ([_]u64{ 16, 8 }) |kv_bits| {
+            const latent_row: usize = if (kv_bits == 16) @as(usize, cfg.mla_kv_lora_rank) * 2 else @import("glm5_latent.zig").rowBytes(cfg.mla_kv_lora_rank, 8);
+            for (shapes) |shape| {
+                const seq: usize = @intCast(shape[0]);
+                if (seq >= ctx) continue;
+                const max_tokens: u32 = @intCast(@min(shape[1], ctx - seq));
+                const lc = try reserve.capacity(seq);
+                const pc = try reserve.capacity(seq / 4);
+                const p = try reserve.plan(seq, lc, pc, latent_row, cfg.indexer_head_dim, 2, seq + max_tokens + 3);
+                const held: u64 = mla_layers * (lc * latent_row + pc * pool_row) + cfg.ssmCheckpointBytes();
+                try std.testing.expect(try reserve.statesPeak(mla_layers, p) <= glmDflashReserveBudget(&cfg, seq, max_tokens, kv_bits, held));
+            }
         }
     }
 }
