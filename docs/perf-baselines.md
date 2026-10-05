@@ -1324,6 +1324,28 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-three-row-a6-offset"></a>
+## GLM three-row A6: constant row offsets (component measurement)
+
+2026-10-05–06 (Asia/Bangkok), M5 Max 128 GB, native Sushi MLX runtime, parent `83e1d799`. The helper admits one complete
+three-row tile. Fixing its row offset at zero lets Metal remove masked loads without changing the dot-product order.
+
+Synthetic A6/group128 banks rotate through at least 160 MiB (the full vocabulary bank is larger). Sixty randomized
+reference/candidate/unchanged-control comparisons per shape, `taskpolicy -a`, GPU lock `codex-glm-a6-bounds` or
+`codex-glm-head-micro`. Hot box; a CPU build overlapped part of the first run. Figures are paired median reductions
+in component build/evaluate/free time, not whole-model verification or throughput results.
+
+| Projection, output × input | Component reduction | Faster pairs |
+|---|---:|---:|
+| 8192 × 4096 | 14.9% | 59/60 |
+| 4096 × 8192 | 9.5% | 58/60 |
+| 4096 × 16384 | 12.1% | 59/60 |
+| 2048 × 4096 | 6.1% | 60/60 |
+| 154880 × 4096 | 11.0% | 60/60 |
+
+Every output bit matched; unchanged-control medians stayed within 0.6%. The GLM suite passed 310 tests with
+3 skips. Full-model verification timing remains pending while conversion uses the box.
+
 <a id="glm-three-row-a6"></a>
 ## GLM DFlash2: three-row A6 coefficient reuse beyond QKV
 

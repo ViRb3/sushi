@@ -5,10 +5,11 @@ const Arr = mlx.mlx_array;
 const Ops = @import("glm5_model.zig").Ops;
 const Linear = @import("glm5_model.zig").Linear;
 // The per-row dot/update order is inherited from glm5_decode's MLX-derived qmv_fast.
+// The admitted three rows occupy one complete row tile, so its offset is constant.
 const SOURCE =
     \\const int lane = int(thread_index_in_simdgroup);
     \\const int output0 = int(threadgroup_position_in_grid.x) * 8 + int(simdgroup_index_in_threadgroup) * 4;
-    \\const int token0 = int(threadgroup_position_in_grid.y) * R;
+    \\const int token0 = 0;
     \\const device uint8_t* codes = reinterpret_cast<const device uint8_t*>(w);
     \\float result[R][4];
     \\for (int m = 0; m < R; ++m) for (int r = 0; r < 4; ++r) result[m][r] = 0.0f;
