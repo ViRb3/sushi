@@ -290,6 +290,10 @@ settings, same binary as the off arm): KLD 0.086674 / top-1 91.78% (7404) / NLL 
 
 ## GLM-5.3-Flash: native BF16 teacher, 4x512 (2026-10-04)
 
+GLM's release reading is this 4x512 screen, with the two code prompts (2x512) reported apart: a 16x512 BF16 teacher
+would stream the BF16 experts and is too slow to capture. Shipping config (kv8, FP32 decode attention): KLD 0.0716 /
+top-1 90.3%; code 0.0324 / 95.8%, prose 0.1107 / 84.9%.
+
 Teacher: the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
 standard4 --tokens 512 --no-template --kv-quant off --ssd-budget-gb 100` (streamed BF16 experts, dense prefill in
 chunks of at most 512, synchronous layers, BF16 MLA cache, FP32 KDA state). Native prompt lengths 242/261/190/183; no
