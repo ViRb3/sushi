@@ -689,6 +689,12 @@ pub const ReplOptions = struct {
     }
 };
 
+/// The one switch for the prompt-lookup drafts in MTP rounds and GLM DFlash2; `--pld`/`--no-pld`
+/// (standalone PLD) and `--no-mtp` are separate flags and never imply it.
+pub fn isNoMtpLookupFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--no-mtp-lookup");
+}
+
 /// `on`/`off` for `--tool` and `/tool`.
 pub fn parseToolSwitch(word: []const u8) ?bool {
     if (std.mem.eql(u8, word, "on")) return true;
@@ -1535,6 +1541,13 @@ fn mergeToolCallDelta(allocator: std.mem.Allocator, calls: *std.ArrayList(ToolCa
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "cli: --no-mtp-lookup is its own flag, not --no-pld or --no-mtp" {
+    try testing.expect(isNoMtpLookupFlag("--no-mtp-lookup"));
+    for ([_][]const u8{ "--no-pld", "--pld", "--no-mtp", "--mtp", "--no-mtp-lookups", "--mtp-lookup" }) |other| {
+        try testing.expect(!isNoMtpLookupFlag(other));
+    }
+}
 
 test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Bare alias picks the family default.

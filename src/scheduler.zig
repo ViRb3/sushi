@@ -40,6 +40,7 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
@@ -127,7 +128,7 @@ pub const LoadParams = struct {
     /// `--mtp` / `--no-mtp` was given: `mtp_enabled` then outranks the per-model `mtp`.
     mtp_explicit: bool = false,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// Build the ANE prefill-MLP offload at load (`--ane-prefill`,
@@ -1191,7 +1192,7 @@ pub const LoadRequest = struct {
     mtp_enabled: bool = true,
     mtp_explicit: bool = false,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// `--ane-prefill` survives cold loads (the flag-eater class).
@@ -1315,7 +1316,7 @@ pub const Scheduler = struct {
     ssm_checkpoint_max: u32,
     /// Launch-flag MTP settings, retained (same rationale as the prefix-cache
     /// fields above) so COLD-LOADED models — on-demand `/v1/load-model`, model
-    /// switches — honor `--no-mtp` / `--mtp-depth` like the `--model` primary.
+    /// switches — honor `--no-mtp` / `--mtp-max-depth` like the `--model` primary.
     /// Pre-plumbing, the cold-load `LoadRequest` used its struct defaults
     /// (mtp on, default depth), silently ignoring these flags on every
     /// on-demand load and model switch.
@@ -2037,7 +2038,7 @@ pub const Scheduler = struct {
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             // Cold loads honor the launch-flag MTP settings too (same reason
             // as prefix-cache above) — pre-plumbing these were LoadRequest
-            // defaults, so --no-mtp / --mtp-depth were silently dropped on
+            // defaults, so --no-mtp / --mtp-max-depth were silently dropped on
             // every on-demand load and model switch.
             .mtp_enabled = self.mtp_enabled,
             .mtp_explicit = self.mtp_explicit,
@@ -5055,6 +5056,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.mtp_depth = @min(entry.mtp_depth, @min(@as(u32, @intCast(h.heads)), rows_max));
         xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, @min(@as(u32, @intCast(h.heads)), rows_max));
     }
+    if (entry.mtp != null) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
+        depth_bounds.floorFor(depth_bounds.active, entry.mtp_depth),
+        entry.mtp_depth,
+        if (depth_bounds.active.explicit()) "--mtp-min-depth/--mtp-max-depth" else "default",
+    });
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
     // must not disagree about the same sidecar.
@@ -9054,10 +9060,14 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         probe = true;
         recovering = true;
     }
-    if (Generator.mtpForcedDepth()) |depth| {
-        for (rows[0..active.len], 0..) |row, i| decision.widths[i] = @intCast(@min(depth, row.cap));
-        probe = false;
-        recovering = false;
+    // A width the range moves no longer matches what a probe was meant to price.
+    for (rows[0..active.len], 0..) |row, i| {
+        const width: u8 = @intCast(depth_bounds.plannerWidth(decision.widths[i], row.cap, depth_bounds.active));
+        if (width != decision.widths[i] or depth_bounds.active.pinned() != null) {
+            decision.widths[i] = width;
+            probe = false;
+            recovering = false;
+        }
     }
     var stale: [Planner.MAX_ROWS]bool = undefined;
     for (active, 0..) |slot, row| stale[row] = slot.legacy_gen.?.mtp_hidden_stale;

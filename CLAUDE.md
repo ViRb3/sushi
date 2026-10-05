@@ -103,8 +103,8 @@ Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
 
-Flags that matter: `--model --serve --host --port --ctx-size --kv-quant --kv-attn-mode --mtp --no-mtp --mtp-depth
---mtp-head-kv-quant --max-mtp-ctx --ssd-budget-gb --expert-cache-gb --prefix-cache-entries --prefix-cache-mem
+Flags that matter: `--model --serve --host --port --ctx-size --kv-quant --kv-attn-mode --mtp --no-mtp --mtp-min-depth
+--mtp-max-depth --mtp-head-kv-quant --max-mtp-ctx --ssd-budget-gb --expert-cache-gb --prefix-cache-entries --prefix-cache-mem
 --prefix-cache-disk --prefill-chunk --max-concurrent --max-tokens --timeout --reasoning-budget --preserve-thinking
 --wired-margin-gib --skip-mem-preflight --metrics --api-key --model-dir --log-level --log-file --parent-pid`. `--help`
 lists the rest.

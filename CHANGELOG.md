@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`--mtp-depth` is replaced by `--mtp-min-depth` / `--mtp-max-depth`**: every depth the MTP planner picks stays inside the
+  range so each machine can calibrate its own, equal values pin one depth, and `SUSHI_MTP_FORCE_DEPTH` is gone.
+- **`--no-mtp-lookup` turns off prompt-lookup drafts in MTP rounds and GLM DFlash2**, replacing the `SUSHI_MTP_LOOKUP` and `SUSHI_GLM_NO_LOOKUP` env switches; `--no-pld` still governs standalone PLD only.
 - **Sushi-2.6bpw decodes 12-15% faster per forward again**: the EXL3 decode reader no longer branches around its
   third weight word, a slowdown since v1.1.0; output is unchanged.
 - **The browser chat page opens on the logo and title only**: the subtitle, privacy note and canned prompts are gone.

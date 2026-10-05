@@ -13,6 +13,7 @@ const model_discovery = @import("model_discovery.zig");
 const model_registry_mod = @import("model_registry.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -181,7 +182,11 @@ fn printUsage(io: std.Io) void {
         \\                        agentic loops). Adaptive prompt-time gate
         \\                        auto-disables it on novel content. Pass
         \\                        --no-pld to force-disable.
-        \\  --no-pld            Force-disable Prompt Lookup Decoding.
+        \\  --no-pld            Force-disable standalone Prompt Lookup Decoding
+        \\                        (the lookups inside MTP rounds stay on).
+        \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
+        \\                        rounds and GLM DFlash2 (default: ON); standalone
+        \\                        PLD (--pld/--no-pld) is unaffected.
         \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
         \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
         \\  --fast              MTP with typical acceptance and greedy tail, plus kv8: lossy
@@ -210,12 +215,18 @@ fn printUsage(io: std.Io) void {
         \\                      SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
         \\                      moves the 4-bit boundary, =off keeps the whole
         \\                      stack INT8.
-        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
+        \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
+        \\                        (default 1). Every depth the planner picks
+        \\                        stays inside --mtp-min-depth..--mtp-max-depth;
+        \\                        equal values pin one depth.
+        \\  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
-        \\                        otherwise 6; SUSHI_MTP_ADAPTIVE=0
+        \\                        otherwise 6, lower on silicon with a measured
+        \\                        verify-width cliff; SUSHI_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
-        \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\                        cap 3). A --mtp-min-depth above that default
+        \\                        lifts it. Each machine finds its own range.
         \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
         \\                        Use 0.2 for the Qwen3.8 matched comparison.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
@@ -534,7 +545,6 @@ pub fn main(init: std.process.Init) !void {
     // Either flag given: it outranks the per-model `mtp` (the last one wins).
     var mtp_explicit = false;
     var mtp_head_kv_quant = false;
-    var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_TYPICAL")) |v| std.mem.span(v) else null;
     var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_TOKENV3")) |v| std.mem.span(v) else null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
@@ -687,6 +697,8 @@ pub fn main(init: std.process.Init) !void {
             pld_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_mod.g_tool_autocorrect = false;
+        } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
+            generate_mod.mtp_lookup_disabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {
             enable_pld = false;
             pld_explicit = true;
@@ -756,9 +768,18 @@ pub fn main(init: std.process.Init) !void {
             transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = false;
-        } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--mtp-depth")) {
+            log.err("{s}\n", .{depth_bounds.removed_flag_message});
+            std.process.exit(1);
+        } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
+            const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             i += 1;
-            mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+            const text: []const u8 = if (i < args.len) args[i] else "";
+            const n = depth_bounds.parseDepth(text, mtp_mod.MAX_DEPTH) catch {
+                log.err("{s}: expected an integer in 1..{d}; got '{s}'\n", .{ args[i - 1], mtp_mod.MAX_DEPTH, text });
+                std.process.exit(1);
+            };
+            if (is_min) depth_bounds.active.min = n else depth_bounds.active.max = n;
         } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
             i += 1;
             mtp_typical_raw = args[i];
@@ -1016,6 +1037,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    depth_bounds.validate(depth_bounds.active) catch {
+        log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
+        std.process.exit(1);
+    };
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.sushi/models
@@ -1472,7 +1497,7 @@ pub fn main(init: std.process.Init) !void {
             .mtp_enabled = enable_mtp,
             .mtp_explicit = mtp_explicit,
             .mtp_head_kv_quant = mtp_head_kv_quant,
-            .mtp_depth = mtp_depth,
+            .mtp_depth = depth_bounds.active.max,
             .ane_prefill = ane_prefill,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
             .ane_headroom_resolver = server_mod.aneGateHeadroom,
@@ -1641,7 +1666,7 @@ pub fn main(init: std.process.Init) !void {
         } else {
             // Non-streaming: generate all tokens then print
             const result = if (mtp_head) |*h|
-                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, mtp_depth, null)
+                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, depth_bounds.active.max, null)
             else
                 try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);

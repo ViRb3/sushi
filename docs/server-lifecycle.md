@@ -114,6 +114,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
   `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
+- **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
+  `model-settings.json` key; a removed `--mtp-depth` exits naming the two
+  ([engine-mtp](engine-mtp.md#depth-range)).
+- **`--no-mtp-lookup` is launch-only too** (no `model-settings.json` key): it turns off the prompt-lookup drafts in MTP
+  rounds (Qwen, MiMo) and GLM DFlash2's lookup chains. Standalone PLD keeps `--pld`/`--no-pld`; neither implies the other.
 - **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >
   `model-settings.json` > the default, per key (`model_settings.pickLaunch`; the one table is
   `model_settings.fast_preset`: MTP, typical acceptance, greedy tail, kv8). Its values report source `--fast` in the

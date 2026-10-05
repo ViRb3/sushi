@@ -192,7 +192,7 @@ NOT a quiet box (a system daemon at ~100% of one core). Greedy, 4 prompts x 256 
 <a id="mtp-lookup"></a>
 ## Flash-Next: prompt lookup inside the MTP round (2f1e4bf2 + the port)
 
-Arms of one binary per step: A = `SUSHI_MTP_LOOKUP=0`, B = lookup (c68b4cf7, ReleaseFast, sha256 848bd456…),
+Arms of one binary per step: A = `SUSHI_MTP_LOOKUP=0` (now `--no-mtp-lookup`), B = lookup (c68b4cf7, ReleaseFast, sha256 848bd456…),
 C = lookup with the line rule (6ea00e3f, sha256 ea4f6fd0…). M5 Max 128 GB, 2026-09-27, `tests/bench_mtp_lookup.sh`
 (a file of ~600 tokens in the prompt; thinking off; greedy, and sampled 0.6 / 0.95 / 20 seed 7; 2 reps per boot),
 `--ctx-size 131072 --kv-quant 8 --prefix-cache-entries 0`, `SUSHI_ROUND_COST_PERSIST=0`, MTP and exact acceptance at
@@ -837,7 +837,7 @@ tok/s over the four runs per arm:
 - Each boot's second rep runs fewer lookups (33 vs 66) at +10-18%: the rep0 prose request trains the model's round
   table to narrow MTP widths, and the gate prices the MTP chain at the plan's base width with the request's
   MTP-round acceptance.
-- Lookup alone at three drafts (ae92c897, `SUSHI_MTP_LOOKUP=0|1`, A B B A, busy box) was neutral: the three heads
+- Lookup alone at three drafts (ae92c897, `SUSHI_MTP_LOOKUP=0|1` (now `--no-mtp-lookup`), A B B A, busy box) was neutral: the three heads
   already land ~3.9 tokens per round on a verbatim copy, and a three-draft lookup round (47-51 ms) costs what an MTP
   round does.
 
