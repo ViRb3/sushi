@@ -179,6 +179,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - The KDA body, prework, post and FP32 router are plain SIMD kernels whose unary variants are probed against MLX on the
   device; they run on every GPU. The 1024-thread KDA body compiles to 24 GPRs for G13/G14 (`metal-tt`), inside M1/M2's
   1024-thread cap; every other GLM kernel dispatches at most 256 threads.
+- The T2048 grid takes NHW from each projection's trellis and keys its config cache on the rate.
 - Routed experts: the T2048 grid declines off NAX and the sorted chain takes the simdgroup-matrix body
   (`[exl3-gemm] simdgroup-matrix body engaged`); decode lanes and group2 rows are SIMD already.
 - The cold MLA D256 `force_fused` SDPA has a non-NAX steel kernel (256 threads); vision uses stock D64 attention.
