@@ -1016,7 +1016,7 @@ fn codebookHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:0]co
         \\  const uint prev = last == 0u ? nwords - 1u : last - 1u;
         \\  const uint s = (0u - end) & 31u;
         \\  ulong bits = (((ulong)words[prev] << 32u) | (ulong)words[last]) >> s;
-        \\  if (full && s != 0u) bits |= ((ulong)words[prev == 0u ? nwords - 1u : prev - 1u] << 32u) << (32u - s);
+        \\  if (full) bits |= ((ulong)words[prev == 0u ? nwords - 1u : prev - 1u] << 32u) << (32u - s);
         \\  return bits;
         \\}
         \\// Lane l reads weights 8l..8l+7 from the bits ending at its group's last bit; weight
@@ -9001,6 +9001,87 @@ test "exl3 Sushi CPU dispatch selects fast layouts for every rate" {
         try std.testing.expectEqual(n != 64, funnelReads(n));
         try std.testing.expectEqual(GemvLayout{ .funnel = n != 64, .tiles = if (n == 64) 1 else 2 }, gemvLayout(n, 128));
         try std.testing.expectEqual(n, (try packedRate(@intCast(n))).n);
+    }
+}
+
+/// A copy of `a` that waits on `dep`, so the timed GEMV steps run one after another.
+const LANE_LINK_SOURCE: [:0]const u8 =
+    \\const uint i = thread_position_in_grid.x;
+    \\if (i >= uint(LEN)) return;
+    \\out[i] = a[i];
+    \\if (i == 0u && float(dep[0]) == 1.5e30f) out[0] = a[1];
+;
+var lane_link_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// Nanoseconds for `steps` dependent pair + fused-down GEMV steps over one-row fixture `f`.
+fn laneChainNs(s: mlx.mlx_stream, f: *const MimoMoeFixture, c: MimoMoeCase, steps: usize) !u64 {
+    const a = f.arrays;
+    const hidden: c_int = @intCast(c.hidden);
+    const inter: c_int = @intCast(c.inter);
+    const nslots: c_int = @intCast(c.topk);
+    const link = try getNamedKernel(&lane_link_kernel, "sushi_exl3_lane_link", &.{ "a", "dep" }, &.{"out"}, LANE_LINK_SOURCE, "");
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, hidden }, 2, .float16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, hidden, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LEN", hidden));
+    var x = try applyUnary(s, link, &.{ a[8], a[8] }, cfg);
+    defer _ = mlx.mlx_array_free(x);
+    for (0..steps) |_| {
+        const inner = try pairGemv(s, x, a[3], a[3], a[0], a[1], a[7], hidden, inter, nslots, @intCast(c.topk), 0);
+        defer _ = mlx.mlx_array_free(inner[0]);
+        defer _ = mlx.mlx_array_free(inner[1]);
+        const y = try downGemvFusedMid(s, inner[0], inner[1], a[2], a[4], a[4], a[5], a[7], inter, hidden, nslots);
+        defer _ = mlx.mlx_array_free(y);
+        const next = try applyUnary(s, link, &.{ a[8], y }, cfg);
+        _ = mlx.mlx_array_free(x);
+        x = next;
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sw = io_util.Stopwatch.init(io);
+    try mlx.check(mlx.mlx_array_eval(x));
+    return sw.read();
+}
+
+// A reader change can keep every byte and still slow a rate (n42 to n62 but n48 read a third word
+// per decode lane), so every K2 to K4 rate's decode GEMVs are held to a margin over n48's.
+test "exl3 every K2 to K4 rate decodes within a margin of n48" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
+    setDecodeParams(dec);
+    defer setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ref_case: MimoMoeCase = .{ .e = 16, .hidden = 2560, .inter = 640, .topk = 10, .rows = 1, .rate = .{ .n = 48 }, .dec = dec, .seed = 4848 };
+    var ref = try mimoMoeFixture(arena.allocator(), ref_case);
+    defer ref.deinit();
+    var n: u32 = 32;
+    while (n <= 64) : (n += 2) {
+        if (n == 48) continue;
+        var c = ref_case;
+        c.rate = .{ .n = n };
+        c.seed = 4800 + n;
+        var rate_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer rate_arena.deinit();
+        var rate = try mimoMoeFixture(rate_arena.allocator(), c);
+        defer rate.deinit();
+        // Each round times both rates back to back, so contention lands on both sides of its ratio.
+        var ratios: [9]f64 = undefined;
+        for (&ratios, 0..) |*ratio, round| {
+            var ns: [2]u64 = undefined;
+            for (0..2) |j| {
+                const k = (round + j) % 2;
+                ns[k] = try laneChainNs(s, if (k == 0) &rate else &ref, if (k == 0) c else ref_case, 48);
+            }
+            ratio.* = @as(f64, @floatFromInt(ns[0])) / @as(f64, @floatFromInt(ns[1]));
+        }
+        std.mem.sort(f64, &ratios, {}, std.sort.asc(f64));
+        // n64's packed branch carries one output tile per threadgroup where the funnel carries two.
+        const limit: f64 = if (n == 64) 1.8 else 1.4;
+        benchPrint("[exl3-lane-margin] n{d} over n48: {d:.3} (median of {d})\n", .{ n, ratios[ratios.len / 2], ratios.len });
+        try std.testing.expect(ratios[ratios.len / 2] < limit);
     }
 }
 

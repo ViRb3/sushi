@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Sushi-2.6bpw decodes 12-15% faster per forward again**: the EXL3 decode reader no longer branches around its
+  third weight word, a slowdown since v1.1.0; output is unchanged.
 - **The browser chat page opens on the logo and title only**: the subtitle, privacy note and canned prompts are gone.
 - **`sushi run` opens a chat on GLM-5.3-Flash**: the chat preflight no longer refuses `glm5_next` as an unsupported model.
 - **GLM decode, two-row tails and four-row lookup run the parallel HC coefficient kernel the three-row verify already had**: about 6% faster per serial token, same bytes.

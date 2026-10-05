@@ -1153,7 +1153,62 @@ Live runs:
 - Residual n42 cost, same session, new binary, forward meter: 2.6bpw vs 3bpw read 17.93 vs 17.80 ms at 1 row, and
   28.72 vs 27.04 ms at 4 verify rows.
 - Greedy 1024-token outputs are byte-identical across arms: MiMo 8/8, Sushi-2.6bpw 4/4.
+- `4ca5ece4` (rates K1 to K8, in v1.1.0) lost the n42 gain again; [exl3-lane-third-word](#exl3-lane-third-word)
+  restores it.
 
+<a id="exl3-lane-third-word"></a>
+## EXL3 decode lane: the third word loads on every lane (Sushi-2.6bpw n42)
+
+`4ca5ece4` put the decode lane's third-word load behind `s != 0` (a lane whose window ends on a word boundary needs
+no third word). Every byte stayed the same, but at each rate whose lane reads a third word (n42 to n62 but n48) the
+pair GEMV took twice as long and the fused-mid down 1.5 times as long. Sushi-2.6bpw forwards ran 13-15% slower
+(bisected against its parent `632d5b5b`). This change loads the word on every lane again. Rates whose lane reads
+no third word (MiMo and GLM-2.3bpw n36, GLM-2.5bpw n40, Sushi-3bpw n48, Sushi-4bpw n64) compile to the same AIR in
+both arms.
+
+Setup: M5 Max 128 GB, 2026-10-05, fans at max, `taskpolicy -a`, GPU lock `qwen-fix`, interleaved on the FIFO lock
+with another worker's boots. Base = main `f21637dc` (binary SHA-256 `fd0e9e21`); fix = base plus this change's reader
+line (`fc613aa3`); the llmprobe boot and the last two MiMo boots ran the whole change (`f42f57b5`). All ReleaseFast.
+
+Kernel microbench (scratch harness, not landed): 47 dependent steps per chain; the tree's kernel and the same
+source over the base reader, interleaved in one process; median of 11, net of a copy-only chain. Flash-Next
+geometry (E=512, 2560 -> 640, top-10), MCG w15, us per step, base -> fix:
+
+| rate | rows | pair GEMV | fused-mid down |
+|---|---|---|---|
+| n42 | 1 | 74.4 -> 36.9 | 31.2 -> 20.6 |
+| n42 | 4 | 208.4 -> 114.8 | 105.0 -> 71.2 |
+| n44 | 1 | 70.8 -> 37.6 | 33.3 -> 21.0 |
+| n56 | 1 | 73.9 -> 37.9 | 34.3 -> 21.7 |
+| n48, no third word | 1 | 32.4 / 31.1 | 18.8 / 18.8 |
+
+Forward meter (`SUSHI_DECODE_FWD_UBENCH=50`, `SUSHI_DECODE_FWD_UBENCH_S=1,2,3,4,6`, `--no-mtp --kv-quant 8
+--ctx-size 131072`), ms per forward. Sushi-2.6bpw is A B B A; the parent row is the bisect worker's same-day pair.
+Sushi-4bpw took one boot per arm.
+
+| pack, arm | 1 row | 2 rows | 3 rows | 4 rows | 6 rows |
+|---|---|---|---|---|---|
+| Sushi-2.6bpw, base | 21.45 / 21.46 | 25.50 / 25.91 | 30.61 / 30.47 | 35.49 / 36.84 | 44.94 / 48.58 |
+| Sushi-2.6bpw, fix | 18.89 / 18.84 | 22.59 / 23.45 | 25.93 / 26.51 | 30.81 / 30.90 | 39.79 / 40.35 |
+| Sushi-2.6bpw, parent `632d5b5b` | 19.16 / 19.20 | 24.73 / 24.91 | 27.50 / 27.87 | 32.16 / 32.63 | 42.98 / 43.73 |
+| Sushi-4bpw, base / fix | 16.82 / 16.78 | 21.19 / 21.33 | 24.84 / 24.92 | 29.07 / 29.08 | 38.13 / 38.19 |
+
+- MiMo Sushi-2.3bpw (n36, last layer n64), same meter, 1 row / 6 rows over seven boots: base 20.76, 20.64, 20.06 /
+  66.39, 54.09, 60.18; fix 21.87, 21.99, 20.28, 20.34 / 54.49, 55.51, 59.53, 61.49. The spread is boot to boot.
+- GLM-5.3 Sushi-2.3bpw (n36) and 2.5bpw (n40), `SUSHI_GLM_ROWS_UBENCH=24` at ctx 1024, one boot per arm, grouped
+  rows B=1 / B=4 in ms: 2.3bpw base 30.99 / 63.75, fix 30.35 / 62.01; 2.5bpw base 29.99 / 62.45, fix 31.10 / 64.88.
+  The second boot of each pair read faster.
+- MiMo's, GLM's and Sushi-4bpw's kernels are the same code in both arms. Sushi-3bpw is not on this box; its n48 reader
+  compiles to the same AIR in both arms.
+- At every even n from 32 to 64 the fix's pair GEMV and fused-mid down compile to the parent's LLVM IR (value names
+  stripped); the base differs at exactly the third-word rates.
+- Sushi-2.6bpw, `--mtp --ctx-size 131072 --kv-quant 8`, llmprobe 0.6.12 `--bench-only --rungs 2k`, one boot of the
+  whole change: decode 86.8 tok/s (80.8-94.4), prefill 1920 tok/s on the 2041-token prompt, first token 221 ms,
+  2.74 tokens per step at the 2.1k rung. The bisect worker's same-day decode cells (`--rungs 4k`, median of 7): parent
+  `632d5b5b` 83.2 / 83.4, `4ca5ece4` 70.6 / 71.3 tok/s.
+- The guard test `every K2 to K4 rate decodes within a margin of n48` reads n42 at 1.73 over n48 on the base reader.
+  On the fix, n32 to n62 read 0.92-1.19 quiet and up to 1.25 with three copies contending; n64 reads 1.34-1.41.
+  Its limits are 1.4, and 1.8 for n64.
 
 <a id="gdn-verify-fold"></a>
 ## Flash-Next: GDN verify epilogues in the recurrence

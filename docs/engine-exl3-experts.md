@@ -43,7 +43,9 @@ kernel on supported hardware.
   bits, and 16 weights span n. Below n64 every codebook reads through them. n64 keeps its packed K4 branch, which does
   the same reads at a word-aligned rate, one output tile per threadgroup:
   - decode GEMV lane: 64 bits ending at the lane's last bit. A third word is read only when the first codeword can
-    start before the two words (every n from 42 to 62 but 48).
+    start before the two words (every n from 42 to 62 but 48), and then on every lane: a branch around that load on
+    the lane's bit alignment kept every byte and doubled the n42 pair GEMV
+    ([perf-baselines](perf-baselines.md#exl3-lane-third-word)).
   - simdgroup-matrix group: one or two 32-bit funnels, split at the widest weight whose first codeword still fits.
   - NAX fragment: one funnel per quad of weights; above n50 a quad's codewords pass 32 bits, and the funnel reads 64
     bits from three words.
@@ -162,6 +164,11 @@ Ruled out for GLM experts (each exact unless noted; "component" = an isolated re
   reference). A layout that changes which simdgroup sums which k-tile (8 simdgroups) is NOT bit-identical.
 - A rate on the generic reader decodes ~40% slower per GEMV than on the funnel, with no other symptom. The engagement
   line `[exl3] n<n> funnel engaged arm=<arm>` names the rate and arm in a live log.
+- **A reader change is timed on every served pack's decode before it lands** (forward meter, against its parent): the
+  byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K2 to K4, the served
+  range: the test `every K2 to K4 rate decodes within a margin of n48` holds each even n from 32 to 64 within 1.4x of
+  n48's GEMV steps (n64's packed branch 1.8x). Rates below K2 and above K4 stay admitted and tested for correctness,
+  never timed.
 - **MiMo verify rows share an expert's weight reads** (`PAIR_GEMV_GROUPED_SOURCE`, `DOWN_PREPARED_GROUPED_SOURCE`;
   prepared-mid geometry, 2+ rows): among an expert's slots, each even-ranked slot leads itself and the next one,
   decodes each weight once and feeds both members in the single-slot order, so every row's bytes are its one-row
