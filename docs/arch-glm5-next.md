@@ -178,7 +178,8 @@ inside 1.46% drift) because verification per round grew 20.6%.
 llmprobe 0.6.13 `--bench-only --runs 1`, reasoning default, one request per cell, server timers. Runtime `4fcb541e`
 (2026-10-04): Sushi-2.3bpw + A6 g128 assistant, N2/children 4, prefill chunk 2048, BF16 MLA, FP32 KDA, greedy,
 prefix reuse off; decode = (outputs − 1) / decode time, 192 outputs (ordinary 16K stopped at 177 on EOS). The cells
-ran through the loopback bench bridge that `sushi serve` has since replaced; no `sushi serve` ladder is recorded yet.
+ran through the loopback bench bridge that `sushi serve` has since replaced; the `sushi serve` quiet-box ladder
+(`b8267038`) is in [perf-baselines](perf-baselines.md).
 
 | Context | Ordinary prefill | Ordinary decode | Predictable prefill | Predictable decode |
 |---|---:|---:|---:|---:|

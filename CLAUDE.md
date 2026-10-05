@@ -229,7 +229,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
   Under it one A then one B suffices; A B B A only when the expected difference is within a few percent.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
 - Launch flags outrank `model-settings.json`; confirm the load lines (`[kv-cache]`, `[mtp]`) show the intended arm.
-- KLD is 16 prompts x 512 tokens scored to the first EOS, for every model; the teacher carries no lossy step of its own.
+- KLD is 16 prompts x 512 tokens scored to the first EOS (GLM: the 4x512 native teacher, code 2x512 reported apart);
+  the teacher carries no lossy step of its own.
 
 **Coordinator.**
 - Reports partial work to the owner every :00 and :30 while work runs.

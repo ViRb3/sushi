@@ -59,6 +59,7 @@ const supported_model_types = [_][]const u8{
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "mimo_v2", // MiMo-V2.6-Flash: resident EXL3 packs (text + image), or the original checkpoint streamed.
+    "glm5_next", // GLM-5.3-Flash (MLA + KDA hybrid MoE)
 };
 
 fn isSupportedModelType(model_type: []const u8) bool {
@@ -1566,6 +1567,10 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("vit"));
     // Labels stay column-friendly.
     try testing.expectEqualStrings("chat", ModelKind.chat.label());
+}
+
+test "every served arch classifies as chat, so `sushi run` accepts it" {
+    for (@import("model.zig").served_model_types) |t| try testing.expectEqual(ModelKind.chat, modelKindFromType(t));
 }
 
 test "classifyModelPath: gguf/drafter dirs classify; junk is null" {

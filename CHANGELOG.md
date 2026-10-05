@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`sushi run` opens a chat on GLM-5.3-Flash**: the chat preflight no longer refuses `glm5_next` as an unsupported model.
+- **GLM decode, two-row tails and four-row lookup run the parallel HC coefficient kernel the three-row verify already had**: about 6% faster per serial token, same bytes.
+- **Qwen decode folds the shared-expert gate into the router kernel**, one fewer pair of launches per layer, same bytes.
 - **GLM-5.3-Flash prompts tokenize exactly like Hugging Face**: the plain Llama-3 pre-tokenizer no longer takes Muse's
   case-splitting grammar (`iPhone`, `McDonald`, `//!`, `½`), and the BPE `ignore_merges` flag is honoured.
 - **The load memory check counts an MTP head shipped as a separate `mtp/` file**, so a model that loads it beside a nearly
@@ -18,6 +21,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Qwen attention reads exact values from a K/V view whose base is not 16-byte aligned**: the fused prefill and QSA
   gather kernels decline such a view and the stock attention serves it.
 - **Qwen MTP picks its draft depth from measured acceptance below 8k context**, which speeds up short code and mixed replies; output is unchanged.
+- **A 130k+ token Qwen session decoding beside short requests is no longer split into its own serial forward every
+  tick**: about 59 to 97 tok/s aggregate for one such session beside two short ones.
 - **A GLM-5.3 prompt served without prefix checkpoints no longer hangs its prefill** (prefix cache off, or admission
   shedding every checkpoint at long context).
 - **Qwen3.8 late system notes (hook output, a mid-conversation `developer` turn) stay where they were sent** instead of

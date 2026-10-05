@@ -14,6 +14,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
+- **A served arch must be in `model_discovery.supported_model_types`**: `run` refuses what `classifyModelPath` calls non-chat
+  (guard test: every `model.served_model_types` entry classifies chat).
 - **An arg loop with no else branch is a silent flag eater** (`cli.classifyUnparsedArg`): every `--flag` any script
   passes must be in main.zig's match list. Removed flags are rejected by name, never eaten.
 - **`--parent-pid <pid>`** is for a host that runs sushi as its engine (`src/parent_watch.zig`): a thread polls the pid
@@ -87,7 +89,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `ensurePortFree` probes the address with a connect AND a bind, so a listener or a bound-but-silent socket both refuse
   with "port N is already in use"; the listener binds with SO_REUSEADDR only, so a racing second sushi fails its bind
   with the same message instead of co-binding. Guard: `tests/test_port_conflict.sh`.
-- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`) by
+- The arch gate: the loader refuses any `model_type` outside `model.served_model_types` (`qwen4_exp`, `mimo_v2`, `glm5_next`) by
   name (`ArchitectureUnsupported` → 503). A checkpoint in an unsupported file format is refused by name
   (`ModelFormatUnsupported` → 503; `--model` exits).
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`: streaming index > MiMo source trunk > vision >
@@ -121,7 +123,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
   resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props
   settings.mtp.source`). Guard: `tests/test_cold_load_launch_flags.sh`, `tests/test_model_settings.sh`.
-- MTP's default is ON for the served archs (source `default`; `/props settings.mtp.default_on` true); the flag and
+- MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack.
 - `[pld] on|off (source)` and `/props settings.pld` report what a slot runs (`server.pldReport`): a module-wired arch
   (qwen4_exp) reads `off (module spec wiring)` whatever `--pld` says, since `scheduler.specInitWiring` never runs it.
@@ -141,6 +143,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   budget revise.
 - Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A
   batched group is capped by PADDING WASTE (`batchedKvKeepCount`, `MAX_PAD_WASTE` 1.5 < 2.0), not slot count.
+  `groupKeepCount` lifts the cap for a group billed <= 4096 rows whose longest true context is >= 131072
+  ([engine-qsa-long-context](engine-qsa-long-context.md#small-sparse-groups-at-long-context)).
   Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
   ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)); resident GLM does the same through `verifyGroups`, and a
   drafting GLM slot joins as a plain row when its model has company ([arch-glm5-next](arch-glm5-next.md#concurrency)).
