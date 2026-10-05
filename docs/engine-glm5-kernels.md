@@ -110,8 +110,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   diag arms, Sushi-2.5bpw, kv8, 4x512 teacher): KLD 0.071569 against the fused arm's 0.071762 (−0.27%), top-1 90.33%
   against 89.70%. Serial decode 34.07 → 32.54 ms/token at 8K and 33.84 → 32.66 at 32K, arms interleaved in one
   process on a contended box; DFlash2 verification per round is unchanged (~60 ms). 32 MiB per pending layer.
-- HC collapse on three verify rows: one SIMD32 subgroup runs the coefficients and 20 Sinkhorn iterations that thread 0
-  ran alone while 255 threads waited (exact; −27.6% component, 8K model −2.65% vs 1.99% drift).
+- HC collapse on one to four rows (T3 first, then T1/T2/T4: serial decode, tails, lookup and company): one SIMD32 subgroup runs the coefficients and 20 Sinkhorn iterations that thread 0
+  ran alone while 255 threads waited (exact; −27.6% component, 8K model −2.65% vs 1.99% drift). T1/T2/T4 in one process on Sushi-2.5bpw kv8 at 1K (`SUSHI_GLM_ROWS_UBENCH`, 24 rounds,
+  arms interleaved, `taskpolicy -a`, lock, AC): serial token 30.87 → 28.98 ms (−6.1%), grouped T2 40.92 → 38.98 (−4.7%),
+  T4 66.41 → 64.19 (−3.3%); T3 unchanged (51.50 vs 51.41, the control). Bit-exact against the reference kernel at every width.
 
 ## DFlash2 verification
 

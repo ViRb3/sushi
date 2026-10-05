@@ -7,6 +7,7 @@ earlier history is mlx-serve's, in that project's changelog.
 ## Unreleased
 
 - **`sushi run` opens a chat on GLM-5.3-Flash**: the chat preflight no longer refuses `glm5_next` as an unsupported model.
+- **GLM decode, two-row tails and four-row lookup run the parallel HC coefficient kernel the three-row verify already had**: about 6% faster per serial token, same bytes.
 - **Qwen decode folds the shared-expert gate into the router kernel**, one fewer pair of launches per layer, same bytes.
 - **GLM-5.3-Flash prompts tokenize exactly like Hugging Face**: the plain Llama-3 pre-tokenizer no longer takes Muse's
   case-splitting grammar (`iPhone`, `McDonald`, `//!`, `½`), and the BPE `ignore_merges` flag is honoured.

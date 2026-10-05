@@ -1,4 +1,4 @@
-//! Fixed exact T3 mHC coefficients: one uniform SIMD32 subgroup per row.
+//! Exact mHC coefficients for 1-4 rows: one uniform SIMD32 subgroup per row.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
@@ -15,7 +15,7 @@ pub fn resetDispatchCount() void {
     calls = 0;
 }
 pub fn geometry(x: []const c_int, mixes: []const c_int, scale: []const c_int, base: []const c_int, iters: c_int, epsilon: f32) bool {
-    return std.mem.eql(c_int, x, &.{ 1, 3, 4, 4096 }) and std.mem.eql(c_int, mixes, &.{ 1, 3, 24 }) and
+    return x.len == 4 and x[0] == 1 and x[1] >= 1 and x[1] <= 4 and std.mem.eql(c_int, x[2..], &.{ 4, 4096 }) and std.mem.eql(c_int, mixes, &.{ 1, x[1], 24 }) and
         std.mem.eql(c_int, scale, &.{3}) and std.mem.eql(c_int, base, &.{24}) and iters == 20 and std.math.isFinite(epsilon) and epsilon > 0;
 }
 const SOURCE: [:0]const u8 =
@@ -79,10 +79,11 @@ pub fn collapse(x: Arr, mixes: Arr, scale: Arr, base: Arr, iters: c_int, epsilon
     }
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, 3, 4096 }, 3, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, 3, 4 }, 3, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, 3, 4, 4 }, 4, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 3 * 256, 1, 1));
+    const rows = mlx.getShape(x)[1];
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, 4096 }, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, 4 }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, 4, 4 }, 4, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OutT", .bfloat16));
     const eps = mlx.mlx_array_new_float(epsilon);
@@ -134,27 +135,87 @@ fn check(ops: *Ops, x: Arr, mix: Arr, scale: Arr, base: Arr, expected_calls: usi
     try exact(ops, reference.post, new.post);
     try exact(ops, reference.comb, new.comb);
 }
-test "GLM HC SIMD32 primitive hook exact T3 specials and original fallback" {
+fn fixtureTensor(comptime name: []const u8) ![]const u8 {
+    const bytes = @embedFile("fixtures/glm5_layers.safetensors");
+    const header_len: usize = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
+    const header = bytes[8 .. 8 + header_len];
+    const at = std.mem.indexOf(u8, header, "\"" ++ name ++ "\"") orelse return error.MissingFixture;
+    const key = "\"data_offsets\":[";
+    const o = std.mem.indexOfPos(u8, header, at, key) orelse return error.MissingFixture;
+    const rest = header[o + key.len ..];
+    const comma = std.mem.indexOfScalar(u8, rest, ',') orelse return error.MissingFixture;
+    const close = std.mem.indexOfScalar(u8, rest, ']') orelse return error.MissingFixture;
+    const lo = try std.fmt.parseInt(usize, rest[0..comma], 10);
+    const hi = try std.fmt.parseInt(usize, rest[comma + 1 .. close], 10);
+    return bytes[8 + header_len + lo .. 8 + header_len + hi];
+}
+fn bf16At(raw: []const u8, i: usize) f32 {
+    return @bitCast(@as(u32, std.mem.readInt(u16, raw[i * 2 ..][0..2], .little)) << 16);
+}
+fn f32At(raw: []const u8, i: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
+}
+
+test "GLM HC SIMD32 primitive hook exact T1-T4 specials and original fallback" {
     var ops = Ops{ .s = mlx.gpuStream() };
     defer ops.deinit();
-    const x = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 3, 4, 4096 }, 731, ops.s));
-    var values: [72]f32 = undefined;
+    var values: [96]f32 = undefined;
     for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) / 8 - 1;
-    const mix = try ops.own(mlx.mlx_array_new_data(&values, &.{ 1, 3, 24 }, 3, .float32));
     const scale = try ops.own(mlx.mlx_array_new_data(&[_]f32{ 0.125, 0.25, 0.0625 }, &.{3}, 1, .float32));
     var bases: [24]f32 = undefined;
     for (&bases, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) / 16 - 0.25;
     const base = try ops.own(mlx.mlx_array_new_data(&bases, &.{24}, 1, .float32));
-    try check(&ops, x, mix, scale, base, 1);
-    values[0] = -0.0;
-    values[1] = 0.0;
-    values[8] = std.math.nan(f32);
-    values[9] = std.math.inf(f32);
-    values[10] = -std.math.inf(f32);
-    values[24 + 8] = 1000;
-    values[24 + 9] = -1000;
-    const special = try ops.own(mlx.mlx_array_new_data(&values, &.{ 1, 3, 24 }, 3, .float32));
-    try check(&ops, x, special, scale, base, 1);
-    try check(&ops, try ops.slice(x, 1, 0, 2), try ops.slice(mix, 1, 0, 2), scale, base, 0);
-    try check(&ops, try ops.cast(x, .float32), mix, scale, base, 0);
+    const wide = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 4, 4, 4096 }, 731, ops.s));
+    // Hostile rows: signed zeros, NaN/Inf, saturated logits and opposite huge comb logits.
+    var special = values;
+    special[0] = -0.0;
+    special[1] = 0.0;
+    special[8] = std.math.nan(f32);
+    special[9] = std.math.inf(f32);
+    special[10] = -std.math.inf(f32);
+    special[24 + 8] = 1000;
+    special[24 + 9] = -1000;
+    for (0..16) |i| special[72 + 8 + i] = if (i % 2 == 0) 1e30 else -1e30;
+    for (1..5) |t| {
+        const x = try ops.slice(wide, 1, 0, @intCast(t));
+        for ([_]*const [96]f32{ &values, &special }) |set| {
+            const mix = try ops.own(mlx.mlx_array_new_data(set, &.{ 1, @intCast(t), 24 }, 3, .float32));
+            try check(&ops, x, mix, scale, base, 1);
+        }
+    }
+    const mix3 = try ops.own(mlx.mlx_array_new_data(&values, &.{ 1, 3, 24 }, 3, .float32));
+    try check(&ops, try ops.cast(try ops.slice(wide, 1, 0, 3), .float32), mix3, scale, base, 0);
+}
+
+test "GLM HC SIMD32 exact on the captured layer's coefficients at T1-T4" {
+    var ops = Ops{ .s = mlx.gpuStream() };
+    defer ops.deinit();
+    const input = try fixtureTensor("hc.input");
+    const fn_w = try fixtureTensor("h.hc_attn_fn");
+    var scale_v: [3]f32 = undefined;
+    var base_v: [24]f32 = undefined;
+    for (&scale_v, 0..) |*v, i| v.* = f32At(try fixtureTensor("h.hc_attn_scale"), i);
+    for (&base_v, 0..) |*v, i| v.* = f32At(try fixtureTensor("h.hc_attn_base"), i);
+    const scale = try ops.own(mlx.mlx_array_new_data(&scale_v, &.{3}, 1, .float32));
+    const base = try ops.own(mlx.mlx_array_new_data(&base_v, &.{24}, 1, .float32));
+    // Captured rows are 4x128; tiling a stream 32x keeps its RMS, so the captured mixes stay valid at D=4096.
+    var mix_v: [4 * 24]f32 = undefined;
+    const x_v = try std.testing.allocator.alloc(u16, 4 * 4 * 4096);
+    defer std.testing.allocator.free(x_v);
+    for (0..4) |r| {
+        var ss: f32 = 0;
+        for (0..512) |k| ss += bf16At(input, r * 512 + k) * bf16At(input, r * 512 + k);
+        const inv = 1.0 / @sqrt(ss / 512 + 1e-6);
+        for (0..24) |m| {
+            var acc: f32 = 0;
+            for (0..512) |k| acc += bf16At(input, r * 512 + k) * inv * bf16At(fn_w, m * 512 + k);
+            mix_v[r * 24 + m] = acc;
+        }
+        for (0..4) |j| for (0..4096) |d| {
+            x_v[(r * 4 + j) * 4096 + d] = std.mem.readInt(u16, input[(r * 512 + j * 128 + d % 128) * 2 ..][0..2], .little);
+        };
+    }
+    const x = try ops.own(mlx.mlx_array_new_data(x_v.ptr, &.{ 1, 4, 4, 4096 }, 4, .bfloat16));
+    const mix = try ops.own(mlx.mlx_array_new_data(&mix_v, &.{ 1, 4, 24 }, 3, .float32));
+    for (1..5) |t| try check(&ops, try ops.slice(x, 1, 0, @intCast(t)), try ops.slice(mix, 1, 0, @intCast(t)), scale, base, 1);
 }
