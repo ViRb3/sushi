@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Image conversations reuse the prefix cache. Vision slots were excluded from
 # commit AND lookup, so every image turn re-prefilled the whole conversation.
 # Two things a byte check cannot see come from the log + usage: the second
@@ -23,7 +24,7 @@ for f in "$F1" "$F2"; do [ -f "$f" ] || { echo "SKIP: fixture $f missing"; exit 
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level debug \
-  --prefix-cache-entries 4 --prefill-chunk 1024 \
+  --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefill-chunk 1024 \
   --ssm-checkpoint-stride 1024 --ssm-checkpoint-max 8 > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT

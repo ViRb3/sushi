@@ -648,7 +648,7 @@ fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
     if (config.isGlm5()) return false;
     const choice = mtpChoiceFor(config);
     if (choice.forced()) return true;
-    return choice.on and model_mod.isServedArch(config.model_type) and !config.expert_streaming;
+    return choice.on and model_mod.isServedArch(config.model_type) and (!config.expert_streaming or config.stream_mtp_head);
 }
 
 const PldReport = struct { on: bool, source: []const u8 };
@@ -1058,24 +1058,32 @@ fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
 // requests from several conversation roots — main thread, subagents, title
 // generation — and a single-entry cache gets its long system-prompt prefix
 // evicted by every interleaved request, forcing a full re-prefill each
-// turn. The count cap is pure retention metadata; the byte budget
-// (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
-// evicting LRU entries by size. 0 disables.
+// turn. The count cap is pure retention metadata; the SSD byte budget
+// (`prefixCacheDiskForLoad`) is what bounds the bytes. 0 disables.
 pub var prefix_cache_capacity: u32 = 32;
-/// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
-pub var prefix_cache_ram_enabled: bool = true;
+/// RAM retention is opt-in: `--prefix-cache-mem` turns it on, `--no-prefix-cache-ram` wins over it.
+pub var prefix_cache_ram_enabled: bool = false;
 
-/// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
-/// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
-/// default (2 GB) is generous for one or two long conversations on a Gemma 4
-/// E4B-sized model and tiny relative to total wired-limit budget; tune via
-/// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
-/// from `--prefix-cache-entries` still applies). An unset budget grows to one
-/// session at the working context where the machine holds it (`defaultPrefixCacheAsk`).
+/// The RAM tier's byte budget, read only where RAM retention is on (`--prefix-cache-mem`). The cache
+/// evicts LRU entries on commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. 0
+/// disables the byte budget (the machine's headroom and the count cap from `--prefix-cache-entries`
+/// still apply).
 pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
 pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 /// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
 pub var prefix_cache_mem_explicit = false;
+
+/// RAM retention is on only when `--prefix-cache-mem` names it, whatever the flag order, and `--no-prefix-cache-ram` wins.
+pub fn ramRetentionFor(mem_named: bool, no_ram_flag: bool) bool {
+    return mem_named and !no_ram_flag;
+}
+
+test "ramRetentionFor: off unless --prefix-cache-mem names it, and --no-prefix-cache-ram wins in either order" {
+    try testing.expect(!ramRetentionFor(false, false));
+    try testing.expect(ramRetentionFor(true, false));
+    try testing.expect(!ramRetentionFor(true, true));
+    try testing.expect(!ramRetentionFor(false, true));
+}
 
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
 /// Every post-load reserve reads it through `resolvedPrefixCacheMem()`. Atomic: written on the
@@ -1101,17 +1109,24 @@ pub fn clearResolvedPrefixCacheMem() void {
     hot_cache_mem_resolved.store(HOT_CACHE_MEM_UNRESOLVED, .monotonic);
 }
 
-/// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
-/// prefixes persist as chunked safetensors under
-/// `~/.sushi/kv-cache/<model-fingerprint>` and are restored across RAM
-/// evictions AND server restarts instead of recomputed — a cold 30-50 s
-/// long-context TTFT becomes a bounded SSD read. LRU-evicted to this byte
-/// budget. v1 covers pure-attention archs; hybrid SSM state stays RAM-only.
-///
-/// DEFAULT OFF (`0`): the tier can hold gigabytes of KV on disk, so it's opt-in
-/// — pass `--prefix-cache-disk <n>{KB,MB,GB}` to enable (10 GB is a sensible
-/// value). The Swift app exposes this as a Settings toggle, default off.
-pub var prefix_cache_disk_bytes: u64 = 0;
+/// The SSD tier's byte ask (`--prefix-cache-disk`, 0 = off). Committed KV prefixes persist as chunked
+/// safetensors under `~/.sushi/kv-cache/<model-fingerprint>` and are restored across restarts instead
+/// of recomputed, LRU-evicted to the budget. Unnamed, the ask is the 20 GB ceiling and the tier is on;
+/// `prefixCacheDiskForLoad` sizes the real budget per model (the Swift app's Settings toggle passes the flag).
+pub var prefix_cache_disk_bytes: u64 = kv_disk_cache.DEFAULT_DISK_CAP;
+/// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
+pub var prefix_cache_disk_explicit = false;
+
+/// Does THIS model run with an SSD tier? The launch asked for one and its load did not decline it
+/// (`ModelConfig.prefix_cache_disk_declined`); every bill, budget and checkpoint policy reads this.
+pub fn diskTierOn(config: *const model_mod.ModelConfig) bool {
+    return prefix_cache_disk_bytes > 0 and !config.prefix_cache_disk_declined;
+}
+
+/// The disk bytes the SSD-tier-dependent policies read: the launch ask, or 0 for a model whose tier is off.
+fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
+    return if (diskTierOn(config)) prefix_cache_disk_bytes else 0;
+}
 
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
 /// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
@@ -2076,11 +2091,8 @@ pub fn serve(
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (!prefix_cache_ram_enabled and prefix_cache_disk_bytes > 0) {
-            log.info("Prefix cache: SSD ONLY (RAM retention disabled, disk cap={d:.1} MB){s}\n", .{
-                @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
-                ssm_note,
-            });
+        if (!prefix_cache_ram_enabled and diskTierOn(config)) {
+            log.info("Prefix cache: SSD ONLY (RAM retention off){s}\n", .{ssm_note});
         } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
@@ -2185,8 +2197,8 @@ pub fn serve(
     }
     if (config.isGlm5()) {
         log.info("MTP: off (GLM native serving has no integrated MTP head)\n", .{});
-    } else if (config.expert_streaming) {
-        log.info("MTP: off under expert streaming (--mtp is refused there)\n", .{});
+    } else if (config.expert_streaming and !config.stream_mtp_head) {
+        log.info("MTP: off under expert streaming (--mtp keeps the head resident)\n", .{});
     } else if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
@@ -4062,7 +4074,7 @@ fn ssdFirstBudgetForLoad(
     quiet: bool,
 ) ?u64 {
     // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
-    if (prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) return null;
+    if (prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, diskTierOn(config), prefix_cache_ram_enabled)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -4268,6 +4280,222 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
     return plan.budget;
+}
+
+/// The SSD bytes one cached token costs this model at these settings, from the serialized geometry:
+/// the KV rows at the served width, the one pooled QSA history the entry writes, and the MTP head's KV
+/// and history where the head is on. Execution state (the QSA score bank, a second history copy) is
+/// RAM-only and never enters it; GLM's KDA checkpoints, DFlash2 window and MiMo's rings are fixed per entry.
+pub fn diskBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    const rows = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken();
+    if (config.isGlm5() or !config.longCtxGated() or !mtpHeadDefaultOn(config)) return rows;
+    const layers = config.attnCacheLayerCount();
+    if (layers == 0) return rows;
+    return rows +| mtpHeadKvBytesPerToken(config) +| config.qsaHistoryBytesPerToken() / layers;
+}
+
+/// The context the SSD budget is sized for: the model's pinned served context (`pinAutoContext`, idempotent
+/// and the one startup and `/v1/load-model` run anyway), so the Allocating line, `/props` and `/v1/models`
+/// name the same number. The weights are resident at this point, so the memory read is the one they would take.
+fn diskContextForLoad(config: *model_mod.ModelConfig) u64 {
+    return pinAutoContext(config);
+}
+
+/// The SSD budget the model gets at load, in bytes (0 = tier off); logs the `Allocating` line, or why
+/// there is none. Runs on the inference thread beside `prefixCacheMemForLoad`.
+pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8) u64 {
+    const kv_bits = defaultKvBits(config);
+    const bpt = diskBytesPerToken(config, kv_bits);
+    const ctx = if (prefix_cache_disk_explicit) 0 else diskContextForLoad(config);
+    // An unreadable volume is no reason to refuse: the tier re-checks before every store.
+    const free: u64 = if (kv_disk_cache.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
+    var buf: [384]u8 = undefined;
+    const plan = kv_disk_cache.resolveDiskBudget(prefix_cache_disk_explicit, prefix_cache_disk_bytes, prefix_cache_capacity, ctx, bpt, free) orelse {
+        log.info("{s}\n", .{kv_disk_cache.diskOffLine(&buf, free, dir)});
+        return 0;
+    };
+    log.info("{s}\n", .{kv_disk_cache.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir)});
+    return plan.bytes;
+}
+
+test "diskBytesPerToken: the serialized geometry, whatever the QSA execution switches say" {
+    const t = std.testing;
+    const saved_mtp = configured_mtp;
+    defer configured_mtp = saved_mtp;
+    const saved_fused = transformer_mod.qsa_score_fused_override;
+    const saved_share = transformer_mod.qsa_history_share_override;
+    defer {
+        transformer_mod.qsa_score_fused_override = saved_fused;
+        transformer_mod.qsa_history_share_override = saved_share;
+    }
+    var q = qwen4DeployedTestConfig();
+    // kv8 rows plus the one pooled history; the head is off.
+    configured_mtp = false;
+    try t.expectEqual(@as(u64, 13_824), diskBytesPerToken(&q, 8));
+    const head = mtpHeadKvBytesPerToken(&q) + q.qsaHistoryBytesPerToken() / q.attnCacheLayerCount();
+    try t.expect(head > 0);
+    configured_mtp = true;
+    try t.expectEqual(@as(u64, 13_824) + head, diskBytesPerToken(&q, 8));
+    try t.expect(diskBytesPerToken(&q, 16) > diskBytesPerToken(&q, 8));
+    // The score bank and a second history copy are execution state, never in an entry.
+    for ([_]?bool{ true, false }) |fused| for ([_]?bool{ true, false }) |share| {
+        transformer_mod.qsa_score_fused_override = fused;
+        transformer_mod.qsa_history_share_override = share;
+        for ([_]bool{ false, true }) |mtp| {
+            configured_mtp = mtp;
+            try t.expectEqual(@as(u64, 13_824) + (if (mtp) head else 0), diskBytesPerToken(&q, 8));
+        }
+    };
+    transformer_mod.qsa_score_fused_override = false;
+    configured_mtp = false;
+    try t.expect(sessionBytesPerToken(&q, 8) > diskBytesPerToken(&q, 8));
+
+    // A ringed arch pays per token only on its global layers; its head is a fixed window.
+    const mimo = mimoV2FlashBillConfig();
+    for ([_]bool{ false, true }) |mtp| {
+        configured_mtp = mtp;
+        try t.expectEqual(kvBytesPerTokenAtBits(mimo.kvBytesPerToken(), 8), diskBytesPerToken(&mimo, 8));
+        try t.expectEqual(kvBytesPerTokenAtBits(mimo.kvBytesPerToken(), 16), diskBytesPerToken(&mimo, 16));
+    }
+
+    // GLM: the latent rows (6,688 at kv8, 11,968 BF16) and the pooled index; DFlash2's window is fixed per entry.
+    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
+    glm.glm_dflash_loaded = false;
+    try t.expectEqual(@as(u64, 6_688), diskBytesPerToken(&glm, 8));
+    try t.expectEqual(@as(u64, 11_968), diskBytesPerToken(&glm, 16));
+    glm.glm_dflash_loaded = true;
+    glm.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    try t.expectEqual(@as(u64, 6_688), diskBytesPerToken(&glm, 8));
+}
+
+test "diskContextForLoad pins the served context, so the Allocating line names what /props and /v1/models name" {
+    const t = std.testing;
+    var cfg = qwen4DeployedTestConfig();
+    cfg.pinned_context = 0;
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 0;
+    const ctx = diskContextForLoad(&cfg);
+    try t.expect(cfg.pinned_context != 0);
+    try t.expectEqual(@as(u64, cfg.pinned_context), ctx);
+    try t.expectEqual(@as(u64, getEffectiveContextLength(&cfg)), ctx);
+}
+
+test "a model whose SSD tier did not come up bills and budgets as with --prefix-cache-disk off" {
+    const t = std.testing;
+    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
+    glm.glm_dflash_loaded = true;
+    glm.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
+    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max };
+    defer {
+        prefix_cache_capacity = saved[0];
+        ssm_checkpoint_stride = saved[1];
+        ssm_checkpoint_max = saved[2];
+    }
+    prefix_cache_capacity = 32;
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    const warm: WarmPrefix = .{ .checkpoints = 4 };
+
+    // RAM off: the SSD tier is the only retention, so with it GLM keeps checkpoints and without it none.
+    const tiers = TierGuard.pin(false, 20 << 30);
+    defer tiers.restore();
+    try t.expect(diskTierOn(&glm));
+    const with_tier = glmCommitStateBytes(&glm, 65536, warm, 8);
+    try t.expect(with_tier > 0);
+    // Declined at load (no room, a failed init): the same answers as an explicit `--prefix-cache-disk off`.
+    glm.prefix_cache_disk_declined = true;
+    try t.expect(!diskTierOn(&glm));
+    prefix_cache_disk_bytes = 0;
+    glm.prefix_cache_disk_declined = false;
+    const off_flag = .{ glmCommitStateBytes(&glm, 65536, warm, 8), glmPrefixStateBytes(&glm, 65536, warm) };
+    prefix_cache_disk_bytes = 20 << 30;
+    glm.prefix_cache_disk_declined = true;
+    try t.expectEqual(off_flag[0], glmCommitStateBytes(&glm, 65536, warm, 8));
+    try t.expectEqual(off_flag[1], glmPrefixStateBytes(&glm, 65536, warm));
+    try t.expectEqual(@as(u64, 0), off_flag[0]);
+    // The RAM sizing no longer takes the SSD-first arm for this model either.
+    var cfg = qwen4DeployedTestConfig();
+    const saved_over = prefix_cache_mod.ssd_first_override;
+    defer prefix_cache_mod.ssd_first_override = saved_over;
+    prefix_cache_mod.ssd_first_override = true;
+    prefix_cache_ram_enabled = true;
+    var idle: u64 = 0;
+    try t.expect(ssdFirstBudgetForLoad(&cfg, 1 << 30, 100 << 30, 40 << 30, 4 << 30, 1 << 30, &idle, true) != null);
+    cfg.prefix_cache_disk_declined = true;
+    try t.expect(ssdFirstBudgetForLoad(&cfg, 1 << 30, 100 << 30, 40 << 30, 4 << 30, 1 << 30, &idle, true) == null);
+}
+
+test "a paused SSD writer's staged bytes refuse an admission that fits the ceiling by less than its permit, on every arch" {
+    const t = std.testing;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var tier = try kv_disk_cache.DiskTier.init(t.allocator, io, base, "fp-admission-writer", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    const w = tier.writer.?;
+    w.setPaused(true);
+    defer {
+        w.setPaused(false);
+        tier.drainWriter();
+    }
+    const blob = try t.allocator.alloc(u8, 4096);
+    @memset(blob, 1);
+    w.submit(try t.allocator.dupe(u8, "/nonexistent/staged.safetensors"), blob);
+    // The one reading: the writer holds its backlog or its permit, whichever is larger.
+    const writer_bytes = tier.writerHostBytes();
+    try t.expect(writer_bytes >= kv_disk_writer.DEFAULT_PERMIT_BYTES);
+
+    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
+    glm.glm_dflash_loaded = false;
+    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride };
+    defer {
+        prefix_cache_capacity = saved[0];
+        ssm_checkpoint_stride = saved[1];
+    }
+    prefix_cache_capacity = 32;
+    ssm_checkpoint_stride = 256;
+    const tiers = TierGuard.pin(false, 20 << 30);
+    defer tiers.restore();
+    const kv_bits: u64 = 8;
+    const configs = [_]model_mod.ModelConfig{ qwen4DeployedTestConfig(), mimoV2FlashBillConfig(), glm };
+    for (configs) |cfg| {
+        const needed = prefillNeededAtChunk(&cfg, 65536, 1024, kv_bits, 2048, .{});
+        // Headroom within the permit of the bill: fits with an idle writer, not beside a staged one.
+        const ceiling = needed + kv_disk_writer.DEFAULT_PERMIT_BYTES / 2;
+        try t.expect(needed <= admissionAvailable(ceiling, 0, 0));
+        try t.expect(needed > admissionAvailable(ceiling, 0, writer_bytes));
+    }
+}
+
+test "admission bills the SSD writers' host bytes before the width and the reservation are chosen" {
+    const t = std.testing;
+    const gib: u64 = 1 << 30;
+    // The ceiling less MLX's bytes less the writers'; never wraps.
+    try t.expectEqual(@as(u64, 20 * gib), admissionAvailable(100 * gib, 79 * gib, gib));
+    try t.expectEqual(@as(u64, 0), admissionAvailable(100 * gib, 99 * gib + gib / 2, gib));
+    try t.expectEqual(admissionAvailable(100 * gib, 79 * gib, 0) - gib, admissionAvailable(100 * gib, 79 * gib, gib));
+    // Every arch takes the one resident total, GLM included: its prefill and commit terms carry no writer term of their own.
+    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
+    glm.glm_dflash_loaded = false;
+    const gsaved = .{ prefix_cache_capacity, ssm_checkpoint_stride };
+    defer {
+        prefix_cache_capacity = gsaved[0];
+        ssm_checkpoint_stride = gsaved[1];
+    }
+    prefix_cache_capacity = 32;
+    ssm_checkpoint_stride = 256;
+    try t.expectEqual(@as(u64, 0), glmPrefixStateBytes(&glm, 65536, .{}));
+    try t.expectEqual(@as(u64, 0), glmCommitStateBytes(&glm, 65536, .{}, 8));
+    // A request that fits the headroom without the writer's bytes and not with them is refused: the gap
+    // between the bill and the bill plus the writer's payload.
+    const cfg = qwen4DeployedTestConfig();
+    const needed = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 4096, .{});
+    try t.expect(needed <= admissionAvailable(needed + gib / 2, 0, 0));
+    try t.expect(needed > admissionAvailable(needed + gib / 2, 0, gib));
 }
 
 test "defaultPrefixCacheAsk: an unnamed budget holds one session at the working context, never under 2 GB" {
@@ -6002,7 +6230,7 @@ fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq:
     // An SSD restore installs each layer at exactly its restored rows, so the first append grows
     // it beside the restored buffer. A ringed arch's admission never sees the restore (it bills a
     // warm request cold), so with a disk tier it bills that coexistence at the prompt's length.
-    if (prefix_cache_disk_bytes > 0 and config.swaRingTokens() > 0 and !config.longCtxGated())
+    if (diskTierOn(config) and config.swaRingTokens() > 0 and !config.longCtxGated())
         return oldBuffersInEvalWindow(config, seq, seq, kv_per_tok);
     return 0;
 }
@@ -6232,28 +6460,25 @@ fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureS
 /// What a GLM request holds for the prefix cache while it runs: its prefill's KDA checkpoints (at
 /// most `warm.checkpoints`, plus the copy taken before each thin) and the assistant window it keeps from prefill end.
 fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix) u64 {
-    if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, prefix_cache_disk_bytes) == 0) return 0;
-    // SSD-first stages the previous request's flush as host bytes, up to the writer's permit.
-    const staged: u64 = if (prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
-    if (warm.checkpoints == 0) return staged;
+    if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config)) == 0) return 0;
+    if (warm.checkpoints == 0) return 0;
     const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
     const held = @as(u64, glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints).peak) * config.ssmCheckpointBytes();
-    return held +| window +| staged;
+    return held +| window;
 }
 
 /// What the finished request holds while its commit runs, beside its live cache: the MLA rows copied, the
-/// checkpoints, the window and the SSD writer's staged flush. The rows are what the destination keeps
-/// (`HotPrefixCache.glmCommitLen`): at most the RAM tier's budget, or one SSD flush.
+/// checkpoints, the window and the SSD writer's staged flush. Only the RAM tier copies rows, at most its
+/// budget (`HotPrefixCache.glmCommitLen`); the SSD flush reads the request's own (`glmDiskLen`).
 fn glmCommitStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: WarmPrefix, kv_bits: u64) u64 {
-    const staged: u64 = if (prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) kv_disk_writer.DEFAULT_PERMIT_BYTES else 0;
-    if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, prefix_cache_disk_bytes) == 0 or warm.checkpoints == 0) return staged;
+    if (effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config)) == 0 or warm.checkpoints == 0) return 0;
     const sched = glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints);
     const rows = @as(u64, sched.newest) * sessionBytesPerToken(config, kv_bits);
-    const bound: u64 = if (prefix_cache_ram_enabled) resolvedPrefixCacheMem() else @min(prefix_cache_disk_bytes, kv_disk_cache.SSD_FIRST_READBACK_BYTES);
-    const copied = if (bound == 0 and prefix_cache_ram_enabled) rows else @min(rows, bound);
+    const bound = resolvedPrefixCacheMem();
+    const copied: u64 = if (!prefix_cache_ram_enabled) 0 else if (bound == 0) rows else @min(rows, bound);
     const window: u64 = if (config.glm_dflash_loaded) config.glm_dflash_window_bytes else 0;
     const kept = @as(u64, @min(sched.events, warm.checkpoints)) * config.ssmCheckpointBytes();
-    return copied +| kept +| window +| staged;
+    return copied +| kept +| window;
 }
 
 /// What `--mtp-head-kv-quant` does on this arch, for the boot log; null when unset.
@@ -6936,6 +7161,13 @@ pub fn adaptivePrefillWidthNow(
     return next;
 }
 
+/// What a request may allocate: the ceiling less MLX's allocations and the SSD writers' host bytes,
+/// which MLX never counts. Taken before the width and the cache reservation are chosen, so an explicit
+/// `--prefill-chunk` bills it too.
+pub fn admissionAvailable(total_limit: u64, active_mem: u64, writer_bytes: u64) u64 {
+    return total_limit -| active_mem -| writer_bytes;
+}
+
 pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
     const heads = config.num_attention_heads;
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
@@ -6948,7 +7180,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const total_limit: u64 = currentGpuMemoryCeiling(config, active_mem);
-    const available = if (total_limit > active_mem) total_limit - active_mem else 0;
+    const available = admissionAvailable(total_limit, active_mem, if (global_scheduler) |sch| scheduler_mod.diskWriterHostBytes(sch) else 0);
 
     // A vision prefill chunks like text since issue #197 (the splice resumes
     // its row index across chunks), so it bills the chunk-bounded envelope —
@@ -8121,6 +8353,9 @@ const PropsSettings = struct {
     max_concurrent: u32,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
+    /// The SSD tier's bytes in use and entry count, as the inference thread last published them.
+    prefix_cache_disk_used_bytes: u64 = 0,
+    prefix_cache_disk_entries: u64 = 0,
     prefix_cache_ram_enabled: bool = true,
     /// The byte figures are a streamed load's (0 resident or off).
     vision: struct { loaded: bool = false, source: []const u8 = "default", tower_bytes: u64 = 0, encode_bytes: u64 = 0 } = .{},
@@ -8136,6 +8371,8 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const kv = kv_cache.config;
     const acceptance = generate_mod.mtpAcceptanceFor(config.mtp_acceptance_override);
     const pld = pldReportFor(lm);
+    // This model's own tier, the four numbers from one publish.
+    const disk = lm.disk_stats.snapshot();
     return .{
         .engine = "mlx",
         .kv_quant = if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
@@ -8145,7 +8382,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
         .mtp_loaded = mtpCapable(lm),
-        .mtp_default_on = defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming),
+        .mtp_default_on = defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head),
         .mtp_choice = mtpChoiceFor(config),
         .mtp_acceptance = acceptance.value,
         .mtp_acceptance_source = model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
@@ -8159,7 +8396,9 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_ram_enabled = prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
-        .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
+        .prefix_cache_disk_bytes = disk.budget,
+        .prefix_cache_disk_used_bytes = disk.used,
+        .prefix_cache_disk_entries = disk.entries,
         .vision = .{
             .loaded = lm.vision_encoder != null,
             .source = scheduler_mod.visionChoiceFor(config, config.expert_streaming).sourceName(),
@@ -8179,7 +8418,7 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
     };
     var vision_buf: [160]u8 = undefined;
     const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"source\":\"{s}\",\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"source\":\"{s}\",\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                st.kv_cache.label(),
         st.kv_cache.sourceName(),                   @tagName(st.kv_attn_mode),
@@ -8194,7 +8433,8 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
         st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
-        st.prefix_cache_disk_bytes,                 vision,
+        st.prefix_cache_disk_bytes,                 st.prefix_cache_disk_used_bytes,
+        st.prefix_cache_disk_entries,               vision,
     });
 }
 
@@ -9365,14 +9605,14 @@ fn handleChatCompletions(
     // subject to the n-gram spec gate below — the trained head holds ~73%
     // per-draft acceptance even on fully novel content.
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming);
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
@@ -9736,14 +9976,14 @@ fn handleCompletions(
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming);
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
@@ -16170,14 +16410,14 @@ fn handleAnthropicMessages(
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming);
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
@@ -18030,14 +18270,14 @@ fn handleResponsesInner(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming);
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
@@ -21189,6 +21429,15 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 4), st.get("max_concurrent").?.integer);
     try testing.expect(st.get("prefix_cache").?.object.get("ram_enabled").?.bool);
 
+    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
+    defer testing.allocator.free(used);
+    var up = try std.json.parseFromSlice(std.json.Value, testing.allocator, used[",\"settings\":".len..], .{});
+    defer up.deinit();
+    const pc = up.value.object.get("prefix_cache").?.object;
+    try testing.expectEqual(@as(i64, 20 << 30), pc.get("disk_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 3 << 30), pc.get("disk_used_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 5), pc.get("disk_entries").?.integer);
+
     const exact = try settingsPropsJson(testing.allocator, .{ .engine = "llama", .kv_quant = "q4", .kv_attn_mode = .dense, .decode_attn_quant = false, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(exact);
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
@@ -21316,14 +21565,38 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
 }
 
+/// Pins the cache tiers a bill test is about. The defaults (no RAM tier, an SSD tier) bill differently:
+/// SSD-first stages the writer's flush and a ringed arch bills its restore's coexistence.
+const TierGuard = struct {
+    ram: bool,
+    disk: u64,
+
+    fn pin(ram: bool, disk: u64) TierGuard {
+        const saved: TierGuard = .{ .ram = prefix_cache_ram_enabled, .disk = prefix_cache_disk_bytes };
+        prefix_cache_ram_enabled = ram;
+        prefix_cache_disk_bytes = disk;
+        return saved;
+    }
+
+    fn restore(self: TierGuard) void {
+        prefix_cache_ram_enabled = self.ram;
+        prefix_cache_disk_bytes = self.disk;
+    }
+};
+
 test "prefix cache default capacity covers interleaved agent flows" {
     // Claude Code-style clients interleave several conversation roots (main
     // thread, subagents, title generation). With capacity 1, every
     // interleaved request evicted the long system-prompt prefix and forced a
-    // full re-prefill per turn. The byte budget (prefix_cache_mem_bytes)
-    // still bounds memory.
+    // full re-prefill per turn.
     try testing.expect(prefix_cache_capacity >= 4);
-    try testing.expect(resolvedPrefixCacheMem() > 0);
+}
+
+test "prefix cache defaults: no RAM retention, an unnamed SSD tier on" {
+    try testing.expect(!prefix_cache_ram_enabled);
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    try testing.expect(!prefix_cache_mem_explicit and !prefix_cache_disk_explicit);
+    try testing.expectEqual(kv_disk_cache.DEFAULT_DISK_CAP, prefix_cache_disk_bytes);
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
@@ -23152,6 +23425,10 @@ test "the load-time bill prices the MTP head a served pack runs by default" {
     var streamed = cfg;
     streamed.expert_streaming = true;
     try t.expect(!mtpHeadDefaultOn(&streamed));
+    // A streamed load that kept its head bills it like a resident one.
+    streamed.stream_mtp_head = true;
+    try t.expect(mtpHeadDefaultOn(&streamed));
+    try t.expectEqual(sessionBytesPerToken(&off, 8) + head, sessionBytesPerToken(&streamed, 8));
 }
 
 test "chat stream tool-call delta escapes the function name" {
@@ -24312,6 +24589,8 @@ test "the advertised context does not move with the cache ask" {
 test "the published hot-cache budget is retired when the cache is dropped" {
     // The budget is per model, the global is process-wide.
     const t = std.testing;
+    const tiers = TierGuard.pin(true, 0);
+    defer tiers.restore();
     publishResolvedPrefixCacheMem(4096);
     try t.expectEqual(@as(u64, 4096), resolvedPrefixCacheMem());
     clearResolvedPrefixCacheMem();
@@ -24699,6 +24978,8 @@ test "ctxSizingCacheReserve: the advertised context is unchanged on every other 
     const GiB: u64 = 1 << 30;
     const saved = prefix_cache_mem_bytes;
     defer prefix_cache_mem_bytes = saved;
+    const tiers = TierGuard.pin(true, 0);
+    defer tiers.restore();
 
     var q4 = longCtxTestConfig(); // declares qwen4_exp
     var other = longCtxTestConfig();
@@ -25115,6 +25396,8 @@ test "a ringed arch's kv-quant dequant scratch is one layer's rebuild, not the m
 
 test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
     const t = std.testing;
+    const tiers = TierGuard.pin(true, 0);
+    defer tiers.restore();
     const cfg = mimoV2BillConfig();
     const seq: u64 = 512 * 1024;
     const chunk: u64 = 1024;
@@ -25159,6 +25442,8 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
 
 test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sheets" {
     const t = std.testing;
+    const tiers = TierGuard.pin(true, 0);
+    defer tiers.restore();
     const cfg = mimoV2BillConfig();
     const seq: u64 = 512 * 1024;
     const chunk: u64 = 1024;
@@ -26396,8 +26681,9 @@ test "GLM requests prefill at 2048 and step down a rung only where a chunk stops
     const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
 
-    // Release defaults: a 1M request is admitted with a 2048-row tail, and 2048 still fits there.
-    const available: u64 = 115_904 * 1024 * 1024 - 104_350_000_000;
+    // Release defaults: a 1M request is admitted with a 2048-row tail, and 2048 still fits there. The SSD-first
+    // default also stages the writer's flush (`kv_disk_writer.DEFAULT_PERMIT_BYTES`), billed beside it.
+    const available: u64 = 115_904 * 1024 * 1024 - 104_350_000_000 + kv_disk_writer.DEFAULT_PERMIT_BYTES;
     const top: u64 = 1_048_576 - 256;
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, available, 2048, 0, .{}));
     var st: generate_mod.AdaptiveWidthState = .{};
@@ -26559,6 +26845,8 @@ test "GLM admission bills the checkpoints and assistant window a request keeps; 
     cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
     cfg.glm_dflash_capture_bytes_per_token = (5 * 4096 + 2 * 4096) * 2 + 5 * 8 * 128 * 4;
     const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max };
+    const tiers = TierGuard.pin(true, 0);
+    defer tiers.restore();
     defer {
         prefix_cache_capacity = saved[0];
         ssm_checkpoint_stride = saved[1];
@@ -26647,10 +26935,13 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
     const per_cp = cfg.ssmCheckpointBytes();
     const row_bytes = sessionBytesPerToken(&cfg, 8);
     const cap = glm5_prefix.checkpointMax(16);
-    for ([_]bool{ true, false }) |ram| {
+    const Arm = struct { ram: bool, disk: u64 };
+    for ([_]Arm{ .{ .ram = true, .disk = 0 }, .{ .ram = false, .disk = 12 << 30 }, .{ .ram = true, .disk = 12 << 30 } }) |arm| {
+        const ram = arm.ram;
         prefix_cache_ram_enabled = ram;
-        prefix_cache_disk_bytes = if (ram) 0 else 12 << 30;
-        const staged: u64 = if (ram) 0 else kv_disk_writer.DEFAULT_PERMIT_BYTES;
+        prefix_cache_disk_bytes = arm.disk;
+        // The writer's permit is billed once, through `scheduler.diskWriterHostBytes` in the admission headroom.
+        const staged: u64 = 0;
         for ([_]u64{ 64, 131_072, 900_000, 1_040_000 }) |seq| {
             const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
             const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, cap, 0, seq, 2048);
@@ -26659,11 +26950,12 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
             const bytes: [8]u64 = @splat(per_cp);
             for (&positions, 1..) |*p, i| p.* = if (i == 8) oracle.newest else @max(oracle.newest * i / 8 / 2048 * 2048, 4);
             const kept: usize = @min(@as(usize, oracle.events), 8);
-            // What the commit copies: its destination's own bound, chosen before the copy.
-            const copied_len = prefix_cache_mod.HotPrefixCache.glmCommitLenFor(
+            // What the commit copies: the RAM tier's rows within its budget, chosen before the copy.
+            // The SSD tier copies none: its flush reads the request's own rows.
+            const copied_len = if (!ram) 0 else prefix_cache_mod.HotPrefixCache.glmCommitLenFor(
                 .min_span_recency,
-                if (ram) resolvedPrefixCacheMem() else @min(prefix_cache_disk_bytes, kv_disk_cache.SSD_FIRST_READBACK_BYTES),
-                !ram,
+                resolvedPrefixCacheMem(),
+                false,
                 oracle.newest,
                 row_bytes,
                 cfg.glm_dflash_window_bytes,
@@ -26679,11 +26971,20 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
             // A long prompt's checkpoints are priced by its prefill alone: the copy is smaller than its transient.
             const warm = WarmPrefix{ .checkpoints = cap };
             try std.testing.expect(glmCommitStateBytes(&cfg, seq, warm, 8) <= glm5TransientBytes(&cfg, seq, 2048, 8) +| glmPrefixStateBytes(&cfg, seq, warm));
+            // SSD-only: checkpoints, window and the writer's staged bytes, no rows at any length.
+            if (!ram) try std.testing.expectEqual(@as(u64, @min(oracle.events, cap)) * per_cp + cfg.glm_dflash_window_bytes + staged, glmCommitStateBytes(&cfg, seq, warm, 8));
+            // Both tiers: the RAM tier's copy; the disk tier adds no term of its own here.
+            if (ram and arm.disk > 0) {
+                prefix_cache_disk_bytes = 0;
+                const ram_only = glmCommitStateBytes(&cfg, seq, warm, 8);
+                prefix_cache_disk_bytes = arm.disk;
+                try std.testing.expectEqual(ram_only, glmCommitStateBytes(&cfg, seq, warm, 8));
+            }
         }
     }
 }
 
-test "GLM SSD-only bills the writer's staged bytes whatever checkpoints a request keeps, and sizes no cache" {
+test "GLM SSD-only bills its checkpoints and window, no writer term (the shared admission headroom has it), and sizes no cache" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     cfg.glm_dflash_loaded = true;
     cfg.glm_dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
@@ -26703,8 +27004,8 @@ test "GLM SSD-only bills the writer's staged bytes whatever checkpoints a reques
     prefix_cache_disk_bytes = 12 << 30;
     prefix_cache_ram_enabled = false;
     const held = (@as(u64, glm5_prefix.checkpointMax(16)) + 1) * cfg.ssmCheckpointBytes() + cfg.glm_dflash_window_bytes;
-    try std.testing.expectEqual(held + kv_disk_writer.DEFAULT_PERMIT_BYTES, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = glm5_prefix.checkpointMax(16) }));
-    try std.testing.expectEqual(kv_disk_writer.DEFAULT_PERMIT_BYTES, glmPrefixStateBytes(&cfg, 65536, .{}));
+    try std.testing.expectEqual(held, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = glm5_prefix.checkpointMax(16) }));
+    try std.testing.expectEqual(@as(u64, 0), glmPrefixStateBytes(&cfg, 65536, .{}));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
     try std.testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     try std.testing.expectEqual(sizer_off, prefillTransientReserve(&cfg, 8, 2048));

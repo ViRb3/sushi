@@ -4329,7 +4329,7 @@ fn sharedGateRowsEligible(widths: []const c_int) bool {
     if (widths.len < 2 or widths.len > 8) return false;
     var total: c_int = 0;
     for (widths) |width| {
-        if (width < 2 or width > 7) return false;
+        if (width < 1 or width > 7) return false;
         total += width;
     }
     return total <= 24;
@@ -7999,6 +7999,7 @@ pub const SlidingView = struct {
 
 var sliding_block_trim_logged: bool = false; // one-shot log guard
 var gdn_batched_logged: bool = false;
+var qwen4_rows_logged: bool = false;
 var mimo_batched_logged: bool = false;
 var gdn_batched_verify_logged: bool = false;
 var row_axis_verify_logged: bool = false;
@@ -13598,62 +13599,6 @@ fn qsaSourceHoldsRowsAt(src: *const SSMCheckpoint, pos: c_int, want: c_int) bool
     return any;
 }
 
-/// One QSA layer's history onto `dst_aux`/`dst_pooled`, sliced to `take` rows
-/// (pooled to `take/ratio` blocks). `materialize` = a fresh buffer (a trim must free the snap
-/// it drops); false = refcount-share the source (a full-length share is the same handle, a
-/// sliced one an `mlx_slice` view). `take <= 0` leaves the destination empty.
-fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src_aux: mlx.mlx_array, src_pooled: mlx.mlx_array, ratio: c_int, src_hist: c_int, take: c_int, materialize: bool, s: mlx.mlx_stream) !void {
-    if (dst_aux.ctx != null) _ = mlx.mlx_array_free(dst_aux.*);
-    dst_aux.* = .{ .ctx = null };
-    if (dst_pooled.ctx != null) _ = mlx.mlx_array_free(dst_pooled.*);
-    dst_pooled.* = .{ .ctx = null };
-    if (take <= 0) return;
-    if (src_pooled.ctx != null) {
-        if (materialize) {
-            dst_pooled.* = try materializedOwnedCopy(s, src_pooled);
-        } else {
-            dst_pooled.* = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(dst_pooled, src_pooled));
-        }
-        try truncatePooled(dst_pooled, take, ratio, s, materialize);
-    }
-    if (src_aux.ctx == null) return;
-    const ks = mlx.getShape(src_aux);
-    if (ks.len < 2) return;
-    const src_ring: c_int = ks[1];
-    const hist: c_int = if (src_hist > 0) src_hist else src_ring;
-    const dest_take: c_int = @min(take, hist);
-    const src_start: c_int = hist - src_ring;
-    const want_start: c_int = if (dest_take > QSA_RING_ROWS) dest_take - QSA_RING_ROWS else 0;
-    const ov_start = @max(src_start, want_start);
-    const ov_end = @min(hist, dest_take);
-    if (ov_end <= ov_start) return;
-    const phys_from = ov_start - src_start;
-    const phys_to = ov_end - src_start;
-    const full = phys_from == 0 and phys_to == src_ring;
-    if (full and !materialize) {
-        dst_aux.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(dst_aux, src_aux));
-    } else if (full) {
-        dst_aux.* = try materializedOwnedCopy(s, src_aux);
-    } else {
-        const start = [_]c_int{ 0, phys_from, 0 };
-        const stop = [_]c_int{ ks[0], phys_to, ks[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        var view = mlx.mlx_array_new();
-        mlx.check(mlx.mlx_slice(&view, src_aux, &start, 3, &stop, 3, &strides, 3, s)) catch |err| {
-            _ = mlx.mlx_array_free(view);
-            return err;
-        };
-        if (materialize) {
-            defer _ = mlx.mlx_array_free(view);
-            dst_aux.* = try materializedOwnedCopy(s, view);
-        } else {
-            dst_aux.* = view;
-        }
-    }
-}
-
 /// Copy QSA aux/pooled from the live entries onto the LATEST checkpoint —
 /// ONE materialized copy, sliced to that checkpoint's position (a cancel
 /// handoff attaches while the live history is ahead of the last stride
@@ -16952,7 +16897,7 @@ pub const Transformer = struct {
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
-    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-depth, else
+    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-max-depth, else
     /// the adaptive default), set at load. The row-resolved cap travels as
     /// `mtp_depth` through server -> slot -> Generator and reads there like
     /// an explicit flag, so the row-less value needs its own carrier.
@@ -22464,21 +22409,6 @@ pub const Transformer = struct {
         }
     }
 
-    /// Index `i` of `arr` along `axis` as an owned view handle (the axis keeps size 1).
-    fn axisView(s: mlx.mlx_stream, arr: mlx.mlx_array, axis: usize, i: usize) !mlx.mlx_array {
-        const shape = mlx.getShape(arr);
-        var start: [8]c_int = @splat(0);
-        var stop: [8]c_int = @splat(0);
-        const strides: [8]c_int = @splat(1);
-        for (0..shape.len) |d| stop[d] = shape[d];
-        start[axis] = @intCast(i);
-        stop[axis] = @intCast(i + 1);
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_slice(&out, arr, &start, @intCast(shape.len), &stop, @intCast(shape.len), &strides, @intCast(shape.len), s));
-        return out;
-    }
-
     /// Can these slots take ONE batched GDN decode tick? Every slot must
     /// already carry initialized state for every linear layer — that is true
     /// after any prefill, and false for a slot that has not run one, whose
@@ -22500,15 +22430,14 @@ pub const Transformer = struct {
         return true;
     }
 
-    /// Does this transformer support `forwardMoeBatchedDecode`? The GDN trunk
-    /// shape only — the archs that share `forwardMoeWith` but add per-layer
-    /// state or routing of their own (inkling short-convs, laguna, MLA,
-    /// gemma4 MoE) are NOT covered and must keep the serial path. Asked by
-    /// the scheduler's batching gate, so a new arch on this forward defaults
-    /// to serial instead of silently riding a path that never modelled it.
     pub fn supportsBatchedGlmRows(self: *const Transformer) bool {
         const glm = self.glm5 orelse return false;
         return self.config.supportsBatchedGlmRows() and glm.expert_stream == null;
+    }
+
+    /// Plain decode rows of one forward, each byte-identical to its solo tick (`forwardQwen4DecodeRows`).
+    pub fn supportsBatchedQwen4Rows(self: *const Transformer) bool {
+        return self.qwen4 != null and self.moe_layers != null and self.expert_stream == null and self.config.supportsBatchedQwen4Rows();
     }
 
     pub fn supportsBatchedMimoDecode(self: *const Transformer) bool {
@@ -22518,24 +22447,11 @@ pub const Transformer = struct {
     }
 
     pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
-        // Arch question: ONE predicate, shared with server.zig's
-        // --max-concurrent clamp so the two cannot disagree about whether
-        // this model batches.
+        // Share the architecture gate with the server's concurrency clamp.
         if (!self.config.supportsBatchedGdnDecode()) return false;
-        // Built-state question: this path reads `moe_layers` and the GDN
-        // ssm entries, so the trunk must actually be that shape.
+        // The loaded trunk must supply MoE layers and per-slot GDN state.
         if (self.moe_layers == null) return false;
         if (self.hybrid_layers != null or self.dsv4 != null or self.glm5 != null) return false;
-        // Every layer must be one of the two shapes this path handles.
-        for (self.moe_layers.?) |*lw| {
-            switch (lw.mlp) {
-                .dense => {},
-                // Routed experts are row-generic (`moeMLP` sorts B*S rows); the
-                // config predicate already named which MoE trunks' per-slot state
-                // this path merges.
-                .moe => {},
-            }
-        }
         return true;
     }
 
@@ -23000,7 +22916,7 @@ pub const Transformer = struct {
     /// gather only fills the tokens.
     fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) bool {
         const ctx_len: usize = self.qwen4.?.hash.ngram_size - 1;
-        return claimPleSpecCapture(entry, n, ctx_len, self.expert_stream == null and self.spec_capture_ssm);
+        return claimPleSpecCapture(entry, n, ctx_len, self.spec_capture_ssm);
     }
 
     /// Every eval inside a `ple_defer` build reads the leaf as it stands, and
@@ -25221,6 +25137,8 @@ pub const Transformer = struct {
             return false;
         }
         if (qwen4_trace != null or diagEnvOn("QWEN4_PROFILE_FWD")) return false;
+        // The grouped verify reads resident expert banks; a streamed trunk has none.
+        if (self.expert_stream != null) return false;
         const si = qwen4Standin();
         if (si.gdn or si.attn or si.mlp or si.gdn_recur or si.gdn_proj or si.attn_qsa or si.attn_sdpa or si.hc or si.moe_shared or si.moe_router or si.moe_gateup or si.moe_down) return false;
         for (self.moe_layers.?) |lw| switch (lw.mlp) {
@@ -25488,6 +25406,225 @@ pub const Transformer = struct {
         mtp_verify_moe_group_last_ops = group_ops;
     }
 
+    /// `HcRead` for every row: one joined kernel pass when it serves, else each row's own read.
+    fn hcReadRows(self: *Transformer, rows: anytype, w: *const HcWeights, out: []HcRead) !void {
+        if (try self.hcReadVerifyRows(rows, w)) |joined| {
+            defer self.allocator.free(joined);
+            @memcpy(out[0..rows.len], joined);
+            return;
+        }
+        var built: usize = 0;
+        errdefer for (out[0..built]) |*read| read.deinit();
+        for (rows, out[0..rows.len]) |*row, *read| {
+            self.fwd_gen = row.generation;
+            read.* = try self.hcReadPending(&row.h, w, 1, row.seq, &row.pending);
+            built += 1;
+        }
+    }
+
+    /// Plain batched decode on qwen4_exp: row i is slot i's decode tick. A row's recurrence, attention, PLE and
+    /// KV append run as the slot's solo tick runs them, on its own state at its own position. The ops that read
+    /// the same weights for every row (hyper-connection reads, projections, routed experts, lm_head) take one
+    /// pass through kernels whose per-row arithmetic is the single-row one. Returns N logits `[1, 1, V]`; the
+    /// caller owns each and the slice. `hidden_rows`, when given, receives every row's pre-mixer stream.
+    pub fn forwardQwen4DecodeRows(
+        self: *Transformer,
+        next_tokens: []const u32,
+        ctxs: []const *ForwardCtx,
+        hidden_rows: ?*?[]mlx.mlx_array,
+    ) ![]mlx.mlx_array {
+        const n = ctxs.len;
+        std.debug.assert(n == next_tokens.len and n >= 1 and n <= MAX_BATCH_ROWS);
+        if (!qwen4_rows_logged) {
+            qwen4_rows_logged = true;
+            log.info("[batched] qwen4 per-row decode engaged (slots={d})\n", .{n});
+        }
+        const cfg = &self.config;
+        const layers = self.moe_layers.?;
+        const hc: c_int = @intCast(cfg.hc_count);
+        const Row = struct {
+            ctx: *ForwardCtx,
+            tokens: mlx.mlx_array,
+            entries: []SSMCacheEntry,
+            offset: usize,
+            seq: c_int,
+            generation: u64,
+            h: mlx.mlx_array,
+            pending: ?HcPending = null,
+        };
+        var rows: [MAX_BATCH_ROWS]Row = undefined;
+        var initialized: usize = 0;
+        defer for (rows[0..initialized]) |*row| {
+            if (row.pending) |*pending| pending.deinit();
+            if (row.h.ctx != null) _ = mlx.mlx_array_free(row.h);
+            _ = mlx.mlx_array_free(row.tokens);
+        };
+        for (ctxs) |ctx| ctx.ple_defer = true;
+        defer for (ctxs) |ctx| {
+            ctx.ple_defer = false;
+        };
+        errdefer for (ctxs) |ctx| self.discardDeferredPle(ctx);
+        self.spec_capture_ssm = false;
+        var generation = self.fwd_gen;
+        for (ctxs, next_tokens) |ctx, token| {
+            try self.ssmGroupRelease(ctx);
+            generation +%= 1;
+            self.fwd_gen = generation;
+            const id: i32 = @intCast(token);
+            const tokens = mlx.mlx_array_new_data(&id, &[_]c_int{ 1, 1 }, 2, .int32);
+            errdefer _ = mlx.mlx_array_free(tokens);
+            const emb = try self.embedding(tokens);
+            defer _ = mlx.mlx_array_free(emb);
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
+            errdefer _ = mlx.mlx_array_free(h);
+            if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+                var h32 = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h32;
+            }
+            rows[initialized] = .{
+                .ctx = ctx,
+                .tokens = tokens,
+                .entries = ctx.ssm_entries orelse return error.MissingSsmEntries,
+                .offset = ctx.moe_seq_offset.*,
+                .seq = 1,
+                .generation = generation,
+                .h = h,
+            };
+            initialized += 1;
+        }
+        const live = rows[0..initialized];
+
+        for (0..layerCap(cfg.num_hidden_layers)) |layer_idx| {
+            const layer = &layers[layer_idx];
+            const li: u32 = @intCast(layer_idx);
+            if (layer.ple) |*pw| for (live, 0..) |*row, i| {
+                self.fwd_gen = row.generation;
+                try self.addVerifyPle(row, pw, layer_idx, i);
+            };
+
+            var attn_reads: [MAX_BATCH_ROWS]HcRead = undefined;
+            try self.hcReadRows(live, &layer.hc_attn.?, &attn_reads);
+            defer for (attn_reads[0..n]) |*read| read.deinit();
+            var inputs: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
+            var entries: [MAX_BATCH_ROWS]*SSMCacheEntry = undefined;
+            var generations: [MAX_BATCH_ROWS]u64 = undefined;
+            for (live, 0..) |*row, i| {
+                inputs[i] = attn_reads[i].mixed;
+                entries[i] = &row.entries[layer_idx];
+                generations[i] = row.generation;
+            }
+            const projected = switch (layer.attn) {
+                .linear => |*la| try self.gdnDecodeRows(inputs[0..n], entries[0..n], generations[0..n], layer_idx, la),
+                .full => |*fa| try self.attnDecodeRows(inputs[0..n], entries[0..n], ctxs, generations[0..n], layer_idx, fa),
+            };
+            defer if (projected) |values| {
+                for (values) |value| _ = mlx.mlx_array_free(value);
+                self.allocator.free(values);
+            };
+            for (live, attn_reads[0..n], 0..) |*row, read, i| {
+                self.fwd_gen = row.generation;
+                const attn = if (projected) |values| try standinRef(values[i]) else switch (layer.attn) {
+                    .linear => |*la| try self.gatedDeltaNet(read.mixed, la, entries[i], layer_idx, 1, 1, false),
+                    .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, entries[i], li, @intCast(row.offset), 0, 1, 1, false),
+                };
+                defer _ = mlx.mlx_array_free(attn);
+                try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, 1, layer.hc_mlp.?.inject_flat, &row.pending);
+            }
+
+            var mlp_reads: [MAX_BATCH_ROWS]HcRead = undefined;
+            try self.hcReadRows(live, &layer.hc_mlp.?, &mlp_reads);
+            defer for (mlp_reads[0..n]) |*read| read.deinit();
+            for (live, 0..) |_, i| inputs[i] = mlp_reads[i].mixed;
+            const mlp: []mlx.mlx_array = switch (layer.mlp) {
+                .moe => |*mw| try self.moeVerifyRows(inputs[0..n], mw),
+                .dense => |*dw| blk: {
+                    const out = try self.allocator.alloc(mlx.mlx_array, n);
+                    var built: usize = 0;
+                    errdefer {
+                        for (out[0..built]) |value| _ = mlx.mlx_array_free(value);
+                        self.allocator.free(out);
+                    }
+                    for (inputs[0..n], out) |input, *slot| {
+                        slot.* = try self.denseMLP(input, dw);
+                        built += 1;
+                    }
+                    break :blk out;
+                },
+            };
+            defer {
+                for (mlp) |value| _ = mlx.mlx_array_free(value);
+                self.allocator.free(mlp);
+            }
+            const next_inject: mlx.mlx_array = if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) layers[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null };
+            for (live, mlp, mlp_reads[0..n]) |*row, value, read| {
+                self.fwd_gen = row.generation;
+                try self.hcWriteOrDefer(&row.h, value, read.inj, 1, 1, next_inject, &row.pending);
+            }
+        }
+
+        var hidden_out: ?[]mlx.mlx_array = null;
+        errdefer if (hidden_out) |values| {
+            for (values) |value| _ = mlx.mlx_array_free(value);
+            self.allocator.free(values);
+        };
+        if (hidden_rows != null) {
+            hidden_out = try self.allocator.alloc(mlx.mlx_array, n);
+            @memset(hidden_out.?, .{ .ctx = null });
+        }
+        var mixed: [MAX_BATCH_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (mixed[0..n]) |value| {
+            if (value.ctx != null) _ = mlx.mlx_array_free(value);
+        };
+        for (live, 0..) |*row, i| {
+            self.fwd_gen = row.generation;
+            try self.hcFlush(&row.h, 1, 1, &row.pending);
+            row.ctx.moe_seq_offset.* += 1;
+            if (hidden_out) |values| values[i] = try materializedOwnedCopy(self.s, row.h);
+            const mix = try self.hcReadPending(&row.h, &self.qwen4_mixer.?, 1, 1, &row.pending);
+            _ = mlx.mlx_array_free(row.h);
+            row.h = .{ .ctx = null };
+            if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
+            mixed[i] = mix.mixed;
+        }
+
+        const logits = try self.allocator.alloc(mlx.mlx_array, n);
+        var made: usize = 0;
+        errdefer {
+            for (logits[0..made]) |value| _ = mlx.mlx_array_free(value);
+            self.allocator.free(logits);
+        }
+        var joined_logits: ?mlx.mlx_array = null;
+        defer if (joined_logits) |value| {
+            _ = mlx.mlx_array_free(value);
+        };
+        if (n >= 2) {
+            const vec = mlx.mlx_vector_array_new_data(&mixed, n);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var joined = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(joined);
+            try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 1, self.s));
+            const widths: [MAX_BATCH_ROWS]c_int = @splat(1);
+            joined_logits = try decodeRowsProjection(self.s, joined, self.lm_head_w, self.lm_head_s, self.lm_head_b, widths[0..n]);
+        }
+        for (live, 0..) |row, i| {
+            logits[i] = if (joined_logits) |value| blk: {
+                var slice = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(slice);
+                try mlx.check(mlx.mlx_slice(&slice, value, &.{ 0, @intCast(i), 0 }, 3, &.{ 1, @as(c_int, @intCast(i)) + 1, mlx.getShape(value)[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
+                break :blk slice;
+            } else try self.lmHeadProject(mixed[i], row.ctx.argmax_only);
+            made += 1;
+        }
+        self.fwd_gen = generation;
+        try self.flushDeferredPleGroup(ctxs);
+        if (hidden_rows) |dst| dst.* = hidden_out;
+        hidden_out = null;
+        return logits;
+    }
+
     /// Qwen3.8-Flash-Next forward: embeddings tiled into `hc` residual
     /// streams; every block reads a gated mix of the streams and writes back
     /// through per-stream scalar gates; the n-gram PLE adds to the streams
@@ -25498,7 +25635,6 @@ pub const Transformer = struct {
         const dumping = moeDumpBeginForward();
         defer if (dumping) moeDumpForwardDone();
         self.fwd_gen +%= 1; // per-forward QSA scratch key
-        if (self.expert_stream != null and ctx.capture_ssm_seq) return error.StreamingSpecCaptureUnsupported;
         if (self.expert_stream) |engine| engine.beginForward();
         const ml = self.moe_layers.?;
         const cfg = &self.config;
@@ -29467,9 +29603,11 @@ pub const Transformer = struct {
 
     const VerifyRowsKind = enum { attention, gdn };
 
+    /// `decode`: every input is one slot's single-token tick (`forwardQwen4DecodeRows`), not a verify block.
     fn verifyRowsJoined(
         self: *Transformer,
         comptime kind: VerifyRowsKind,
+        comptime decode: bool,
         inputs: []const mlx.mlx_array,
         entries: []const *SSMCacheEntry,
         ctxs: []const *ForwardCtx,
@@ -29485,7 +29623,7 @@ pub const Transformer = struct {
         var total: c_int = 0;
         for (inputs, 0..) |input, i| {
             const shape = mlx.getShape(input);
-            if (shape.len != 3 or shape[0] != 1 or shape[2] != 2560 or shape[1] < 2 or shape[1] > 6) return null;
+            if (shape.len != 3 or shape[0] != 1 or shape[2] != 2560 or shape[1] < (if (decode) 1 else 2) or shape[1] > 6) return null;
             widths[i] = shape[1];
             total += shape[1];
         }
@@ -29505,8 +29643,8 @@ pub const Transformer = struct {
             .gdn => .{ "qkv", "z", "a", "b" },
         }) |name| {
             const part = switch (kind) {
-                .attention => try verifyAttnProjection(self.s, joined, @field(w, name ++ "_w"), @field(w, name ++ "_s"), @field(w, name ++ "_b"), widths[0..inputs.len]),
-                .gdn => try verifyGdnProjection(self.s, joined, @field(w, name ++ "_w"), @field(w, name ++ "_s"), @field(w, name ++ "_b"), widths[0..inputs.len]),
+                .attention => try projectRows(self.s, decode, .attention, joined, @field(w, name ++ "_w"), @field(w, name ++ "_s"), @field(w, name ++ "_b"), widths[0..inputs.len]),
+                .gdn => try projectRows(self.s, decode, .gdn, joined, @field(w, name ++ "_w"), @field(w, name ++ "_s"), @field(w, name ++ "_b"), widths[0..inputs.len]),
             };
             @field(projections, name) = part orelse return null;
         }
@@ -29522,12 +29660,12 @@ pub const Transformer = struct {
                     defer values.deinit();
                     self.fwd_gen = generation;
                     const ctx = ctxs[i];
-                    break :blk try self.qwen4AttnProjected(ctx, input, w, entry, @intCast(layer), @intCast(ctx.moe_seq_offset.*), 0, 1, widths[i], true, &values, true);
+                    break :blk try self.qwen4AttnProjected(ctx, input, w, entry, @intCast(layer), @intCast(ctx.moe_seq_offset.*), 0, 1, widths[i], !decode, &values, true);
                 },
                 .gdn => blk: {
                     const values = try projections.slice(self.s, offset, widths[i]);
                     self.fwd_gen = generation;
-                    break :blk try self.gatedDeltaNetProjected(input, w, entry, layer, 1, widths[i], true, values, true);
+                    break :blk try self.gatedDeltaNetProjected(input, w, entry, layer, 1, widths[i], !decode, values, true);
                 },
             };
             offset += widths[i];
@@ -29541,10 +29679,7 @@ pub const Transformer = struct {
         var joined_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(joined_flat);
         try mlx.check(mlx.mlx_concatenate_axis(&joined_flat, flat_vec, 1, self.s));
-        const projected = switch (kind) {
-            .attention => try verifyAttnProjection(self.s, joined_flat, out_w, out_s, out_b, widths[0..inputs.len]),
-            .gdn => try verifyGdnProjection(self.s, joined_flat, out_w, out_s, out_b, widths[0..inputs.len]),
-        };
+        const projected = try projectRows(self.s, decode, kind, joined_flat, out_w, out_s, out_b, widths[0..inputs.len]);
         defer if (projected) |value| {
             _ = mlx.mlx_array_free(value);
         };
@@ -29561,13 +29696,13 @@ pub const Transformer = struct {
                 errdefer _ = mlx.mlx_array_free(result[i]);
                 try mlx.check(mlx.mlx_slice(&result[i], value, &.{ 0, offset, 0 }, 3, &.{ 1, offset + widths[i], mlx.getShape(value)[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
             } else result[i] = switch (kind) {
-                .attention => try self.attnProj(flat[i], out_w, out_s, out_b, false, @intCast(layer)),
+                .attention => try self.attnProj(flat[i], out_w, out_s, out_b, decode, @intCast(layer)),
                 .gdn => try self.qmatmul(flat[i], out_w, out_s, out_b),
             };
             built += 1;
             offset += widths[i];
         }
-        switch (kind) {
+        if (!decode) switch (kind) {
             .attention => {
                 mtp_verify_attn_rows_calls +%= 1;
                 if (projected != null) mtp_verify_attn_output_calls +%= 1;
@@ -29576,9 +29711,10 @@ pub const Transformer = struct {
                 mtp_verify_gdn_rows_calls +%= 1;
                 if (projected != null) mtp_verify_gdn_output_calls +%= 1;
             },
-        }
+        };
         const Once = struct {
             const tag = kind;
+            const mode = decode;
             var logged = false;
         };
         if (!Once.logged) {
@@ -29586,13 +29722,25 @@ pub const Transformer = struct {
             log.info("[batched] " ++ switch (kind) {
                 .attention => "attention",
                 .gdn => "GDN",
-            } ++ " verify projections engaged (slots={d})\n", .{inputs.len});
+            } ++ (if (decode) " decode-row projections engaged (slots={d})\n" else " verify projections engaged (slots={d})\n"), .{inputs.len});
         }
         return result;
     }
 
+    fn attnDecodeRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, ctxs: []const *ForwardCtx, generations: []const u64, layer: usize, fa: *const FullAttnWeights) !?[]mlx.mlx_array {
+        return self.verifyRowsJoined(.attention, true, inputs, entries, ctxs, generations, layer, fa);
+    }
+
     fn attnVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, ctxs: []const *ForwardCtx, generations: []const u64, layer: usize, fa: *const FullAttnWeights) !?[]mlx.mlx_array {
-        return self.verifyRowsJoined(.attention, inputs, entries, ctxs, generations, layer, fa);
+        return self.verifyRowsJoined(.attention, false, inputs, entries, ctxs, generations, layer, fa);
+    }
+
+    fn projectRows(s: mlx.mlx_stream, comptime decode: bool, comptime kind: VerifyRowsKind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
+        const pk: VerifyProjectionKind = switch (kind) {
+            .attention => .attention,
+            .gdn => .gdn,
+        };
+        return if (decode) decodeRowsProjection(s, x, w, sc, bi, widths) else verifyJoinedProjection(s, x, w, sc, bi, widths, pk);
     }
 
     const GdnVerifyInputs = struct {
@@ -29618,9 +29766,14 @@ pub const Transformer = struct {
         }
     };
 
+    fn gdnDecodeRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
+        if (la.combined_proj or self.ane_prefill != null) return null;
+        return self.verifyRowsJoined(.gdn, true, inputs, entries, &.{}, generations, layer, la);
+    }
+
     fn gdnVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
         if (la.combined_proj or self.ane_prefill != null) return null;
-        return self.verifyRowsJoined(.gdn, inputs, entries, &.{}, generations, layer, la);
+        return self.verifyRowsJoined(.gdn, false, inputs, entries, &.{}, generations, layer, la);
     }
 
     // ── GatedDeltaNet (linear attention layers) ──
@@ -29773,7 +29926,7 @@ pub const Transformer = struct {
 
         // Port of mlx-serve #517: prework + recurrence in one dispatch, then the norm-gate,
         // at decode (S=1) and capturing verify widths (S 2..8); the chain below otherwise.
-        if (batch == 1 and projected == null and kernel == 4 and ssm.initialized and ssm.conv_state.ctx != null and
+        if (batch == 1 and (projected == null or !self.spec_capture_ssm) and kernel == 4 and ssm.initialized and ssm.conv_state.ctx != null and
             ssm.ssm_state.ctx != null and (if (self.spec_capture_ssm) seq_len >= 2 else seq_len == 1) and
             !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and !qwen4Standin().gdn_recur and
             !diagEnvOnCached(&gdn_check_env, "QWEN4_GDN_CHECK") and gdnDecodeRecurEnabled())
@@ -31360,7 +31513,7 @@ pub const Transformer = struct {
         return switch (proj) {
             .qmatmul => try self.qmatmul(x, w, sc, bi),
             .mtp_rows => try self.mtpProjectionRows(x, w, sc, bi, false),
-            .verify_rows => try verifySharedProjection(self.s, x, w, sc, bi, widths),
+            .verify_rows => (try decodeRowsProjection(self.s, x, w, sc, bi, widths)) orelse try verifySharedProjection(self.s, x, w, sc, bi, widths),
         };
     }
 
@@ -36483,19 +36636,12 @@ fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
     cache.* = v;
     return v;
 }
-/// The diagnostic-switch decision, split from the `getenv` so it is testable.
+/// Diagnostic switches are off for empty values and values beginning with `0`.
 pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
     return v[0] != 0 and v[0] != '0';
 }
-/// Diagnostic env switch: set to a value that is neither empty nor `0`. A
-/// harness exporting `FOO=0` or `FOO=` must never arm a sync profiler (the
-/// qwen4 MTP verify once measured 70 ms).
-
-/// SUSHI_MOE_DUMP=<dir>: one forward's MoE tensors, per layer, as raw f32
-/// with the shape in the file name. Off by default; the dir is read once. Two
-/// packs that share a trunk must agree at the first MoE layer, so this is the
-/// only way to say WHERE two loads of the same model start to differ.
+/// SUSHI_MOE_DUMP=<dir> writes one forward's MoE tensors as raw f32, with shapes in filenames.
 var moe_dump_dir: ?[]const u8 = null;
 var moe_dump_asked: bool = false;
 var moe_dump_layer: u32 = 0;
@@ -40435,7 +40581,7 @@ fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width:
 }
 
 fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?[]const HcPending) !?[]HcFusedOut {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or inputs.len < 2 or inputs.len > 8 or width < 2) return null;
+    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or inputs.len < 2 or inputs.len > 8 or width < 1) return null;
     const total = @as(c_int, @intCast(inputs.len)) * width;
     if (total > HC_FUSED_MAX_ROWS or w.inject_flat.ctx == null) return null;
     for (inputs) |input| {
@@ -43012,6 +43158,20 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     return value;
 }
 
+/// One row per slot's decode tick, any affine8 group size: each row is computed as the single-row qmv computes it.
+fn decodeRowsProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s) or widths.len < 2 or widths.len > 8) return null;
+    if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
+    const xs = mlx.getShape(x);
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(sc);
+    if (xs.len != 3 or xs[0] != 1 or xs[1] != @as(c_int, @intCast(widths.len)) or ws.len != 2 or ss.len != 2 or ss[0] != ws[0]) return null;
+    for (widths) |width| if (width != 1) return null;
+    const geom = @import("expert_quant.zig").affineGeomFromShapes(@intCast(ws[1]), @intCast(ss[1]), @intCast(xs[2])) orelse return null;
+    if (geom.bits != 8 or mixedPlainEnabled(8, geom.group_size, ws[0])) return null;
+    return @import("mtp_qmv.zig").matmul(s, x, w, sc, bi);
+}
+
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
     // Unquantized weights are pre-transposed to [in, out] at load.
     // Short forwards retain each serial row's matmul arithmetic.
@@ -43137,34 +43297,6 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
     prefill_dq_gemm_engaged += 1;
     return out;
-}
-
-/// Extract timestep t from a [B, T, H, D] tensor → [B, H, D]
-fn sliceTimestep4(arr: mlx.mlx_array, batch: c_int, heads: c_int, dim: c_int, t: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const start = [_]c_int{ 0, t, 0, 0 };
-    const stop = [_]c_int{ batch, t + 1, heads, dim };
-    const strides = [_]c_int{ 1, 1, 1, 1 };
-    var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
-    try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 4, &stop, 4, &strides, 4, s));
-    const out_shape = [_]c_int{ batch, heads, dim };
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 3, s));
-    return result;
-}
-
-/// Extract timestep t from a [B, T, H] tensor → [B, H]
-fn sliceTimestep3(arr: mlx.mlx_array, batch: c_int, heads: c_int, t: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const start = [_]c_int{ 0, t, 0 };
-    const stop = [_]c_int{ batch, t + 1, heads };
-    const strides = [_]c_int{ 1, 1, 1 };
-    var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
-    try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 3, &stop, 3, &strides, 3, s));
-    const out_shape = [_]c_int{ batch, heads };
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 2, s));
-    return result;
 }
 
 fn getWeightFmt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const u8, prefix: []const u8) error{MissingWeight}!mlx.mlx_array {
@@ -47785,7 +47917,7 @@ fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int
     return delta;
 }
 
-test "qwen4 streamed PLE refuses spec capture and clears the claimed length" {
+test "qwen4 PLE spec capture follows the verify flag, streamed or not" {
     var state: qwen4_mod.Qwen4State = undefined;
     state.hash.ngram_size = 3;
     var xfm: Transformer = undefined;
@@ -47802,6 +47934,9 @@ test "qwen4 streamed PLE refuses spec capture and clears the claimed length" {
     var engine: expert_stream_mod.Engine = undefined;
     xfm.expert_stream = &engine;
     entry.spec_ple_len = 17;
+    try testing.expect(xfm.pleClaimSpecCapture(&entry, 4));
+    try testing.expectEqual(@as(u32, 6), entry.spec_ple_len);
+    xfm.spec_capture_ssm = false;
     try testing.expect(!xfm.pleClaimSpecCapture(&entry, 4));
     try testing.expectEqual(@as(u32, 0), entry.spec_ple_len);
 }
@@ -66397,8 +66532,11 @@ const Qwen4TestSlot = struct {
     head: Transformer.Qwen4MtpState,
 
     fn init(alloc: std.mem.Allocator, n_layers: u32) !*Qwen4TestSlot {
+        return initWith(alloc, n_layers, KVQuantConfig.dense);
+    }
+    fn initWith(alloc: std.mem.Allocator, n_layers: u32, kv: KVQuantConfig) !*Qwen4TestSlot {
         const sl = try alloc.create(Qwen4TestSlot);
-        const cache = try KVCache.init(alloc, n_layers);
+        const cache = try KVCache.initWithConfig(alloc, n_layers, kv);
         const head_cache = try KVCache.init(alloc, 1);
         sl.* = .{
             .cache = cache,
@@ -66558,6 +66696,131 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
         pooled = true;
     };
     try testing.expect(pooled);
+}
+
+fn qwen4BitsEqual(alloc: std.mem.Allocator, a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    if (a.ctx == null or b.ctx == null) return a.ctx == b.ctx;
+    const ah = try qwen4ReadF32(alloc, a, s);
+    defer alloc.free(ah);
+    const bh = try qwen4ReadF32(alloc, b, s);
+    defer alloc.free(bh);
+    return std.mem.eql(u8, std.mem.sliceAsBytes(ah), std.mem.sliceAsBytes(bh));
+}
+
+// Row i of a batched decode is slot i's solo tick, byte for byte: ragged KV past the QSA budget, slots joining
+// and leaving, one M-RoPE slot. `QWEN4_ROWS_OLD=1` drives the padded batch instead (the red probe).
+test "qwen4 per-row batched decode == solo ticks bit for bit (ragged KV, join/leave, M-RoPE)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const old_path = diagEnvOn("QWEN4_ROWS_OLD");
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.supportsBatchedQwen4Rows());
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+    const n_layers = config.num_hidden_layers;
+
+    const lens = [_]usize{ 2300, 3100, 5200, 2100 };
+    const mrope_slot = 3;
+    const delta: i32 = -3;
+    var table: [3 * 2100]i32 = undefined;
+    for (0..3) |axis| for (0..2100) |i| {
+        table[axis * 2100 + i] = @intCast(i);
+    };
+    var solo: [4]*Qwen4TestSlot = undefined;
+    var batch: [4]*Qwen4TestSlot = undefined;
+    var made: usize = 0;
+    defer for (0..made) |i| {
+        solo[i].deinit(allocator);
+        batch[i].deinit(allocator);
+    };
+    var prompt: [5200]i32 = undefined;
+    for (0..4) |slot| {
+        var x: u64 = 0x9e3779b97f4a7c15 +% slot;
+        for (prompt[0..lens[slot]]) |*id| {
+            x = x *% 6364136223846793005 +% 1442695040888963407;
+            id.* = @intCast(1000 + (x >> 33) % 100000);
+        }
+        solo[slot] = try Qwen4TestSlot.initWith(allocator, n_layers, KVQuantConfig.affine(8));
+        batch[slot] = try Qwen4TestSlot.initWith(allocator, n_layers, KVQuantConfig.affine(8));
+        made += 1;
+        for ([_]*Qwen4TestSlot{ solo[slot], batch[slot] }) |sl| {
+            if (slot == mrope_slot) {
+                sl.ctx.mrope_pos = &table;
+                sl.ctx.mrope_total = 2100;
+            }
+            _ = mlx.mlx_array_free(try sl.forward(&xfm, prompt[0..lens[slot]]));
+            if (slot == mrope_slot) sl.ctx.mrope_delta = delta;
+        }
+    }
+
+    // Slots 0 and 1 run together, 2 joins, 0 leaves as 3 joins, 2 is cancelled, 0 comes back.
+    const active = [_][]const usize{
+        &.{ 0, 1 },    &.{ 0, 1 },    &.{ 0, 1, 2 }, &.{ 0, 1, 2 }, &.{ 1, 2, 3 },
+        &.{ 1, 2, 3 }, &.{ 1, 3 },    &.{ 0, 1, 3 }, &.{ 0, 1, 3 }, &.{ 0, 1, 2, 3 },
+    };
+    var mismatched: usize = 0;
+    for (active, 0..) |set, tick| {
+        var ctxs: [4]*ForwardCtx = undefined;
+        var toks: [4]u32 = undefined;
+        var offs: [4]u32 = undefined;
+        for (set, 0..) |slot, i| {
+            ctxs[i] = &batch[slot].ctx;
+            toks[i] = @intCast(5000 + (slot * 131 + tick * 17) % 90000);
+            offs[i] = @intCast(batch[slot].off);
+        }
+        const out = if (old_path)
+            try xfm.forwardMoeBatchedDecode(toks[0..set.len], ctxs[0..set.len], offs[0..set.len], null)
+        else
+            try xfm.forwardQwen4DecodeRows(toks[0..set.len], ctxs[0..set.len], null);
+        defer {
+            for (out) |o| _ = mlx.mlx_array_free(o);
+            allocator.free(out);
+        }
+        for (set, 0..) |slot, i| {
+            if (old_path) batch[slot].off += 1;
+            const id: i32 = @intCast(toks[i]);
+            const ref = try solo[slot].forward(&xfm, &.{id});
+            defer _ = mlx.mlx_array_free(ref);
+            if (!try qwen4BitsEqual(allocator, ref, out[i], s)) {
+                mismatched += 1;
+                std.debug.print("[qwen4 rows] tick {d} slot {d} (rows {d}): logits differ\n", .{ tick, slot, set.len });
+            }
+            try testing.expectEqual(solo[slot].off, batch[slot].off);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), mismatched);
+    if (old_path) return;
+
+    for (0..4) |slot| {
+        for (0..n_layers) |l| {
+            const es = &solo[slot].entries[l];
+            const eb = &batch[slot].entries[l];
+            try testing.expectEqual(es.ple_prev_valid, eb.ple_prev_valid);
+            try testing.expectEqualSlices(u32, &es.ple_prev, &eb.ple_prev);
+            inline for (.{ "conv_state", "ssm_state", "aux_state", "qsa_pooled" }) |field| {
+                try testing.expect(try qwen4BitsEqual(allocator, @field(es, field), @field(eb, field), s));
+            }
+            if (xfm.moe_layers.?[l].attn == .full) {
+                var ds = try solo[slot].cache.denseView(@intCast(l), s);
+                defer ds.deinit();
+                var db = try batch[slot].cache.denseView(@intCast(l), s);
+                defer db.deinit();
+                try testing.expect(try qwen4BitsEqual(allocator, ds.k, db.k, s));
+                try testing.expect(try qwen4BitsEqual(allocator, ds.v, db.v, s));
+            }
+        }
+    }
 }
 
 test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direct forward (QWEN4_TEST_MODEL)" {
@@ -75264,7 +75527,7 @@ test "mimo v2 mixed-precision streamed and resident forwards agree" {
     defer config.deinit(a);
     var resident_weights = try model_mod.loadWeights(io, a, path);
     defer resident_weights.deinit();
-    var streamed_weights = try model_mod.loadWeightsStreaming(io, a, path, .mxfp4_split, false);
+    var streamed_weights = try model_mod.loadWeightsStreaming(io, a, path, .mxfp4_split, false, false);
     defer streamed_weights.deinit();
     const per_expert = try expert_stream_mod.mxfp4ExpertBytes(config.hidden_size, config.moe_intermediate_size);
     var stream_config = config;

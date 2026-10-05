@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: concurrent agent loops each get THEIR OWN tool calls.
 #
 # Batched decode and tool buffering are individually tested and have never been

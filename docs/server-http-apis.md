@@ -185,6 +185,11 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
   streaming grammar → per-token mask), `src/reasoning_protocol.zig`.
 
+- `/props.settings.prefix_cache` = `{ram_enabled, mem_bytes, disk_bytes, disk_used_bytes, disk_entries}`: `disk_bytes` is
+  the SSD budget the model was given at load (0 = tier off), `disk_used_bytes` and `disk_entries` what the tier holds,
+  published by the inference thread after each commit (the web page's meter reads them; the same numbers log as
+  `[disk-cache] usage <used> / <budget> GB, <n> entries` once per finished turn). They are the REQUESTED model's own
+  tier (`/props?model=X`), the four numbers from one publish. `GB` is binary (1 GB = 1 GiB), as the flags read it.
 - `/props.settings.prefill_decode_share` reports the effective process-wide share, including zero under the interleave kill switch.
 
 ## Security and observability
@@ -221,6 +226,9 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those two paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. Guards: `tests/test_webui.sh`, the `chat page:` tests.
+- The right sidebar's "Prefix cache (SSD)" section is a bar meter of `/props` `settings.prefix_cache`
+  (`disk_used_bytes / disk_bytes`, "<used> / <budget> GB" and the entry count beside it). It is read after each reply
+  and again 2.5 s later (the server stores a turn's entry after answering) and stays hidden while `disk_bytes` is 0.
 - It speaks only the public API: `/v1/models` for the picker (`vision` or an `image` input modality shows the attach
   button), `/v1/chat/completions` streamed with `include_usage` (the
   readout is the final chunk's `usage` + `timings`), `reasoning_content` shown collapsed. Stop aborts the fetch; the
@@ -323,7 +331,7 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   disallowed. The result loads in an isolated image, never as live SVG in the chat DOM. The original code stays
   copyable. The upstream minified bundle is inline to keep the page self-contained; its license is in
   `src/webui/DOMPurify.LICENSE`. Updates should use a reviewed upstream release and rerun the renderer checks.
-- Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `tests/test_webui.sh`, and the
+- Checks: `node tests/test_webui_tools.cjs`, `node tests/test_webui_effort.cjs`, `node tests/test_webui_prefix_cache.cjs`, `tests/test_webui.sh`, and the
   `web tools:` unit test. Generate the
   browser renderer suite with `node tests/test_webui_render.cjs /tmp/sushi-render-tests/index.html`, serve that
   directory locally (or open the HTML), and require **All renderer checks passed**.

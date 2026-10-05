@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_prefix_cache_hot.sh — plan 03 phase 1 hot prefix cache validation.
 #
 # Two parallel conversations against the same server, each with a long shared
@@ -77,7 +78,7 @@ run_with_capacity() {
     local cap="$1"
 
     "$BINARY" --model "$MODEL_DIR" --serve --port "$PORT" --ctx-size 4096 \
-        --prefix-cache-entries "$cap" --log-level info > /tmp/test_prefix_cache.log 2>&1 &
+        --prefix-cache-entries "$cap" --prefix-cache-mem 2GB --prefix-cache-disk off --log-level info > /tmp/test_prefix_cache.log 2>&1 &
     local pid=$!
     # Called inside $(...): the subshell's own EXIT trap is the only one that knows this pid.
     trap "kill -9 $pid 2>/dev/null" EXIT

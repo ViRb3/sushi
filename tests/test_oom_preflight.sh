@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Regression test for the GPU-OOM pre-flight refusal path (issue #47).
 #
 # When the #45 memory pre-flight refuses a load (error.InsufficientMemory),

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: the JSON grammar mask is built PER MODEL.
 #
 # Live 2026-08-11: the token-byte table backing the mask was a process-wide

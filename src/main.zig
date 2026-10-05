@@ -13,6 +13,7 @@ const model_discovery = @import("model_discovery.zig");
 const model_registry_mod = @import("model_registry.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
@@ -181,7 +182,11 @@ fn printUsage(io: std.Io) void {
         \\                        agentic loops). Adaptive prompt-time gate
         \\                        auto-disables it on novel content. Pass
         \\                        --no-pld to force-disable.
-        \\  --no-pld            Force-disable Prompt Lookup Decoding.
+        \\  --no-pld            Force-disable standalone Prompt Lookup Decoding
+        \\                        (the lookups inside MTP rounds stay on).
+        \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
+        \\                        rounds and GLM DFlash2 (default: ON); standalone
+        \\                        PLD (--pld/--no-pld) is unaffected.
         \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
         \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
         \\  --fast              MTP with typical acceptance and greedy tail, plus kv8: lossy
@@ -210,12 +215,18 @@ fn printUsage(io: std.Io) void {
         \\                      SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
         \\                      moves the 4-bit boundary, =off keeps the whole
         \\                      stack INT8.
-        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
+        \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
+        \\                        (default 1). Every depth the planner picks
+        \\                        stays inside --mtp-min-depth..--mtp-max-depth;
+        \\                        equal values pin one depth.
+        \\  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
-        \\                        otherwise 6; SUSHI_MTP_ADAPTIVE=0
+        \\                        otherwise 6, lower on silicon with a measured
+        \\                        verify-width cliff; SUSHI_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
-        \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\                        cap 3). A --mtp-min-depth above that default
+        \\                        lifts it. Each machine finds its own range.
         \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
         \\                        Use 0.2 for the Qwen3.8 matched comparison.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
@@ -274,20 +285,24 @@ fn printUsage(io: std.Io) void {
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
         \\  --no-prefix-cache-ram
-        \\                      Disable idle RAM retention; an enabled SSD tier
-        \\                        still persists and restores reusable prefixes.
+        \\                      Keep RAM retention off even when
+        \\                        --prefix-cache-mem is given (RAM is off by
+        \\                        default).
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
-        \\                      Hot prefix cache KV-bytes budget (default: one
-        \\                        session at the working context where memory
-        \\                        holds it, never under 2GB).
+        \\                      Turn on RAM retention of idle prefix-cache
+        \\                        entries with this KV-bytes budget (default:
+        \\                        off; prefixes live on the SSD tier).
         \\                      Evicts LRU entries until the budget fits.
-        \\                      Pass 0/off to disable the byte budget.
+        \\                      Pass 0 to leave the byte budget to the
+        \\                        machine's headroom.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
-        \\                      SSD tier for the prefix cache (default: off).
+        \\                      SSD tier byte budget for the prefix cache
+        \\                        (default: on, min(entries x context x bytes
+        \\                        per token + 2GB, 20GB, free disk - 4GB)).
+        \\                      Sizes are binary: 1GB = 1 GiB.
         \\                      Seen prefixes persist under ~/.sushi/kv-cache
-        \\                        and are restored across restarts and RAM
-        \\                        evictions instead of recomputed. Can use many
-        \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
+        \\                        (SUSHI_PREFIX_CACHE_DIR) and are restored
+        \\                        across restarts instead of recomputed. 0/off
         \\                        disables.
         \\  --ssm-checkpoint-stride <n>
         \\                      Hybrid SSM architectures only (Qwen3.8-Flash-Next's
@@ -534,7 +549,6 @@ pub fn main(init: std.process.Init) !void {
     // Either flag given: it outranks the per-model `mtp` (the last one wins).
     var mtp_explicit = false;
     var mtp_head_kv_quant = false;
-    var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_TYPICAL")) |v| std.mem.span(v) else null;
     var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_TOKENV3")) |v| std.mem.span(v) else null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
@@ -557,6 +571,7 @@ pub fn main(init: std.process.Init) !void {
     var metrics_enabled = false;
     var log_level_explicit = false;
     var decode_share_flag: ?[]const u8 = null;
+    var no_prefix_cache_ram = false;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -687,6 +702,8 @@ pub fn main(init: std.process.Init) !void {
             pld_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_mod.g_tool_autocorrect = false;
+        } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
+            generate_mod.mtp_lookup_disabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {
             enable_pld = false;
             pld_explicit = true;
@@ -756,9 +773,18 @@ pub fn main(init: std.process.Init) !void {
             transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = false;
-        } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--mtp-depth")) {
+            log.err("{s}\n", .{depth_bounds.removed_flag_message});
+            std.process.exit(1);
+        } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
+            const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             i += 1;
-            mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+            const text: []const u8 = if (i < args.len) args[i] else "";
+            const n = depth_bounds.parseDepth(text, mtp_mod.MAX_DEPTH) catch {
+                log.err("{s}: expected an integer in 1..{d}; got '{s}'\n", .{ args[i - 1], mtp_mod.MAX_DEPTH, text });
+                std.process.exit(1);
+            };
+            if (is_min) depth_bounds.active.min = n else depth_bounds.active.max = n;
         } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
             i += 1;
             mtp_typical_raw = args[i];
@@ -817,7 +843,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
         } else if (std.mem.eql(u8, args[i], "--no-prefix-cache-ram")) {
-            server_mod.prefix_cache_ram_enabled = false;
+            no_prefix_cache_ram = true;
+            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionFor(server_mod.prefix_cache_mem_explicit, true);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -832,6 +859,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             server_mod.prefix_cache_mem_explicit = true;
+            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionFor(true, no_prefix_cache_ram);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
@@ -842,6 +870,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            server_mod.prefix_cache_disk_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--logit-bias-file") and i + 1 < args.len) {
             i += 1;
             model_settings_mod.logit_bias_file_flag = args[i];
@@ -1016,6 +1045,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     generate_mod.mtp_acceptance_explicit = mtp_typical_raw != null or mtp_tokenv3_raw != null;
+    depth_bounds.validate(depth_bounds.active) catch {
+        log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
+        std.process.exit(1);
+    };
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.sushi/models
@@ -1472,7 +1505,7 @@ pub fn main(init: std.process.Init) !void {
             .mtp_enabled = enable_mtp,
             .mtp_explicit = mtp_explicit,
             .mtp_head_kv_quant = mtp_head_kv_quant,
-            .mtp_depth = mtp_depth,
+            .mtp_depth = depth_bounds.active.max,
             .ane_prefill = ane_prefill,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
             .ane_headroom_resolver = server_mod.aneGateHeadroom,
@@ -1487,6 +1520,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+            .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
             .expert_cache_bytes = expert_cache_bytes,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
@@ -1641,7 +1675,7 @@ pub fn main(init: std.process.Init) !void {
         } else {
             // Non-streaming: generate all tokens then print
             const result = if (mtp_head) |*h|
-                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, mtp_depth, null)
+                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, depth_bounds.active.max, null)
             else
                 try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
@@ -1676,14 +1710,6 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     var max_rec: usize = 0;
     if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) return 0;
     return @as(u64, max_rec) * 4 / 5;
-}
-
-fn dirBasename(path: []const u8) []const u8 {
-    var p = path;
-    while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-    if (p.len == 0) return p;
-    if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| return p[i + 1 ..];
-    return p;
 }
 
 /// Headless serve mode: start with NO primary model. The registry holds all
@@ -1792,6 +1818,7 @@ fn runHeadlessServe(
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+        .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
         .expert_cache_bytes = expert_cache_bytes,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,

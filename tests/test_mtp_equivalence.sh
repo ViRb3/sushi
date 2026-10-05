@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # MTP (native multi-token-prediction head) correctness + engagement test, for both served
 # archs: Qwen's head and MiMo-V2.6's three heads (`model_type` from config.json picks the
 # markers, the engagement lines and whether reasoning is part of the compared answer).
@@ -23,7 +24,7 @@
 #      Every divergence fails, with the serial top-two gap reported.
 #   3. PROMPT LOOKUP — a copy task (return a file with one rename) runs
 #      lookup rounds (`lookup=R/..` with R > 0) and still matches the
-#      --no-mtp bytes, stream and non-stream; `SUSHI_MTP_LOOKUP=0` runs none
+#      --no-mtp bytes, stream and non-stream; `--no-mtp-lookup` runs none
 #      and matches too; a seeded sampled copy is the same bytes streamed.
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
@@ -41,7 +42,7 @@
 # mimo_v2 (MTP_TEST_MODEL=<MiMo pack>): a pack without its heads FAILS, never skips. Its
 # thinking is on by default, so reasoning + content is the compared answer. It checks the
 # qk-192 fused prefill engagement instead of Qwen's hd-256 and GDN lines, the head-count
-# depth cap instead of the chunk-B extension, and adds a SUSHI_MTP_FORCE_DEPTH=3 boot that
+# depth cap instead of the chunk-B extension, and adds a pinned `--mtp-min-depth 3 --mtp-max-depth 3` boot that
 # must be byte-identical to --no-mtp. Its copy task runs prompt-lookup rounds as Qwen's does.
 
 set -u
@@ -455,11 +456,11 @@ fi
 
 stop_server
 
-echo "── MTP server, prompt lookup off (SUSHI_MTP_LOOKUP=0) ──"
+echo "── MTP server, prompt lookup off (--no-mtp-lookup) ──"
 # The EV checks need MTP rounds on an echo; with lookup on, an echo is served
 # by lookup rounds instead. The echo runs first: a copy before it would seed the
 # EV surface at the depth cap, where a round has no chunk B to extend into.
-SUSHI_MTP_LOOKUP=0 start_server ""
+start_server "--no-mtp-lookup"
 ENGAGE_BASE=0
 # EV-controller engagement (dispatch-hole lesson: output equality can't see a
 # silent fallback). An ECHO workload is the max-confidence case: past the
@@ -500,9 +501,9 @@ copy_request false > "$ARTIFACTS/mtp_nolookup_copy.txt"
 PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
     check "copy non-stream (lookup off)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_nolookup_copy.txt" yes
 if [ "$(lookup_rounds_max)" = "0" ] && ! grep -q "prompt-lookup drafts engaged" "$LOG"; then
-    echo "PASS [SUSHI_MTP_LOOKUP=0 runs no lookup round]"; PASS=$((PASS+1))
+    echo "PASS [--no-mtp-lookup runs no lookup round]"; PASS=$((PASS+1))
 else
-    echo "FAIL [SUSHI_MTP_LOOKUP=0]: lookup rounds ran"; FAIL=$((FAIL+1))
+    echo "FAIL [--no-mtp-lookup]: lookup rounds ran"; FAIL=$((FAIL+1))
 fi
 stop_server
 
@@ -553,12 +554,10 @@ fi
 stop_server
 
 if [ "$ARCH" = mimo_v2 ]; then
-    echo "── forced-depth server (SUSHI_MTP_FORCE_DEPTH=3) ──"
-    # Every MiMo verify row keeps its decode tick's arithmetic, so a forced depth-3 round
+    echo "── pinned-depth server (--mtp-min-depth 3 --mtp-max-depth 3) ──"
+    # Every MiMo verify row keeps its decode tick's arithmetic, so a pinned depth-3 round
     # must reproduce --no-mtp byte for byte.
-    export SUSHI_MTP_FORCE_DEPTH=3
-    start_server ""
-    unset SUSHI_MTP_FORCE_DEPTH
+    start_server "--mtp-min-depth 3 --mtp-max-depth 3"
     ENGAGE_BASE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
     chat_nonstream > "$ARTIFACTS/mtp_forced_chat.txt"
     check "forced depth 3, chat non-stream" "$ARTIFACTS/mtp_base_chat.txt" "$ARTIFACTS/mtp_forced_chat.txt" yes

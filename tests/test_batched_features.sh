@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_batched_features.sh — heterogeneous requests in ONE batched decode group.
 # Every per-request feature is tested alone somewhere; none of them is tested
 # beside the others in the same tick. Six requests with different contracts

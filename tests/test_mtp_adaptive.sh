@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Adaptive serial switch: past some context a speculative round costs more per token than the
 # plain step it replaces, so the server measures a plain token per KV bucket and stops
 # speculating when the planned round loses. Pins the INVARIANT, never the model's choice:

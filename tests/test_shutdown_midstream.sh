@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Regression: SIGTERM (graceful shutdown) while a streaming request is in flight
 # must NOT crash the server. Pre-fix, the accept loop exited and scheduler.deinit
 # tore down the slot queues while a detached connection thread was still inside

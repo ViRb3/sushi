@@ -118,6 +118,10 @@ fn config(key: Key) !struct { value: mlx.mlx_fast_metal_kernel_config, cached: b
     };
     return .{ .value = c, .cached = false };
 }
+/// The packed rates the cooperative reader serves; every admitted n in the range, never a pack's own.
+pub fn servesRate(n: c_int) bool {
+    return n >= 32 and n <= 64 and @mod(n, 2) == 0;
+}
 fn eligible(x: Arr, bank: Arr, ids: Arr) bool {
     if (x.ctx == null or bank.ctx == null or ids.ctx == null) return false;
     const xs = mlx.getShape(x);
@@ -125,7 +129,7 @@ fn eligible(x: Arr, bank: Arr, ids: Arr) bool {
     const is = mlx.getShape(ids);
     return xs.len == 2 and ws.len == 4 and is.len == 1 and xs[0] == is[0] and xs[0] >= 2 and xs[0] <= 128 and
         xs[1] > 0 and @mod(xs[1], 128) == 0 and ws[0] > 0 and ws[1] == @divExact(xs[1], 16) and ws[2] > 0 and ws[2] <= @divTrunc(std.math.maxInt(c_int), 128) and @mod(ws[2], 8) == 0 and
-        ws[3] >= 32 and ws[3] <= 64 and @mod(ws[3], 2) == 0 and mlx.mlx_array_dtype(x) == .float16 and mlx.mlx_array_dtype(bank) == .uint16 and
+        servesRate(ws[3]) and mlx.mlx_array_dtype(x) == .float16 and mlx.mlx_array_dtype(bank) == .uint16 and
         (mlx.mlx_array_dtype(ids) == .uint32 or mlx.mlx_array_dtype(ids) == .int32);
 }
 pub fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: Reduction) !?Arr {
@@ -437,6 +441,31 @@ test "GLM group2 half4 composition preserves all-rate cooperative projection bit
                 try exact(rg, pair_out[0]);
                 try exact(ru, pair_out[1]);
             }
+        }
+    }
+}
+
+test "GLM group2 serves exactly the admitted rates its reader decodes" {
+    const s = mlx.gpuStream();
+    base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+    defer base.setDecodeParams(.mul1);
+    var owned: Owned = .{};
+    defer owned.deinit();
+    const x = try owned.floats(&.{ 4, 128 }, .float16, 5, 0.3, s);
+    const ids = try owned.own(mlx.mlx_array_new_data(&[_]u32{ 0, 1, 1, 2 }, &.{4}, 1, .uint32));
+    const expert = @import("expert_exl3.zig");
+    var n: u32 = expert.Rate.min_n;
+    while (n <= expert.Rate.max_n) : (n += 1) {
+        if (expert.kFromPackedDim(n) == null) {
+            try std.testing.expect(!servesRate(@intCast(n)));
+            continue;
+        }
+        const bank = try owned.weights(4, 128, 128, @intCast(n), 41);
+        const got = try project(s, x, bank, ids, .serial);
+        try std.testing.expectEqual(servesRate(@intCast(n)), got != null);
+        if (got) |value| {
+            defer _ = mlx.mlx_array_free(value);
+            try exact(try owned.own(try base.indexedGemvCoopF16(s, x, bank, ids)), value);
         }
     }
 }

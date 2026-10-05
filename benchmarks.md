@@ -3,13 +3,16 @@
 **Update rules — read before editing:**
 - Results go into the tables ONLY. No text, no commentary, no per-release notes — commit messages carry the stories.
 - **Apple M5 Max 128 GB ONLY.** Numbers across hardware are not comparable and one mixed column poisons the history.
-- A cell is `./tests/bench.sh` decode tok/s (llmprobe `--bench-only`: warmup discarded, median of 3, its own code-completion prompt), sushi ReleaseFast at its FASTEST config, with the speculative mode that engaged named beside the number. `·` = not measured that release.
+- A cell is `./tests/bench.sh` decode tok/s (llmprobe `--bench-only`: warmup discarded, median of measured runs (3 unless specified), its own code-completion prompt), sushi ReleaseFast at its FASTEST config, with the speculative mode that engaged named beside the number. `·` = not measured that release.
 - The perf gate is one pack, Qwen3.8-Flash-Next-Sushi-4bpw. `speedup` = first measured column vs the latest.
 
 ## Decode tok/s by release
 
-| Model | v1.0.0 | v1.0.4 | v1.0.5 | v1.1.0 | speedup |
-|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-3bpw (MTP) | · | 98 mtp | · | · | · |
-| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | · | · | 83 mtp | 89 mtp | 1.08× |
-| MiMo-V2.6-Flash-Sushi-2.3bpw (MTP) | · | · | · | · | · |
+| Model | v1.0.0 | v1.0.4 | v1.0.5 | v1.1.0 | v1.2.0-dev | speedup |
+|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-3bpw (MTP) | · | 98 mtp | · | · | · | · |
+| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | · | · | 83 mtp | 89 mtp | 92.7 mtp (2 runs) | · |
+| MiMo-V2.6-Flash-Sushi-2.3bpw (MTP) | · | · | · | · | 42.8 mtp (2 runs) | · |
+| GLM-5.3-Flash-Sushi-2.5bpw | · | · | · | · | 44.7 dflash (3 runs) | · |
+| Qwen3.8-Flash-Next-Sushi-2bpw | · | · | · | · | 108.8 mtp (2 runs) | · |
+| Qwen3.8-Flash-Next-Sushi-2.6bpw | · | · | · | · | 95.3 mtp (2 runs) | · |

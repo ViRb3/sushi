@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Workload-fair hot-cache eviction (issue #378).
 #
 # One model, two workloads sharing a 4-entry hot prefix cache: a conversation
@@ -45,8 +46,8 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
 fi
 
 LOGFILE=$(mktemp)
-echo "  starting server (--prefix-cache-entries 4)..."
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --prefix-cache-entries 4 --prefix-cache-disk off --log-level info ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
+echo "  starting server (--prefix-cache-entries 4 --prefix-cache-mem 2GB)..."
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off --log-level info ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
 cleanup() {
     kill $SERVER_PID 2>/dev/null || true

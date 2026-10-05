@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Streaming PLD byte-equivalence test.
 #
 # Verifies that running the same temp=0 chat completion request with

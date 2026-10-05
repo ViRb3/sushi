@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Usage: test_load_context_preflight.sh [resident Flash-Next or MiMo pack] [port] [startup|cold] [--mtp|--no-mtp]
 # Owns one GPU-lock run; checks warmup memory, not timing. Silent on success.
 set -euo pipefail

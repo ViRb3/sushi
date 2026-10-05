@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # pi ↔ sushi integration test driver.
 #
 # Tests every model × streaming × thinking combo by pointing the `pi`

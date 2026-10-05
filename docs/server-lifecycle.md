@@ -114,11 +114,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
   `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
+- **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
+  `model-settings.json` key; a removed `--mtp-depth` exits naming the two
+  ([engine-mtp](engine-mtp.md#depth-range)).
+- **`--no-mtp-lookup` is launch-only too** (no `model-settings.json` key): it turns off the prompt-lookup drafts in MTP
+  rounds (Qwen, MiMo) and GLM DFlash2's lookup chains. Standalone PLD keeps `--pld`/`--no-pld`; neither implies the other.
 - **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >
   `model-settings.json` > the default, per key (`model_settings.pickLaunch`; the one table is
   `model_settings.fast_preset`: MTP, typical acceptance, greedy tail, kv8). Its values report source `--fast` in the
   load lines, `/props` and the boot line `[args] fast: ...`. It asks only for what applies: an SSD-streamed load drops
-  its MTP (`[mtp] off: unsupported under streaming (--fast)`, `MtpChoice.streamed`), where an explicit `--mtp` refuses.
+  its MTP (`[mtp] off: unsupported under streaming (--fast)`, `MtpChoice.streamed`), where an explicit `--mtp` refuses (a Sushi EXL3 Qwen pack keeps its head instead).
 - A flag that shapes a LOAD is retained on the Scheduler with its `*_explicit` bit (`ensureLoaded`'s cold-load
   `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
   resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props
@@ -133,6 +138,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
+- **The prefix cache's tiers are launch flags only** (no `model-settings.json` key): RAM retention is off unless
+  `--prefix-cache-mem` is given (`--no-prefix-cache-ram` wins over it), and the SSD tier is on unless `--prefix-cache-disk 0`
+  or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)).
 - A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
   cold loads, and logs its resolved value with its source at load.
 - Load-time context bills see explicit KV and MTP choices before `Scheduler.init` returns, including `--no-mtp`.
@@ -141,10 +149,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - `src/scheduler.zig`: slots, inference thread (sole MLX caller), queues, batching, admission, spec wiring, hot-cache
   budget revise.
-- Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A
-  batched group is capped by PADDING WASTE (`batchedKvKeepCount`, `MAX_PAD_WASTE` 1.5 < 2.0), not slot count.
-  `groupKeepCount` lifts the cap for a group billed <= 4096 rows whose longest true context is >= 131072
-  ([engine-qsa-long-context](engine-qsa-long-context.md#small-sparse-groups-at-long-context)).
+- Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A resident
+  `qwen4_exp` decodes plain slots as rows of one forward (`forwardQwen4DecodeRows`, up to eight, no padding, no cap):
+  each row's recurrence, attention, PLE and KV append run as the slot's solo tick runs them, and the ops that read the
+  same weights for every row (hyper-connection reads, projections, routed experts, lm_head) share one pass through
+  kernels whose per-row arithmetic is the single-row one, so a slot's output does not depend on who shares its tick.
+  A STREAMED load and the other GDN trunks keep the padded batch, capped by PADDING WASTE (`batchedKvKeepCount`,
+  `MAX_PAD_WASTE` 1.5 < 2.0); the grouped MTP verify keeps both cap functions (`groupKeepCount` lifts the cap for a group
+  billed <= 4096 rows whose longest true context is >= 131072,
+  [engine-qsa-long-context](engine-qsa-long-context.md#small-sparse-groups-at-long-context)).
   Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
   ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)); resident GLM does the same through `verifyGroups`, and a
   drafting GLM slot joins as a plain row when its model has company ([arch-glm5-next](arch-glm5-next.md#concurrency)).

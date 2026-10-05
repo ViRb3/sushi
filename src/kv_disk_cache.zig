@@ -94,22 +94,97 @@ pub const SSM_DISK_MAX_PER_ENTRY_LEGACY: usize = 8;
 /// Ring restore points one entry keeps on disk (~16 MiB each on MiMo at kv8), thinned (`thinRingPositions`).
 pub const RING_DISK_MAX_PER_ENTRY: usize = 8;
 
-/// SSD-first per-flush readback bound: only the device->host copy on the inference thread; the file write is off thread.
-pub const SSD_FIRST_READBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// One piece of a writer-armed commit: the bytes it stages before its manifest commits. The
+/// commit runs pieces until the entry is whole, so a crash keeps every finished piece.
+pub const FLUSH_PIECE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// The disk budget is derived from the volume, not only the operator's cap.
-pub const DISK_RESERVE_CAP: u64 = 64 * 1024 * 1024 * 1024;
-/// Below this there is no point storing anything.
-pub const DISK_STORE_FLOOR: u64 = 1024 * 1024 * 1024;
+/// Guard against a commit that never completes: 64 pieces is 128 GiB, past any tier.
+const MAX_FLUSH_PIECES: usize = 64;
 
-/// Bytes this tier may occupy given the operator cap (0 = none) and the volume. Reserve =
-/// min(64 GiB, 10% of the volume); under `DISK_STORE_FLOOR` = null ("do not store"), never 0.
-pub fn diskBudgetFromFreeSpace(operator_cap: u64, free_bytes: u64, volume_bytes: u64) ?u64 {
-    const reserve = @min(DISK_RESERVE_CAP, volume_bytes / 10);
-    const avail = free_bytes -| reserve;
+/// Free space the tier never uses, for resolution, every store and the report alike. Sizes are binary
+/// (1 GB = 1 GiB), as the flag parser reads them.
+pub const DISK_FREE_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// What the volume leaves the tier: free space less the reserve.
+pub fn freeDiskRoom(free_bytes: u64) u64 {
+    return free_bytes -| DISK_FREE_RESERVE;
+}
+
+/// Bytes this tier may occupy given the operator cap (0 = none) and the volume's free space; null when
+/// nothing is left ("do not store"), never 0.
+pub fn diskBudgetFromFreeSpace(operator_cap: u64, free_bytes: u64) ?u64 {
+    const avail = freeDiskRoom(free_bytes);
     const budget = if (operator_cap == 0) avail else @min(operator_cap, avail);
-    if (budget < DISK_STORE_FLOOR) return null;
+    if (budget == 0) return null;
     return budget;
+}
+
+/// The unnamed SSD budget's ceiling, the slack added to the per-token formula, and the free space it leaves.
+pub const DEFAULT_DISK_CAP: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_DISK_SLACK: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Which term set the SSD budget.
+pub const DiskBound = enum {
+    formula,
+    cap,
+    free_disk,
+    flag,
+
+    pub fn label(self: DiskBound) []const u8 {
+        return switch (self) {
+            .formula => "the formula",
+            .cap => "20 GB cap",
+            .free_disk => "free disk - 4 GB",
+            .flag => "the flag",
+        };
+    }
+};
+
+pub const DefaultDiskBudget = struct { bytes: u64, bound: DiskBound };
+
+/// An operator's `--prefix-cache-disk` is the budget as given; unnamed it is
+/// `min(entries x context x bytes_per_token + 2 GB, 20 GB, free - 4 GB)`. Null when that is not positive.
+pub fn resolveDiskBudget(explicit: bool, ask: u64, entries: u32, context: u64, bytes_per_token: u64, free_bytes: u64) ?DefaultDiskBudget {
+    if (explicit) return if (ask == 0) null else .{ .bytes = ask, .bound = .flag };
+    const formula = @as(u64, entries) *| context *| bytes_per_token +| DEFAULT_DISK_SLACK;
+    const room = freeDiskRoom(free_bytes);
+    if (room == 0) return null;
+    var out: DefaultDiskBudget = .{ .bytes = formula, .bound = .formula };
+    if (DEFAULT_DISK_CAP < out.bytes) out = .{ .bytes = DEFAULT_DISK_CAP, .bound = .cap };
+    if (room < out.bytes) out = .{ .bytes = room, .bound = .free_disk };
+    return out;
+}
+
+fn toGb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+}
+
+/// The startup line for the SSD tier: the sizing terms and the bound that set the number.
+pub fn allocatingDiskLine(buf: []u8, plan: DefaultDiskBudget, entries: u32, context: u64, bytes_per_token: u64, dir: []const u8) []const u8 {
+    const text = if (plan.bound == .flag)
+        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache (--prefix-cache-disk) at {s}", .{ toGb(plan.bytes), dir })
+    else
+        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache ({d} entries x {d} tokens x {d:.1} KB + 2 GB; bound: {s}) at {s}", .{ toGb(plan.bytes), entries, context, @as(f64, @floatFromInt(bytes_per_token)) / 1024.0, plan.bound.label(), dir });
+    return text catch buf[0..0];
+}
+
+/// The per-turn usage line, also what the web page shows.
+pub fn diskUsageLine(buf: []u8, used: u64, budget: u64, entries: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "[disk-cache] usage {d:.2} / {d:.1} GB, {d} entries", .{ toGb(used), toGb(budget), entries }) catch buf[0..0];
+}
+
+/// The startup line when no SSD budget remains.
+pub fn diskOffLine(buf: []u8, free_bytes: u64, dir: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "SSD prefix cache OFF: {d:.1} GB free at {s} leaves nothing after the 4 GB reserve", .{ toGb(free_bytes), dir }) catch buf[0..0];
+}
+
+/// `volumeSpace` of the nearest existing ancestor: the cache directory is created on first store.
+pub fn volumeSpaceNear(path: []const u8) ?VolumeSpace {
+    var p = path;
+    while (true) {
+        if (volumeSpace(p)) |v| return v;
+        p = std.fs.path.dirname(p) orelse return null;
+    }
 }
 
 /// macOS `struct statfs`, leading fields only; the rest is slack. std has no binding for it.
@@ -330,6 +405,48 @@ fn nbytesOf(a: mlx.mlx_array) u64 {
     return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
 }
 
+/// The header allowance per file and per tensor in `DiskTier.entryBytesAt`'s estimate.
+const FILE_OVERHEAD_BYTES: u64 = 512;
+const TENSOR_OVERHEAD_BYTES: u64 = 128;
+
+fn mib(b: u64) f64 {
+    return @as(f64, @floatFromInt(b)) / (1024.0 * 1024.0);
+}
+
+/// A KV layer's buffers: keys, values and, when quantized, their scales and biases.
+fn layerArrays(e: *const transformer_mod.KVCacheEntry) [6]mlx.mlx_array {
+    return .{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+}
+
+/// Bytes per token row of a `[1, H, rows, D]` buffer; 0 for an empty one.
+fn rowBytes(a: mlx.mlx_array) u64 {
+    if (a.ctx == null) return 0;
+    const sh = mlx.getShape(a);
+    if (sh.len != 4 or sh[2] <= 0) return 0;
+    return nbytesOf(a) / @as(u64, @intCast(sh[2]));
+}
+
+fn checkpointFileBytes(cp: *const transformer_mod.SSMCheckpoint) u64 {
+    var n: u64 = FILE_OVERHEAD_BYTES;
+    for (cp.layers) |*l| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |a| {
+        if (a.ctx != null) n += nbytesOf(a) + TENSOR_OVERHEAD_BYTES;
+    };
+    return n;
+}
+
+fn specFileBytes(sc_opt: ?SpecCommit) u64 {
+    const sc = sc_opt orelse return 0;
+    var n: u64 = FILE_OVERHEAD_BYTES;
+    for (sc.entries) |*e| {
+        if (!e.initialized) continue;
+        for (layerArrays(e)) |a| n += rowBytes(a) * sc.step + TENSOR_OVERHEAD_BYTES;
+    }
+    if (sc.head_aux) |h| for ([_]mlx.mlx_array{ h.aux_state, h.qsa_pooled }) |a| {
+        if (a.ctx != null) n += nbytesOf(a) + TENSOR_OVERHEAD_BYTES;
+    };
+    return n;
+}
+
 /// Batched-eval meter for the staged serializer: one increment per chunk file, never per tensor.
 pub var serialize_eval_count = std.atomic.Value(u64).init(0);
 
@@ -373,11 +490,9 @@ pub const DiskTier = struct {
     /// Byte budget across all entries. 0 = unbounded.
     max_bytes: u64,
     chunk_tokens: u32,
-    /// Max bytes written per appendCommit call (default 512 MB). The flush
-    /// runs synchronously on the inference thread after the response; a
-    /// 4 GB first-commit write measurably stalls the NEXT request, so large
-    /// entries persist incrementally across turns (appendCommit reports
-    /// incomplete and the hot cache keeps its dirty flag set).
+    /// Max bytes one appendCommit piece writes. Without the writer a piece is synchronous on the
+    /// inference thread (a 4 GB first commit stalled the next request), so the entry persists one
+    /// 512 MB piece per turn; with it, a commit runs `FLUSH_PIECE_BYTES` pieces until it is whole.
     max_flush_bytes: u64 = 512 * 1024 * 1024,
     /// SSD-first mode (mirrored from `HotPrefixCache.ssd_first`): SSM checkpoints ride outside
     /// the per-flush byte budget, beside the chunk that closes their position.
@@ -387,14 +502,14 @@ pub const DiskTier = struct {
     cp_thin: transformer_mod.ThinPolicy = .oldest,
     /// How many checkpoint positions one entry may keep on disk; the default is the previous cap.
     ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
-    /// SSD-first background writer (heap-allocated so the mutex survives `init`'s by-value
+    /// Background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
     /// The operator's `--prefix-cache-disk` value; `max_bytes` is re-derived from it before every store.
     operator_cap: u64 = 0,
     /// The free-space probe; tests arm a fixed answer with `armTestSpace`.
     space_probe: SpaceProbeFn = volumeSpace,
-    /// The volume is under `DISK_STORE_FLOOR`: no new entry persists, existing ones stay restorable.
+    /// The volume has nothing left after `DISK_FREE_RESERVE`: no new entry persists, existing ones stay restorable.
     store_declined: bool = false,
     /// `<base>` (the parent of `root`), for the root-wide sweep. Null when the dupe failed.
     base_dir: ?[]u8 = null,
@@ -406,6 +521,8 @@ pub const DiskTier = struct {
     /// red-on-revert guard that a short-prefix restore reads only the chunks
     /// covering the usable prefix, not the whole stored entry. Not persisted.
     chunks_loaded_last: u32 = 0,
+    /// The entry the most recent append committed; null when it committed none.
+    last_store_id: ?u64 = null,
 
     /// Create the tier rooted at `<base>/<fingerprint>` and scan whatever
     /// already exists there. Crash leftovers (no meta.json) are deleted.
@@ -447,7 +564,7 @@ pub const DiskTier = struct {
         self.space_probe = testSpaceProbe;
     }
 
-    /// Arm the background writer (SSD-first only). A spawn failure keeps the synchronous path.
+    /// Arm the background writer. A spawn failure keeps the synchronous path.
     pub fn enableBackgroundWriter(self: *DiskTier) void {
         if (self.writer != null) return;
         const w = self.allocator.create(disk_writer.Writer) catch return;
@@ -458,10 +575,8 @@ pub const DiskTier = struct {
             return;
         };
         self.writer = w;
-        // With the write off-thread the only inference-thread cost is the readback, and the
-        // bound is no longer a correctness cliff (checkpoints ride outside it).
-        self.max_flush_bytes = SSD_FIRST_READBACK_BYTES;
-        log.info("[disk-cache] background writer armed (permit {d} MB, readback bound {d} MB/flush)\n", .{
+        self.max_flush_bytes = FLUSH_PIECE_BYTES;
+        log.info("[disk-cache] background writer armed (permit {d} MB, {d} MB pieces, whole entries per commit)\n", .{
             w.permit_bytes / (1024 * 1024),
             self.max_flush_bytes / (1024 * 1024),
         });
@@ -476,6 +591,14 @@ pub const DiskTier = struct {
     pub fn stagedHostBytes(self: *DiskTier) u64 {
         const w = self.writer orelse return 0;
         return w.pendingBytes();
+    }
+
+    /// What the writer holds or may hold of host memory outside MLX's accounting: its unwritten
+    /// backlog, never under the permit its next submit may fill. Zero when the writer is not armed.
+    /// The single reading admission bills (`scheduler.diskWriterHostBytes` sums it over resident models).
+    pub fn writerHostBytes(self: *DiskTier) u64 {
+        const w = self.writer orelse return 0;
+        return @max(w.pendingBytes(), w.permit_bytes);
     }
 
     /// Background write failures so far.
@@ -635,12 +758,12 @@ pub const DiskTier = struct {
         self.allocator.free(e.rings);
     }
 
-    /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a budget
-    /// under the store floor declines new stores without touching what is already persisted.
+    /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a volume with
+    /// nothing left after the reserve declines new stores without touching what is already persisted.
     fn refreshDiskBudget(self: *DiskTier) void {
         const vs = self.space_probe(self.root) orelse return;
         // Our own entries are already counted in `used`; add what the tier holds back.
-        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes, vs.total);
+        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes);
         if (budget) |b| {
             self.store_declined = false;
             if (b != self.max_bytes) {
@@ -649,12 +772,10 @@ pub const DiskTier = struct {
             }
         } else if (!self.store_declined) {
             self.store_declined = true;
-            // The number compared is free less the reserve, not free.
-            log.warn("[disk-cache] {s}: {d} MB free less the {d} MB reserve (min 64 GiB, 10% of the volume) is below the {d} MB store floor — no NEW entries persist (already-persisted entries stay restorable)\n", .{
+            log.warn("[disk-cache] {s}: {d} MB free leaves nothing after the {d} MB reserve — no NEW entries persist (already-persisted entries stay restorable)\n", .{
                 self.root,
                 vs.free >> 20,
-                @min(DISK_RESERVE_CAP, vs.total / 10) >> 20,
-                DISK_STORE_FLOOR >> 20,
+                DISK_FREE_RESERVE >> 20,
             });
         }
     }
@@ -1333,10 +1454,15 @@ pub const DiskTier = struct {
         ring: ?RingCommit,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, ring, s, self.max_flush_bytes);
+        // With the writer armed the commit lands whole, piece by piece: each piece stages at most
+        // `max_flush_bytes`, and the writer's permit bounds the host bytes in flight. Without it a
+        // piece is a synchronous write, so one per commit bounds the stall.
+        return self.appendCommitPieces(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, ring, s, self.writer != null);
     }
 
-    fn appendCommitWithSpecBounded(
+    /// `appendCommitWithRing` that writes pieces until the entry is whole, writer or not: its
+    /// caller's source is gone when it returns, so nothing could resume a partial entry.
+    pub fn appendCommitWhole(
         self: *DiskTier,
         kv_entries: []const transformer_mod.KVCacheEntry,
         step: usize,
@@ -1348,8 +1474,137 @@ pub const DiskTier = struct {
         mtp_snap: ?SpecCommit,
         ring: ?RingCommit,
         s: mlx.mlx_stream,
+    ) !PersistOutcome {
+        return self.appendCommitPieces(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, ring, s, true);
+    }
+
+    fn appendCommitPieces(
+        self: *DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        config: kv_quant.KVQuantConfig,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        dflash_snap: ?SpecCommit,
+        mtp_snap: ?SpecCommit,
+        ring: ?RingCommit,
+        s: mlx.mlx_stream,
+        whole: bool,
+    ) !PersistOutcome {
+        var out = try self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, ring, s, self.max_flush_bytes);
+        if (!whole) return out;
+        const first = self.last_store_id orelse return out;
+        var pieces: usize = 1;
+        while (out == .partial and pieces < MAX_FLUSH_PIECES) : (pieces += 1) {
+            const before = self.storeProgress(first) orelse break;
+            out = try self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, ssm_checkpoints, dflash_snap, mtp_snap, ring, s, self.max_flush_bytes);
+            // A piece that landed nothing, or an entry the budget evicted, ends the flush.
+            if (self.last_store_id != first) break;
+            const after = self.storeProgress(first) orelse break;
+            if (std.meta.eql(before, after)) break;
+        }
+        return out;
+    }
+
+    /// What an entry holds on disk so far: its flushed rows and its checkpoint and ring files.
+    fn storeProgress(self: *const DiskTier, id: u64) ?[3]usize {
+        for (self.entries.items) |*e| {
+            if (e.id == id) return .{ e.kv_len, e.ssm_positions.len, e.rings.len };
+        }
+        return null;
+    }
+
+    /// The longest restorable record of `kv_entries` that fits the tier's byte budget on its own:
+    /// `kv_target` when it fits, else the highest checkpoint or ring restore point that does (any
+    /// length when the cache has neither). Null when nothing of `MIN_PERSIST_TOKENS` or more fits.
+    fn budgetTarget(
+        self: *const DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        kv_target: u32,
+        cps: ?[]const transformer_mod.SSMCheckpoint,
+        ring_srcs: []const RingSource,
+        spec_bytes: u64,
+    ) ?u32 {
+        if (self.max_bytes == 0) return kv_target;
+        if (self.entryBytesAt(kv_entries, kv_target, cps, ring_srcs, spec_bytes) <= self.max_bytes) return kv_target;
+        var best: u32 = 0;
+        if (ring_srcs.len > 0) {
+            for (ring_srcs) |src| {
+                if (src.pos < kv_target and src.pos > best and self.entryBytesAt(kv_entries, src.pos, cps, ring_srcs, 0) <= self.max_bytes) best = src.pos;
+            }
+        } else if (cps != null and cps.?.len > 0) {
+            for (cps.?) |*cp| {
+                const p: u32 = @intCast(cp.pos);
+                if (p > best and p < kv_target and self.entryBytesAt(kv_entries, p, cps, ring_srcs, 0) <= self.max_bytes) best = p;
+            }
+        } else {
+            var hi: u32 = kv_target;
+            while (hi - best > 1) {
+                const mid = best + (hi - best) / 2;
+                if (self.entryBytesAt(kv_entries, mid, cps, ring_srcs, 0) <= self.max_bytes) best = mid else hi = mid;
+            }
+        }
+        return if (best >= MIN_PERSIST_TOKENS) best else null;
+    }
+
+    /// What a record of rows [0, p) of `kv_entries` occupies with no chunk shared: its chunks, the
+    /// checkpoints and ring files the entry keeps at or below `p`, the token record, the manifest
+    /// and `extra` (its spec sidecar). Headers are an allowance, not an exact count.
+    fn entryBytesAt(
+        self: *const DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        p: u32,
+        cps: ?[]const transformer_mod.SSMCheckpoint,
+        ring_srcs: []const RingSource,
+        extra: u64,
+    ) u64 {
+        var row: u64 = 0;
+        var tensors: u64 = 0;
+        for (kv_entries) |*e| {
+            if (!e.initialized or e.ringed) continue;
+            for (layerArrays(e)) |a| {
+                const rb = rowBytes(a);
+                if (rb == 0) continue;
+                row += rb;
+                tensors += 1;
+            }
+        }
+        const chunks: u64 = (@as(u64, p) + self.chunk_tokens - 1) / self.chunk_tokens;
+        var total: u64 = @as(u64, p) * (row + 4) + chunks * (FILE_OVERHEAD_BYTES + tensors * TENSOR_OVERHEAD_BYTES) + FILE_OVERHEAD_BYTES + extra;
+        var cp_bytes: u64 = 0;
+        var cp_count: u64 = 0;
+        if (cps) |list| for (list) |*cp| {
+            if (cp.pos == 0 or cp.pos > p) continue;
+            cp_bytes += checkpointFileBytes(cp);
+            cp_count += 1;
+        };
+        // Retention keeps at most `ssm_max_per_entry` of them.
+        if (cp_count > self.ssm_max_per_entry) cp_bytes = cp_bytes * self.ssm_max_per_entry / cp_count;
+        total += cp_bytes;
+        for (ring_srcs) |src| {
+            if (src.pos <= p) total += ringFileBytes(src);
+        }
+        return total;
+    }
+
+    fn appendCommitWithSpecBounded(
+        self: *DiskTier,
+        kv_entries: []const transformer_mod.KVCacheEntry,
+        step: usize,
+        config: kv_quant.KVQuantConfig,
+        all_tokens: []const u32,
+        has_tools: bool,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
+        all_dflash: ?SpecCommit,
+        all_mtp: ?SpecCommit,
+        ring: ?RingCommit,
+        s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
+        var tokens = all_tokens;
+        var dflash_snap = all_dflash;
+        var mtp_snap = all_mtp;
         // Every production caller swallows our error (the disk tier is best-effort end to
         // end), and three writers inside can raise: persistSsmCheckpoints, writeChunkFile,
         // appendSsmOnly. Drop the latch THIS call raised at the one funnel they all pass
@@ -1357,6 +1612,8 @@ pub const DiskTier = struct {
         // unrelated request. `writeSpecSidecar` swallows internally, so it keeps its own pair.
         const had_error = mlx.errorPending();
         errdefer mlx.dropLatchedErrorUnless(had_error);
+        self.last_store_id = null;
+        const waited_before: u64 = if (self.writer) |w| w.waitedNs() else 0;
         // On EOS-terminated turns the cache runs 1-2 positions AHEAD of the
         // committed token record (forwarded terminator tokens that never
         // land in `tokens`). Persist the prefix covered by the record —
@@ -1373,7 +1630,7 @@ pub const DiskTier = struct {
 
         const kv_target_u: usize = persistTargetLen(kv_entries, step, tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return .skipped;
-        const kv_target: u32 = @intCast(kv_target_u);
+        var kv_target: u32 = @intCast(kv_target_u);
         // Every initialized layer must cover the persisted range with B == 1
         // — anything else (mid-spec-decode state, batched cache) is not a
         // persistable snapshot. A ringed layer covers it through ring files instead.
@@ -1395,7 +1652,7 @@ pub const DiskTier = struct {
             }
         }
 
-        const ring_srcs: []const RingSource = if (ringed) blk: {
+        var ring_srcs: []const RingSource = if (ringed) blk: {
             const rc = ring orelse return .skipped;
             break :blk try self.ringSources(kv_entries, kv_target, rc);
         } else &.{};
@@ -1418,6 +1675,27 @@ pub const DiskTier = struct {
         if (self.ssd_first) {
             self.refreshDiskBudget();
             // Its eviction swap-removes: indices picked above may now name other entries.
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            if (target.superseded) return .persisted;
+        }
+        // A sole entry never outgrows the tier: a record over the byte budget is cut to the highest
+        // restore point that fits, without its spec state (that describes the whole record).
+        const spec_bytes = specFileBytes(dflash_snap) + specFileBytes(mtp_snap);
+        const fit = self.budgetTarget(kv_entries, kv_target, ssm_checkpoints, ring_srcs, spec_bytes) orelse {
+            log.info("  [disk-cache] skip: no restore point of {d} tokens fits the {d:.1} MB budget\n", .{ kv_target, mib(self.max_bytes) });
+            return .skipped;
+        };
+        if (fit < kv_target) {
+            log.info("  [disk-cache] {d}-token record over the {d:.1} MB budget: persisting {d} tokens\n", .{ kv_target, mib(self.max_bytes), fit });
+            kv_target = fit;
+            tokens = all_tokens[0..fit];
+            dflash_snap = null;
+            mtp_snap = null;
+            if (ringed) {
+                const srcs = try self.ringSources(kv_entries, kv_target, ring.?);
+                self.allocator.free(ring_srcs);
+                ring_srcs = srcs;
+            }
             target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
             if (target.superseded) return .persisted;
         }
@@ -1543,9 +1821,14 @@ pub const DiskTier = struct {
 
         // v4 spec snapshots — one sidecar file, REPLACED wholesale by every
         // commit (a commit with no payload deletes a stale one, the RAM
-        // tier's supersede rule). Best-effort DRAFT-side state: a failed
-        // write costs the entry its spec, never the entry.
-        const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
+        // tier's supersede rule), by the piece that completes its rows; an
+        // earlier piece keeps what the entry had. Best-effort DRAFT-side
+        // state: a failed write costs the entry its spec, never the entry.
+        const spec_res: SpecSidecarResult = if (!chunk_complete) (if (extend_idx) |i| .{
+            .bytes = self.entries.items[i].spec_bytes,
+            .dflash = self.entries.items[i].spec_dflash,
+            .mtp = self.entries.items[i].spec_mtp,
+        } else .{}) else self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
             log.warn("  [disk-cache] spec persist failed: {s} — entry keeps no spec\n", .{@errorName(err)});
             break :blk .{};
         };
@@ -1627,12 +1910,14 @@ pub const DiskTier = struct {
             try self.entries.append(self.allocator, new_entry);
             self.total_bytes += new_entry.bytes;
         }
+        self.last_store_id = id;
         self.gcToBudget();
 
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
         const ms: u64 = sw.read() / std.time.ns_per_ms;
-        log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms); resident={d:.1} MB ({d} entries)\n", .{
-            kv_len,                                                        kv_target,              chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms,
+        const waited_ms: u64 = if (self.writer) |w| (w.waitedNs() -| waited_before) / std.time.ns_per_ms else 0;
+        log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms, {d}ms waiting on the writer); resident={d:.1} MB ({d} entries)\n", .{
+            kv_len,                                                        kv_target,              chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms, waited_ms,
             @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0), self.entries.items.len,
         });
         // The one completion marker: every chunk and every wanted checkpoint is staged. A
@@ -1753,6 +2038,7 @@ pub const DiskTier = struct {
         self.allocator.free(live.rings);
         live.* = updated;
         self.total_bytes = clampAdd(self.total_bytes, delta);
+        self.last_store_id = updated.id;
         self.gcToBudget();
         return if (ssm_res.complete) .persisted else .partial;
     }
@@ -1790,34 +2076,32 @@ pub const DiskTier = struct {
         // drop what it set — or the next decode tick fails an unrelated request.
         const had_error = mlx.errorPending();
         errdefer mlx.dropLatchedErrorUnless(had_error);
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors\x00", .{dir_abs});
-        defer self.allocator.free(path);
         if (dflash == null and mtp == null) {
-            std.Io.Dir.deleteFileAbsolute(self.io, path[0 .. path.len - 1]) catch {};
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors", .{dir_abs});
+            defer self.allocator.free(path);
+            // A staged copy of the old sidecar must not land after the delete.
+            if (self.writer) |w| w.fence(path);
+            std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
             return .{};
         }
-        const tensor_map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-        const meta_map = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        var list = std.ArrayList(NamedTensor).empty;
+        defer self.freeNamed(&list);
         var res: SpecSidecarResult = .{};
-        if (dflash) |dc| res.dflash = try self.insertSpecTensors(tensor_map, "d", dc, s);
-        if (mtp) |mc| res.mtp = try self.insertSpecTensors(tensor_map, "m", mc, s);
+        if (dflash) |dc| res.dflash = try self.appendSpecTensors(&list, "d", dc, s);
+        if (mtp) |mc| res.mtp = try self.appendSpecTensors(&list, "m", mc, s);
         // The file is replaced before the manifest commits; equal-shaped windows share a byte
         // size, so the load re-checks base/step from here.
-        if (res.dflash) |sm| try insertSpecStamp(meta_map, "d", sm);
-        if (res.mtp) |sm| try insertSpecStamp(meta_map, "m", sm);
-        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
-        res.bytes = fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
+        var stamp_buf: [2][48]u8 = undefined;
+        var meta: [2]MetaPair = undefined;
+        var n_meta: usize = 0;
+        for ([_]?SpecMeta{ res.dflash, res.mtp }, [_][]const u8{ "d.pos", "m.pos" }) |sm_opt, key| {
+            const sm = sm_opt orelse continue;
+            meta[n_meta] = .{ .key = key, .value = try std.fmt.bufPrint(&stamp_buf[n_meta], "{d}:{d}", .{ sm.base, sm.step }) };
+            n_meta += 1;
+        }
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors", .{dir_abs});
+        res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], s);
         return res;
-    }
-
-    fn insertSpecStamp(meta_map: mlx.mlx_map_string_to_string, prefix: []const u8, sm: SpecMeta) !void {
-        var key: [8]u8 = undefined;
-        var val: [48]u8 = undefined;
-        const k = try std.fmt.bufPrint(&key, "{s}.pos\x00", .{prefix});
-        const v = try std.fmt.bufPrint(&val, "{d}:{d}\x00", .{ sm.base, sm.step });
-        try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(k.ptr), @ptrCast(v.ptr)));
     }
 
     /// False for a sidecar whose stamp is absent (written before stamps) or names other rows.
@@ -1831,19 +2115,19 @@ pub const DiskTier = struct {
         return std.mem.eql(u8, std.mem.span(got), w);
     }
 
-    fn insertSpecTensors(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, sc: SpecCommit, s: mlx.mlx_stream) !SpecMeta {
+    fn appendSpecTensors(self: *DiskTier, list: *std.ArrayList(NamedTensor), prefix: []const u8, sc: SpecCommit, s: mlx.mlx_stream) !SpecMeta {
         if (sc.step == 0) return error.DiskCacheEmptyEntry;
         const limit: u32 = @intCast(sc.step);
         const affine = sc.config.scheme != .off;
         for (sc.entries, 0..) |*entry, li| {
             if (!entry.initialized) continue;
-            try self.insertSpecSlice(map, prefix, li, "k", entry.keys, limit, s);
-            try self.insertSpecSlice(map, prefix, li, "v", entry.values, limit, s);
+            try self.appendSpecSlice(list, prefix, li, "k", entry.keys, limit, s);
+            try self.appendSpecSlice(list, prefix, li, "v", entry.values, limit, s);
             if (affine) {
-                try self.insertSpecSlice(map, prefix, li, "ks", entry.keys_scales, limit, s);
-                try self.insertSpecSlice(map, prefix, li, "kb", entry.keys_biases, limit, s);
-                try self.insertSpecSlice(map, prefix, li, "vs", entry.values_scales, limit, s);
-                try self.insertSpecSlice(map, prefix, li, "vb", entry.values_biases, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "ks", entry.keys_scales, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "kb", entry.keys_biases, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "vs", entry.values_scales, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "vb", entry.values_biases, limit, s);
             }
         }
         // v5 head half: the QSA raw-key history and pooled bank go in whole.
@@ -1860,8 +2144,8 @@ pub const DiskTier = struct {
             // a head half without it, and an empty array raises inside mlx.
             const rows_ok = hist == @as(c_int, @intCast(limit)) and a.aux_state.ctx != null;
             if (rows_ok) {
-                try self.insertSpecArray(map, prefix, "h.aux", a.aux_state);
-                if (a.qsa_pooled.ctx != null) try self.insertSpecArray(map, prefix, "h.pooled", a.qsa_pooled);
+                try self.appendSpecArray(list, prefix, "h.aux", a.aux_state);
+                if (a.qsa_pooled.ctx != null) try self.appendSpecArray(list, prefix, "h.pooled", a.qsa_pooled);
                 var hm: SpecHeadMeta = .{
                     .pos_base = sc.head_pos_base,
                     .ratio = a.qsa_ratio,
@@ -1874,7 +2158,7 @@ pub const DiskTier = struct {
                     if (hm.mark_count == transformer_mod.QSA_HEAD_MARKS_MAX) break;
                     var kind_buf: [16]u8 = undefined;
                     const kind = try std.fmt.bufPrint(&kind_buf, "h.lv{d}", .{hm.mark_count});
-                    try self.insertSpecArray(map, prefix, kind, mk.rows);
+                    try self.appendSpecArray(list, prefix, kind, mk.rows);
                     hm.marks[hm.mark_count] = mk.pos;
                     hm.mark_count += 1;
                 }
@@ -1890,25 +2174,29 @@ pub const DiskTier = struct {
         };
     }
 
-    fn insertSpecArray(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, kind: []const u8, arr: mlx.mlx_array) !void {
-        const key = try std.fmt.allocPrint(self.allocator, "{s}{s}\x00", .{ prefix, kind });
-        defer self.allocator.free(key);
-        try mlx.check(mlx.mlx_map_string_to_array_insert(map, @ptrCast(key.ptr), arr));
+    /// A second handle on `arr`, keyed `{prefix}{kind}`; the list owns it.
+    fn appendSpecArray(self: *DiskTier, list: *std.ArrayList(NamedTensor), prefix: []const u8, kind: []const u8, arr: mlx.mlx_array) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, kind });
+        errdefer self.allocator.free(key);
+        var owned = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(owned);
+        try mlx.check(mlx.mlx_array_set(&owned, arr));
+        try list.append(self.allocator, .{ .key = key, .arr = owned });
     }
 
-    fn insertSpecSlice(self: *DiskTier, map: mlx.mlx_map_string_to_array, prefix: []const u8, layer: usize, kind: []const u8, buf: mlx.mlx_array, limit: u32, s: mlx.mlx_stream) !void {
+    fn appendSpecSlice(self: *DiskTier, list: *std.ArrayList(NamedTensor), prefix: []const u8, layer: usize, kind: []const u8, buf: mlx.mlx_array, limit: u32, s: mlx.mlx_stream) !void {
         const shape = mlx.getShape(buf);
         if (shape.len != 4) return error.DiskCacheBadShape;
         if (shape[2] < limit) return error.DiskCacheBadShape;
         var sliced = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(sliced);
         const st = [_]c_int{ 0, 0, 0, 0 };
         const sp = [_]c_int{ shape[0], shape[1], @intCast(limit), shape[3] };
         const sd = [_]c_int{ 1, 1, 1, 1 };
         try mlx.check(mlx.mlx_slice(&sliced, buf, &st, 4, &sp, 4, &sd, 4, s));
-        defer _ = mlx.mlx_array_free(sliced);
-        const key = try std.fmt.allocPrint(self.allocator, "{s}{d}.{s}\x00", .{ prefix, layer, kind });
-        defer self.allocator.free(key);
-        try mlx.check(mlx.mlx_map_string_to_array_insert(map, @ptrCast(key.ptr), sliced));
+        const key = try std.fmt.allocPrint(self.allocator, "{s}{d}.{s}", .{ prefix, layer, kind });
+        errdefer self.allocator.free(key);
+        try list.append(self.allocator, .{ .key = key, .arr = sliced });
     }
 
     /// Load one persisted spec snapshot as a transient `KVCacheSnapshot` the
@@ -2165,19 +2453,10 @@ pub const DiskTier = struct {
         }
     }
 
-    /// Write (or, under SSD-first, stage) one safetensors file at `path`, which it takes.
+    /// Write (or, with the writer, stage) one safetensors file at `path`, which it takes.
     /// Returns the file's byte size.
     fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
-        if (self.writer) |w| {
-            // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
-            const bytes = self.serializeSafetensors(list, meta, s) catch |err| {
-                self.allocator.free(path);
-                return err;
-            };
-            const n = bytes.len;
-            w.submit(path, bytes); // takes both buffers
-            return n;
-        }
+        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, s);
         defer self.allocator.free(path);
         const tensor_map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
@@ -2266,9 +2545,94 @@ pub const DiskTier = struct {
 
     /// Header + payload encode over an already-materialized tensor list. Evaluates nothing.
     fn encodeSafetensors(self: *DiskTier, tensors: []const NamedTensor, meta: []const MetaPair) ![]u8 {
-        var data_len: u64 = 0;
-        for (tensors) |*t| data_len += nbytesOf(t.arr);
+        const head = try self.encodeHeader(tensors, meta);
+        defer self.allocator.free(head);
+        const total = head.len + dataLen(tensors);
+        const out = try self.allocator.alloc(u8, total);
+        errdefer self.allocator.free(out);
+        var stream: ByteStream = .{ .head = head, .tensors = tensors };
+        try stream.fill(out);
+        return out;
+    }
 
+    fn dataLen(tensors: []const NamedTensor) usize {
+        var n: u64 = 0;
+        for (tensors) |*t| n += nbytesOf(t.arr);
+        return @intCast(n);
+    }
+
+    /// A materialized file's bytes in order: its header, then each tensor's payload.
+    const ByteStream = struct {
+        head: []const u8,
+        tensors: []const NamedTensor,
+        /// 0 = the header, i + 1 = tensor i.
+        src: usize = 0,
+        off: usize = 0,
+
+        fn fill(self: *ByteStream, dst: []u8) !void {
+            var at: usize = 0;
+            while (at < dst.len) {
+                const piece: []const u8 = if (self.src == 0) self.head else blk: {
+                    const t = &self.tensors[self.src - 1];
+                    const nb: usize = @intCast(nbytesOf(t.arr));
+                    if (nb == 0) break :blk &.{};
+                    const p = rawBytes(t.arr) orelse return error.DiskCacheUnreadable;
+                    break :blk p[0..nb];
+                };
+                const n = @min(piece.len - self.off, dst.len - at);
+                @memcpy(dst[at .. at + n], piece[self.off .. self.off + n]);
+                at += n;
+                self.off += n;
+                if (self.off == piece.len) {
+                    if (self.src == self.tensors.len) break;
+                    self.src += 1;
+                    self.off = 0;
+                }
+            }
+            if (at != dst.len) return error.DiskCacheUnreadable;
+        }
+    };
+
+    /// Stage one materialized file through the writer: one blob, or `Writer.partBytes` parts
+    /// when larger, each allocated only once the permit has room for it. Takes `path`.
+    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
+        var path_owned: ?[]u8 = path;
+        defer if (path_owned) |p| self.allocator.free(p);
+        // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
+        try materializeContiguous(tensors, s);
+        const head = try self.encodeHeader(tensors, meta);
+        defer self.allocator.free(head);
+        const total = head.len + dataLen(tensors);
+        const part_max: usize = @intCast(w.partBytes());
+        var stream: ByteStream = .{ .head = head, .tensors = tensors };
+        var staged: usize = 0;
+        errdefer if (staged > 0) {
+            w.fence(path);
+            disk_writer.unlinkTmp(path);
+        };
+        while (staged < total) {
+            const n = @min(part_max, total - staged);
+            const last = staged + n == total;
+            const part: disk_writer.Part = if (staged == 0 and last) .whole else if (staged == 0) .first else if (last) .last else .middle;
+            w.waitForRoom(n);
+            const bytes = try self.allocator.alloc(u8, n);
+            stream.fill(bytes) catch |err| {
+                self.allocator.free(bytes);
+                return err;
+            };
+            const blob_path = if (last) path_owned.? else self.allocator.dupe(u8, path) catch |err| {
+                self.allocator.free(bytes);
+                return err;
+            };
+            if (last) path_owned = null;
+            w.submitPart(blob_path, bytes, part); // takes both buffers
+            staged += n;
+        }
+        return total;
+    }
+
+    /// The 8-byte little-endian header length and the header JSON, as `mlx::core::save_safetensors` writes them.
+    fn encodeHeader(self: *DiskTier, tensors: []const NamedTensor, meta: []const MetaPair) ![]u8 {
         var header = std.ArrayList(u8).empty;
         defer header.deinit(self.allocator);
         const hw = &header;
@@ -2293,19 +2657,9 @@ pub const DiskTier = struct {
         }
         try hw.appendSlice(self.allocator, "}");
 
-        const total = 8 + header.items.len + data_len;
-        const out = try self.allocator.alloc(u8, total);
-        errdefer self.allocator.free(out);
+        const out = try self.allocator.alloc(u8, 8 + header.items.len);
         std.mem.writeInt(u64, out[0..8], @intCast(header.items.len), .little);
-        @memcpy(out[8 .. 8 + header.items.len], header.items);
-        var cursor: usize = 8 + header.items.len;
-        for (tensors) |*t| {
-            const nb: usize = @intCast(nbytesOf(t.arr));
-            if (nb == 0) continue;
-            const src = rawBytes(t.arr) orelse return error.DiskCacheUnreadable;
-            @memcpy(out[cursor .. cursor + nb], src[0..nb]);
-            cursor += nb;
-        }
+        @memcpy(out[8..], header.items);
         return out;
     }
 
@@ -2473,10 +2827,10 @@ pub const DiskTier = struct {
             const p = target[ti - 1];
             if (std.mem.indexOfScalar(u32, old_positions, p) != null) continue; // already on disk
             const cp = findCp(cps, p) orelse continue;
-            // Under SSD-first a checkpoint is written beside its chunk, outside the byte budget;
-            // elsewhere its share of the flush budget is bounded by `max_spend` (half the cap —
+            // Under SSD-first or the writer a checkpoint is written beside its chunk, outside the
+            // byte budget; a synchronous flush bounds its share by `max_spend` (half the cap —
             // chunk-first budgeting starved them to zero, live 2026-09-07).
-            if (!self.ssd_first and written_bytes.* >= max_spend) {
+            if (!self.ssd_first and self.writer == null and written_bytes.* >= max_spend) {
                 complete = false;
                 continue; // share exhausted — persist on a later flush
             }
@@ -2645,36 +2999,8 @@ pub const DiskTier = struct {
             }
         }
         if (list.items.len == 0) return 0;
-        if (self.writer) |w| {
-            const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
-            const bytes = self.serializeSafetensors(list.items, meta.items, s) catch |err| {
-                self.allocator.free(path);
-                return err;
-            };
-            const n = bytes.len;
-            w.submit(path, bytes);
-            return n;
-        }
-        const tensor_map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-        const meta_map = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-        for (meta.items) |m| {
-            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.key});
-            defer self.allocator.free(kz);
-            const vz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.value});
-            defer self.allocator.free(vz);
-            try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(kz.ptr), @ptrCast(vz.ptr)));
-        }
-        for (list.items) |*t| {
-            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.key});
-            defer self.allocator.free(kz);
-            try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(kz.ptr), t.arr));
-        }
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors\x00", .{dir_rel});
-        defer self.allocator.free(path);
-        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
-        return fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
+        return self.saveNamed(path, list.items, meta.items, s);
     }
 
     fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !transformer_mod.SSMCheckpoint {
@@ -2796,6 +3122,18 @@ pub const DiskTier = struct {
 
     /// Where a commit can write a ring file: `rows` below `pos` of `entries`' ringed layers.
     const RingSource = struct { pos: u32, rows: u32, entries: []const transformer_mod.KVCacheEntry };
+
+    fn ringFileBytes(src: RingSource) u64 {
+        var n: u64 = FILE_OVERHEAD_BYTES;
+        for (src.entries) |*e| {
+            if (!e.initialized or !e.ringed) continue;
+            for (layerArrays(e)) |a| {
+                const rb = rowBytes(a);
+                if (rb > 0) n += rb * src.rows + TENSOR_OVERHEAD_BYTES;
+            }
+        }
+        return n;
+    }
 
     /// Rows every ringed layer of `entries` can give a restore point at `pos`: window + backoff at
     /// most, at least the window (or every row from 0). Null when one cannot, or none rings.
@@ -3011,9 +3349,9 @@ pub const DiskTier = struct {
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
-    /// the legacy arm or under `SUSHI_SSD_CHUNK_SHARE=0`.
+    /// the synchronous legacy arm or under `SUSHI_SSD_CHUNK_SHARE=0`.
     fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
-        if (!self.ssd_first or !chunkShareEnabled()) return null;
+        if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // never inherit from a dead entry
@@ -3141,8 +3479,10 @@ pub const DiskTier = struct {
         // `defer` does not cancel an enclosing `errdefer`, and that was a double free on ENOSPC).
         if (self.writer) |w| {
             // The index rides the same FIFO queue as the chunks, so it is the last file to land.
+            // Its rendering is handed over, not copied, once the permit has room for it.
             errdefer self.allocator.free(final_path);
-            const bytes = try self.allocator.dupe(u8, buf.items);
+            w.waitForRoom(buf.items.len);
+            const bytes = try buf.toOwnedSlice(self.allocator);
             w.submit(final_path, bytes);
             return;
         }
@@ -4263,8 +4603,7 @@ test "DiskTier: byte budget evicts LRU entries, keeps newest" {
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
 
-    // Budget deliberately tiny: every new entry evicts the previous one.
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-gc", 4096, 128);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-gc", 0, 128);
     defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 1);
@@ -4277,8 +4616,9 @@ test "DiskTier: byte budget evicts LRU entries, keeps newest" {
     for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, null, s);
+    // A budget that holds one entry but not two: the newest evicts the previous one.
+    tier.max_bytes = tier.total_bytes + tier.total_bytes / 2;
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
-    // Both entries exceed 4 KB each — only the newest survives.
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expect(std.mem.eql(u32, tier.entries.items[0].tokens, &tokens_b));
 
@@ -6714,7 +7054,7 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     tier.enableBackgroundWriter();
     try testing.expect(tier.writer != null);
-    try testing.expectEqual(SSD_FIRST_READBACK_BYTES, tier.max_flush_bytes);
+    try testing.expectEqual(FLUSH_PIECE_BYTES, tier.max_flush_bytes);
     tier.writer.?.setPaused(true);
     defer tier.writer.?.setPaused(false);
 
@@ -6761,6 +7101,210 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
             );
         }
     }
+}
+
+test "DiskTier: a writer-armed commit lands the whole entry in bounded pieces, in one call" {
+    // A long prompt is whole on disk after its first turn, its checkpoints outside every piece's bound.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    for ([_]bool{ false, true }, [_][]const u8{ "fp-pieces-ram", "fp-pieces-ssd" }) |ssd_first, fp| {
+        var tier = try DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = ssd_first;
+        if (ssd_first) tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+        tier.enableBackgroundWriter();
+        tier.max_flush_bytes = 1; // one chunk per piece
+
+        try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s));
+        tier.drainWriter();
+        try testing.expectEqual(@as(u64, 0), tier.writeErrors());
+        const e = &tier.entries.items[0];
+        try testing.expectEqual(@as(u32, 600), e.kv_len);
+        try testing.expectEqualSlices(u32, &.{ 256, 512 }, e.ssm_positions);
+        try testing.expect(tier.entryWholeOnDisk(e.id));
+
+        var out = try KVCache.init(testing.allocator, 3);
+        defer out.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(@as(u32, 512), try tier.restoreIntoHybrid(&out, &dst, 0, 512, s));
+        try testing.expectEqual(@as(f32, 100.0), ssmArrVal(dst[0].conv_state, 0, s));
+        for ([_]u32{ 0, 2 }) |li| for ([_]u32{ 0, 255, 256, 511 }) |pos| {
+            try testing.expectEqual(try cacheValueAt(&cache, li, pos, 3, s), try cacheValueAt(&out, li, pos, 3, s));
+        };
+    }
+}
+
+test "DiskTier: a sole entry over the byte budget is cut to a checkpoint that fits, and stays within it" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    // 600 rows of 192 bytes and their files are ~121 KB; 512 rows and their files ~104 KB.
+    const budget: u64 = 112_000;
+    for ([_]bool{ false, true }) |writer| {
+        const fp: []const u8 = if (writer) "fp-sole-writer" else "fp-sole-sync";
+        {
+            var tier = try DiskTier.init(testing.allocator, io, base, fp, budget, 128);
+            defer tier.deinit();
+            if (writer) tier.enableBackgroundWriter();
+            _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+            tier.drainWriter();
+            try testing.expectEqual(@as(usize, 1), tier.entryCount());
+            try testing.expect(tier.total_bytes <= budget);
+            try testing.expectEqual(@as(u32, 512), tier.entries.items[0].kv_len);
+        }
+        // Reopened, the tier still holds it within the budget and restores at the checkpoint.
+        var tier2 = try DiskTier.init(testing.allocator, io, base, fp, budget, 128);
+        defer tier2.deinit();
+        try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+        try testing.expect(tier2.total_bytes <= budget);
+        var out = try KVCache.init(testing.allocator, 3);
+        defer out.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(@as(u32, 512), try tier2.restoreIntoHybrid(&out, &dst, 0, 512, s));
+        try testing.expectEqual(try cacheValueAt(&cache, 2, 511, 3, s), try cacheValueAt(&out, 2, 511, 3, s));
+    }
+}
+
+test "DiskTier: a multi-piece commit stages its spec sidecar once, through the writer" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var dfl = try KVCache.init(testing.allocator, 2);
+    defer dfl.deinit();
+    try fillCache(&dfl, s, 2, 600, 8, 3.5, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-pieces", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    tier.max_flush_bytes = 1; // one chunk per piece: five pieces
+    tier.writer.?.setPaused(true);
+    defer tier.writer.?.setPaused(false);
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        .{ .entries = dfl.entries, .step = dfl.step, .config = dfl.config, .base_pos = 0 },
+        .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
+        s,
+    ));
+    // Nothing was written on this thread, and the sidecar is staged once.
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-spec-pieces/e1/spec.safetensors", .{}));
+    var paths = std.ArrayList([]const u8).empty;
+    defer {
+        for (paths.items) |p| testing.allocator.free(p);
+        paths.deinit(testing.allocator);
+    }
+    try tier.writer.?.stagedPaths(&paths, testing.allocator);
+    var specs: usize = 0;
+    for (paths.items) |p| specs += @intFromBool(std.mem.endsWith(u8, p, "/spec.safetensors"));
+    try testing.expectEqual(@as(usize, 1), specs);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec-pieces", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(u32, 600), m.usable);
+    var loaded = tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.dense) orelse return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), loaded.snap.step);
+    var mloaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse return error.TestExpectedSpecSnap;
+    defer mloaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 590), mloaded.snap.step);
+}
+
+test "DiskTier: staged host bytes never pass the writer's permit; a file larger than it goes in parts" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    // 3 layers of 64-wide f32 K and V: each 128-token chunk file is ~192 KB, three permits.
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 64, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-permit", 0, 128);
+        defer tier.deinit();
+        tier.enableBackgroundWriter();
+        tier.writer.?.permit_bytes = 64 * 1024;
+        try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s));
+        tier.drainWriter();
+        try testing.expectEqual(@as(u64, 0), tier.writeErrors());
+        try testing.expect(tier.writer.?.peakBytes() <= 64 * 1024);
+    }
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-permit", 0, 128);
+    defer tier2.deinit();
+    var out = try KVCache.init(testing.allocator, 3);
+    defer out.deinit();
+    try testing.expectEqual(@as(u32, 600), try tier2.restoreInto(&out, 0, s));
+    for ([_]u32{ 0, 2 }) |li| for ([_]u32{ 0, 127, 128, 599 }) |pos| {
+        try testing.expectEqual(try cacheValueAt(&cache, li, pos, 63, s), try cacheValueAt(&out, li, pos, 63, s));
+    };
 }
 
 test "DiskTier: SSD-first write-through extends without rewriting a persisted chunk" {
@@ -6833,16 +7377,66 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     try testing.expectEqual(@as(u32, 768), tier.entries.items[0].kv_len);
 }
 
-test "diskBudgetFromFreeSpace: reserve is min(64 GiB, 10% of volume); below the floor stores nothing" {
+test "resolveDiskBudget: the formula, the 20 GB cap and free disk - 4 GB bind in turn; no room is null; a flag wins" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    // 2 entries x 1000 tokens x 1 MB + 2 GB: the formula binds.
+    const small = resolveDiskBudget(false, DEFAULT_DISK_CAP, 2, 1000, MB, 500 * GB).?;
+    try testing.expectEqual(@as(u64, 2000 * MB + 2 * GB), small.bytes);
+    try testing.expectEqual(DiskBound.formula, small.bound);
+    // 32 entries x 262144 tokens x 18.4 kB is far past 20 GB.
+    const big = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 500 * GB).?;
+    try testing.expectEqual(DEFAULT_DISK_CAP, big.bytes);
+    try testing.expectEqual(DiskBound.cap, big.bound);
+    // 10 GB free leaves 6.
+    const tight = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 10 * GB).?;
+    try testing.expectEqual(6 * GB, tight.bytes);
+    try testing.expectEqual(DiskBound.free_disk, tight.bound);
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 4 * GB));
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 1 * GB));
+    // Overflow saturates to the cap, never wraps.
+    try testing.expectEqual(DEFAULT_DISK_CAP, resolveDiskBudget(false, 0, std.math.maxInt(u32), std.math.maxInt(u64), 1 << 40, 500 * GB).?.bytes);
+    // An explicit number is the budget, whatever the formula or the free space say; 0 is off.
+    const flag = resolveDiskBudget(true, 50 * GB, 32, 262144, 18_400, 10 * GB).?;
+    try testing.expectEqual(@as(u64, 50 * GB), flag.bytes);
+    try testing.expectEqual(DiskBound.flag, flag.bound);
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(true, 0, 32, 262144, 18_400, 500 * GB));
+}
+
+test "diskUsageLine: used / budget in GB and the entry count" {
+    var buf: [128]u8 = undefined;
+    const GB: u64 = 1024 * 1024 * 1024;
+    try testing.expectEqualStrings("[disk-cache] usage 3.50 / 20.0 GB, 5 entries", diskUsageLine(&buf, 3 * GB + GB / 2, 20 * GB, 5));
+}
+
+test "allocatingDiskLine: starts with Allocating and names the terms, the bound and the directory" {
+    var buf: [256]u8 = undefined;
+    const GB: u64 = 1024 * 1024 * 1024;
+    const line = allocatingDiskLine(&buf, .{ .bytes = 20 * GB, .bound = .cap }, 32, 262144, 18_400, "/c");
+    try testing.expectEqualStrings("Allocating 20.0 GB SSD for the prefix cache (32 entries x 262144 tokens x 18.0 KB + 2 GB; bound: 20 GB cap) at /c", line);
+    const flag = allocatingDiskLine(&buf, .{ .bytes = 12 * GB, .bound = .flag }, 32, 0, 0, "/c");
+    try testing.expectEqualStrings("Allocating 12.0 GB SSD for the prefix cache (--prefix-cache-disk) at /c", flag);
+    try testing.expectEqualStrings("SSD prefix cache OFF: 3.0 GB free at /c leaves nothing after the 4 GB reserve", diskOffLine(&buf, 3 * GB, "/c"));
+}
+
+test "diskBudgetFromFreeSpace: the one reserve is 4 GiB, whatever the volume; nothing left stores nothing" {
     const GB: u64 = 1 << 30;
-    // 4 TB volume, 1 TB free: reserve is the 64 GiB cap.
-    try testing.expectEqual(@as(?u64, 1024 * GB - 64 * GB), diskBudgetFromFreeSpace(0, 1024 * GB, 4096 * GB));
-    try testing.expectEqual(@as(?u64, 100 * GB), diskBudgetFromFreeSpace(100 * GB, 1024 * GB, 4096 * GB));
-    // Small volume: 10% is the binding reserve.
-    try testing.expectEqual(@as(?u64, 60 * GB), diskBudgetFromFreeSpace(0, 80 * GB, 200 * GB));
-    // Under the store floor: refuse, never a silent 0.
-    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(0, 20 * GB, 200 * GB));
-    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(500 * GB, 20 * GB, 200 * GB));
+    try testing.expectEqual(@as(?u64, 1020 * GB), diskBudgetFromFreeSpace(0, 1024 * GB));
+    try testing.expectEqual(@as(?u64, 100 * GB), diskBudgetFromFreeSpace(100 * GB, 1024 * GB));
+    // A small budget is still a budget: free less 4 GiB, announced and stored alike.
+    try testing.expectEqual(@as(?u64, 6 * GB), diskBudgetFromFreeSpace(0, 10 * GB));
+    try testing.expectEqual(@as(?u64, GB / 2), diskBudgetFromFreeSpace(0, 4 * GB + GB / 2));
+    // The operator's cap is a cap, not a promise the volume must keep.
+    try testing.expectEqual(@as(?u64, 6 * GB), diskBudgetFromFreeSpace(500 * GB, 10 * GB));
+    // Refuse, never a silent 0.
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(0, 4 * GB));
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(500 * GB, 2 * GB));
+    // Load-time resolution and the store-time bound read the same free space the same way.
+    for ([_]u64{ 10 * GB, 5 * GB, 4 * GB + GB / 2, 3 * GB }) |free| {
+        const announced = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 1 << 20, 1 << 20, free);
+        const stored = diskBudgetFromFreeSpace(if (announced) |a| a.bytes else 0, free);
+        try testing.expectEqual(if (announced) |a| @as(?u64, a.bytes) else null, stored);
+    }
 }
 
 test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
@@ -6864,7 +7458,7 @@ test "volumeSpace: free is what the OS grants, never statfs' f_bavail" {
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {
-    // 10 GiB free against a 512 GiB volume leaves nothing after the reserve: the tier stores nothing.
+    // 3 GiB free against a 512 GiB volume leaves nothing after the reserve: the tier stores nothing.
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -6875,7 +7469,7 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-short", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
-    tier.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+    tier.armTestSpace(3 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
 
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
@@ -6895,6 +7489,59 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     try testing.expect(!tier.store_declined);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
+}
+
+test "DiskTier.writerHostBytes: the permit when idle, the backlog when it is past it, zero without a writer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-writer-bytes", 0, 128);
+    defer tier.deinit();
+    try testing.expectEqual(@as(u64, 0), tier.writerHostBytes());
+    tier.enableBackgroundWriter();
+    const w = tier.writer.?;
+    w.permit_bytes = 64 * 1024;
+    try testing.expectEqual(@as(u64, 64 * 1024), tier.writerHostBytes());
+    // A paused writer keeps what it was handed; one blob past the permit is what the host holds.
+    w.setPaused(true);
+    const path = try testing.allocator.dupe(u8, "/nonexistent/never-written.safetensors");
+    const blob = try testing.allocator.alloc(u8, 96 * 1024);
+    @memset(blob, 1);
+    w.submit(path, blob);
+    try testing.expectEqual(@as(u64, 96 * 1024), tier.writerHostBytes());
+    w.setPaused(false);
+    tier.drainWriter();
+}
+
+test "DiskTier: a budget the load line announced is a budget the store honours (10 GiB free on a 1 TiB volume)" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    const free: u64 = 10 * 1024 * 1024 * 1024;
+    const total: u64 = 1024 * 1024 * 1024 * 1024;
+    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free).?;
+    try testing.expectEqual(DiskBound.free_disk, plan.bound);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-announced", plan.bytes, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(free, total);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(!tier.store_declined);
+    try testing.expectEqual(plan.bytes, tier.max_bytes);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 640), tier.bestMatch(&tokens, false, cache.config).?.usable);
 }
 
 test "DiskTier: the free-space probe runs only before a store, never for a copy already on disk" {
@@ -6943,8 +7590,8 @@ test "DiskTier: the free-space probe runs only before a store, never for a copy 
     tier.drainWriter();
     try testing.expect(test_space_probes > p);
 
-    // Below the store floor a copy already on disk still counts; a new entry declines.
-    tier.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+    // With nothing left after the reserve a copy already on disk still counts; a new entry declines.
+    tier.armTestSpace(3 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
     try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s));
     var other: [640]u32 = undefined;
     for (&other, 0..) |*t, i| t.* = @intCast(i + 90_000);
@@ -7481,6 +8128,35 @@ test "DiskTier chunk share: total_bytes is bytes on disk whichever holder dies f
         try testing.expectEqual(@as(usize, 0), tier.entryCount());
         try testing.expectEqual(@as(u64, 0), tier.total_bytes);
     }
+}
+
+test "DiskTier chunk share: a writer-armed tier beside a RAM tier links like SSD-first" {
+    // With both tiers on, every turn of one conversation lands a new disk entry; the link spares
+    // each a rewrite of the whole conversation.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-share-ram", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
+    tier.drainWriter();
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const heir = &tier.entries.items[1];
+    try testing.expectEqual(@as(u32, 4), heir.inherited_chunks);
+    try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(chunkStat(io, base, "fp-share-ram", heir.id, 0).?.nlink)));
 }
 
 test "DiskTier chunk share: the legacy arm and the kill switch never link" {

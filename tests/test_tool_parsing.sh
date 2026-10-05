@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration tests for tool call argument parsing and thinking tag handling.
 # Verifies fixes for:
 #   - Gemma 4 tool call args with nested JSON/braces getting mangled

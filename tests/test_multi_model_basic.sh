@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Plan 05 Phase F — multi-model routing.
 #
 # Starts the server with `--model-dir <dir>` containing >=2 discoverable

@@ -124,7 +124,7 @@ inside 1.46% drift) because verification per round grew 20.6%.
 - **Verbatim lookup chains instead of PLD**: PLD never runs on GLM (`specInitWiring`'s module branch), so `--no-drafter`
   decodes plain serial and the 0.010 n-gram gate is inert. A request drafting alone whose output agrees with its context
   for `mtp_lookup.STRONG_SUFFIX` tokens verifies the context's next three tokens as a four-row chain in place of the
-  assistant's tree (`glmLookupProposal`, `[spec-stats] … lookup=rounds/landed`).
+  assistant's tree (`glmLookupProposal`, `[spec-stats] … lookup=rounds/landed`). `--no-mtp-lookup` turns the chains off.
 
 <a id="concurrency"></a>
 ## Concurrency

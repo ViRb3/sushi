@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # An MLX error costs ONE REQUEST, never the server (#353). mlx-c's default handler was
 # exit(-1). `SUSHI_MLX_FAULT_CHUNK=<n>` / `_STEP=<n>` latch a synthetic Metal OOM at the
 # n-th prefill-chunk / decode-step checkpoint and disarm, so one boot exercises the failure

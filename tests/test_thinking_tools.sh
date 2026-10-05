@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration tests: thinking + tools combinations (streaming and non-streaming).
 # Tests all 8 permutations:
 #   thinking × tools × streaming = 2 × 2 × 2 = 8 cases

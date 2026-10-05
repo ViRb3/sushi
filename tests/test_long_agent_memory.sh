@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Long-running Claude-Code-style agent memory test.
 #
 # Existing coverage:

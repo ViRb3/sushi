@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration tests for thinking-tag streaming behavior.
 # Verifies fixes for:
 #   - Templates that pre-inject the opener (Qwen 3.5/3.6) — model output starts inside the think block

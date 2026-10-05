@@ -51,7 +51,7 @@ const expert_quant = @import("expert_quant.zig");
 /// (weighted) 48.6 vs 40.9 (+19%), creative temp-0.8 39.1 vs 37.9 (+3% —
 /// the class that REGRESSED under the old cost model now holds even at ~30%
 /// per-draft acceptance because the controller demotes without churn).
-/// Users can cap rounds with `--mtp-depth`; the Generator's adaptive
+/// Users can cap rounds with `--mtp-max-depth`; the Generator's adaptive
 /// controller demotes/promotes within [1, configured].
 pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
@@ -73,7 +73,7 @@ pub fn mtpCtxWithinLimit(max: u32, ctx_tokens: usize) bool {
 /// (the GPU arch string cannot tell Ultra from Max); "" lands on default.
 /// The row carries its own LABEL so the resolve site can say which one it
 /// applied: a bare depth=4 in the spec-stats line is indistinguishable from
-/// the EV controller having picked 4 on its own, or from `--mtp-depth 4`.
+/// the EV controller having picked 4 on its own, or from `--mtp-max-depth 4`.
 /// `measured` marks a row a HUMAN swept as realized throughput. Those beat the
 /// boot probe's cost ladder, which cannot see acceptance or the extension sync
 /// — see `generate.mtpDepthCapResolved`.
@@ -1227,19 +1227,6 @@ pub fn shortlistArgmax(s: mlx.mlx_stream, sl: Shortlist) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
     return out;
-}
-
-fn rerankRescoreRow(
-    s: mlx.mlx_stream,
-    target: *Transformer,
-    coarse: *?RerankCoarse,
-    flat: mlx.mlx_array,
-    rows: c_int,
-    x_row: mlx.mlx_array,
-) !?mlx.mlx_array {
-    var sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x_row)) orelse return null;
-    defer sl.deinit();
-    return try shortlistArgmax(s, sl);
 }
 
 /// The coarse full-vocab readout of one row as a flat `[rows]` array, reserved

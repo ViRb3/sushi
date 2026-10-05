@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # repeat_penalty / presence_penalty reach the default decode path (one boot, MTP on by default).
 #
 #   1. APPLIED: a penalised request answers the same bytes as with `logprobs` on, whose synchronous

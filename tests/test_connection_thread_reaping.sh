@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Regression: one completed HTTP request must not retain one pthread stack.
 #
 # The accept loop used to discard each joinable std.Thread handle. The handler

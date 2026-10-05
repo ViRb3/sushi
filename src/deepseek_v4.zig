@@ -484,16 +484,6 @@ fn qmmHost(alloc: std.mem.Allocator, q: *const Q, x: []const f32, m: usize, in_d
     return toHostF32(alloc, y, m * out_dim, s);
 }
 
-/// Dequantize q to host f32 [out, in] (transient use only — wo_a einsum).
-fn dequantHost(alloc: std.mem.Allocator, q: *const Q, len: usize, s: mlx.mlx_stream) ![]f32 {
-    var d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(d);
-    const empty = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(empty);
-    try mlx.check(mlx.mlx_dequantize(&d, q.w, q.s, q.b, mlx.mlx_optional_int.some(@intCast(q.qp.group_size)), mlx.mlx_optional_int.some(@intCast(q.qp.bits)), "affine", empty, mlx.mlx_optional_dtype{}, s));
-    return toHostF32(alloc, d, len, s);
-}
-
 /// out[m, n] = x[m, k] @ w[n, k]ᵀ — naive host matmul (correctness mode).
 fn matHost(out: []f32, x: []const f32, w: []const f32, m: usize, k: usize, n: usize) void {
     for (0..m) |i| {

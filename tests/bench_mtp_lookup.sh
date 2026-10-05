@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # bench_mtp_lookup.sh — the MTP prompt-lookup workload: agent-style copies and edits of a file in
 # context, plus tasks that copy nothing. A benchmark driver, NOT a test.
 #
 #   tests/bench_mtp_lookup.sh <label> <model-dir> [extra sushi flags...]   one boot, one arm
 #   tests/bench_mtp_lookup.sh --compare <run-dir-A> <run-dir-B> [...]      paired table of runs
 #
-# One arm per boot: `SUSHI_MTP_LOOKUP` is read once per process. An A/B is A B B A, e.g.
-#   scripts/gpu-lock.sh acquire lookup-ab && SUSHI_MTP_LOOKUP=0 taskpolicy -a tests/bench_mtp_lookup.sh A <pack>; scripts/gpu-lock.sh release lookup-ab
+# One arm per boot: `--no-mtp-lookup` is read once per process. An A/B is A B B A, e.g.
+#   scripts/gpu-lock.sh acquire lookup-ab && taskpolicy -a tests/bench_mtp_lookup.sh A <pack> --no-mtp-lookup; scripts/gpu-lock.sh release lookup-ab
 #   scripts/gpu-lock.sh acquire lookup-ab && taskpolicy -a tests/bench_mtp_lookup.sh B <pack>; scripts/gpu-lock.sh release lookup-ab
 # A third boot with `--no-mtp` (label S) turns the compare's greedy byte line into the serial bar.
 # Speeds are the server's own `timings.predicted_per_second`; each request's `[spec-stats]` lines
 # are cut from the server log. The arm is proven by `lookup=R/D/L` and the one-shot
-# `[mtp] prompt-lookup drafts engaged` line, never by the launch env.
+# `[mtp] prompt-lookup drafts engaged` line, never by the launch flags.
 #
 # Env: TASKS (comma list, default all), PORT (11377), BIN (./zig-out/bin/sushi), REPS (2), MAX_TOKENS (2048), THINK (0: thinking
 # off, so the answer is the copy), SAMPLED (1: also a seeded sampled pass), LONG (0; 1 adds the
@@ -66,7 +67,7 @@ LOG="$OUT/server.log"
 
 {
     echo "{\"label\":\"$LABEL\",\"model\":\"$(basename "$MODEL")\",\"commit\":\"$(git rev-parse --short HEAD 2>/dev/null)\","
-    echo "\"binary_mtime\":\"$(stat -f %Sm "$BIN" 2>/dev/null)\",\"SUSHI_MTP_LOOKUP\":\"${SUSHI_MTP_LOOKUP-unset}\","
+    echo "\"binary_mtime\":\"$(stat -f %Sm "$BIN" 2>/dev/null)\","
     echo "\"reps\":${REPS:-2},\"max_tokens\":${MAX_TOKENS:-2048},\"think\":${THINK:-0},\"long\":${LONG:-0},\"flags\":\"$*\"}"
 } >"$OUT/meta.json"
 

@@ -47,6 +47,7 @@ doc for the area before changing it, and update it in the same landing.
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, ownership, media |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, `__metadata__` stamp, window, g-scale in `suh`, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | roofline, recorded tok/s tables with binaries and settings, ruled-out levers |
+| [docs/bench/v1.2.0-dev/summary.md](docs/bench/v1.2.0-dev/summary.md) | version-pinned release context ladder and individual model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, KLD of every served pack |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
@@ -103,8 +104,8 @@ Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
 
-Flags that matter: `--model --serve --host --port --ctx-size --kv-quant --kv-attn-mode --mtp --no-mtp --mtp-depth
---mtp-head-kv-quant --max-mtp-ctx --ssd-budget-gb --expert-cache-gb --prefix-cache-entries --prefix-cache-mem
+Flags that matter: `--model --serve --host --port --ctx-size --kv-quant --kv-attn-mode --mtp --no-mtp --mtp-min-depth
+--mtp-max-depth --mtp-head-kv-quant --max-mtp-ctx --ssd-budget-gb --expert-cache-gb --prefix-cache-entries --prefix-cache-mem
 --prefix-cache-disk --prefill-chunk --max-concurrent --max-tokens --timeout --reasoning-budget --preserve-thinking
 --wired-margin-gib --skip-mem-preflight --metrics --api-key --model-dir --log-level --log-file --parent-pid`. `--help`
 lists the rest.

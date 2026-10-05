@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: POST /v1/models/rescan absorbs models downloaded AFTER boot.
 #
 # Discovery walks the --model-dir roots ONCE at startup, so a model the app's

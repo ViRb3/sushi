@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_mlx_staged_nax.sh — static guard for the self-built, NAX-enabled MLX runtime.
 #
 # sushi pins mlx + mlx-c as git submodules and builds them via

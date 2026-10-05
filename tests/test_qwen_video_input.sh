@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Qwen3-VL video input end-to-end over HTTP: a `video_url` content block
 # carrying multiple DISTINCT frame images (house / robot / street signs / a
 # "not hot dog" app screenshot — no real video clip is checked into fixtures/,

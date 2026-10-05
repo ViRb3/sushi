@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_format_matrix.sh — cross-model-family format-correctness matrix.
 #
 # Live layer of the format test suite (the hermetic layer is

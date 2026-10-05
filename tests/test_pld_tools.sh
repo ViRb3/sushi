@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # PLD + tools equivalence test.
 #
 # Agent clients (Claude Code, the app's agent loop) send `tools` on every

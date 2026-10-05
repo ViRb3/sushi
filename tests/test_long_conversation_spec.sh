@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Long-conversation sliding-window regression for spec-decode.
 #
 # Build a single conversation that grows past the model's sliding window

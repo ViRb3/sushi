@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Usage: test_prefix_cache_disabled.sh MODEL [PORT] [extra server flags...]
 set -euo pipefail
 cd "$(dirname "$0")/.."

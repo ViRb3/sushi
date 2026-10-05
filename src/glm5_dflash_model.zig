@@ -92,14 +92,6 @@ pub const MlaTape = struct {
     }
 };
 
-fn mlaTree(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, mode: kda.ProjectionMode) !struct { output: Arr, tape: MlaTape } {
-    const rows = try mlaProject(layer, ops, x, cfg, mode);
-    var attended: [16]Arr = undefined;
-    var tape = try mlaAttend(layer, ops, rows, 0, cfg, state, parents, &attended);
-    errdefer tape.deinit();
-    return .{ .output = try mlaFinish(layer, ops, rows, attended[0..parents.len], cfg, mode), .tape = tape };
-}
-
 const MlaRows = struct { qa: Arr, latent: Arr, index_q: Arr, keys: Arr, index_weights: Arr, gates: Arr, broadcast: bool };
 
 /// Every MLA projection over all rows. The absorbed query keeps each row's one-row geometry

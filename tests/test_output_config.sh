@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: Anthropic `output_config` (the 2026 spelling Claude Code sends) is
 # honored on /v1/messages.
 #

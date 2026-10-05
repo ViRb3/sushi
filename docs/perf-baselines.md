@@ -192,7 +192,7 @@ NOT a quiet box (a system daemon at ~100% of one core). Greedy, 4 prompts x 256 
 <a id="mtp-lookup"></a>
 ## Flash-Next: prompt lookup inside the MTP round (2f1e4bf2 + the port)
 
-Arms of one binary per step: A = `SUSHI_MTP_LOOKUP=0`, B = lookup (c68b4cf7, ReleaseFast, sha256 848bd456…),
+Arms of one binary per step: A = `SUSHI_MTP_LOOKUP=0` (now `--no-mtp-lookup`), B = lookup (c68b4cf7, ReleaseFast, sha256 848bd456…),
 C = lookup with the line rule (6ea00e3f, sha256 ea4f6fd0…). M5 Max 128 GB, 2026-09-27, `tests/bench_mtp_lookup.sh`
 (a file of ~600 tokens in the prompt; thinking off; greedy, and sampled 0.6 / 0.95 / 20 seed 7; 2 reps per boot),
 `--ctx-size 131072 --kv-quant 8 --prefix-cache-entries 0`, `SUSHI_ROUND_COST_PERSIST=0`, MTP and exact acceptance at
@@ -837,7 +837,7 @@ tok/s over the four runs per arm:
 - Each boot's second rep runs fewer lookups (33 vs 66) at +10-18%: the rep0 prose request trains the model's round
   table to narrow MTP widths, and the gate prices the MTP chain at the plan's base width with the request's
   MTP-round acceptance.
-- Lookup alone at three drafts (ae92c897, `SUSHI_MTP_LOOKUP=0|1`, A B B A, busy box) was neutral: the three heads
+- Lookup alone at three drafts (ae92c897, `SUSHI_MTP_LOOKUP=0|1` (now `--no-mtp-lookup`), A B B A, busy box) was neutral: the three heads
   already land ~3.9 tokens per round on a verbatim copy, and a three-draft lookup round (47-51 ms) costs what an MTP
   round does.
 
@@ -1153,7 +1153,62 @@ Live runs:
 - Residual n42 cost, same session, new binary, forward meter: 2.6bpw vs 3bpw read 17.93 vs 17.80 ms at 1 row, and
   28.72 vs 27.04 ms at 4 verify rows.
 - Greedy 1024-token outputs are byte-identical across arms: MiMo 8/8, Sushi-2.6bpw 4/4.
+- `4ca5ece4` (rates K1 to K8, in v1.1.0) lost the n42 gain again; [exl3-lane-third-word](#exl3-lane-third-word)
+  restores it.
 
+<a id="exl3-lane-third-word"></a>
+## EXL3 decode lane: the third word loads on every lane (Sushi-2.6bpw n42)
+
+`4ca5ece4` put the decode lane's third-word load behind `s != 0` (a lane whose window ends on a word boundary needs
+no third word). Every byte stayed the same, but at each rate whose lane reads a third word (n42 to n62 but n48) the
+pair GEMV took twice as long and the fused-mid down 1.5 times as long. Sushi-2.6bpw forwards ran 13-15% slower
+(bisected against its parent `632d5b5b`). This change loads the word on every lane again. Rates whose lane reads
+no third word (MiMo and GLM-2.3bpw n36, GLM-2.5bpw n40, Sushi-3bpw n48, Sushi-4bpw n64) compile to the same AIR in
+both arms.
+
+Setup: M5 Max 128 GB, 2026-10-05, fans at max, `taskpolicy -a`, GPU lock `qwen-fix`, interleaved on the FIFO lock
+with another worker's boots. Base = main `f21637dc` (binary SHA-256 `fd0e9e21`); fix = base plus this change's reader
+line (`fc613aa3`); the llmprobe boot and the last two MiMo boots ran the whole change (`f42f57b5`). All ReleaseFast.
+
+Kernel microbench (scratch harness, not landed): 47 dependent steps per chain; the tree's kernel and the same
+source over the base reader, interleaved in one process; median of 11, net of a copy-only chain. Flash-Next
+geometry (E=512, 2560 -> 640, top-10), MCG w15, us per step, base -> fix:
+
+| rate | rows | pair GEMV | fused-mid down |
+|---|---|---|---|
+| n42 | 1 | 74.4 -> 36.9 | 31.2 -> 20.6 |
+| n42 | 4 | 208.4 -> 114.8 | 105.0 -> 71.2 |
+| n44 | 1 | 70.8 -> 37.6 | 33.3 -> 21.0 |
+| n56 | 1 | 73.9 -> 37.9 | 34.3 -> 21.7 |
+| n48, no third word | 1 | 32.4 / 31.1 | 18.8 / 18.8 |
+
+Forward meter (`SUSHI_DECODE_FWD_UBENCH=50`, `SUSHI_DECODE_FWD_UBENCH_S=1,2,3,4,6`, `--no-mtp --kv-quant 8
+--ctx-size 131072`), ms per forward. Sushi-2.6bpw is A B B A; the parent row is the bisect worker's same-day pair.
+Sushi-4bpw took one boot per arm.
+
+| pack, arm | 1 row | 2 rows | 3 rows | 4 rows | 6 rows |
+|---|---|---|---|---|---|
+| Sushi-2.6bpw, base | 21.45 / 21.46 | 25.50 / 25.91 | 30.61 / 30.47 | 35.49 / 36.84 | 44.94 / 48.58 |
+| Sushi-2.6bpw, fix | 18.89 / 18.84 | 22.59 / 23.45 | 25.93 / 26.51 | 30.81 / 30.90 | 39.79 / 40.35 |
+| Sushi-2.6bpw, parent `632d5b5b` | 19.16 / 19.20 | 24.73 / 24.91 | 27.50 / 27.87 | 32.16 / 32.63 | 42.98 / 43.73 |
+| Sushi-4bpw, base / fix | 16.82 / 16.78 | 21.19 / 21.33 | 24.84 / 24.92 | 29.07 / 29.08 | 38.13 / 38.19 |
+
+- MiMo Sushi-2.3bpw (n36, last layer n64), same meter, 1 row / 6 rows over seven boots: base 20.76, 20.64, 20.06 /
+  66.39, 54.09, 60.18; fix 21.87, 21.99, 20.28, 20.34 / 54.49, 55.51, 59.53, 61.49. The spread is boot to boot.
+- GLM-5.3 Sushi-2.3bpw (n36) and 2.5bpw (n40), `SUSHI_GLM_ROWS_UBENCH=24` at ctx 1024, one boot per arm, grouped
+  rows B=1 / B=4 in ms: 2.3bpw base 30.99 / 63.75, fix 30.35 / 62.01; 2.5bpw base 29.99 / 62.45, fix 31.10 / 64.88.
+  The second boot of each pair read faster.
+- MiMo's, GLM's and Sushi-4bpw's kernels are the same code in both arms. Sushi-3bpw is not on this box; its n48 reader
+  compiles to the same AIR in both arms.
+- At every even n from 32 to 64 the fix's pair GEMV and fused-mid down compile to the parent's LLVM IR (value names
+  stripped); the base differs at exactly the third-word rates.
+- Sushi-2.6bpw, `--mtp --ctx-size 131072 --kv-quant 8`, llmprobe 0.6.12 `--bench-only --rungs 2k`, one boot of the
+  whole change: decode 86.8 tok/s (80.8-94.4), prefill 1920 tok/s on the 2041-token prompt, first token 221 ms,
+  2.74 tokens per step at the 2.1k rung. The bisect worker's same-day decode cells (`--rungs 4k`, median of 7): parent
+  `632d5b5b` 83.2 / 83.4, `4ca5ece4` 70.6 / 71.3 tok/s.
+- The guard test `every K2 to K4 rate decodes within a margin of n48` reads n42 at 1.73 over n48 on the base reader.
+  On the fix, n32 to n62 read 0.92-1.19 quiet and up to 1.25 with three copies contending; n64 reads 1.34-1.41.
+  Its limits are 1.4, and 1.8 for n64.
 
 <a id="gdn-verify-fold"></a>
 ## Flash-Next: GDN verify epilogues in the recurrence
@@ -1340,16 +1395,38 @@ per step). Four concurrent requests decode 44 tok/s in aggregate against ~34 alo
 the `4fcb541e` table in [arch-glm5-next](arch-glm5-next.md#recorded-performance).
 
 <a id="mtp-depth-policy"></a>
-## MTP depth policy (acceptance EMAs below 8k KV)
+## MTP depth policy: one chunk from acceptance EMAs below 8k KV (reverted)
 
-Commit 81c36bb5, Sushi-2.6bpw, kv8, ctx 32768, solo greedy 256 tokens, 5 reps per prompt, `taskpolicy -a`, lock
-`qport-mtp`, shared box. A = accept policy, B = the previous planner (a pre-removal env switch, `SUSHI_MTP_DEPTH_POLICY=legacy`), boots A B B A, median tok/s:
+c3f29b8e planned a Qwen round below 8192 KV as ONE chunk priced from the acceptance EMAs, with no chunk B; it landed on
+a +2% average from solo 256-token prompts on Sushi-2.6bpw (ctx 32768), within the ~5% drift of its own boots. It never
+shipped and is reverted.
 
-| prompt | A1 | B1 | B2 | A2 |
+Its parent 1193f72f against it on Sushi-4bpw (settings below), decode cell median of 7, A B B A: 87.4 / 82.3 against
+77.4 / 73.3. The EMAs drove depth ~5 rounds (m_avg 5.06, no extension) at 48.3 ms per round, against m_avg 2.42 with
+chunk B at 31.8 ms. With the depth pinned at 3 (`SUSHI_MTP_FORCE_DEPTH=3`), 06a3187b matched v1.1.1 711572e9: decode
+93.8 / 94.3 against 92.4 / 90.6, round 33 ms on both.
+
+The revert against main, 26ef54dc against this change, both ReleaseFast, `--mtp --ctx-size 131072` kv8, llmprobe 0.6.12
+`--bench-only --rungs 2k,16k --runs 3`, `SUSHI_MTP_TRACE=1` on every arm, `taskpolicy -a`, lock per boot, fans max,
+quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
+
+| pack, cell | main | revert | revert | main |
 |---|---|---|---|---|
-| code | 83.4 | 78.2 | 75.6 | 76.5 |
-| prose | 62.0 | 62.9 | 61.0 | 61.6 |
-| echo | 93.6 | 96.2 | 90.6 | 92.5 |
-| mixed | 71.8 | 66.6 | 66.7 | 68.6 |
+| Sushi-4bpw, decode | 87.9 | 87.1 | 91.2 | 77.3 |
+| Sushi-4bpw, 2k rung | 85.2 | 80.0 | 75.0 | 79.0 |
+| Sushi-4bpw, 16k rung | 82.3 | 80.4 | 79.7 | 79.6 |
+| Sushi-2.6bpw, decode | 90.8 | 85.2 | 76.4 | 83.4 |
+| Sushi-2.6bpw, 2k rung | 81.7 | 84.4 | 82.4 | 82.1 |
+| Sushi-2.6bpw, 16k rung | 82.3 | 77.9 | 81.0 | 82.9 |
 
-Output hashes are identical in all four boots. A logs `ext_rounds=0`, B extends. About +2% average, code +4%, mixed +5%, prose/echo flat, within ~5% boot drift.
+- On 4bpw's decode prompt main's rounds run m_avg 5.11 / 4.43 at 43.0 / 45.0 ms with no extension, the revert's
+  m_avg 2.64 / 3.13 at 32.3 / 36.6 ms with extensions on 13-15% of rounds.
+- On 4bpw's 2k rung the one-chunk plan accepts more per round at a similar round time (2.70 / 2.31 against 1.75 /
+  2.48), so it wins there.
+- On 2.6bpw it does not go deep (m_avg 3.2) and tokens per ms are equal.
+- Above 8192 KV both arms run the same planner. Against v1.1.1 on 4bpw in other boots that day (decode 80.8-89.4,
+  2k rung 76.1-82.5; llmprobe 0.6.12 and 0.6.13) the revert is at parity.
+
+## v1.2.0-dev release context ladder
+
+[Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.

@@ -19,26 +19,32 @@ fn replace(comptime source: []const u8, comptime old: []const u8, comptime value
 }
 const SOURCE = replace(replace(support.source, "uint win = uint(threadgroup_position_in_grid.y);", "uint win = uint(threadgroup_position_in_grid.x);"), "uint(threadgroup_position_in_grid.x) * 128u + sg * 32u", "uint(threadgroup_position_in_grid.y) * 128u + sg * 32u");
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
-const Config = struct { input: c_int, output: c_int, value: mlx.mlx_fast_metal_kernel_config };
-var configs: [2]?Config = @splat(null);
+const Config = struct { input: c_int, output: c_int, rate: c_int, value: mlx.mlx_fast_metal_kernel_config };
+var configs: [8]?Config = @splat(null);
 fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, starts: Arr, live: Arr, windows: c_int) !Arr {
     const k = mlx.getShape(x)[1];
     const n = mlx.getShape(bank)[2] * 16;
+    const rate = mlx.getShape(bank)[3];
     var cached: ?mlx.mlx_fast_metal_kernel_config = null;
-    for (configs) |entry| if (entry) |e| if (e.input == k and e.output == n) {
+    for (configs) |entry| if (entry) |e| if (e.input == k and e.output == n and e.rate == rate) {
         cached = e.value;
     };
+    var owned = false;
     const cfg = cached orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ 16384, n }, 2, .float16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
-        inline for (.{ "IDIM", "ODIM", "NHW", "WIN" }, .{ k, n, @as(c_int, 36), @as(c_int, 32) }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, value));
+        inline for (.{ "IDIM", "ODIM", "NHW", "WIN" }, .{ k, n, rate, @as(c_int, 32) }) |name, value| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, value));
         for (&configs) |*entry| if (entry.* == null) {
-            entry.* = .{ .input = k, .output = n, .value = c };
+            entry.* = .{ .input = k, .output = n, .rate = rate, .value = c };
             break :blk c;
         };
-        return error.GlmGridConfigCacheFull;
+        owned = true;
+        break :blk c;
+    };
+    defer if (owned) {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * windows, @divExact(n, 128), 1));
     if (kernel == null) kernel = try support.makeKernel(SOURCE);
@@ -58,7 +64,6 @@ fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr
     inline for (.{ .{ "gate", 4096, 2048 }, .{ "up", 4096, 2048 }, .{ "down", 2048, 4096 } }) |entry| {
         const p = @field(bank, entry[0]);
         api.validateClampedProjection(p, 288, entry[1], entry[2]) catch return false;
-        if (mlx.getShape(p.trellis)[3] != 36) return false;
     }
     return true;
 }
@@ -131,4 +136,105 @@ test "GLM prefill grid declines guards before dispatch" {
     try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 9)) == null);
     try std.testing.expect((try tryMoe(mlx.gpuStream(), nil, bank, nil, nil, .{ .codebook = .mcg, .window = .w12 }, 10)) == null);
     try std.testing.expectEqual(count, dispatchCount());
+}
+
+const Owned = struct {
+    list: std.ArrayList(*Arr) = .empty,
+    fn deinit(self: *Owned) void {
+        for (self.list.items) |a| {
+            _ = mlx.mlx_array_free(a.*);
+            std.testing.allocator.destroy(a);
+        }
+        self.list.deinit(std.testing.allocator);
+    }
+    fn slot(self: *Owned) !*Arr {
+        const a = try std.testing.allocator.create(Arr);
+        a.* = mlx.mlx_array_new();
+        self.list.append(std.testing.allocator, a) catch |e| {
+            std.testing.allocator.destroy(a);
+            return e;
+        };
+        return a;
+    }
+    fn own(self: *Owned, value: Arr) !*Arr {
+        const a = try self.slot();
+        _ = mlx.mlx_array_free(a.*);
+        a.* = value;
+        return a;
+    }
+};
+
+fn testProj(o: *Owned, s: mlx.mlx_stream, input: c_int, output: c_int, rate: c_int, seed: u32) !api.Proj {
+    const key = try o.slot();
+    try mlx.check(mlx.mlx_random_key(key, seed));
+    const trellis = try o.slot();
+    try mlx.check(mlx.mlx_random_bits(trellis, &[_]c_int{ 288, @divExact(input, 16), @divExact(output, 16), rate }, 4, 2, key.*, s));
+    const lo = try o.slot();
+    try mlx.check(mlx.mlx_astype(lo, (try o.own(mlx.mlx_array_new_float(-0.2))).*, .float16, s));
+    const hi = try o.slot();
+    try mlx.check(mlx.mlx_astype(hi, (try o.own(mlx.mlx_array_new_float(0.2))).*, .float16, s));
+    const suh = try o.slot();
+    try mlx.check(mlx.mlx_random_uniform(suh, lo.*, hi.*, &[_]c_int{ 288, input }, 2, .float16, key.*, s));
+    const svh = try o.slot();
+    try mlx.check(mlx.mlx_random_uniform(svh, lo.*, hi.*, &[_]c_int{ 288, output }, 2, .float16, key.*, s));
+    return .{ .trellis = trellis.*, .suh = suh.*, .svh = svh.* };
+}
+
+/// The grid chain must return the sorted chain's bytes; `skewed` piles half the tokens on eight experts.
+fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool) !void {
+    const s = mlx.gpuStream();
+    if (!support.available()) return error.SkipZigTest;
+    // Each rate allocates several GB of trellis; return it before the next case.
+    defer _ = mlx.mlx_clear_cache();
+    var o: Owned = .{};
+    defer o.deinit();
+    const bank = api.Bank{
+        .gate = try testProj(&o, s, 4096, 2048, rates[0], 11),
+        .up = try testProj(&o, s, 4096, 2048, rates[1], 13),
+        .down = try testProj(&o, s, 2048, 4096, rates[2], 17),
+    };
+    const key = try o.slot();
+    try mlx.check(mlx.mlx_random_key(key, 19));
+    const x32 = try o.slot();
+    try mlx.check(mlx.mlx_random_normal(x32, &[_]c_int{ 1, 2048, 4096 }, 3, .float32, 0, 1, key.*, s));
+    const x = try o.slot();
+    try mlx.check(mlx.mlx_astype(x, x32.*, .bfloat16, s));
+    var id_data: [2048 * 8]u32 = undefined;
+    var score_data: [2048 * 8]f32 = undefined;
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+    for (0..2048) |t| {
+        const span: u32 = if (skewed and t % 2 == 0) 8 else 288;
+        var taken: [8]u32 = undefined;
+        for (0..8) |j| {
+            var e = rnd.uintLessThan(u32, span);
+            while (std.mem.indexOfScalar(u32, taken[0..j], e) != null) e = (e + 1) % span;
+            taken[j] = e;
+            id_data[t * 8 + j] = e;
+            score_data[t * 8 + j] = rnd.float(f32) + 0.1;
+        }
+    }
+    const ids = try o.own(mlx.mlx_array_new_data(&id_data, &[_]c_int{ 1, 2048, 8 }, 3, .uint32));
+    const scores = try o.own(mlx.mlx_array_new_data(&score_data, &[_]c_int{ 1, 2048, 8 }, 3, .float32));
+    const dec = api.format.Decode{ .codebook = .mcg, .window = .w12 };
+    const want = try o.own(try api.moeClamped(s, x.*, bank, ids.*, scores.*, dec, 10));
+    const before = dispatchCount();
+    const got = try o.own((try tryMoe(s, x.*, bank, ids.*, scores.*, dec, 10)) orelse return error.TestExpectedGlmGrid);
+    try std.testing.expectEqual(before + 1, dispatchCount());
+    try mlx.check(mlx.mlx_array_eval(want.*));
+    try mlx.check(mlx.mlx_array_eval(got.*));
+    try std.testing.expectEqual(mlx.mlx_array_dtype(want.*), mlx.mlx_array_dtype(got.*));
+    const count = mlx.mlx_array_size(want.*);
+    try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(want.*).?[0..count], mlx.mlx_array_data_bfloat16(got.*).?[0..count]);
+}
+
+test "GLM prefill grid serves every admitted rate, mixed projections included, with the sorted chain's bytes" {
+    const expert = @import("expert_exl3.zig");
+    var n: c_int = expert.Rate.min_n;
+    while (n <= expert.Rate.max_n) : (n += 2) {
+        try gridMatchesSortedChain(.{ n, n, n }, @mod(n, 8) == 0);
+    }
+    try gridMatchesSortedChain(.{ 40, 40, 36 }, true);
+    try gridMatchesSortedChain(.{ 36, 40, 48 }, false);
+    try gridMatchesSortedChain(.{ 32, 64, 40 }, true);
 }

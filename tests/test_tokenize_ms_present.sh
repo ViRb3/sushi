@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_tokenize_ms_present.sh — Iteration 1 of overnight perf push.
 #
 # The Phase 4 "instrumentation first" rule says: before we move chat-template

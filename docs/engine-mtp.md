@@ -30,8 +30,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - Per-request state is a `Qwen4MtpState` swapped onto the module (`qwen4MtpActivate` before EVERY head touch);
   nothing is module-owned, so MTP slots are not exclusive.
 - `--no-mtp` gates the IN-CHECKPOINT head too (`entry.mtp` reads `mtpChoiceFor`, logged `[mtp] on|off (<source>)`);
-  an explicit `--mtp`/`--no-mtp` beats `model-settings.json` `mtp`. An explicit `--mtp` is refused while
-  streaming; the engine default resolves off ([engine-expert-streaming](engine-expert-streaming.md)).
+  an explicit `--mtp`/`--no-mtp` beats `model-settings.json` `mtp`. A streamed Sushi EXL3 Qwen pack keeps the head resident by
+  default ([engine-expert-streaming](engine-expert-streaming.md)); other streamed models resolve it off.
 
 <a id="mimo"></a>
 ## MiMo's three heads
@@ -120,12 +120,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   before relying on either reading.
 - **Off NAX (M1-M4) a qwen4 verify row is ~47% of a forward** (~16 ms of ~34 on an M2 Max; the M5 Max ~26%), spread
   over experts, GDN, HC and attention, so MTP nets ~1.1-1.35x there ([perf-baselines](perf-baselines.md#m2max-decode)).
-- Acceptance is a PROMPT-TYPE property (code ≫ prose; `SUSHI_MTP_FORCE_DEPTH=n` + `acc_idx=` on `[mtp-trace]`).
+- Acceptance is a PROMPT-TYPE property (code ≫ prose; `--mtp-min-depth n --mtp-max-depth n` + `acc_idx=` on `[mtp-trace]`).
 - **MTP is ON by default for both served models** (owner policy, `server.defaultEnableMtp` `served`): a request
   that omits `enable_mtp` runs the loaded head. `--no-mtp`, `"mtp": false` in `model-settings.json` or
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
-  `scheduler.mtpDefaultOffUnderStreaming`) and an explicit `--mtp` there still refuses. The load-time bill prices the head's
-  KV whenever it runs by default (`server.mtpHeadDefaultOn`).
+  `scheduler.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
+  head's KV whenever it runs by default (`server.mtpHeadDefaultOn`).
 - **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default, `SUSHI_MTP_GROUP_PLANNER`;
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis
   verify) when it prices one cheaper, and `mtpRoundsStaySolo` does not gate it. Only when the planner declines the
@@ -145,12 +145,30 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   restores the full readout). A greedy target drafts the argmax (byte-identity contract); a sampled target draws
   from the re-scored top-32 (`mtpDraftStepPath`); draft temperature is per family.
 
+<a id="depth-range"></a>
+## Depth range
+
+- **`--mtp-min-depth N` / `--mtp-max-depth N` bound every depth the planner picks** (`src/mtp_depth_bounds.zig`): the
+  EV plan's base and extension (`mtpPlanInBounds`), the windowed controller, the grouped planner's row widths
+  (`plannerWidth`; a plain tick is not a depth and stays), the width trial, and a prompt lookup's draft count. Both are
+  1..8; `min > max` and the removed `--mtp-depth` exit at startup. The boot logs `[mtp] depth range lo..hi (source)`.
+- **Defaults are the planner's own**: min 1, max the cost profile's cap (8 on an eligible M5 NAX target, else 6, lower on
+  a measured per-silicon row, 3 under `SUSHI_MTP_ADAPTIVE=0`). An explicit max is also the table's ceiling (no
+  trusted-width climb past it), and a min above the default cap lifts it. A MiMo head count or verify row budget below
+  `--mtp-min-depth` wins over it.
+- **`min == max` pins one depth**: every round drafts it, with no EV plan, EV seed, depth demotion or sticky disable
+  (the byte bar's and the acceptance meter's mode, `acc_idx=` on `[mtp-trace]`); the round-cost table is not persisted.
+  A `min` above 1 also keeps the depth-1 sticky disable from ever firing.
+- **Calibrate per machine**: boot `--mtp-min-depth N --mtp-max-depth N` for each N on one prompt set (same boot rules as
+  [process-measurement](process-measurement.md)), read `[spec-stats]` tok/s per N, then set max where the curve turns
+  down and min where a shallower round never wins.
+
 <a id="lookup"></a>
 ## Prompt lookup inside the round
 
 - **A lookup stands in for the chain when the output copies its context** (`mtpLookupChain`, ported from mlx-serve
   #523/#533): the last 3 committed tokens plus t1 matched earlier in the prompt or output, agreeing back 8+ tokens,
-  make the drafts with no head forward. On by default for the qwen4 and MiMo heads; `SUSHI_MTP_LOOKUP=0` turns it off.
+  make the drafts with no head forward. On by default for the qwen4 and MiMo heads; `--no-mtp-lookup` turns it off (and GLM DFlash2's lookup chains with it; standalone PLD, `--pld`/`--no-pld`, is a separate switch that neither implies nor is implied by it).
 - **An ordinary match (suffix under 32) must agree past the start of a line**: a unified diff echoes the file's
   lines behind a `-`/`+`/space prefix, so its matches agree to the end of one line and fail at the next (-4.8% on
   the diff before the rule, -1.6% after). A line's own last token (`):\n`) agrees whatever the next line starts
@@ -172,8 +190,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
 - **On MiMo a lookup drafts no wider than its verify keeps decode rows** (`mtpLookupDraftCap` =
   `mtpVerifyDraftsMax(true)`); its stash append is the head-generic `mtpApplyStash`, and a lookup as round 1 leaves the
   prompt's lazy head catch-up to the next head forward, as an MTP round 1 does.
-- **Declined** under `SUSHI_MTP_FORCE_DEPTH` (the byte bar's measurement mode), for a batched head and in
-  planner-owned rounds; a serial block (adaptive serial past 32k) runs none either.
+- **Declined** for a batched head and in planner-owned rounds; a serial block (adaptive serial past 32k) runs none
+  either. An explicit depth range holds it: at most `--mtp-max-depth` drafts, and a lookup shorter than
+  `--mtp-min-depth` is declined, so a pinned depth takes only the lookups that fill it.
 - **Output**: greedy is serial byte for byte (every row is a decode tick's); sampled under `exact` keeps the target
   distribution, but seeded text differs from lookup-off because the draws land differently. A lookup round always
   verifies with `exact` (`acceptGraphFor`/`acceptPrefixFor`, keep the copy with probability p; MTP rounds keep the
@@ -202,15 +221,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   confidence, maybe extend to m_hi) against single-chunk at m_lo, each as round wall over tokens. A round emits 1..m+1
   tokens, so each shape is judged on the running mean of `MTP_REGIME_MIN_SAMPLES` rounds or more; a verdict on one
   round per shape judged acceptance luck (the 40-70 ms/tok first verdicts on Flash-Next, then 128 rounds throttled).
-- **Below 8192 KV (Qwen) the base depth plans from the acceptance EMAs** (`MtpDepthPolicy.accept`): the table prices
-  round TIME only, the plan is ONE chunk (no confidence read mid-round), and an untimed next width is probed at once.
-  Long context and MiMo keep the table-token planner with chunk B. Greedy bytes are unchanged. Sushi-2.6bpw kv8,
-  solo, A B B A across four boots: about +2% average, code +4%, mixed +5%, prose/echo flat, within ~5% boot drift
-  ([perf-baselines](perf-baselines.md#mtp-depth-policy)).
+- **The base plan reads the table's realized tokens and keeps the confidence-gated chunk B at every KV.** One chunk
+  planned from the acceptance EMAs below 8192 KV (never shipped, reverted) ran depth ~5 rounds on 4bpw's llmprobe decode
+  for -11% and won 6% on its 2k rung: a wash ([perf-baselines](perf-baselines.md#mtp-depth-policy)).
 - Persistence is OPT-IN (`SUSHI_ROUND_COST_PERSIST=1`); an A/B with the table live measures the TABLE, so set
   `=0` on BOTH arms. A round's wall is between round ENDS, so an interleaved prefill chunk drops the round clock too.
 - **The EV seed lives on `Qwen4Mtp`** (`ev_seed_accept`/`ev_seed_m_lo`), per loaded model; publish AND consume
-  decline under `SUSHI_MTP_FORCE_DEPTH`. `MtpCostProfile` comes from the runtime fingerprint
+  decline under a pinned depth. `MtpCostProfile` comes from the runtime fingerprint
   (`g17_nax_qwen4_q4_gs64`; `SUSHI_MTP_QWEN4_PROFILE=0` revokes it); unmeasured = generic/cap-6.
 - EXL3 packs take the chip's generic depth row (6 on M5 Max). A deeper round pays only on predictable text: at the
   MCG K3 round costs (31.2 / 36.0 / 42.4 ms at depth 1 / 2 / 3, ~5 ms per row after) and a ~20 ms serial token,
@@ -234,8 +251,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   (`test_mtp_equivalence_strict.py`); its servers boot `--prefix-cache-entries 0`.
 - **Sampled auto-mode output follows the round times**: the plan reads measured round costs, and the draft counts
   decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
-  SUSHI_MTP_COST_TABLE=0`, or `SUSHI_MTP_FORCE_DEPTH`).
-- Forced-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
+  SUSHI_MTP_COST_TABLE=0`, or a pinned depth).
+- Pinned-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
 - `SUSHI_MTP_DENSE_ROWS=1` stays off by default: one `test_mtp_equivalence.sh` run with it on failed (top-2 gap
   1.125 nats, a slow loaded run) and seven reruns passed ([perf-baselines](perf-baselines.md#m2max-decode)).
 
