@@ -134,6 +134,32 @@ pub fn compositeWith(ops: *Ops, q: Arr, kv_bank: Arr, mask: Arr, scale: f32, how
     try mlx.check(mlx.mlx_where(masked, try ops.reshape(mask, &.{ rows, 1, 2051 }), try gemm(ops, queries, try ops.transpose(kv, &.{ 0, 2, 1 }), how), try ops.scalar(-std.math.inf(f32), .float32), ops.s));
     return ops.reshape(try ops.cast(try gemm(ops, try ops.softmax(masked.*, -1), kv, how), .bfloat16), &.{ rows, 1, 64, 512 });
 }
+
+test "GLM block-masked composite batching preserves every B1 output bit" {
+    const s = mlx.gpuStream();
+    for (0..8) |case| {
+        var ops = Ops{ .s = s };
+        defer ops.deinit();
+        const key = try ops.slot();
+        try mlx.check(mlx.mlx_random_key(key, 1103 + case));
+        const q = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(q, &.{ 3, 64, 512 }, 3, .bfloat16, 0, if (case < 4) 0.05 else 2, key.*, s));
+        const bank = try ops.reshape(try ops.own(try latent_store.randomRows(3 * 2051, 512, 1201 + case, s)), &.{ 3, 2051, 512 });
+        var masks: [3 * 2051]bool = undefined;
+        for (&masks, 0..) |*valid, i| valid.* = case % 2 == 0 or switch (i / 2051) {
+            0 => i < 1024,
+            1 => i % 7 == 0,
+            else => i % 2051 == 2050,
+        };
+        const mask = try ops.own(mlx.mlx_array_new_data(&masks, &.{ 3, 2051 }, 2, .bool_));
+        const batched = try compositeWith(&ops, q.*, bank, mask, 1.0 / 16.0, .block_masked);
+        for (0..3) |r| {
+            const at: c_int = @intCast(r);
+            const one = try compositeWith(&ops, try ops.slice(q.*, 0, at, at + 1), try ops.slice(bank, 0, at, at + 1), try ops.slice(mask, 0, at, at + 1), 1.0 / 16.0, .block_masked);
+            try @import("glm5_attention.zig").expectSameBits(one, try ops.slice(batched, 0, at, at + 1));
+        }
+    }
+}
 /// Valid IDs must be unique per real query, as guaranteed by IndexPool selection.
 pub fn run(ops: *Ops, q: Arr, cache: Latent, selected: Arr, offset: usize, history: usize, scale: f32) !?Arr {
     const fused = @import("glm5_model.zig").naxArms();

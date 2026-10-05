@@ -1324,6 +1324,46 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-verify-final"></a>
+## GLM DFlash2: three/four-row verification, final combined result
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8 latent, async-four schedule.
+One ReleaseFast binary and model load, 40 alternating samples per width and arm after two warmups; fixed source-text
+prefixes and token chains. Timings include the vocabulary head and replay/capture arrays, exclude drafting and commit.
+GPU lock `codex-glm-final-model`, interactive QoS, maximum fans. Instrumented binary SHA256 prefix `c252977fe9625d03`.
+
+The original arm restores the pre-`83e1d799` QKV-only A6 hoist and its dynamic row offset. The final arm includes `83e1d799`, `d08b6ed1`,
+three/four-row FP32 attention batching, direct FP32 gathers, four-row value projections, and two-output A6 SIMD tiles.
+
+| Context tokens | Verify rows | Original ms/round | Final ms/round | Reduction |
+|---|---:|---:|---:|---:|
+| 1024 | 3 | 46.861 | 41.476 | 11.49% |
+| 8192 | 3 | 49.005 | 43.578 | 11.07% |
+| 1024 | 4 | 57.764 | 51.277 | 11.23% |
+| 8192 | 4 | 62.199 | 54.916 | 11.71% |
+
+One- and two-row controls stayed within 0.4%. Every arm matched complete logits, captures and replay arrays by byte
+hash at all four widths and both contexts. No draft-depth policy or quantization changed. Scratch remains capped at
+32 MiB per native MLA layer; the FP32 gather removes the intervening BF16 bank while preserving its rounding.
+The clean ReleaseFast build passed the complete suite: 3420 tests passed, 108 skipped, zero failures.
+
+### Wider drafting remains workload-dependent
+
+A separate live pilot used the preceding four-row candidate (before the final FP32-gather/tile combination), greedy
+sampling, lookup disabled, one warmup and four 256-token runs per cell. N2 means two drafts plus the root; N3 adds
+one draft. The bounded N3 readout projected only its three usable draft positions. All generated messages matched.
+
+| Workload | N2 tok/s | N3, full readout | N3, bounded readout |
+|---|---:|---:|---:|
+| Short code | 48.01 | 47.29 | 48.35 |
+| Code, 8035 prompt tokens | 40.32 | 35.81 | 36.45 |
+| Copy, 8042 prompt tokens | 52.18 | 52.11 | 53.03 |
+| Novel writing | 38.84 | 36.11 | 36.85 |
+
+Bounding readout saved about 1.1 ms of drafting, but N3 still lost on the longer code and novel-writing cells. The
+three-row default remains; the faster four-row verifier also serves existing lookup chains and mixed-request ticks.
+The N3 policy/readout experiment and benchmark switches were removed from production code.
+
 <a id="glm-three-row-a6-offset"></a>
 ## GLM DFlash2: specialize the complete three-row A6 tile
 

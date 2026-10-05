@@ -5,14 +5,14 @@ const Arr = mlx.mlx_array;
 const Ops = @import("glm5_model.zig").Ops;
 const Linear = @import("glm5_model.zig").Linear;
 // The per-row dot/update order is inherited from glm5_decode's MLX-derived qmv_fast.
-// The admitted three rows occupy one complete row tile, so its offset is constant.
+// Each admitted width occupies one complete row tile, so its offset is constant.
 const SOURCE =
     \\const int lane = int(thread_index_in_simdgroup);
-    \\const int output0 = int(threadgroup_position_in_grid.x) * 8 + int(simdgroup_index_in_threadgroup) * 4;
+    \\const int output0 = int(threadgroup_position_in_grid.x) * 8 + int(simdgroup_index_in_threadgroup) * 2;
     \\const int token0 = 0;
     \\const device uint8_t* codes = reinterpret_cast<const device uint8_t*>(w);
-    \\float result[R][4];
-    \\for (int m = 0; m < R; ++m) for (int r = 0; r < 4; ++r) result[m][r] = 0.0f;
+    \\float result[R][2];
+    \\for (int m = 0; m < R; ++m) for (int r = 0; r < 2; ++r) result[m][r] = 0.0f;
     \\for (int k = 0; k < K; k += 256) {
     \\  float local[R][8];
     \\  float sum[R];
@@ -35,7 +35,7 @@ const SOURCE =
     \\    }
     \\    }
     \\  }
-    \\  for (int r = 0; r < 4; ++r) {
+    \\  for (int r = 0; r < 2; ++r) {
     \\    const int output = output0 + r;
     \\    const int group = output * (K / 128) + k / 128 + lane / 16;
     \\    const float scale = float(scales[group]);
@@ -73,7 +73,7 @@ const SOURCE =
     \\    }
     \\  }
     \\}
-    \\for (int m = 0; m < R; ++m) for (int r = 0; r < 4; ++r) {
+    \\for (int m = 0; m < R; ++m) for (int r = 0; r < 2; ++r) {
     \\  const float value = simd_sum(result[m][r]);
     \\  if (lane == 0 && token0 + m < M) y[(token0 + m) * N + output0 + r] = bfloat(value);
     \\}
@@ -105,7 +105,7 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     if (!mlx.streamIsGpu(stream) or x.ctx == null or linear.w.ctx == null or linear.scales.ctx == null or linear.biases.ctx == null) return null;
     const sh = mlx.getShape(x);
     const ws = mlx.getShape(linear.w);
-    if (sh.len != 3 or sh[0] != 1 or sh[1] != 3 or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0) return null;
+    if (sh.len != 3 or sh[0] != 1 or (sh[1] != 3 and sh[1] != 4) or sh[2] < 256 or @mod(sh[2], 256) != 0 or ws.len != 2 or ws[0] < 8 or @mod(ws[0], 8) != 0) return null;
     const bits: c_int = if (ws[1] == @divExact(sh[2], 4)) 8 else if (@as(i64, ws[1]) * 16 == @as(i64, sh[2]) * 3) 6 else return null;
     if (bits != 6) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(linear.w) != .uint32 or !(try rowMajorReady(linear.w))) return null;
@@ -139,8 +139,8 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     if (cached == null) {
         const tile: c_int = if (key.m < 4) key.m else 4;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ 1, key.m, key.n }, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(key.n, 8) * 64, @divTrunc(key.m + tile - 1, tile), 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(key.n, 8) * 128, @divTrunc(key.m + tile - 1, tile), 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "M", key.m));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "N", key.n));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", key.k));
