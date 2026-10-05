@@ -222,6 +222,8 @@ Prefill KDA and trunk:
 Decode and verify:
 - One-token HC norm/mix fusion: −8% queued component, model 26.49 vs 26.54 tok/s; removed. Short-row HC collapse +
   RMS fusion: 0.4 µs per call, never integrated.
+- Whole HC prep in one kernel (RMS, 24 mixes, gates, collapse, sublayer norm; bit-exact, BF16 matrices read in place):
+  -5% serial before the 1-4 row SIMD32 collapse; on top of it 0 to +2% at B=1-4, 8K (`de867e94`).
 - Joined QKV dispatch (3–4 rows: +0.7–3.0%; later over the three hoisted A6 banks: −0.57%, 6/11): noise.
 - Raw A6 four-product unpack: +1.3% (5/11). A6 hoist on the output projection: −2.8%, 7/11, drifting.
 - Per-node packed NAX decode attention: +23–60%, 0/6 in all nine cases. Shared-factor split-8 merge: +2–5%.
