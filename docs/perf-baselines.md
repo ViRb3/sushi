@@ -1324,6 +1324,29 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-three-row-a6"></a>
+## GLM DFlash2: three-row A6 coefficient reuse beyond QKV
+
+2026-10-05, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw, A4 g64 assistant, kv8 latent.
+Parent `24da5f95`; instrumented ReleaseFast binary built 22:33:36 Asia/Bangkok, SHA256 prefix `216b3800ee543d2f`.
+GPU lock `codex-glm-verify`, `taskpolicy -a`, maximum fans and ten seconds idle before boot; no concurrent build or GPU job.
+
+One model load, 20 alternating old/new samples per depth after two warmups, fixed source-text prefix and token
+chain, async-four schedule. Timings include the vocabulary head and all replay/capture arrays, exclude drafting
+and commit. The isolated comparison is the original QKV-only hoist against the same kernel serving every
+supported three-row A6/group128 projection; attention is identical in these two arms.
+
+| Context tokens | Original verify ms/round | Expanded A6 verify ms/round | Reduction |
+|---|---:|---:|---:|
+| 1024 | 46.311 | 45.192 | 2.4% |
+| 8192 | 48.188 | 47.197 | 2.1% |
+
+Full-model logits, captures and replay tapes matched by byte hash at depths 1–4 in both contexts. The affine-row
+tests also compare every BF16 output against serial qmv and assert hoist engagement at the additional shapes.
+One-, two- and four-row dispatch remains unchanged. Fused QKV, alternate threadgroups, async-two scheduling
+and MLA batching experiments are not part of this change. This is a verification-time result, not a measured
+end-to-end throughput gain.
+
 <a id="glm-prefill-chunk"></a>
 ## GLM-5.3-Flash: prefill chunk 2048 against 4096 (observation, not a recorded number)
 

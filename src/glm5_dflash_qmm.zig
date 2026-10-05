@@ -177,7 +177,11 @@ test "GLM DFlash affine row tiles preserve serial qmv bits" {
             var scope = Ops{ .s = s };
             defer scope.deinit();
             const input = try scope.slice(x.*, 1, 0, rows);
+            const hoist = @import("glm5_dflash_a6_hoist.zig");
+            const hoist_before = hoist.dispatchCount();
             const actual = try scope.own((try project(s, input, linear)) orelse return error.TestExpectedGlmTreeQmm);
+            // Coefficient reuse must also engage beyond the Q/K/V shape.
+            try std.testing.expectEqual(hoist_before + @as(usize, if (bits == 6 and rows == 3) 1 else 0), hoist.dispatchCount());
             try mlx.check(mlx.mlx_array_eval(actual));
             if (rows > 1) {
                 const before = dispatchCount();
