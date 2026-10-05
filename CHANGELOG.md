@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **GLM-5.3 index scoring respects M1–M4 threadgroup limits without changing score bits**, avoiding a Metal launch failure on wider query groups.
 - **GLM-5.3-Flash joins Qwen3.8 and MiMo**: serve it, chat with `sushi run`, or drive it from the coding-agent
   launchers. Up to four requests decode together, DFlash2 drafting copies long verbatim spans four tokens per round,
   prompts are reused across turns from an SSD cache that is on by default and sizes itself (the RAM tier is opt-in with `--prefix-cache-mem`; the web UI shows the cache's use), and image/video input works. The 2.5bpw Sushi pack targets 128 GB
@@ -25,6 +26,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **More reliable under memory pressure and restarts**: memory admission, the SSD prompt cache and request metrics
   were hardened across the board, long GLM sessions no longer hang, leak or overrun memory, and the SSD prompt cache
   saves a long prompt whole on its first turn, so the next turn restores all of it.
+- **An idle streamed server no longer burns CPU**: its SSD-read workers park instead of spinning while no request is
+  running.
 
 ---
 
