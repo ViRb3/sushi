@@ -1325,26 +1325,26 @@ on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of 
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
 <a id="glm-three-row-a6-offset"></a>
-## GLM three-row A6: constant row offsets (component measurement)
+## GLM DFlash2: specialize the complete three-row A6 tile
 
-2026-10-05–06 (Asia/Bangkok), M5 Max 128 GB, native Sushi MLX runtime, parent `83e1d799`. The helper admits one complete
-three-row tile. Fixing its row offset at zero lets Metal remove masked loads without changing the dot-product order.
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8 latent.
+Parent `83e1d799` against `d08b6ed1`'s constant row offset. The helper admits exactly three rows and dispatches one
+complete row tile; fixing its offset at zero lets Metal remove unreachable masked loads without changing arithmetic.
 
-Synthetic A6/group128 banks rotate through at least 160 MiB (the full vocabulary bank is larger). Sixty randomized
-reference/candidate/unchanged-control comparisons per shape, `taskpolicy -a`, GPU lock `codex-glm-a6-bounds` or
-`codex-glm-head-micro`. Hot box; a CPU build overlapped part of the first run. Figures are paired median reductions
-in component build/evaluate/free time, not whole-model verification or throughput results.
+One ReleaseFast instrumented binary, one model load, fixed source-text prefixes and token chains, async-four schedule.
+Forty alternating samples per depth after two warmups; includes the vocabulary head and all replay/capture arrays,
+excludes drafting and commit. GPU lock `codex-glm-bounds-model`, `taskpolicy -a`, maximum fans, no concurrent build
+or GPU job. Timing run began 02:13 Asia/Bangkok at 45°C. Instrumented binary SHA256 prefix: `f12465f57a687268`.
 
-| Projection, output × input | Component reduction | Faster pairs |
-|---|---:|---:|
-| 8192 × 4096 | 14.9% | 59/60 |
-| 4096 × 8192 | 9.5% | 58/60 |
-| 4096 × 16384 | 12.1% | 59/60 |
-| 2048 × 4096 | 6.1% | 60/60 |
-| 154880 × 4096 | 11.0% | 60/60 |
+| Context tokens | Original verify ms/round | Constant offset ms/round | Reduction | Paired saving, 95% CI (ms) |
+|---|---:|---:|---:|---:|
+| 1024 | 44.505 | 42.077 | 5.46% | 2.428 ± 0.033 |
+| 8192 | 46.166 | 43.661 | 5.43% | 2.505 ± 0.152 |
 
-Every output bit matched; unchanged-control medians stayed within 0.6%. The GLM suite passed 310 tests with
-3 skips. Full-model verification timing remains pending while conversion uses the box.
+Unaffected one-, two- and four-row controls stayed within 0.6%. Full-model logits, captures and replay tapes matched
+by byte hash at every measured depth in both contexts; the 128-token greedy response also matched the earlier baseline.
+The clean build passed 310 GLM/EXL3 tests with 3 skips. This is an additional verification-time gain over the preceding
+A6 coefficient-reuse change below; no end-to-end throughput gain is inferred from this table.
 
 <a id="glm-three-row-a6"></a>
 ## GLM DFlash2: three-row A6 coefficient reuse beyond QKV
