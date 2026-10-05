@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Concurrent OpenAI completions and Anthropic messages get distinct response IDs**, including when the wall clock repeats or moves backwards.
 - **GLM-5.3 index scoring respects M1–M4 threadgroup limits without changing score bits**, avoiding a Metal launch failure on wider query groups.
 - **GLM-5.3-Flash joins Qwen3.8 and MiMo**: serve it, chat with `sushi run`, or drive it from the coding-agent
   launchers. Up to four requests decode together, DFlash2 drafting copies long verbatim spans four tokens per round,

@@ -42,6 +42,31 @@ const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 const stop_sequences = @import("stop_sequences.zig");
 
+test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
+    const Worker = struct {
+        fn run(counter: *std.atomic.Value(i64), ids: *[64]i64) void {
+            for (ids) |*id| id.* = @import("server.zig").nextCompletionId(counter, 1234);
+        }
+    };
+    var counter = std.atomic.Value(i64).init(0);
+    var ids: [8][64]i64 = undefined;
+    {
+        var threads: [ids.len]std.Thread = undefined;
+        var started: usize = 0;
+        defer for (threads[0..started]) |thread| thread.join();
+        for (&threads, 0..) |*thread, i| {
+            thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &counter, &ids[i] });
+            started += 1;
+        }
+    }
+    var flattened: [ids.len * ids[0].len]i64 = undefined;
+    for (ids, 0..) |row, i| @memcpy(flattened[i * row.len ..][0..row.len], &row);
+    std.mem.sort(i64, &flattened, {}, std.sort.asc(i64));
+    for (flattened[1..], flattened[0 .. flattened.len - 1]) |current, previous| {
+        try testing.expect(current != previous);
+    }
+}
+
 test "format corpus: late system notes never vanish, and a template that places them keeps history a prefix" {
     // `in_place` templates render a late note where it was sent (the stock Qwen ones through the
     // adapter); the rest fold it into the leading turn, which rewrites earlier bytes by design.

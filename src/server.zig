@@ -57,6 +57,7 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 /// detached conn thread still in `Scheduler.complete` would otherwise race
 /// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
 var active_conn_threads = std.atomic.Value(u32).init(0);
+var completion_id_counter = std.atomic.Value(i64).init(0);
 /// Set from main.zig before serve() is called when --metrics is on; null
 /// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
 /// routes. When null, `/metrics*` return 503.
@@ -230,6 +231,15 @@ const nowSecs = io_util.nowSecs;
 const nowMs = io_util.nowMs;
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const Stopwatch = io_util.Stopwatch;
+
+/// Clock ties and rollback must not alias independent response envelopes.
+pub fn nextCompletionId(counter: *std.atomic.Value(i64), now_ms: i64) i64 {
+    var previous = counter.load(.monotonic);
+    while (true) {
+        const next = @max(now_ms, previous + 1);
+        previous = counter.cmpxchgWeak(previous, next, .monotonic, .monotonic) orelse return next;
+    }
+}
 
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
 /// transport instead of HTTP/SSE. When `Conn.ws_mode` is set, `sendResponse`
@@ -10143,7 +10153,7 @@ fn handleNonStreamingCompletion(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
-        nowMs(stream.io),
+        nextCompletionId(&completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
         model_name,
         escaped_text,
@@ -10180,7 +10190,7 @@ fn handleStreamingCompletion(
     cache_key: u64,
     kv_quant_override: ?transformer_mod.KVQuantConfig,
 ) !void {
-    const cmpl_id = nowMs(stream.io);
+    const cmpl_id = nextCompletionId(&completion_id_counter, nowMs(stream.io));
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
@@ -10894,7 +10904,7 @@ fn handleNonStreamingGeneration(
             const response = try std.fmt.allocPrint(allocator,
                 \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
             , .{
-                nowMs(stream.io),
+                nextCompletionId(&completion_id_counter, nowMs(stream.io)),
                 nowSecs(stream.io),
                 model_name,
                 tc_content_json,
@@ -10984,7 +10994,7 @@ fn handleNonStreamingGeneration(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
     , .{
-        nowMs(stream.io),
+        nextCompletionId(&completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
         model_name,
         escaped_text,
@@ -11404,7 +11414,7 @@ fn handleStreamingGeneration(
     defer if (ve_local) |arr| disposeVision(arr);
 
     const config = lm.config.?;
-    const chat_id = nowMs(stream.io);
+    const chat_id = nextCompletionId(&completion_id_counter, nowMs(stream.io));
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed buffered output is
     // reasoning, never content (mirrors the non-streaming split policy).
@@ -16886,7 +16896,7 @@ fn handleAnthropicNonStreaming(
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
     , .{
-        nowMs(stream.io),
+        nextCompletionId(&completion_id_counter, nowMs(stream.io)),
         content.items,
         model_name,
         stop_reason,
@@ -17003,7 +17013,7 @@ fn handleAnthropicStreaming(
     {
         const data = try std.fmt.allocPrint(allocator,
             \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
-        , .{ nowMs(stream.io), model_name, prompt_token_count });
+        , .{ nextCompletionId(&completion_id_counter, nowMs(stream.io)), model_name, prompt_token_count });
         defer allocator.free(data);
         try sendAnthropicEvent(stream, "message_start", data);
     }
@@ -27254,4 +27264,14 @@ test "countRejected moves only the rejected counter, and does nothing with metri
     try std.testing.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
     try std.testing.expectEqual(@as(u64, 0), m.requests_failed_total.load());
     try std.testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
+}
+
+test "completion IDs stay distinct with a repeated or backwards clock" {
+    var counter = std.atomic.Value(i64).init(0);
+    const times = [_]i64{ 100, 100, 99, 200, 200, 100 };
+    var ids: [times.len]i64 = undefined;
+    for (times, 0..) |now_ms, i| {
+        ids[i] = nextCompletionId(&counter, now_ms);
+        for (ids[0..i]) |previous| try std.testing.expect(previous != ids[i]);
+    }
 }
