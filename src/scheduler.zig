@@ -1913,7 +1913,9 @@ pub const Scheduler = struct {
         )) blk: {
             if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
-            switch (mtpStreamingVerdict(mtp)) {
+            const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(self.io, self.allocator, owned.config, entry.path));
+            switch (verdict) {
+                .keep => owned.config.stream_mtp_head = true,
                 .refuse => return error.ExpertStreamingMtpUnsupported,
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
@@ -2760,22 +2762,29 @@ pub fn mtpChoiceFor(mtp_enabled: bool, mtp_explicit: bool, config: *const ModelC
 
 /// The streaming gate's verdict on a load's MTP choice (`expert_stream.mtpUnderStreaming`). The gate
 /// runs before the load marks its config streamed.
-fn mtpStreamingVerdict(choice: model_settings.MtpChoice) expert_stream_mod.MtpUnderStreaming {
+fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: bool) expert_stream_mod.MtpUnderStreaming {
     const c = choice.streamed();
-    return expert_stream_mod.mtpUnderStreaming(c.on, c.source == .model_settings, c.source == .default);
+    return expert_stream_mod.mtpUnderStreaming(c.on, c.source == .model_settings, c.source == .default, head_supported);
+}
+
+fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
+    const geometry = config.expertGeometry();
+    const layout = expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer) catch return false;
+    return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), layout);
 }
 
 /// An engine-default MTP under expert streaming resolves off (`expert_stream.mtpUnderStreaming`):
 /// the head is not loaded and the load log reads `off (streaming; default)`.
-pub fn mtpDefaultOffUnderStreaming(choice: model_settings.MtpChoice, expert_streaming: bool) bool {
-    return expert_streaming and choice.on and choice.source == .default;
+pub fn mtpDefaultOffUnderStreaming(choice: model_settings.MtpChoice, expert_streaming: bool, head_kept: bool) bool {
+    return expert_streaming and !head_kept and choice.on and choice.source == .default;
 }
 
 test "a streamed load drops only the engine-default MTP, never an asked-for one" {
-    try testing.expect(mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, true));
-    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, false));
-    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .flag }, true));
-    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true));
+    try testing.expect(mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, true, false));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, true, true));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, false, false));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .flag }, true, false));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true, false));
 }
 
 /// What a load line and `/props` read for the four keys `--fast` sets, under the launch globals.
@@ -2861,13 +2870,13 @@ test "--fast: its preset, named --fast, outranks model-settings.json; an explici
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
 }
 
-test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp still refuses" {
+test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp keeps the head" {
     const saved = LaunchGlobals.save();
     defer saved.restore();
     model_settings.fast = true;
     const gate = mtpChoiceFor(true, false, &ModelConfig{});
     try testing.expect(gate.on);
-    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.off, mtpStreamingVerdict(gate));
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.off, mtpStreamingVerdict(gate, true));
     var streamed = ModelConfig{};
     streamed.expert_streaming = true;
     const loaded = mtpChoiceFor(true, false, &streamed);
@@ -2875,7 +2884,8 @@ test "--fast drops its MTP on a streamed load, before and after the load marks i
     try testing.expectEqualStrings("--fast", loaded.sourceName());
     try testing.expect(!loaded.forced());
     const asked = mtpChoiceFor(true, true, &ModelConfig{});
-    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked));
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.keep, mtpStreamingVerdict(asked, true));
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked, false));
     try testing.expect(mtpChoiceFor(true, true, &streamed).on);
 }
 
@@ -2979,9 +2989,14 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     const geometry = config.expertGeometry();
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
+    if (config.stream_mtp_head and !expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), streamed.expert_layout)) {
+        log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
+        return error.ExpertStreamingMtpUnsupported;
+    }
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
     split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry);
     if (!config.has_vision) split.vision = 0;
+    if (!config.stream_mtp_head) split.mtp = 0;
     const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
     const picked = resolveStreamedVision(explicit_cache_bytes, budget_bytes, config, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
@@ -3000,9 +3015,9 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
 pub fn resolveStreamedVision(explicit_bytes: u64, budget_bytes: u64, config: *const ModelConfig, split: model_mod.ResidentSplit, per_expert: u64, want: bool) !struct { resolved: ExpertCacheResolution, cost: VisionCost } {
     var text = split;
     text.vision = 0;
-    const without = try resolveExpertCache(explicit_bytes, budget_bytes, config, text, false, per_expert);
+    const without = try resolveExpertCache(explicit_bytes, budget_bytes, config, text, config.stream_mtp_head, per_expert);
     if (split.vision == 0) return .{ .resolved = without, .cost = .{} };
-    const with: ?ExpertCacheResolution = resolveExpertCache(explicit_bytes, budget_bytes, config, split, false, per_expert) catch |err| switch (err) {
+    const with: ?ExpertCacheResolution = resolveExpertCache(explicit_bytes, budget_bytes, config, split, config.stream_mtp_head, per_expert) catch |err| switch (err) {
         error.SsdBudgetBelowResident => null,
         else => return err,
     };
@@ -4188,10 +4203,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
         if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
-        switch (mtpStreamingVerdict(mtp)) {
+        const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(sch.io, sch.allocator, params.config, params.model_dir));
+        switch (verdict) {
             .refuse => {
                 log.err("[expert-stream] {s}; MTP is on ({s}), pass --no-mtp\n", .{ expert_stream_mod.MTP_UNSUPPORTED, mtp.sourceName() });
                 return error.ExpertStreamingMtpUnsupported;
+            },
+            .keep => {
+                log.info("[expert-stream] MTP head resident ({s}); routed experts stream\n", .{mtp.sourceName()});
+                params.config.stream_mtp_head = true;
             },
             .drop_settings => {
                 log.info("[expert-stream] model-settings mtp=true ignored: {s}\n", .{expert_stream_mod.MTP_UNSUPPORTED});
@@ -4386,7 +4406,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     });
     const kv_quant_config = kv_cache.config;
     const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
-    const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming);
+    const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
     const acceptance = generate_mod.mtpAcceptanceFor(params.config.mtp_acceptance_override);
     const greedy_tail = generate_mod.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
     log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{

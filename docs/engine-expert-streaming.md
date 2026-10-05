@@ -105,10 +105,12 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 - `GroupCache`: plain per-layer LRU, prefill misses at MRU, every HIT of a route touched before any admit, surplus
   misses fall to the union workspace. Batched decode rides the union path.
-- **MTP is refused at the door** (`ExpertStreamingMtpUnsupported`; `enable_mtp:true` = named 400): it prices at 1.27x
-  expert bytes per committed token and the streamed forward declines spec's per-position SSM capture. Only an
-  explicit `--mtp` refuses the load; the engine default resolves off (`[mtp] off (streaming; default)`), a
-  `model-settings.json` `mtp: true` is dropped with a warning.
+- **MTP is on by default on a Sushi EXL3 Qwen pack** (`streamedMtpHeadSupported`): the head and its own routed experts
+  load resident (`ModelConfig.stream_mtp_head`, billed in the ledger and its KV in the session bill), verify rows take
+  the streamed decode path, and the PLE window rolls back like a resident verify. `--no-mtp` or `"mtp": false` loads
+  without it (`[mtp] off`). Any other streamed model or layout refuses an explicit `--mtp`
+  (`ExpertStreamingMtpUnsupported`), drops a settings `mtp: true` with a warning and resolves the default off;
+  grouped multi-request verify stays resident-only; `enable_mtp:true` without a loaded head is a named 400.
 - **Load-time cache warm**: preload the lowest expert IDs into `floor(0.8 * slots_per_layer)` slots per MoE layer
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
   routes; dense prefix layers are skipped.
