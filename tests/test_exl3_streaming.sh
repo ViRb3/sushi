@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PACK=${1:?usage: test_exl3_streaming.sh PACK BUDGET_GIB PORT}

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # bench_versions.sh — the SAME engine, two builds. Shipped app binary vs the
 # working-tree build, same models, same flags, llmprobe measuring both.
 #

@@ -10122,7 +10122,7 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-tier2b", 0, 128);
         defer hc.deinit();
         hc.disk.?.ssd_first = true;
-        hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+        hc.disk.?.armTestSpace(3 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
 
         _ = try hc.commit(&cache, &tok_a, false); // oldest
         _ = try hc.commit(&cache, &tok_b, false);
@@ -10171,7 +10171,7 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         defer hc.deinit();
         hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
         hc.disk.?.ssd_first = true;
-        hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+        hc.disk.?.armTestSpace(3 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
 
         _ = try commitUnflushed(&hc, &cache, &tokens_a);
         _ = try commitUnflushed(&hc, &cache, &tokens_b);

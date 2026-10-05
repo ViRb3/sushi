@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # `/v1/load-model` `"default": true` re-points the server's default model.
 #
 # The app's model picker hot-switches a running server instead of restarting

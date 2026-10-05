@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Agent-loop cross-mode regression test for spec-decode.
 #
 # A single long-running server with `--pld` (and `--drafter` when the target

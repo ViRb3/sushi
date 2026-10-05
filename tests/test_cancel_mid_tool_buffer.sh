@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: disconnecting WHILE the stream is buffering for tool detection leaves
 # no leak and no wedge.
 #

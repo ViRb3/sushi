@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_smoke_matrix.sh — quick hot smoke: both served archs (qwen4_exp,
 # mimo_v2) × server configs × every API surface. Not a bench and not a correctness oracle: the
 # bar per cell is "answers, no leak, no crash", so a checkpoint's choices

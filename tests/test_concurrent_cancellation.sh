@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Concurrent cancellation test (Phase A7).
 #
 # Hammers the server with N cycles of "start a long generation, kill the

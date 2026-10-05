@@ -1,4 +1,5 @@
 #!/bin/zsh
+. "$(dirname "$0")/private_cache.sh"
 # Same-boot qwen4_exp A/B harness (M4 Max numbers in docs/gotchas/engine-mlx.md;
 # the M5 box re-measures with the same script).
 #   tests/qwen4_ab.sh mtp <tag> [server flags...]     MTP vs serial per prompt, 3 reps interleaved, then MTP + plain concurrent

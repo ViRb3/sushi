@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: a path this server does not serve costs NOTHING.
 #
 # Model resolution ran ahead of dispatch, so a POST to a non-existent endpoint

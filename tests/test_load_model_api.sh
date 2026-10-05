@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Plan 05 Phase F — POST /v1/load-model.
 #
 # Starts the server with a `--model-dir` containing >=2 models. Hits the

@@ -8,7 +8,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **GLM-5.3-Flash joins Qwen3.8 and MiMo**: serve it, chat with `sushi run`, or drive it from the coding-agent
   launchers. Up to four requests decode together, DFlash2 drafting copies long verbatim spans four tokens per round,
-  prompts are reused across turns in RAM and on SSD, and image/video input works. The 2.5bpw Sushi pack targets 128 GB
+  prompts are reused across turns from an SSD cache that is on by default and sizes itself (the RAM tier is opt-in with `--prefix-cache-mem`; the web UI shows the cache's use), and image/video input works. The 2.5bpw Sushi pack targets 128 GB
   Macs (KLD 0.07 against the BF16 model); M1–M4 Macs keep its fused kernels.
 - **Stream any model's experts from SSD**: GLM-5.3, MiMo and Qwen3.8 run on smaller Macs with `--ssd-budget-gb`,
   including vision. Streamed Qwen packs now decode with MTP by default — thanks @gomezvd.

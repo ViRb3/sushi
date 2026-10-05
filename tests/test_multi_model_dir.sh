@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # `--model-dir` is REPEATABLE, and every folder it names is actually served.
 #
 # Before this the flag took ONE directory, so a user whose models lived in more

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Asserts that the KV cache reuses BOTH the prompt prefix AND the previous
 # turn's generated tokens across requests.
 #

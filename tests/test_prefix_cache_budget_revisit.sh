@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # The hot-cache byte budget follows the machine's residency (issue #364).
 #
 # The budget used to be clamped ONCE at load against everything resident and

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: verify response_format.json_schema is grammar-enforced.
 #
 # Without grammar enforcement, the model often emits prose around the JSON, or

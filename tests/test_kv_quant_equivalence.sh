@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # KV-cache quantization equivalence test.
 #
 # Verifies that running the same greedy (temp=0) chat completion request

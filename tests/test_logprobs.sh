@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_logprobs.sh — the logprobs wire contract, on every surface that serves it.
 #
 # Three defects fixed 2026-08-05 (temperature-scaled logits, float-equality id

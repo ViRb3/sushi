@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration tests for the opt-in observability layer (--metrics):
 #   * GET /metrics       — Prometheus text exposition (headless scraping)
 #   * GET /metrics.json  — open JSON feed of the same counters

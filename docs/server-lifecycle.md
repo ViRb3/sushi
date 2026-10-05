@@ -138,6 +138,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
+- **The prefix cache's tiers are launch flags only** (no `model-settings.json` key): RAM retention is off unless
+  `--prefix-cache-mem` is given (`--no-prefix-cache-ram` wins over it), and the SSD tier is on unless `--prefix-cache-disk 0`
+  or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)).
 - A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
   cold loads, and logs its resolved value with its source at load.
 - Load-time context bills see explicit KV and MTP choices before `Scheduler.init` returns, including `--no-mtp`.

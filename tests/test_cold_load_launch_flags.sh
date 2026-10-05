@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: launch flags survive a COLD load (hot model switch,
 # /v1/load-model, first request naming an unloaded model).
 #

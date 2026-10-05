@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_late_system_prefix_reuse.sh — a mid-conversation system turn keeps the prefix cache.
 #
 # Codex sends a new `developer` turn mid-input and Claude Code sends hook output as

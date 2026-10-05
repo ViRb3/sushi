@@ -529,6 +529,10 @@ pub const ModelConfig = struct {
     glm_dflash_window_bytes: u64 = 0,
     glm_dflash_capture_bytes_per_token: u64 = 0,
 
+    /// Set at load when this model's SSD prefix tier was wanted and did not come up (no room on the
+    /// volume, an unreadable fingerprint, a failed init): every bill and budget then runs as without a disk.
+    prefix_cache_disk_declined: bool = false,
+
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = @splat(false),

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: /v1/responses streaming emits deltas incrementally.
 #
 # Regression for the bug surfaced by Local LLM Bench run #6 where

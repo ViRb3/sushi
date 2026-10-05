@@ -285,20 +285,24 @@ fn printUsage(io: std.Io) void {
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
         \\  --no-prefix-cache-ram
-        \\                      Disable idle RAM retention; an enabled SSD tier
-        \\                        still persists and restores reusable prefixes.
+        \\                      Keep RAM retention off even when
+        \\                        --prefix-cache-mem is given (RAM is off by
+        \\                        default).
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
-        \\                      Hot prefix cache KV-bytes budget (default: one
-        \\                        session at the working context where memory
-        \\                        holds it, never under 2GB).
+        \\                      Turn on RAM retention of idle prefix-cache
+        \\                        entries with this KV-bytes budget (default:
+        \\                        off; prefixes live on the SSD tier).
         \\                      Evicts LRU entries until the budget fits.
-        \\                      Pass 0/off to disable the byte budget.
+        \\                      Pass 0 to leave the byte budget to the
+        \\                        machine's headroom.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
-        \\                      SSD tier for the prefix cache (default: off).
+        \\                      SSD tier byte budget for the prefix cache
+        \\                        (default: on, min(entries x context x bytes
+        \\                        per token + 2GB, 20GB, free disk - 4GB)).
+        \\                      Sizes are binary: 1GB = 1 GiB.
         \\                      Seen prefixes persist under ~/.sushi/kv-cache
-        \\                        and are restored across restarts and RAM
-        \\                        evictions instead of recomputed. Can use many
-        \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
+        \\                        (SUSHI_PREFIX_CACHE_DIR) and are restored
+        \\                        across restarts instead of recomputed. 0/off
         \\                        disables.
         \\  --ssm-checkpoint-stride <n>
         \\                      Hybrid SSM architectures only (Qwen3.8-Flash-Next's
@@ -567,6 +571,7 @@ pub fn main(init: std.process.Init) !void {
     var metrics_enabled = false;
     var log_level_explicit = false;
     var decode_share_flag: ?[]const u8 = null;
+    var no_prefix_cache_ram = false;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -838,7 +843,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
         } else if (std.mem.eql(u8, args[i], "--no-prefix-cache-ram")) {
-            server_mod.prefix_cache_ram_enabled = false;
+            no_prefix_cache_ram = true;
+            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionFor(server_mod.prefix_cache_mem_explicit, true);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -853,6 +859,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             server_mod.prefix_cache_mem_explicit = true;
+            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionFor(true, no_prefix_cache_ram);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
@@ -863,6 +870,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            server_mod.prefix_cache_disk_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--logit-bias-file") and i + 1 < args.len) {
             i += 1;
             model_settings_mod.logit_bias_file_flag = args[i];
@@ -1512,6 +1520,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+            .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
             .expert_cache_bytes = expert_cache_bytes,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
@@ -1817,6 +1826,7 @@ fn runHeadlessServe(
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+        .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
         .expert_cache_bytes = expert_cache_bytes,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,

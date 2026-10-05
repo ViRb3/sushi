@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Batched-kernel byte-equivalence test (Phase A7).
 #
 # Verifies that the scheduler's batched-decode kernel produces *byte-identical*

@@ -101,19 +101,90 @@ pub const FLUSH_PIECE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Guard against a commit that never completes: 64 pieces is 128 GiB, past any tier.
 const MAX_FLUSH_PIECES: usize = 64;
 
-/// The disk budget is derived from the volume, not only the operator's cap.
-pub const DISK_RESERVE_CAP: u64 = 64 * 1024 * 1024 * 1024;
-/// Below this there is no point storing anything.
-pub const DISK_STORE_FLOOR: u64 = 1024 * 1024 * 1024;
+/// Free space the tier never uses, for resolution, every store and the report alike. Sizes are binary
+/// (1 GB = 1 GiB), as the flag parser reads them.
+pub const DISK_FREE_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Bytes this tier may occupy given the operator cap (0 = none) and the volume. Reserve =
-/// min(64 GiB, 10% of the volume); under `DISK_STORE_FLOOR` = null ("do not store"), never 0.
-pub fn diskBudgetFromFreeSpace(operator_cap: u64, free_bytes: u64, volume_bytes: u64) ?u64 {
-    const reserve = @min(DISK_RESERVE_CAP, volume_bytes / 10);
-    const avail = free_bytes -| reserve;
+/// What the volume leaves the tier: free space less the reserve.
+pub fn freeDiskRoom(free_bytes: u64) u64 {
+    return free_bytes -| DISK_FREE_RESERVE;
+}
+
+/// Bytes this tier may occupy given the operator cap (0 = none) and the volume's free space; null when
+/// nothing is left ("do not store"), never 0.
+pub fn diskBudgetFromFreeSpace(operator_cap: u64, free_bytes: u64) ?u64 {
+    const avail = freeDiskRoom(free_bytes);
     const budget = if (operator_cap == 0) avail else @min(operator_cap, avail);
-    if (budget < DISK_STORE_FLOOR) return null;
+    if (budget == 0) return null;
     return budget;
+}
+
+/// The unnamed SSD budget's ceiling, the slack added to the per-token formula, and the free space it leaves.
+pub const DEFAULT_DISK_CAP: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_DISK_SLACK: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Which term set the SSD budget.
+pub const DiskBound = enum {
+    formula,
+    cap,
+    free_disk,
+    flag,
+
+    pub fn label(self: DiskBound) []const u8 {
+        return switch (self) {
+            .formula => "the formula",
+            .cap => "20 GB cap",
+            .free_disk => "free disk - 4 GB",
+            .flag => "the flag",
+        };
+    }
+};
+
+pub const DefaultDiskBudget = struct { bytes: u64, bound: DiskBound };
+
+/// An operator's `--prefix-cache-disk` is the budget as given; unnamed it is
+/// `min(entries x context x bytes_per_token + 2 GB, 20 GB, free - 4 GB)`. Null when that is not positive.
+pub fn resolveDiskBudget(explicit: bool, ask: u64, entries: u32, context: u64, bytes_per_token: u64, free_bytes: u64) ?DefaultDiskBudget {
+    if (explicit) return if (ask == 0) null else .{ .bytes = ask, .bound = .flag };
+    const formula = @as(u64, entries) *| context *| bytes_per_token +| DEFAULT_DISK_SLACK;
+    const room = freeDiskRoom(free_bytes);
+    if (room == 0) return null;
+    var out: DefaultDiskBudget = .{ .bytes = formula, .bound = .formula };
+    if (DEFAULT_DISK_CAP < out.bytes) out = .{ .bytes = DEFAULT_DISK_CAP, .bound = .cap };
+    if (room < out.bytes) out = .{ .bytes = room, .bound = .free_disk };
+    return out;
+}
+
+fn toGb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+}
+
+/// The startup line for the SSD tier: the sizing terms and the bound that set the number.
+pub fn allocatingDiskLine(buf: []u8, plan: DefaultDiskBudget, entries: u32, context: u64, bytes_per_token: u64, dir: []const u8) []const u8 {
+    const text = if (plan.bound == .flag)
+        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache (--prefix-cache-disk) at {s}", .{ toGb(plan.bytes), dir })
+    else
+        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache ({d} entries x {d} tokens x {d:.1} KB + 2 GB; bound: {s}) at {s}", .{ toGb(plan.bytes), entries, context, @as(f64, @floatFromInt(bytes_per_token)) / 1024.0, plan.bound.label(), dir });
+    return text catch buf[0..0];
+}
+
+/// The per-turn usage line, also what the web page shows.
+pub fn diskUsageLine(buf: []u8, used: u64, budget: u64, entries: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "[disk-cache] usage {d:.2} / {d:.1} GB, {d} entries", .{ toGb(used), toGb(budget), entries }) catch buf[0..0];
+}
+
+/// The startup line when no SSD budget remains.
+pub fn diskOffLine(buf: []u8, free_bytes: u64, dir: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "SSD prefix cache OFF: {d:.1} GB free at {s} leaves nothing after the 4 GB reserve", .{ toGb(free_bytes), dir }) catch buf[0..0];
+}
+
+/// `volumeSpace` of the nearest existing ancestor: the cache directory is created on first store.
+pub fn volumeSpaceNear(path: []const u8) ?VolumeSpace {
+    var p = path;
+    while (true) {
+        if (volumeSpace(p)) |v| return v;
+        p = std.fs.path.dirname(p) orelse return null;
+    }
 }
 
 /// macOS `struct statfs`, leading fields only; the rest is slack. std has no binding for it.
@@ -438,7 +509,7 @@ pub const DiskTier = struct {
     operator_cap: u64 = 0,
     /// The free-space probe; tests arm a fixed answer with `armTestSpace`.
     space_probe: SpaceProbeFn = volumeSpace,
-    /// The volume is under `DISK_STORE_FLOOR`: no new entry persists, existing ones stay restorable.
+    /// The volume has nothing left after `DISK_FREE_RESERVE`: no new entry persists, existing ones stay restorable.
     store_declined: bool = false,
     /// `<base>` (the parent of `root`), for the root-wide sweep. Null when the dupe failed.
     base_dir: ?[]u8 = null,
@@ -520,6 +591,14 @@ pub const DiskTier = struct {
     pub fn stagedHostBytes(self: *DiskTier) u64 {
         const w = self.writer orelse return 0;
         return w.pendingBytes();
+    }
+
+    /// What the writer holds or may hold of host memory outside MLX's accounting: its unwritten
+    /// backlog, never under the permit its next submit may fill. Zero when the writer is not armed.
+    /// The single reading admission bills (`scheduler.diskWriterHostBytes` sums it over resident models).
+    pub fn writerHostBytes(self: *DiskTier) u64 {
+        const w = self.writer orelse return 0;
+        return @max(w.pendingBytes(), w.permit_bytes);
     }
 
     /// Background write failures so far.
@@ -679,12 +758,12 @@ pub const DiskTier = struct {
         self.allocator.free(e.rings);
     }
 
-    /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a budget
-    /// under the store floor declines new stores without touching what is already persisted.
+    /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a volume with
+    /// nothing left after the reserve declines new stores without touching what is already persisted.
     fn refreshDiskBudget(self: *DiskTier) void {
         const vs = self.space_probe(self.root) orelse return;
         // Our own entries are already counted in `used`; add what the tier holds back.
-        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes, vs.total);
+        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes);
         if (budget) |b| {
             self.store_declined = false;
             if (b != self.max_bytes) {
@@ -693,12 +772,10 @@ pub const DiskTier = struct {
             }
         } else if (!self.store_declined) {
             self.store_declined = true;
-            // The number compared is free less the reserve, not free.
-            log.warn("[disk-cache] {s}: {d} MB free less the {d} MB reserve (min 64 GiB, 10% of the volume) is below the {d} MB store floor — no NEW entries persist (already-persisted entries stay restorable)\n", .{
+            log.warn("[disk-cache] {s}: {d} MB free leaves nothing after the {d} MB reserve — no NEW entries persist (already-persisted entries stay restorable)\n", .{
                 self.root,
                 vs.free >> 20,
-                @min(DISK_RESERVE_CAP, vs.total / 10) >> 20,
-                DISK_STORE_FLOOR >> 20,
+                DISK_FREE_RESERVE >> 20,
             });
         }
     }
@@ -7300,16 +7377,66 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     try testing.expectEqual(@as(u32, 768), tier.entries.items[0].kv_len);
 }
 
-test "diskBudgetFromFreeSpace: reserve is min(64 GiB, 10% of volume); below the floor stores nothing" {
+test "resolveDiskBudget: the formula, the 20 GB cap and free disk - 4 GB bind in turn; no room is null; a flag wins" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    // 2 entries x 1000 tokens x 1 MB + 2 GB: the formula binds.
+    const small = resolveDiskBudget(false, DEFAULT_DISK_CAP, 2, 1000, MB, 500 * GB).?;
+    try testing.expectEqual(@as(u64, 2000 * MB + 2 * GB), small.bytes);
+    try testing.expectEqual(DiskBound.formula, small.bound);
+    // 32 entries x 262144 tokens x 18.4 kB is far past 20 GB.
+    const big = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 500 * GB).?;
+    try testing.expectEqual(DEFAULT_DISK_CAP, big.bytes);
+    try testing.expectEqual(DiskBound.cap, big.bound);
+    // 10 GB free leaves 6.
+    const tight = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 10 * GB).?;
+    try testing.expectEqual(6 * GB, tight.bytes);
+    try testing.expectEqual(DiskBound.free_disk, tight.bound);
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 4 * GB));
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 1 * GB));
+    // Overflow saturates to the cap, never wraps.
+    try testing.expectEqual(DEFAULT_DISK_CAP, resolveDiskBudget(false, 0, std.math.maxInt(u32), std.math.maxInt(u64), 1 << 40, 500 * GB).?.bytes);
+    // An explicit number is the budget, whatever the formula or the free space say; 0 is off.
+    const flag = resolveDiskBudget(true, 50 * GB, 32, 262144, 18_400, 10 * GB).?;
+    try testing.expectEqual(@as(u64, 50 * GB), flag.bytes);
+    try testing.expectEqual(DiskBound.flag, flag.bound);
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(true, 0, 32, 262144, 18_400, 500 * GB));
+}
+
+test "diskUsageLine: used / budget in GB and the entry count" {
+    var buf: [128]u8 = undefined;
+    const GB: u64 = 1024 * 1024 * 1024;
+    try testing.expectEqualStrings("[disk-cache] usage 3.50 / 20.0 GB, 5 entries", diskUsageLine(&buf, 3 * GB + GB / 2, 20 * GB, 5));
+}
+
+test "allocatingDiskLine: starts with Allocating and names the terms, the bound and the directory" {
+    var buf: [256]u8 = undefined;
+    const GB: u64 = 1024 * 1024 * 1024;
+    const line = allocatingDiskLine(&buf, .{ .bytes = 20 * GB, .bound = .cap }, 32, 262144, 18_400, "/c");
+    try testing.expectEqualStrings("Allocating 20.0 GB SSD for the prefix cache (32 entries x 262144 tokens x 18.0 KB + 2 GB; bound: 20 GB cap) at /c", line);
+    const flag = allocatingDiskLine(&buf, .{ .bytes = 12 * GB, .bound = .flag }, 32, 0, 0, "/c");
+    try testing.expectEqualStrings("Allocating 12.0 GB SSD for the prefix cache (--prefix-cache-disk) at /c", flag);
+    try testing.expectEqualStrings("SSD prefix cache OFF: 3.0 GB free at /c leaves nothing after the 4 GB reserve", diskOffLine(&buf, 3 * GB, "/c"));
+}
+
+test "diskBudgetFromFreeSpace: the one reserve is 4 GiB, whatever the volume; nothing left stores nothing" {
     const GB: u64 = 1 << 30;
-    // 4 TB volume, 1 TB free: reserve is the 64 GiB cap.
-    try testing.expectEqual(@as(?u64, 1024 * GB - 64 * GB), diskBudgetFromFreeSpace(0, 1024 * GB, 4096 * GB));
-    try testing.expectEqual(@as(?u64, 100 * GB), diskBudgetFromFreeSpace(100 * GB, 1024 * GB, 4096 * GB));
-    // Small volume: 10% is the binding reserve.
-    try testing.expectEqual(@as(?u64, 60 * GB), diskBudgetFromFreeSpace(0, 80 * GB, 200 * GB));
-    // Under the store floor: refuse, never a silent 0.
-    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(0, 20 * GB, 200 * GB));
-    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(500 * GB, 20 * GB, 200 * GB));
+    try testing.expectEqual(@as(?u64, 1020 * GB), diskBudgetFromFreeSpace(0, 1024 * GB));
+    try testing.expectEqual(@as(?u64, 100 * GB), diskBudgetFromFreeSpace(100 * GB, 1024 * GB));
+    // A small budget is still a budget: free less 4 GiB, announced and stored alike.
+    try testing.expectEqual(@as(?u64, 6 * GB), diskBudgetFromFreeSpace(0, 10 * GB));
+    try testing.expectEqual(@as(?u64, GB / 2), diskBudgetFromFreeSpace(0, 4 * GB + GB / 2));
+    // The operator's cap is a cap, not a promise the volume must keep.
+    try testing.expectEqual(@as(?u64, 6 * GB), diskBudgetFromFreeSpace(500 * GB, 10 * GB));
+    // Refuse, never a silent 0.
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(0, 4 * GB));
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(500 * GB, 2 * GB));
+    // Load-time resolution and the store-time bound read the same free space the same way.
+    for ([_]u64{ 10 * GB, 5 * GB, 4 * GB + GB / 2, 3 * GB }) |free| {
+        const announced = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 1 << 20, 1 << 20, free);
+        const stored = diskBudgetFromFreeSpace(if (announced) |a| a.bytes else 0, free);
+        try testing.expectEqual(if (announced) |a| @as(?u64, a.bytes) else null, stored);
+    }
 }
 
 test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
@@ -7331,7 +7458,7 @@ test "volumeSpace: free is what the OS grants, never statfs' f_bavail" {
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {
-    // 10 GiB free against a 512 GiB volume leaves nothing after the reserve: the tier stores nothing.
+    // 3 GiB free against a 512 GiB volume leaves nothing after the reserve: the tier stores nothing.
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7342,7 +7469,7 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-short", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
-    tier.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+    tier.armTestSpace(3 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
 
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
@@ -7362,6 +7489,59 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     try testing.expect(!tier.store_declined);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
+}
+
+test "DiskTier.writerHostBytes: the permit when idle, the backlog when it is past it, zero without a writer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-writer-bytes", 0, 128);
+    defer tier.deinit();
+    try testing.expectEqual(@as(u64, 0), tier.writerHostBytes());
+    tier.enableBackgroundWriter();
+    const w = tier.writer.?;
+    w.permit_bytes = 64 * 1024;
+    try testing.expectEqual(@as(u64, 64 * 1024), tier.writerHostBytes());
+    // A paused writer keeps what it was handed; one blob past the permit is what the host holds.
+    w.setPaused(true);
+    const path = try testing.allocator.dupe(u8, "/nonexistent/never-written.safetensors");
+    const blob = try testing.allocator.alloc(u8, 96 * 1024);
+    @memset(blob, 1);
+    w.submit(path, blob);
+    try testing.expectEqual(@as(u64, 96 * 1024), tier.writerHostBytes());
+    w.setPaused(false);
+    tier.drainWriter();
+}
+
+test "DiskTier: a budget the load line announced is a budget the store honours (10 GiB free on a 1 TiB volume)" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    const free: u64 = 10 * 1024 * 1024 * 1024;
+    const total: u64 = 1024 * 1024 * 1024 * 1024;
+    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free).?;
+    try testing.expectEqual(DiskBound.free_disk, plan.bound);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-announced", plan.bytes, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(free, total);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(!tier.store_declined);
+    try testing.expectEqual(plan.bytes, tier.max_bytes);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 640), tier.bestMatch(&tokens, false, cache.config).?.usable);
 }
 
 test "DiskTier: the free-space probe runs only before a store, never for a copy already on disk" {
@@ -7410,8 +7590,8 @@ test "DiskTier: the free-space probe runs only before a store, never for a copy 
     tier.drainWriter();
     try testing.expect(test_space_probes > p);
 
-    // Below the store floor a copy already on disk still counts; a new entry declines.
-    tier.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+    // With nothing left after the reserve a copy already on disk still counts; a new entry declines.
+    tier.armTestSpace(3 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
     try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s));
     var other: [640]u32 = undefined;
     for (&other, 0..) |*t, i| t.* = @intCast(i + 90_000);

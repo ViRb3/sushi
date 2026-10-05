@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_api_edges.sh — request-validation edges across the four text surfaces,
 # on one small model. Every check is a server CONTRACT (status +
 # shape), never a checkpoint expectation: what a request that is malformed,

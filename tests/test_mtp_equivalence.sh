@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # MTP (native multi-token-prediction head) correctness + engagement test, for both served
 # archs: Qwen's head and MiMo-V2.6's three heads (`model_type` from config.json picks the
 # markers, the engagement lines and whether reasoning is part of the compared answer).

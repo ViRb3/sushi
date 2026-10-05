@@ -63,13 +63,13 @@ trap cleanup EXIT
 
 start_server() { # extra args...
     : > "$LOGFILE"
-    # The SSD tier is OPT-IN since the off-by-default flip (ad3fd24) — the
-    # suite must enable it explicitly. Callers' "$@" comes later, so section
-    # 5's `--prefix-cache-disk off` still wins (last flag parses last).
+    # The suite names both tiers (RAM is opt-in, the SSD default would size its own budget). Callers'
+    # "$@" comes later, so section 5's `--prefix-cache-disk off` and the SSD-only arms'
+    # `--no-prefix-cache-ram` still win.
     # SERVER_ULIMIT_N lowers the server's soft open-file limit.
     ( [ -n "${SERVER_ULIMIT_N:-}" ] && ulimit -n "$SERVER_ULIMIT_N"
       SUSHI_PREFIX_CACHE_DIR="$SCRATCH_HOME/.sushi/kv-cache" exec "$BINARY" --model "$MODEL" --serve --port "$PORT" \
-        --ctx-size 8192 --no-pld --log-level info --prefix-cache-disk 4GB "$@" ) > "$LOGFILE" 2>&1 &
+        --ctx-size 8192 --no-pld --log-level info --prefix-cache-mem 2GB --prefix-cache-disk 4GB "$@" ) > "$LOGFILE" 2>&1 &
     SERVER_PID=$!
     for i in $(seq 1 90); do
         if curl -s -f "$BASE/health" > /dev/null 2>&1; then return 0; fi

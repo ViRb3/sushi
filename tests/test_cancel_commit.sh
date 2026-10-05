@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_cancel_commit.sh — cancelled requests preserve their committed KV.
 #
 # Two contracts, one per cancellation phase:
@@ -67,7 +68,7 @@ boot_server() {
     rm -f "$LOG"
     "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
         --ctx-size 16384 --prefill-chunk 512 --ssm-checkpoint-stride 512 \
-        --kv-quant 4 --prefix-cache-entries 4 \
+        --kv-quant 4 --prefix-cache-entries 4 --prefix-cache-mem 2GB \
         > "$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do

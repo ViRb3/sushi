@@ -43,8 +43,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   explicit-context reduction where applicable. Native GLM has its separate BF16 load and serving bill.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
-  from the capture schedule the generator runs), one assistant window, the RAM tier's row copy and, with a disk
-  tier, the SSD writer's 1 GiB permit, and keeps fewer checkpoints where they do not fit, never refusing for them
+  from the capture schedule the generator runs), one assistant window and the RAM tier's row copy (the SSD writer's
+  1 GiB permit is the shared headroom term below, for every arch), and keeps fewer checkpoints where they do not fit, never refusing for them
   ([engine-prefix-cache](engine-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
@@ -100,6 +100,15 @@ architectures need their own measured envelope. These runs do not simulate a 64 
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
   as much context as 512: the `max_safe_context` bill picks it, not a quarter of free memory
   ([arch-glm5-next](arch-glm5-next.md#memory)).
+- RAM retention is off by default and the SSD tier on, so every model bills as SSD-first: a ringed arch with a disk tier
+  bills its restore's coexistence (`oldBuffersInEvalWindow`) ([engine-prefix-cache](engine-prefix-cache.md#defaults)). Context sizing reserves nothing
+  for an idle cache (`ctxSizingCacheReserve` is 0 with RAM off). A model whose tier did not come up bills as without one
+  (`server.diskTierOn`).
+- **Admission bills the SSD writers' host bytes** (`prefillAdmissionBill` -> `admissionAvailable`): the writer holds its
+  backlog, up to its ~1 GiB permit, outside `mlx_get_active_memory`, so every resident model's `writerHostBytes` (the
+  larger of the backlog and the permit) is taken off the headroom BEFORE the width and the cache reservation are chosen,
+  an explicit `--prefill-chunk` included. The ONE reading is `scheduler.diskWriterHostBytes`, for Qwen, MiMo and GLM
+  alike; GLM's `glmPrefixStateBytes`/`glmCommitStateBytes` carry no writer term, so the permit is billed exactly once.
 - The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next) prefills every request

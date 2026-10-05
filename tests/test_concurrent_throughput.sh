@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Concurrent decode throughput test (Phase A7).
 #
 # Asserts that with `--max-concurrent 4`, four parallel client requests

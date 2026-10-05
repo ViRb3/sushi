@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: `sushi launch <agent>` (issue #188) — configures and
 # launches a third-party coding agent against the local server, ollama-style.
 #

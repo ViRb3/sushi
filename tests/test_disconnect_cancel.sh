@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Regression tests for client-disconnect handling during long prefills.
 #
 # Pins the 2026-06-10 live failure: Claude Code with a huge MCP toolset sent a

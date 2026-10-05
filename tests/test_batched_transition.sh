@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Batched-decode transition consistency test.
 #
 # Regression for the legacy→batched decode-tick transition bug: a slot that

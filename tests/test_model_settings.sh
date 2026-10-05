@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Per-model settings (`~/.sushi/model-settings.json`, issue #269): a model's
 # `ctx_size` / `kv_quant` / `mtp` / `mtp_acceptance` / `mtp_greedy_tail` follow the MODEL, apply on its
 # load (boot AND cold load), and a second model cold-loaded in the same process

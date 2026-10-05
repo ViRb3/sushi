@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration tests for sushi API endpoints.
 # Usage: ./tests/integration_test.sh [model_dir] [port]
 #

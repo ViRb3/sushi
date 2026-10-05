@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Concurrent MTP users on one model: every stream's greedy output at a FIXED draft depth
 # must be byte-identical to its solo run (the byte bar for spec decode), whether the
 # rounds ride one batched verify (qwen3_5 dense/MoE) or interleave with their own head

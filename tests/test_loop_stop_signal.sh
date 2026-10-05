@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # The degenerate-tail guard's WIRE contract, on every surface that can emit it.
 #
 # Live 2026-08-05 (under pi): five loop-stops in a row, each

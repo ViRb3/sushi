@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Qwen3-VL image input end-to-end over HTTP (OpenAI + Anthropic surfaces).
 # Starts its own server on the Qwen3.5-0.8B 4-bit checkpoint, sends a real image,
 # and asserts an HTTP 200 with a relevant, non-empty completion. Also confirms the

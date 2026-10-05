@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Stop-latency test: when the client cancels a streaming request mid-decode,
 # the server's connection thread must notice within ~100ms and stop the
 # inference for that slot. Without this, the GPU keeps generating tokens for

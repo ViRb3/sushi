@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # `sushi run` (TTY REPL mode) must not print `[discovery] skip …` lines.
 #
 # Regression: the REPL log-quieting (info → warn) sat AFTER the models-root

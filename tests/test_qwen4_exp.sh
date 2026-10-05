@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Qwen3.8-Flash-Next (qwen4_exp) live end-to-end on the converted pack.
 # Boots the pack, then: architecture advertised, a short greedy answer, a tool
 # call + round-trip, streaming delta cleanliness, and a prompt past the QSA

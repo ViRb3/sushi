@@ -13,7 +13,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 | File | Role |
 |---|---|
 | `src/prefix_cache.zig` | Hot prefix cache (`--prefix-cache-entries`, `--prefix-cache-mem`) |
-| `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
+| `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`), its default budget (`resolveDiskBudget`) and startup/usage lines |
 | `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
 | `src/glm5_prefix.zig` | GLM restore points: KDA checkpoints, MLA rows, their SSD layout ([GLM](#glm)) |
@@ -106,7 +106,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **The hot-cache budget is CLAMPED at load** to what the weights leave under the GPU ceiling and is a HARD cap; it
   FOLLOWS residency (`reviseHotCacheBudgets` after every load/unload, repeated for 10 s because the OS returns pages
   lazily).
-- **An unnamed `--prefix-cache-mem` holds one session at the working context** (`oneSessionFor`, >= 2 GB, both arms)
+- **A RAM tier with no named size holds one session at the working context** (`oneSessionFor`, >= 2 GB, both arms; only
+  reachable below the CLI now that RAM retention is opt-in)
   where the ceiling holds it beside the weights, the n-gram page cache (`page_cache_claim`) and a cold full-context
   prompt's bill (MiMo refuses rather than evicts); else that room, at most half the bill, so an outgrown session's
   trim copy fits beside it. A flag stands, `2GB` too; context sizing and the chunk pin still read the raw ask.
@@ -118,10 +119,71 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Eviction is WORKLOAD-fair (`cache_key`: `prompt_cache_key` > `metadata.user_id` > system-prompt hash;
   `lruIndexExcluding`).
 
+<a id="defaults"></a>
+## Defaults: SSD tier on, RAM tier off
+
+- **RAM retention is opt-in.** Unnamed, `server.prefix_cache_ram_enabled` is false and the RAM budget is 0 bytes for
+  every served model; `--prefix-cache-mem <n>` turns it on (`0` = the machine's headroom) and `--no-prefix-cache-ram`
+  wins over it. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
+  SSD-first (`prefix_cache.ssdFirstActive`: a disk tier and RAM off).
+- **The SSD tier is on and sized per model at load** (`server.prefixCacheDiskForLoad` through
+  `LoadParams.prefix_cache_disk_resolver`, the pure `kv_disk_cache.resolveDiskBudget`):
+  `min(entries x context x bytes_per_token + 2 GB, 20 GB, free disk - 4 GB)`. **Sizes are binary: 1 GB = 1 GiB and 1 KB = 1 KiB**, as
+  `--prefix-cache-disk 20GB` is read; every `GB` and `KB` in the lines, the logs and the page is that unit.
+  - entries = `--prefix-cache-entries`; context = the model's PINNED served context (`diskContextForLoad` runs the
+    idempotent `pinAutoContext`), so the line, `/props` and `/v1/models` name one number; free disk =
+    `kv_disk_cache.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
+  - bytes_per_token = `server.diskBytesPerToken`, from the SERIALIZED geometry: KV rows at the served width, the one
+    pooled QSA history an entry writes, and the MTP head's KV and history where the head is on. The QSA score bank and a
+    second history copy are execution state and never count, so no QSA switch moves it. GLM's KDA checkpoints and
+    DFlash2 window, Qwen's GDN checkpoints and MiMo's ring files are fixed per entry, not per token; the 2 GB slack is
+    all the formula leaves them.
+  - A result of zero or less turns the tier off and one line says why. `--prefix-cache-disk <n>` is the budget as
+    given (an operator's cap: the tier still stores no more than the volume leaves) and `0`/`off` disables;
+    `--prefix-cache-entries 0` disables both tiers.
+  - It is a budget, not a preallocation, and ONE reserve governs it: free space less 4 GB (`kv_disk_cache.freeDiskRoom`,
+    `DISK_FREE_RESERVE`) at resolution, before every store (`refreshDiskBudget`) and in the report. A budget under 1 GB
+    still stores.
+  - **The tier comes up before anything is sized for it.** `doLoadOnInferenceThread` resolves and attaches it first; a
+    tier that was wanted and did not come up (no room, a fingerprint or init failure) sets
+    `ModelConfig.prefix_cache_disk_declined`, and `server.diskTierOn(config)` then answers as `--prefix-cache-disk off`
+    for the RAM sizing (`ssdFirstBudgetForLoad`, `reviseHotCacheBudgets`), GLM's writer and checkpoint bills, MiMo's
+    restore coexistence and checkpoint capture. With no tier and no RAM the model gets no cache object at all.
+- **Startup prints one line per tier in use**, each starting `Allocating`: `Allocating 20.0 GB SSD for the prefix cache
+  (32 entries x 1048576 tokens x 15.5 KB + 2 GB; bound: 20 GB cap) at <dir>` (bound: the formula, `20 GB cap`,
+  `free disk - 4 GB` or `the flag`), and `Allocating 2.0 GB RAM for the prefix cache (--prefix-cache-mem)` only when RAM
+  retention is on.
+- **Each finished turn logs `[disk-cache] usage <used> / <budget> GB, <n> entries`** from the FINISHING model's own
+  tier (`scheduler.logDiskUsage`), and `/props settings.prefix_cache` carries that model's `disk_bytes` (the budget),
+  `disk_used_bytes` and `disk_entries` ([server-http-apis](server-http-apis.md)). `publishDiskStats` writes them onto each
+  `LoadedModel.disk_stats` (a sequence-locked snapshot, so the four numbers come from one publish) after every commit,
+  load and unload; `/props?model=A` reads A's, whatever model loaded last.
+- **Measured at the defaults** (GLM-5.3-Flash-Sushi-2.5bpw, a 146,795-token prompt of source files, greedy, 16 tokens,
+  streamed TTFT, tokens reused; binary 80b97a28, the code of the SSD-default commit, a private cache dir per boot, a lock
+  per boot, `taskpolicy -a`, 2026-10-05). The `Allocating` line reads `32 entries x 1048576 tokens x 6.5 KB + 2 GB;
+  bound: 20 GB cap`; the disk holds 2.05 GB after turn 1.
+
+  | setup | cold | repeat | append | append 2 | after a restart (append) |
+  |---|---|---|---|---|---|
+  | defaults (RAM off, SSD on) | 315 s | 0.46 s, 146,764 | 0.72 s, 146,764 | 0.56 s, 146,768 | 0.92 s, 146,772 (restore 409 ms) |
+  | `--prefix-cache-mem 1GB` + SSD | 233 s | 0.46 s, 146,764 | 0.73 s, 146,764 | 0.55 s, 146,768 | 0.91 s, 146,772 |
+  | `--prefix-cache-mem 2GB` + SSD | 224 s | 0.34 s, 146,764 | 0.64 s, 146,764 | 0.44 s, 146,768 | 0.93 s, 146,772 |
+
+  The 2 GB setup serves repeats from RAM; the others restore from SSD. The cold times are the box's load, not the
+  cache. MiMo-V2.6-Flash-Sushi-2.3bpw at the defaults (148,898 tokens; line `32 entries x 946176 tokens x 12.0 KB
+  + 2 GB; bound: 20 GB cap`): 0.45 / 0.47 / 0.46 s from SSD, 0.67 s after a restart (restore 492 ms), 1.73 GB on disk.
+  Qwen3.8-Flash-Next-Sushi-2.6bpw: `tests/test_prefix_cache_ssd_default.sh`.
+- Bytes per token at kv8 (`diskBytesPerToken`): Qwen3.8-Flash-Next 13,824 for the trunk rows and the pooled history, plus
+  the MTP head's KV and history when the head is on (about 15.5 KB deployed); MiMo-V2.6-Flash 12,240 (global layers
+  only; the head is a fixed window); GLM-5.3 6,688 (BF16: 11,968). With 32 entries the formula is past the cap at any
+  context over about 40K tokens, so all three get 20 GB: one 1M-token Qwen entry (16.7 GB at 15.5 KB) fits, or four of
+  260K tokens, not 32. Fixed state is on top (a Qwen GDN checkpoint is 58.8 MB, a GLM KDA checkpoint 147.6 MB, a MiMo
+  ring about 128 MB): a 20K-token Qwen turn measured 0.46 GB on disk against 0.32 GB of per-token bytes.
+
 ## SSD-only storage
 
-`--no-prefix-cache-ram --prefix-cache-disk 10GB` keeps reusable text prefixes on SSD without retaining idle
-KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
+`--no-prefix-cache-ram --prefix-cache-disk 10GB` (the default arrangement, with a sized budget) keeps reusable text
+prefixes on SSD without retaining idle KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
 buffers temporarily. The entry count must remain positive: `--prefix-cache-entries 0` disables both tiers.
 With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports
 `settings.prefix_cache.ram_enabled=false` and `mem_bytes=0` when RAM retention is off.
@@ -129,8 +191,8 @@ Context and prefill-chunk sizing also reserve zero idle-cache bytes in this mode
 of `--prefix-cache-mem`; live KV and temporary SSD write buffers still consume memory.
 
 Qwen prefill chunks write through continuously in SSD-only mode. Hybrid SSM checkpoints, MiMo ring
-restore points and GLM state ([GLM](#glm)) survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD defaults
-are unchanged. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
+restore points and GLM state ([GLM](#glm)) survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD is the opt-in
+`--prefix-cache-mem` arrangement. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
 `~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.
 
 Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
@@ -299,8 +361,9 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
 - **Checkpoint state is copied bit for bit** (`bitsOwnedCopy`: an integer view plus an integer zero).
   `materializedOwnedCopy` adds a float zero, which turns -0.0 into +0.0, and the restored KDA state carried that
   into the next chunk.
-- **The unnamed RAM tier is 1 GiB** (`GLM_PREFIX_CACHE_MEM_DEFAULT`; `--prefix-cache-mem` overrides). The
-  advertised context reserves nothing for it: admission evicts it to admit a long prefill.
+- **The RAM tier is opt-in; named without a size it is 1 GiB** (`GLM_PREFIX_CACHE_MEM_DEFAULT`, reachable only below
+  the CLI, which always names a size). The advertised context reserves nothing for it: admission evicts it to admit a
+  long prefill.
   - At kv8 it keeps a 30K session at its prompt end with 5 of 8 checkpoints, a 60K one with 4, and trims a 140K one
     to its checkpoint near 121K with 1. Each case keeps the assistant window.
   - For long reuse add `--prefix-cache-disk`, or run SSD-only (`--no-prefix-cache-ram --prefix-cache-disk 12GB`).
@@ -337,8 +400,9 @@ pooled index (`src/glm5_prefix.zig`; [arch-glm5-next](arch-glm5-next.md)).
 - **Bills.** A GLM request holds up to 9 checkpoints during prefill (the cap plus the copy taken before each thin)
   and one assistant window. The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
   tier's row copy (at most its budget; the SSD tier copies none), the checkpoints and the window, whichever of that
-  and the prefill's transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. Any disk tier
-  adds the writer's 1 GiB permit (`ssdWriterStagedBytes`: the previous request's staged flush); SSD-only reserves no
+  and the prefill's transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. The writer's
+  1 GiB permit (the previous request's staged flush) is not in this bill: admission takes it off the headroom for every
+  arch (`scheduler.diskWriterHostBytes`, [engine-memory-admission](engine-memory-admission.md)); SSD-only reserves no
   idle cache.
   - Only the inference thread's admission pass bills the checkpoints (`WarmPrefix.checkpoints`). The connection
     thread, the context sizer and the cache clamp bill none, so the advertised context is the cache-off one.

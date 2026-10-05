@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: /v1/models advertises capabilities, input_modalities, and
 # uses the loaded model's full name (directory basename) as the `id`.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Tick-time A/B: two streams at ~64k and ~162k, SUSHI_QSA_BATCHED_GATHER=0|1.
 # Same-boot pair, 100s idle first, SUSHI_ROUND_COST_PERSIST=0 on both arms.
 # Counterbalance by running twice with GATHER_ORDER=1,0 then GATHER_ORDER=0,1.

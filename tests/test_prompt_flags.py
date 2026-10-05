@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 
 binary = str(Path(os.environ.get("SUSHI_BIN", "zig-out/bin/sushi")).resolve())
+# The SSD prefix cache is on by default: a live arm must not touch the real ~/.sushi/kv-cache.
+os.environ.setdefault("SUSHI_PREFIX_CACHE_DIR", tempfile.mkdtemp(prefix="sushi-test-kv-"))
 
 
 def run(*args, ok=False, timeout=30, gpu=False):

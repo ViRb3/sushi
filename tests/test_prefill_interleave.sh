@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Prefill-side interleaving: a cold prefill must not stall concurrent decode
 # streams for its whole duration.
 #

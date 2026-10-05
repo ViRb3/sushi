@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_tool_choice_forced.sh — a forced tool_choice is honoured on every surface.
 #
 # `required` / Anthropic `any` / a named function used to reach only the generic

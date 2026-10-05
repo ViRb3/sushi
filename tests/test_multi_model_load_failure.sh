@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Plan 05 Phase F — a model that fails to LOAD surfaces as a named 500.
 #
 # Two failure shapes live under one temp --model-dir root, because they are

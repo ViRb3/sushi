@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # sweep_agent_memory.sh — run the 11-turn agent memory test against each
 # listed checkpoint. For each:
 #   1. Boot sushi on a free port.

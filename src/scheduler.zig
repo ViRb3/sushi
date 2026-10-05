@@ -172,6 +172,9 @@ pub const LoadParams = struct {
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.sushi/kv-cache/<fingerprint>`.
     prefix_cache_disk_bytes: u64 = 0,
+    /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
+    /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64 = null,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
@@ -1212,6 +1215,7 @@ pub const LoadRequest = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64 = null,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
@@ -1309,6 +1313,7 @@ pub const Scheduler = struct {
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64,
     expert_cache_bytes: u64,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
@@ -1354,6 +1359,9 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Host bytes every resident model's SSD writer holds or may hold (`LoadedModel.disk_stats`
+    /// summed), outside MLX's accounting; read through `diskWriterHostBytes`.
+    disk_writer_host_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// KV + recurrent state the live slots own beyond what the hot caches bill, once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -1520,6 +1528,7 @@ pub const Scheduler = struct {
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
+            .prefix_cache_disk_resolver = params.prefix_cache_disk_resolver,
             .expert_cache_bytes = params.expert_cache_bytes,
             .ssd_budget_bytes = params.ssd_budget_bytes,
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
@@ -2031,6 +2040,7 @@ pub const Scheduler = struct {
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+            .prefix_cache_disk_resolver = self.prefix_cache_disk_resolver,
             .expert_cache_bytes = self.expert_cache_bytes,
             .ssd_budget_bytes = self.ssd_budget_bytes,
             .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
@@ -3829,6 +3839,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
         "prefix_cache_mem_resolver", "expert_cache_bytes",    "expert_cache_fit_resolver",
         "ssd_budget_bytes",          "kv_quant_explicit",     "mtp_explicit",
+        "prefix_cache_disk_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -5085,10 +5096,43 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // full reset, so we keep the legacy single-slot path for hybrid.
     const enable_ssm_cps = params.ssm_checkpoint_stride > 0;
     const ram_prefix_cache = params.prefix_cache_ram_enabled;
-    const disk_prefix_cache = params.prefix_cache_disk_bytes > 0;
-    if (params.prefix_cache_capacity > 0 and (ram_prefix_cache or disk_prefix_cache) and
-        prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
-    {
+    // Phase 3 persists hybrid recurrent state too: the disk tier is allowed whenever the RAM tier
+    // accepts the arch — pure-attention always, hybrid iff SSM checkpoints are enabled.
+    const has_ssm_layers = params.config.has_hybrid_layers or
+        params.config.full_attention_interval > 0;
+    const disk_ok = !has_ssm_layers or enable_ssm_cps;
+    const cache_applies = params.prefix_cache_capacity > 0 and
+        prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps);
+    // The SSD tier comes up BEFORE anything is sized for it: whether this model has one decides its
+    // RAM semantics (SSD-first or not), its bills and its checkpoint capture. A tier that was wanted
+    // and did not come up (no room, an unreadable fingerprint, a failed init) is recorded on the config,
+    // so every bill reads the same answer as `--prefix-cache-disk off`.
+    var disk_tier: ?kv_disk_cache.DiskTier = null;
+    if (cache_applies and params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
+        const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+            log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
+            break :attach;
+        };
+        defer sch.allocator.free(fp);
+        const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
+        defer sch.allocator.free(base);
+        const disk_budget = if (params.prefix_cache_disk_resolver) |resolve| resolve(params.config, base) else params.prefix_cache_disk_bytes;
+        if (disk_budget == 0) break :attach;
+        disk_tier = kv_disk_cache.DiskTier.init(
+            sch.allocator,
+            sch.io,
+            base,
+            fp,
+            disk_budget,
+            kv_disk_cache.DEFAULT_CHUNK_TOKENS,
+        ) catch |err| {
+            log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
+            break :attach;
+        };
+    }
+    params.config.prefix_cache_disk_declined = params.prefix_cache_disk_bytes > 0 and disk_tier == null;
+    const disk_prefix_cache = disk_tier != null;
+    if (cache_applies and (ram_prefix_cache or disk_prefix_cache)) {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
@@ -5100,6 +5144,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
+        if (ram_prefix_cache) {
+            // On an SSD-first arch `--prefix-cache-mem` is the idle allowance beside the live session.
+            const ram_bytes = if (prefix_cache_mod.ssdFirstActive(params.config, disk_prefix_cache, ram_prefix_cache)) ssd_idle_mem else clamped_prefix_mem;
+            log.info("Allocating {d:.1} GB RAM for the prefix cache (--prefix-cache-mem)\n", .{@as(f64, @floatFromInt(ram_bytes)) / (1024.0 * 1024.0 * 1024.0)});
+        }
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
             if (ram_prefix_cache) params.prefix_cache_capacity else 0,
@@ -5110,35 +5159,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5()) .min_span_recency else .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
-        // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
-        // state too: the disk tier is allowed whenever the RAM tier accepted
-        // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
-        // are enabled (`enable_ssm_cps`, the same gate `shouldUse` applied).
-        // Every failure mode is caught: persistence silently stays off, the
-        // RAM cache is unaffected.
-        const has_ssm_layers = params.config.has_hybrid_layers or
-            params.config.full_attention_interval > 0;
-        const disk_ok = !has_ssm_layers or enable_ssm_cps;
         entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5();
-        if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
-                log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
-                break :attach;
-            };
-            defer sch.allocator.free(fp);
-            const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
-            defer sch.allocator.free(base);
-            entry.prefix_cache.?.disk = kv_disk_cache.DiskTier.init(
-                sch.allocator,
-                sch.io,
-                base,
-                fp,
-                params.prefix_cache_disk_bytes,
-                kv_disk_cache.DEFAULT_CHUNK_TOKENS,
-            ) catch |err| {
-                log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
-                break :attach;
-            };
+        if (disk_tier) |tier| {
+            entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5()) .min_span_recency else .oldest;
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isGlm5())
@@ -5148,8 +5171,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
         }
-        // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
-        // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
+        // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
             params.config,
             entry.prefix_cache.?.disk != null,
@@ -5250,6 +5272,7 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    publishDiskStats(sch);
     publishHotCacheDigests(sch);
     if (sch.metrics != null) publishCachedSessions(sch);
 }
@@ -6187,6 +6210,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
     sch.registry.mutex.unlock(sch.io);
+    publishDiskStats(sch);
 
     // Shrink `fit` capacity back to the surviving live set — leaving the
     // freed model's headroom in place is exactly the per-transient-commit
@@ -6706,6 +6730,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             // already has a complete copy to spill into.
             hc.spillIdleEntries(s);
             publishHotCacheResidency(sch);
+            logDiskUsage(slot.model);
         }
     }
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
@@ -6714,6 +6739,41 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // so without this a short turn hands everything it stranded to the next one
     // and the process footprint ratchets across a session (issue #110).
     _ = mlx.mlx_clear_cache();
+}
+
+/// Publish every resident model's SSD tier (budget, bytes in use, entries, writer bytes) onto its own
+/// `LoadedModel`, and the writers' total for admission. Inference thread.
+fn publishDiskStats(sch: *Scheduler) void {
+    var writer_total: u64 = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        var snap: model_registry_mod.DiskStats.Snapshot = .{};
+        if (entry.state == .ready) {
+            if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
+                snap = .{ .budget = d.operator_cap, .used = d.total_bytes, .entries = d.entryCount(), .writer_bytes = d.writerHostBytes() };
+            };
+        }
+        entry.disk_stats.publish(snap);
+        writer_total +|= snap.writer_bytes;
+    }
+    sch.disk_writer_host_bytes.store(writer_total, .monotonic);
+}
+
+/// The one reading admission bills for the SSD writers: host bytes every resident model's writer
+/// holds or may hold, which `mlx_get_active_memory` never counts. Safe from any thread.
+pub fn diskWriterHostBytes(sch: *const Scheduler) u64 {
+    return sch.disk_writer_host_bytes.load(.monotonic);
+}
+
+/// One `[disk-cache] usage` line per finished turn, from the finishing model's own tier.
+fn logDiskUsage(model: *const LoadedModel) void {
+    const snap = model.disk_stats.snapshot();
+    if (snap.budget == 0) return;
+    var buf: [128]u8 = undefined;
+    log.info("{s}\n", .{kv_disk_cache.diskUsageLine(&buf, snap.used, snap.budget, snap.entries)});
 }
 
 /// Free finished slots on the inference thread. The request-end clear ran before this, so a

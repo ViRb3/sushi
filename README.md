@@ -152,8 +152,8 @@ MTP and the 8-bit KV cache are on by default for MiMo, and thinking is on by def
   it for the shorter context; each new instruction then re-processes the prompt from the first dropped thought.
 - `--prefill-chunk 2048` is the widest prompt step per forward; a wider one costs memory without prefilling faster,
   and a request that does not fit steps down to a narrower chunk.
-- `--prefix-cache-mem 1GB` keeps seen prompt prefixes hot in RAM, faster than the SSD.
-- `--prefix-cache-disk 20GB` keeps seen prompt prefixes on the SSD, so a repeated prompt skips its prefill.
+- `--prefix-cache-mem 1GB` also keeps seen prompt prefixes hot in RAM, faster than the SSD (RAM retention is off by default).
+- Seen prompt prefixes live on the SSD by default, so a repeated prompt skips its prefill; the budget is sized per model and capped at 20GB, and `--prefix-cache-disk 20GB` sets it.
 - `--prefix-cache-entries 1` keeps one conversation's prefix; raise it to 4-8 when several agents share the server.
 
 ## Coding agents

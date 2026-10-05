@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Tool-call boundary safety test for spec-decode.
 #
 # Send a streaming chat completion with `tools` AND `enable_pld:true`.

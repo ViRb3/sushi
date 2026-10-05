@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard (issue #331): completed schema JSON must reach CONTENT on every mask-building
 # surface. Supported unlimited Qwen reasoning may defer the grammar; requests
 # with a finite response-side reasoning budget retain the thinking-off fallback.

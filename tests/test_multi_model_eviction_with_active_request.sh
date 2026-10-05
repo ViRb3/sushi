@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Plan 05 Phase F — eviction is blocked by in-flight requests.
 #
 # Server: max-resident-models 2 with 3 models in --model-dir. Start a long

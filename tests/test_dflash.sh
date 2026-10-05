@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # DFlash block-drafter integration test — env-gated on a local target +
 # assistant pair (Muse-Glimmer-30B + its DFlash assistant today):
 #

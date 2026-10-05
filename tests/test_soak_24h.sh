@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Plan 01 — A8 24h concurrent soak test.
 #
 # Spins up the server with `--max-concurrent 4 --kv-quant 4` and pounds it
