@@ -1027,11 +1027,44 @@ fn forwardPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *transform
     return logits;
 }
 
+fn captureGlmPromptChunks(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, writer: *hidden_capture.Writer, chunk: usize) !mlx.mlx_array {
+    const request = ctx.glm5_request orelse return error.GlmRequestMissing;
+    if (request.boundaries != null) return error.GlmHiddenCaptureAlreadyActive;
+    const saved_prefill = request.prefill_async;
+    const saved_decode = request.decode_async;
+    request.prefill_async = false;
+    request.decode_async = false;
+    defer {
+        request.prefill_async = saved_prefill;
+        request.decode_async = saved_decode;
+    }
+    const counts = try allocator.alloc(usize, l.config.num_hidden_layers + 1);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    const Sink = struct {
+        writer: *hidden_capture.Writer,
+        stream: mlx.mlx_stream,
+        counts: []usize,
+        fn append(raw: *anyopaque, boundary: usize, rows: mlx.mlx_array) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (boundary >= self.counts.len) return error.HiddenCaptureBoundaryCount;
+            self.counts[boundary] += try self.writer.appendRows(self.stream, boundary, rows, null);
+        }
+    };
+    var sink = Sink{ .writer = writer, .stream = l.xfm.s, .counts = counts };
+    request.boundaries = .{ .ctx = &sink, .append = Sink.append };
+    defer request.boundaries = null;
+    const logits = try forwardPromptChunks(allocator, l, ctx, ids, chunk);
+    errdefer _ = mlx.mlx_array_free(logits);
+    for (counts) |n| if (n != ids.len) return error.HiddenCaptureBoundaryCount;
+    try writer.appendTokens(ids);
+    return logits;
+}
+
 /// The prompt forward; with `hidden`, every block boundary of it is appended there.
 fn forwardPromptCapture(allocator: std.mem.Allocator, l: *Loaded, ctx: *transformer_mod.ForwardCtx, ids: []const u32, hidden: ?*hidden_capture.Writer) !mlx.mlx_array {
     const w = hidden orelse return forwardPrompt(allocator, l, ctx, ids);
-    // A GLM boundary is all four HC streams; only the native BF16 teacher capture emits them.
-    if (l.config.isGlm5()) return error.GlmHiddenCaptureNeedsNativeTeacher;
+    if (l.config.isGlm5()) return captureGlmPromptChunks(allocator, l, ctx, ids, w, glm_prompt_chunk);
     const layers = l.config.num_hidden_layers;
     const layer_ids = try allocator.alloc(u32, layers);
     defer allocator.free(layer_ids);
@@ -2667,4 +2700,51 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
         if (!kv.isQuant()) try testing.expectEqual(@as(f64, 0), kld);
         try testing.expectEqual(@as(u8, if (kv.isQuant()) 8 else 0), loaded.xfm.glm5_request.?.latent_bits);
     }
+}
+
+test "kld: GLM full-stream hidden capture retains chunked boundaries and native logits" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const glm = @import("glm5_forward.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try arena.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glm.routedFixture(&weights, 4);
+    var loaded = Loaded{ .allocator = a, .io = io, .config = cfg, .tok = undefined, .chat_config = undefined, .weights = undefined, .xfm = undefined };
+    loaded.xfm = try transformer_mod.Transformer.init(io, a, cfg, &weights);
+    defer loaded.xfm.deinit();
+    const ids = [_]u32{ 1, 3, 0, 2, 2, 1, 3 };
+    var ctx = loaded.xfm.defaultCtx();
+    const expected = try forwardPromptChunks(a, &loaded, &ctx, &ids, 3);
+    defer _ = mlx.mlx_array_free(expected);
+    try loaded.xfm.resetCache();
+    const dir = try std.fmt.allocPrint(arena, "{s}/hidden", .{root});
+    const writer = try hidden_capture.Writer.open(a, io, dir, cfg.num_hidden_layers, cfg.hidden_size * cfg.hc_count);
+    defer writer.close();
+    var capture_ctx = loaded.xfm.defaultCtx();
+    const actual = try captureGlmPromptChunks(a, &loaded, &capture_ctx, &ids, writer, 3);
+    defer _ = mlx.mlx_array_free(actual);
+    try mlx.check(mlx.mlx_array_eval(actual));
+    try mlx.check(mlx.mlx_array_eval(expected));
+    var same = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(same);
+    try mlx.check(mlx.mlx_array_equal(&same, actual, expected, true, loaded.xfm.s));
+    var equal = false;
+    try mlx.check(mlx.mlx_array_item_bool(&equal, same));
+    try testing.expect(equal);
+    try writer.sync();
+    for (0..cfg.num_hidden_layers + 1) |b| {
+        const path = try std.fmt.allocPrint(arena, "hidden/boundary-{d:0>2}.bin", .{b});
+        const bytes = try tmp.dir.readFileAlloc(io, path, arena, .limited(1 << 20));
+        try testing.expectEqual(@as(usize, ids.len * cfg.hidden_size * cfg.hc_count * 2), bytes.len);
+    }
+    const tokens = try tmp.dir.readFileAlloc(io, "hidden/tokens.bin", arena, .limited(1 << 20));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&ids), tokens);
+    try testing.expect(loaded.xfm.glm5_request.?.boundaries == null);
 }

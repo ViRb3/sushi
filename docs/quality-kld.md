@@ -18,7 +18,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 - `kld` takes the SERVED weight loader (`model.loadWeightsForConfig`); a second loader once bound a MiMo pack's raw FP8
   QKV and made every pack score the same.
 - Teacher captures run the KV cache dense (`--kv-quant off`); students are scored at kv8 unless the row says so.
-- `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4 and GLM (`[tokens, 4, hidden]`), including boundary zero. GLM boundaries come only from the native BF16 teacher capture; the generic path refuses them (`GlmHiddenCaptureNeedsNativeTeacher`).
+- `SUSHI_HIDDEN_OUT` stores bf16 block boundaries at residual-stream width: `hidden_size` for MiMo, `hc_count * hidden_size` for Qwen4 and GLM (`[tokens, 4, hidden]`), including boundary zero. GLM teacher and served-pack capture retain every native HC stream. The served path appends each chunk's native boundaries and commits token IDs only after every boundary has the complete prompt.
 - A `--prompts` jsonl line may carry `prompt_ids` (token ids, used as given, no template) instead of `prompt`.
 
 Native GLM capture runs the native forward through `sushi kld capture` with individual BF16 expert streaming,

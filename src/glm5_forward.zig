@@ -292,6 +292,102 @@ const LayerState = struct {
     }
 };
 
+/// Frozen attention and mHC values for fitting only routed FFN scales.
+pub const FfnPrefix = struct {
+    input: Arr,
+    residual: Arr,
+    post: Arr,
+    comb: Arr,
+    pub fn deinit(self: *FfnPrefix) void {
+        for ([_]Arr{ self.input, self.residual, self.post, self.comb }) |value| _ = mlx.mlx_array_free(value);
+    }
+};
+
+fn prepareFrozenPrefix(cfg: *const model.ModelConfig, stream: mlx.mlx_stream, ops: *Ops, layer: *const Layer, state: *LayerState, h: Arr, dense_prefill: bool) !FfnPrefix {
+    const pre = try layer.hc_attn.collapse(ops, h, cfg);
+    defer pre.deinit();
+    const x = try ops.rms(pre.mixed, layer.norm_attn, cfg.rms_norm_eps);
+    const a = switch (layer.attn) {
+        .kda => |kda| try kda.apply(ops, x, cfg, &state.recurrent),
+        .mla => |*mla| try mla.applyMode(ops, x, cfg, &state.attention, dense_prefill),
+    };
+    const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, stream));
+    const ff = try layer.hc_ffn.collapse(ops, joined, cfg);
+    defer ff.deinit();
+    const fx = try ops.rms(ff.mixed, layer.norm_ffn, cfg.rms_norm_eps);
+    const input = try ops.result(fx);
+    errdefer _ = mlx.mlx_array_free(input);
+    const residual = try ops.result(joined);
+    errdefer _ = mlx.mlx_array_free(residual);
+    const post = try ops.result(ff.post);
+    errdefer _ = mlx.mlx_array_free(post);
+    return .{ .input = input, .residual = residual, .post = post, .comb = try ops.result(ff.comb) };
+}
+
+/// Load only a layer's frozen trunk. Individual teacher experts never enter this replay.
+pub const FfnPrefixReplay = struct {
+    cfg: model.ModelConfig,
+    layer: Layer,
+    index: usize,
+    stream: mlx.mlx_stream,
+    router: Arr,
+    correction: Arr,
+    shared: ?base.DenseMlp,
+
+    pub fn load(cfg: model.ModelConfig, weights: *const model.Weights, index: usize, stream: mlx.mlx_stream) !FfnPrefixReplay {
+        if (!cfg.isGlm5() or index < cfg.first_k_dense_replace or index >= cfg.num_hidden_layers) return error.InvalidGlmLayer;
+        var buf: [256]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&buf, "{s}.layers.{d}", .{ cfg.weight_prefix, index });
+        const hc_attn = try base.Hc.load(weights, prefix, "hc_attn", cfg.hidden_size);
+        const hc_ffn = try base.Hc.load(weights, prefix, "hc_ffn", cfg.hidden_size);
+        const norm_attn = try tensor(weights, prefix, "input_layernorm.weight");
+        const norm_ffn = try tensor(weights, prefix, "post_attention_layernorm.weight");
+        var name_buf: [256]u8 = undefined;
+        const attn_name = try std.fmt.bufPrint(&name_buf, "{s}.self_attn", .{prefix});
+        var attn: Attention = if ((index + 1) % cfg.full_attention_interval == 0)
+            .{ .mla = try Mla.load(weights, attn_name, &cfg, stream) }
+        else blk: {
+            var kda = try base.KdaLayer.load(weights, attn_name, &cfg);
+            errdefer kda.deinit();
+            try kda.prepare(stream);
+            try kda.preparePrefillCluster(stream);
+            break :blk .{ .kda = kda };
+        };
+        errdefer switch (attn) {
+            .kda => |*kda| kda.deinit(),
+            .mla => |*mla| mla.deinit(),
+        };
+        const router = try tensor(weights, prefix, "mlp.gate.weight");
+        const correction = try tensor(weights, prefix, "mlp.gate.e_score_correction_bias");
+        const shared = if (cfg.shared_expert_intermediate_size > 0)
+            try base.DenseMlp.load(weights, try std.fmt.bufPrint(&name_buf, "{s}.mlp.shared_experts", .{prefix}), cfg.hidden_size, cfg.shared_expert_intermediate_size)
+        else
+            null;
+        return .{ .cfg = cfg, .index = index, .stream = stream, .router = router, .correction = correction, .shared = shared, .layer = .{ .attn = attn, .ffn = undefined, .hc_attn = hc_attn, .hc_ffn = hc_ffn, .norm_attn = norm_attn, .norm_ffn = norm_ffn } };
+    }
+
+    pub fn deinit(self: *FfnPrefixReplay) void {
+        self.layer.deinit();
+    }
+
+    pub fn prepare(self: *const FfnPrefixReplay, request: *Request, h: Arr) !FfnPrefix {
+        if (request.layers.len != self.cfg.num_hidden_layers) return error.InvalidGlmLayer;
+        var ops = Ops{ .s = self.stream };
+        defer ops.deinit();
+        var prefix = try prepareFrozenPrefix(&self.cfg, self.stream, &ops, &self.layer, &request.layers[self.index], h, request.dense_prefill);
+        errdefer prefix.deinit();
+        const evals = mlx.mlx_vector_array_new_data(&[_]Arr{ prefix.input, prefix.residual, prefix.post, prefix.comb }, 4);
+        defer _ = mlx.mlx_vector_array_free(evals);
+        try appendLayerState(evals, &request.layers[self.index]);
+        try mlx.check(mlx.mlx_eval(evals));
+        return prefix;
+    }
+
+    pub fn routing(self: *const FfnPrefixReplay, ops: *Ops, input: Arr) !Routed {
+        return route(ops, input, self.router, self.correction, @intCast(self.cfg.num_experts_per_tok), self.cfg.router_scaling_factor, self.cfg.moe_route_norm);
+    }
+};
+
 pub const Capture = struct { ids: []const u32, out: []Arr };
 
 /// Receives every block boundary of a forward, [1, t, hc, hidden] BF16: 0 = layer 0's input, b = layer b-1's output.
@@ -609,23 +705,43 @@ pub const Model = struct {
         return ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(hidden, &.{ 1, t, 1, @intCast(self.cfg.hidden_size) }), &.{ 1, t, 4, @intCast(self.cfg.hidden_size) })));
     }
 
-    fn layerBody(self: *const Model, ops: *Ops, layer: *const Layer, state: *LayerState, h: Arr, dense_prefill: bool) !Arr {
-        const pre = try layer.hc_attn.collapse(ops, h, &self.cfg);
-        defer pre.deinit();
-        const x = try ops.rms(pre.mixed, layer.norm_attn, self.cfg.rms_norm_eps);
-        const a = switch (layer.attn) {
-            .kda => |kda| try kda.apply(ops, x, &self.cfg, &state.recurrent),
-            .mla => |*mla| try mla.applyMode(ops, x, &self.cfg, &state.attention, dense_prefill),
-        };
-        const joined = try ops.own(try primitive.hcExpand(h, a, pre.post, pre.comb, self.s));
-        const ff = try layer.hc_ffn.collapse(ops, joined, &self.cfg);
-        defer ff.deinit();
-        const fx = try ops.rms(ff.mixed, layer.norm_ffn, self.cfg.rms_norm_eps);
+    fn prepareFfn(self: *const Model, ops: *Ops, layer: *const Layer, state: *LayerState, h: Arr, dense_prefill: bool) !FfnPrefix {
+        return prepareFrozenPrefix(&self.cfg, self.s, ops, layer, state, h, dense_prefill);
+    }
+
+    fn finishFfn(self: *const Model, ops: *Ops, layer: *const Layer, prefix: *const FfnPrefix) !Arr {
         const y = switch (layer.ffn) {
-            .dense => |dense| try dense.apply(ops, fx, self.cfg.glm_swiglu_limit),
-            .moe => |moe| try moe.apply(ops, fx, &self.cfg),
+            .dense => |dense| try dense.apply(ops, prefix.input, self.cfg.glm_swiglu_limit),
+            .moe => |moe| try moe.apply(ops, prefix.input, &self.cfg),
         };
-        return ops.own(try primitive.hcExpand(joined, y, ff.post, ff.comb, self.s));
+        return ops.own(try primitive.hcExpand(prefix.residual, y, prefix.post, prefix.comb, self.s));
+    }
+
+    fn layerBody(self: *const Model, ops: *Ops, layer: *const Layer, state: *LayerState, h: Arr, dense_prefill: bool) !Arr {
+        var prefix = try self.prepareFfn(ops, layer, state, h, dense_prefill);
+        defer prefix.deinit();
+        return self.finishFfn(ops, layer, &prefix);
+    }
+
+    /// Each call advances only this layer's attention state. Reset between independent windows.
+    pub fn prepareFfnLayer(self: *const Model, request: *Request, index: usize, h: Arr) !FfnPrefix {
+        if (index >= self.layers.len or request.layers.len != self.layers.len) return error.InvalidGlmLayer;
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        var result = try self.prepareFfn(&ops, &self.layers[index], &request.layers[index], h, request.dense_prefill);
+        errdefer result.deinit();
+        const evals = mlx.mlx_vector_array_new_data(&[_]Arr{ result.input, result.residual, result.post, result.comb }, 4);
+        defer _ = mlx.mlx_vector_array_free(evals);
+        try appendLayerState(evals, &request.layers[index]);
+        try mlx.check(mlx.mlx_eval(evals));
+        return result;
+    }
+
+    pub fn finishFfnLayer(self: *const Model, index: usize, prefix: *const FfnPrefix) !Arr {
+        if (index >= self.layers.len) return error.InvalidGlmLayer;
+        var ops = Ops{ .s = self.s };
+        defer ops.deinit();
+        return ops.result(try self.finishFfn(&ops, &self.layers[index], prefix));
     }
 
     /// One prefill chunk through one layer with the request's state for it, settled as a streamed forward settles
@@ -1441,4 +1557,61 @@ test "GLM request picks its latent storage before the first token and keeps the 
     defer base.reference_numerics = false;
     try std.testing.expectError(error.GlmTeacherLatentMustBeBf16, req.setLatentBits(8));
     try req.setLatentBits(0);
+}
+
+test "GLM frozen FFN prefix recomposes native layers and releases independent-window state" {
+    const a = std.testing.allocator;
+    var weights = model.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try routedFixture(&weights, 4);
+    var mdl = try Model.load(a, cfg, &weights, mlx.gpuStream());
+    defer mdl.deinit();
+    var original = try Request.init(a, cfg.num_hidden_layers);
+    defer original.deinit();
+    var cached = try Request.init(a, cfg.num_hidden_layers);
+    defer cached.deinit();
+    const ids = mlx.mlx_array_new_data(&[_]u32{ 1, 2, 3 }, &[_]c_int{ 1, 3 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    var h = try mdl.embedStreams(ids, null);
+    defer _ = mlx.mlx_array_free(h);
+    for (0..cfg.num_hidden_layers) |i| {
+        const expected = try mdl.prefillLayer(&original, i, h);
+        defer _ = mlx.mlx_array_free(expected);
+        var prefix = try mdl.prepareFfnLayer(&cached, i, h);
+        defer prefix.deinit();
+        const actual = try mdl.finishFfnLayer(i, &prefix);
+        defer _ = mlx.mlx_array_free(actual);
+        try mlx.check(mlx.mlx_array_eval(actual));
+        try mlx.check(mlx.mlx_array_eval(expected));
+        const n = mlx.mlx_array_size(actual);
+        try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(expected).?[0..n], mlx.mlx_array_data_bfloat16(actual).?[0..n]);
+        try std.testing.expectEqualSlices(c_int, &.{ 1, 3, 128 }, mlx.getShape(prefix.input));
+        var replay_cfg = cfg;
+        replay_cfg.first_k_dense_replace = 0;
+        replay_cfg.shared_expert_intermediate_size = 0;
+        if (i < cfg.first_k_dense_replace) {
+            var name_buf: [128]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "{s}.layers.{d}.mlp.gate", .{ cfg.weight_prefix, i });
+            try fixtureTensor(&weights, name, "weight", &.{ 4, 128 }, .float32, false);
+            try fixtureTensor(&weights, name, "e_score_correction_bias", &.{4}, .float32, false);
+        }
+        var replay = try FfnPrefixReplay.load(replay_cfg, &weights, i, mlx.gpuStream());
+        defer replay.deinit();
+        var request = try Request.init(a, cfg.num_hidden_layers);
+        defer request.deinit();
+        var frozen = try replay.prepare(&request, h);
+        defer frozen.deinit();
+        try expectArrayBits(frozen.input, prefix.input);
+        try expectArrayBits(frozen.residual, prefix.residual);
+        try expectArrayBits(frozen.post, prefix.post);
+        try expectArrayBits(frozen.comb, prefix.comb);
+        request.reset();
+        var repeat = try replay.prepare(&request, h);
+        defer repeat.deinit();
+        try expectArrayBits(repeat.input, frozen.input);
+        try mlx.check(mlx.mlx_array_set(&h, expected));
+    }
+    cached.reset();
+    original.reset();
+    try std.testing.expectError(error.InvalidGlmLayer, mdl.prepareFfnLayer(&cached, cfg.num_hidden_layers, h));
 }
