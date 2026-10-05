@@ -86,10 +86,10 @@ are the router's precondition, never synced to the CPU. Every path below is bit-
   by `half4` (`downLanePrepare` + `downLaneCoop`: even n 32–64, MCG/W12, BF16 out; −10–15% against the fused
   middle/down, which now serves only what the lane path declines).
 - **Verification rows share weight reads** (`src/exl3/glm_group2.zig`, 3–4 BF16 rows, 4096/2048, top-8, clamp 10,
-  MCG/W12, K2.25): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
+  MCG/W12, every even n 32–64, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
   feeds two independent FP32 accumulator sets, and a serial 4 KiB member reduction keeps the r-then-simdgroup order.
   Singleton leaders run the unchanged body. Routed-chain replay −20% on layers with expert overlap; DFlash2 N2 512/64
-  decode 42.43 → 45.45 tok/s (`ba106e5e`). Real 8K verify rounds are singleton-heavy (70% of assignments).
+  decode 42.43 → 45.45 tok/s at n36 (`ba106e5e`); at n40 (Sushi-2.5bpw, kv8, A4 DFlash2, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) +3.2% at 512/64 (4/4 pairs) and +5.0% at 8K/128, same bytes. Real 8K verify rounds are singleton-heavy (70% of assignments). The gate is `glm_group2.servesRate`; a guard test enumerates every admitted n.
 - **Prefill** prepares gate/up straight from token rows, shares one window table across the three projections,
   builds the inverse routing on the GPU (at most 512 experts) and finishes from the sorted down plane; the stride
   fallback scatters. WIN32 already skips its second 16-row MMA for runs of at most 16 rows (512-token prompts touch a

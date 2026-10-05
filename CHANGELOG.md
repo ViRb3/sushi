@@ -8,6 +8,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **`sushi run` opens a chat on GLM-5.3-Flash**: the chat preflight no longer refuses `glm5_next` as an unsupported model.
 - **GLM decode, two-row tails and four-row lookup run the parallel HC coefficient kernel the three-row verify already had**: about 6% faster per serial token, same bytes.
+- **GLM DFlash2 verification reuses expert weight reads at every even packed rate 32–64**, so the 2.5bpw pack gets the speed-up the 2.25bpw pack already had, same bytes.
 - **Qwen decode folds the shared-expert gate into the router kernel**, one fewer pair of launches per layer, same bytes.
 - **SSD-streamed Qwen3.8-Flash-Next packs now decode with MTP by default**: the head and its own routed experts load
   resident and are billed in the budget, verify rows run on the streamed decode path, and the n-gram window rolls back

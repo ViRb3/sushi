@@ -63,7 +63,7 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             };
             const dec = api.format.Decode{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window };
             const gs = mlx.getShape(layer.bank.gate.trellis);
-            const candidate = if (shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and dec.window == .w12 and gs.len == 4 and gs[2] == 128 and gs[3] == 36)
+            const candidate = if (shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and dec.window == .w12 and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]))
                 try api.glm_group2.moeLayout(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane)
             else
                 null;
@@ -88,7 +88,7 @@ fn equal(a: Arr, b: Arr, stream: mlx.mlx_stream) !void {
     try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(a).?[0..count], mlx.mlx_array_data_bfloat16(b).?[0..count]);
 }
 
-fn bank(ops: *Ops, hidden: c_int, intermediate: c_int, rate: c_int) !api.Bank {
+fn bank(ops: *Ops, hidden: c_int, intermediate: c_int, rate: c_int, down_rate: c_int) !api.Bank {
     var projections: [3]api.Proj = undefined;
     for (&projections, 0..) |*projection, i| {
         const input = if (i == 2) intermediate else hidden;
@@ -96,7 +96,7 @@ fn bank(ops: *Ops, hidden: c_int, intermediate: c_int, rate: c_int) !api.Bank {
         const key = try ops.slot();
         try mlx.check(mlx.mlx_random_key(key, @intCast(123 + i)));
         const codes = try ops.slot();
-        try mlx.check(mlx.mlx_random_bits(codes, &[_]c_int{ 9, @divExact(input, 16), @divExact(output, 16), rate }, 4, 2, key.*, ops.s));
+        try mlx.check(mlx.mlx_random_bits(codes, &[_]c_int{ 9, @divExact(input, 16), @divExact(output, 16), if (i == 2) down_rate else rate }, 4, 2, key.*, ops.s));
         const su = try ops.slot();
         try mlx.check(mlx.mlx_random_uniform(su, try ops.scalar(-0.2, .float16), try ops.scalar(0.2, .float16), &[_]c_int{ 9, input }, 2, .float16, key.*, ops.s));
         const sv = try ops.slot();
@@ -115,7 +115,7 @@ test "GLM DFlash clamped experts keep serial row bits at all supported rates" {
         const rate: c_int = if (production) 36 else @intCast(32 + case * 2);
         var ops = Ops{ .s = s };
         defer ops.deinit();
-        const weights = try bank(&ops, hidden, intermediate, rate);
+        const weights = try bank(&ops, hidden, intermediate, rate, rate);
         const key = try ops.slot();
         try mlx.check(mlx.mlx_random_key(key, 117));
         const input = try ops.slot();
@@ -182,8 +182,7 @@ test "GLM DFlash FFN batch matches each target FFN row" {
     }
 }
 
-test "GLM DFlash FFN integrates production-width batched routing" {
-    const allocator = std.testing.allocator;
+fn expectGroup2Rows(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int) !void {
     const stream = mlx.gpuStream();
     var fixtures = Ops{ .s = stream };
     defer fixtures.deinit();
@@ -200,25 +199,34 @@ test "GLM DFlash FFN integrates production-width batched routing" {
     const bias = try fixtures.own(mlx.mlx_array_new_data(&correction, &.{288}, 1, .float32));
     target.layers[3].ffn.moe.weight = w;
     target.layers[3].ffn.moe.correction = bias;
-    target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 2048, 36);
+    target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 2048, rate, down_rate);
     target.cfg.expert_quant_codebook = .mcg;
     target.cfg.expert_quant_window = .w12;
     target.cfg.glm_swiglu_limit = 10;
     target.layers[3].ffn.moe.shared = null;
     try mlx.check(mlx.mlx_array_eval(w));
-    const x = try fixtures.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 4, 4096 }, 731, stream));
-    var ops = Ops{ .s = stream };
-    defer ops.deinit();
-    @import("glm5_router.zig").resetBatchCallCount();
-    resetGroup2BatchCount();
-    const actual = try apply(&target, 3, &ops, x);
-    try std.testing.expectEqual(@as(usize, 1), group2BatchCount());
-    try std.testing.expectEqual(@as(usize, 1), @import("glm5_router.zig").batchCallCount());
-    for (0..4) |i| {
-        var one = Ops{ .s = stream };
-        defer one.deinit();
-        const row: c_int = @intCast(i);
-        const expected = try target.feedForwardLayer(3, &one, try one.slice(x, 1, row, row + 1));
-        try equal(expected, try one.slice(actual, 1, row, row + 1), stream);
+    const full = try fixtures.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{ 1, 4, 4096 }, 731, stream));
+    for ([_]c_int{ 3, 4 }) |rows_in| {
+        var ops = Ops{ .s = stream };
+        defer ops.deinit();
+        const x = try ops.slice(full, 1, 0, rows_in);
+        @import("glm5_router.zig").resetBatchCallCount();
+        resetGroup2BatchCount();
+        const actual = try apply(&target, 3, &ops, x);
+        try std.testing.expectEqual(@as(usize, 1), group2BatchCount());
+        try std.testing.expectEqual(@as(usize, 1), @import("glm5_router.zig").batchCallCount());
+        for (0..@intCast(rows_in)) |i| {
+            var one = Ops{ .s = stream };
+            defer one.deinit();
+            const row: c_int = @intCast(i);
+            const expected = try target.feedForwardLayer(3, &one, try one.slice(x, 1, row, row + 1));
+            try equal(expected, try one.slice(actual, 1, row, row + 1), stream);
+        }
     }
+}
+
+test "GLM DFlash FFN integrates production-width batched routing at every group-two rate" {
+    var n: c_int = 32;
+    while (n <= 64) : (n += 2) try expectGroup2Rows(std.testing.allocator, n, n);
+    for ([_][2]c_int{ .{ 40, 36 }, .{ 36, 40 }, .{ 48, 32 }, .{ 32, 64 } }) |mixed| try expectGroup2Rows(std.testing.allocator, mixed[0], mixed[1]);
 }
