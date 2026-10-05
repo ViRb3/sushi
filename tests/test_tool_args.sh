@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: verify tool call arguments are parsed correctly.
 # Tests the fix for intermittent "missing parameter: command, args: [none]"
 # caused by convertGemma4ArgsToJson producing invalid JSON for quoted keys.

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Multi-client stress test — the "several pi's + several chats" mix.
 #
 # Simulates the load pattern of multiple concurrent agent CLIs (pi) plus chat

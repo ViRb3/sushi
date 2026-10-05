@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Stopping one stream while another MTP stream decodes must not crash the server:
 # the handler frees its sampling state (`think_bound`) once `complete` returns,
 # and a tick that already holds the slot still reads it (`Slot.in_pass`).

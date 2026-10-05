@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: JSON schema enforcement on /v1/responses and /v1/chat/completions.
 #
 # Background: bench runs (#6, #8) showed Gemma producing ```json``` code-fences

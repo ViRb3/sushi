@@ -110,11 +110,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   diag arms, Sushi-2.5bpw, kv8, 4x512 teacher): KLD 0.071569 against the fused arm's 0.071762 (−0.27%), top-1 90.33%
   against 89.70%. Serial decode 34.07 → 32.54 ms/token at 8K and 33.84 → 32.66 at 32K, arms interleaved in one
   process on a contended box; DFlash2 verification per round is unchanged (~60 ms). 32 MiB per pending layer.
-- HC collapse on three verify rows: one SIMD32 subgroup runs the coefficients and 20 Sinkhorn iterations that thread 0
-  ran alone while 255 threads waited (exact; −27.6% component, 8K model −2.65% vs 1.99% drift).
+- HC collapse on one to four rows (T3 first, then T1/T2/T4: serial decode, tails, lookup and company): one SIMD32 subgroup runs the coefficients and 20 Sinkhorn iterations that thread 0
+  ran alone while 255 threads waited (exact; −27.6% component, 8K model −2.65% vs 1.99% drift). T1/T2/T4 in one process on Sushi-2.5bpw kv8 at 1K (`SUSHI_GLM_ROWS_UBENCH`, 24 rounds,
+  arms interleaved, `taskpolicy -a`, lock, AC): serial token 30.87 → 28.98 ms (−6.1%), grouped T2 40.92 → 38.98 (−4.7%),
+  T4 66.41 → 64.19 (−3.3%); T3 unchanged (51.50 vs 51.41, the control). Bit-exact against the reference kernel at every width.
 
 ## DFlash2 verification
 
+- **Group-two rows serve every even n 32–64** (`glm_group2.servesRate`), never one pack's rate; mixed gate/up and down rates
+  are exact, and the engagement test runs `apply` at each rate.
 - **Groups**: `verifyGroups` runs several requests' trees (≤ 16 rows) in one layer loop. KDA `project`/`finish` and
   MLA `mlaProject`/`mlaFinish` take every row; `recur` and `mlaAttend` take one request's rows and state. Each group
   equals its solo `verify` bit for bit; `SUSHI_GLM_ROWS_UBENCH=N` (`_CTX`, `_TEXT`) times grouped against serial rows.
@@ -175,6 +179,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - The KDA body, prework, post and FP32 router are plain SIMD kernels whose unary variants are probed against MLX on the
   device; they run on every GPU. The 1024-thread KDA body compiles to 24 GPRs for G13/G14 (`metal-tt`), inside M1/M2's
   1024-thread cap; every other GLM kernel dispatches at most 256 threads.
+- The T2048 grid takes NHW from each projection's trellis and keys its config cache on the rate.
 - Routed experts: the T2048 grid declines off NAX and the sorted chain takes the simdgroup-matrix body
   (`[exl3-gemm] simdgroup-matrix body engaged`); decode lanes and group2 rows are SIMD already.
 - The cold MLA D256 `force_fused` SDPA has a non-NAX steel kernel (256 threads); vision uses stock D64 attention.
@@ -217,6 +222,8 @@ Prefill KDA and trunk:
 Decode and verify:
 - One-token HC norm/mix fusion: −8% queued component, model 26.49 vs 26.54 tok/s; removed. Short-row HC collapse +
   RMS fusion: 0.4 µs per call, never integrated.
+- Whole HC prep in one kernel (RMS, 24 mixes, gates, collapse, sublayer norm; bit-exact, BF16 matrices read in place):
+  -5% serial before the 1-4 row SIMD32 collapse; on top of it 0 to +2% at B=1-4, 8K (`de867e94`).
 - Joined QKV dispatch (3–4 rows: +0.7–3.0%; later over the three hoisted A6 banks: −0.57%, 6/11): noise.
 - Raw A6 four-product unpack: +1.3% (5/11). A6 hoist on the output projection: −2.8%, 7/11, drifting.
 - Per-node packed NAX decode attention: +23–60%, 0/6 in all nine cases. Shared-factor split-8 merge: +2–5%.
@@ -229,6 +236,9 @@ Decode and verify:
 - Draft head shortlists (3-bit top-32 over 7 rows; A3 top-32 over 2 rows): −26% readout, decode gain inside drift,
   +265–278 MiB resident; removed. The A4 assistant leaves the premise: the 2-row readout is 1.3 of a 5.3 ms draft,
   at most 2.2% of an 8K round (BF16, `11566d93`).
+- A measured-cost round planner (serial / N2 tree / lookup per request, hysteresis, probes): byte-identical, within
+  noise of the fixed plan at 8K and 128K (2.5bpw kv8 A4). Prose lands 1.7-2.3 tokens per round against a ~1.9
+  break-even, so the always-on tree leaves at most a few percent.
 - Narrower trees: N1 (one draft node) loses to N2 at 1K and 30K (37.5–38.4 vs 32.2–33.6 ms per token; BF16, A4,
   arms rotated every 16 rounds in one request, contended box); N2 beats a serial step above ~1.1 accepted per round.
 - Wider trees: N3 with every T4 kernel optimized 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`, 1.46% drift);

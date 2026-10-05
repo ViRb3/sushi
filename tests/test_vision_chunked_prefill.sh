@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Vision prefill chunking: an image-bearing prompt must prefill in chunks like
 # text does, instead of one whole-prompt forward (issue #197 — the unchunked
 # width is what the memory guard bills, so long conversations + one screenshot

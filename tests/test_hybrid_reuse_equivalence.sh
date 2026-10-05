@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_hybrid_reuse_equivalence.sh — Phase 1 of performance-plan.md.
 #
 # Hybrid SSM models (qwen3_5, qwen3_5_moe, qwen3_next, lfm2, nemotron_h)

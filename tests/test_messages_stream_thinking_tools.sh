@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Regression tests for /v1/messages STREAMING with thinking + tools together —
 # the exact Claude Code shape (Claude Code always sends tools, and Qwen 3.5/3.6
 # templates inject the `<think>\n` opener into the generation prompt).

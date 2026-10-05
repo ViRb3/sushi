@@ -27,6 +27,21 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [arch-qwen4exp](arch-qwen4
   where the NAX gather serves (`qsaPrefillGatherMinKv`), 8192 elsewhere; decode and verify floors are unchanged.
 - **Verify gather kv floor is per KV SCHEME** (`qsaVerifyGatherMinKvFor`: dense 32768, quantized 16384).
 
+## Small sparse groups at long context
+
+A batched group is never split by the pad-waste cap when its longest BILLED length is at most `PAD_FREE_KV` (4096) and
+its longest TRUE context is at least `PAD_FREE_MIN_CTX` (131072) (`groupKeepCount`, decode tick and `runMtpGroups`; the MTP
+planner gate keeps the plain cap). Under the gather arm every long slot bills at the indexer budget (2052 rows), so a
+short sub-agent beside a long session read as a 2x pad and sent a slot through a whole serial forward every tick. Below
+131072 tokens that serial forward is cheap and the plain cap still splits. The group runs the batched path that
+already ships, so its output differs from the serial one only by the documented batched-versus-solo Qwen tolerance.
+This floor now serves the grouped MTP verify and a streamed load only: a resident plain decode batch pads nothing.
+
+- Measured (this change on d3c65fc6, Sushi-2.6bpw, kv8, one ~134k-token session beside two ~200-token requests, 256
+  tokens each, decode-only tok/s of the aggregate, `taskpolicy -a`, GPU lock held, boot-interleaved old/new arms): `--no-mtp
+  --no-pld` 59 -> 97-99 (96.8-99.4 floor on, 59.1-62.1 off); default MTP on 65.1-66.0 -> 95.6-96.2.
+  Engagement: the old arm logs `[batched] pad-waste cap: kept 0 of 2 slots (waste 1.97x, kv_len 32..2052)`, the new arm does not.
+
 ## Batched image and text streams
 
 M-RoPE slots use the same batched QSA gather as text slots. Queries are rotated before attention, cached keys

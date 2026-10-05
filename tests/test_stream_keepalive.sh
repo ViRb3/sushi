@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Streaming-silence regression test (class guard).
 #
 # CLASS: a streaming surface that BUFFERS tokens must never let the socket go

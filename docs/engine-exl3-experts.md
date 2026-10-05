@@ -43,7 +43,9 @@ kernel on supported hardware.
   bits, and 16 weights span n. Below n64 every codebook reads through them. n64 keeps its packed K4 branch, which does
   the same reads at a word-aligned rate, one output tile per threadgroup:
   - decode GEMV lane: 64 bits ending at the lane's last bit. A third word is read only when the first codeword can
-    start before the two words (every n from 42 to 62 but 48).
+    start before the two words (every n from 42 to 62 but 48), and then on every lane: a branch around that load on
+    the lane's bit alignment kept every byte and doubled the n42 pair GEMV
+    ([perf-baselines](perf-baselines.md#exl3-lane-third-word)).
   - simdgroup-matrix group: one or two 32-bit funnels, split at the widest weight whose first codeword still fits.
   - NAX fragment: one funnel per quad of weights; above n50 a quad's codewords pass 32 bits, and the funnel reads 64
     bits from three words.
@@ -86,17 +88,17 @@ are the router's precondition, never synced to the CPU. Every path below is bit-
   by `half4` (`downLanePrepare` + `downLaneCoop`: even n 32–64, MCG/W12, BF16 out; −10–15% against the fused
   middle/down, which now serves only what the lane path declines).
 - **Verification rows share weight reads** (`src/exl3/glm_group2.zig`, 3–4 BF16 rows, 4096/2048, top-8, clamp 10,
-  MCG/W12, K2.25): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
+  MCG/W12, every even n 32–64, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
   feeds two independent FP32 accumulator sets, and a serial 4 KiB member reduction keeps the r-then-simdgroup order.
   Singleton leaders run the unchanged body. Routed-chain replay −20% on layers with expert overlap; DFlash2 N2 512/64
-  decode 42.43 → 45.45 tok/s (`ba106e5e`). Real 8K verify rounds are singleton-heavy (70% of assignments).
+  decode 42.43 → 45.45 tok/s at n36 (`ba106e5e`); at n40 (Sushi-2.5bpw, kv8, A4 DFlash2, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) +3.2% at 512/64 (4/4 pairs) and +5.0% at 8K/128, same bytes. Real 8K verify rounds are singleton-heavy (70% of assignments). The gate is `glm_group2.servesRate`; a guard test enumerates every admitted n.
 - **Prefill** prepares gate/up straight from token rows, shares one window table across the three projections,
   builds the inverse routing on the GPU (at most 512 experts) and finishes from the sorted down plane; the stride
   fallback scatters. WIN32 already skips its second 16-row MMA for runs of at most 16 rows (512-token prompts touch a
   median 230 of 288 experts).
-- **Full T2048 chunks transpose the grid** (`src/exl3/glm_prefill_grid.zig`, B1, H4096/I2048, E288, top-8, n36
-  MCG/W12, clamp 10): physical X walks routing windows and Y the 128-column output stripes; logical IDs, dot body and
-  stores are unchanged. Actual L20 chain 19.64 → 17.96 ms (−8.6%, 11/11). The T2048 routed chain is GEMM-bound
+- **Full T2048 chunks transpose the grid** (`src/exl3/glm_prefill_grid.zig`, B1, H4096/I2048, E288, top-8, every admitted
+  n including mixed per-projection rates, MCG/W12, clamp 10): physical X walks routing windows and Y the 128-column output stripes; logical IDs, dot body and
+  stores are unchanged. Actual L20 chain 19.64 → 17.96 ms at n36 (−8.6%, 11/11); at n40 (Sushi-2.5bpw, kv8, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) prefill +4.5% at 8K and +2.7% at 32K, same bytes. A test enumerates every admitted n against the sorted chain. The T2048 routed chain is GEMM-bound
   (gate/up ≈60%, down ≈30%; sort/prepare/middle/finish ≈1.75 of 17.35 ms).
 - **MCG/W12 decode is pure ALU** (mask, multiply/mask/xor, half adds): there is no codebook table or expanded weight
   plane to cache, and cross-round expert reuse at 8K is only ~40%.
@@ -162,6 +164,11 @@ Ruled out for GLM experts (each exact unless noted; "component" = an isolated re
   reference). A layout that changes which simdgroup sums which k-tile (8 simdgroups) is NOT bit-identical.
 - A rate on the generic reader decodes ~40% slower per GEMV than on the funnel, with no other symptom. The engagement
   line `[exl3] n<n> funnel engaged arm=<arm>` names the rate and arm in a live log.
+- **A reader change is timed on every served pack's decode before it lands** (forward meter, against its parent): the
+  byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K2 to K4, the served
+  range: the test `every K2 to K4 rate decodes within a margin of n48` holds each even n from 32 to 64 within 1.4x of
+  n48's GEMV steps (n64's packed branch 1.8x). Rates below K2 and above K4 stay admitted and tested for correctness,
+  never timed.
 - **MiMo verify rows share an expert's weight reads** (`PAIR_GEMV_GROUPED_SOURCE`, `DOWN_PREPARED_GROUPED_SOURCE`;
   prepared-mid geometry, 2+ rows): among an expert's slots, each even-ranked slot leads itself and the next one,
   decodes each weight once and feeds both members in the single-slot order, so every row's bytes are its one-row
@@ -175,6 +182,8 @@ Ruled out for GLM experts (each exact unless noted; "component" = an isolated re
   before tile k's MMA (+27%), 256- or 64-thread groups (+12% at 2048 rows); on the branch-free body: a threadgroup
   LUT decode of the w12 codebook (+32%), a per-k-step threadgroup barrier (+9%), unroll 4 (+20% over unroll 2),
   64-row windows again (+9-13% on gate/up). The kernel is register/occupancy bound: added live state loses.
+- Dead for prefill routing: a counting sort (histogram, scan, stable scatter) in place of the argsort, exact with
+  ties: -0.03 to -0.16 ms per MoE layer as a component, yet Qwen 2.6bpw prefill 5-10% slower in an A B B A (de867e94 era).
 - **The SwiGLU chain is f32**: gate, up, sigmoid, SiLU and their product stay in f32 registers through the multiply
   by the down suh. In f16, MiMo's activations put gate and up near 400 each and the product past 65504, so a whole
   routed row became inf. The next ceiling is the f16 down inner plane (about 2x above the measured peak).

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_model_discovery.sh — plan 05 Phase 1 (discovery + listing).
 #
 # Validates:

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # --idle-evict-secs: a model nobody is using leaves residency, and the next
 # request cold-loads it back.
 #

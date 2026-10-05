@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # The browser chat page: `GET /` and `GET /chat` serve the page embedded from
 # src/webui/index.html, every other method on those paths is a 405, the API
 # routes beside it answer as before, and `--api-key` leaves the page open while
@@ -67,7 +68,7 @@ code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 echo "Chat page (port $PORT)"
 
-echo "[1/3] the page and its neighbours"
+echo "[1/4] the page and its neighbours"
 if boot; then
     for path in / /chat; do
         curl -s -D "$WORK/headers" -o "$WORK/body" "$BASE$path"
@@ -118,7 +119,7 @@ else
     check "boot" 0
 fi
 
-echo "[2/3] --api-key --api-key-strict: page open, API behind the key"
+echo "[2/4] --api-key --api-key-strict: page open, API behind the key"
 if boot --api-key webui-test-key --api-key-strict; then
     check "tools require the configured API key" \
         "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{}')" 401)"
@@ -134,10 +135,21 @@ else
     check "boot with --api-key" 0
 fi
 
-echo "[3/3] the page stays self-contained"
+echo "[3/4] the page stays self-contained"
 check "no external http(s) fetch or CDN in the page" \
     "$(grep -Eq '(src|href)="https?://|@import|fetch\("https?://' "$PAGE" && echo 0 || echo 1)"
 check "the page is under 200 KB" "$([ "$(wc -c < "$PAGE")" -lt 204800 ] && echo 1 || echo 0)"
+
+echo "[4/4] the page's own functions (node): effort menu, tool loop, SSD prefix-cache meter"
+if command -v node >/dev/null 2>&1; then
+    for t in effort tools prefix_cache; do
+        check "tests/test_webui_$t.cjs passes" "$(node "tests/test_webui_$t.cjs" >/dev/null 2>&1 && echo 1 || echo 0)"
+    done
+    check "the prefix-cache meter test names its pass" \
+        "$(node tests/test_webui_prefix_cache.cjs 2>&1 | grep -q 'prefix-cache meter: passed' && echo 1 || echo 0)"
+else
+    echo "  (node not installed: skipped)"
+fi
 
 echo
 echo "  passed: $PASS   failed: $FAIL"

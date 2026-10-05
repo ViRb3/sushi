@@ -66,8 +66,10 @@ const call = (id) => ({ id, type: 'function', function: { name: 'web_search', ar
   await context.runResearchTurn('test', [], { aborted: false }, undefined, false);
   console.log('Web UI tool loop: round limit, cancellation, disabled pack passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
+let prefixCacheReads = 0;
 const streaming = vm.createContext({
   $: () => ({ value: '' }), TextDecoder, Uint8Array, performance,
+  refreshPrefixCache: () => { prefixCacheReads++; },
   perfMon: { begin() {}, finish() {}, delta() {} },
   createStreamingView: () => ({ text: '', reasoning: '', schedule() {}, finalize() {} }),
   replyMeta: () => null,
@@ -93,6 +95,7 @@ vm.runInContext(script.slice(streamStart, script.indexOf('function setChatBusy('
     assert.equal(reply.tool_calls.length, finish === 'tool_calls' ? 1 : 0);
     if (finish === 'tool_calls') assert.equal(reply.tool_calls[0].function.arguments, '{"query":"sushi"}');
   }
+  assert.equal(prefixCacheReads, 2, 'every reply refreshes the SSD prefix-cache meter');
   console.log('Web UI streaming: fragmented calls and token-limit truncation passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 const labelStart = script.indexOf('function toolCallLabel(');

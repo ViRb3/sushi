@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Think penalty (`--think-penalty`) live contract on a qwen4_exp pack.
 #
 #   1. ENGAGEMENT: the load logs `[think-penalty] lambda L (--think-penalty)`, every thinking

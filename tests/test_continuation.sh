@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: continuing a partial assistant reply extends it — it does not restart.
 #
 # A conversation ending in an assistant message used to render that message as

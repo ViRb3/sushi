@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # /v1/completions speculative-decode test.
 #
 # The legacy text-completions endpoint is the surface FIM / code-completion

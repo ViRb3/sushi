@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test for the tool-call parser. Boots a server against the given
 # model, sends three tool-using chats, asserts each response has a properly
 # structured `tool_calls[0]` (NOT leaked `<tool_call>` text in `content`).

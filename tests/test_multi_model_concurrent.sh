@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Plan 05 Phase F — concurrent requests across two loaded models.
 #
 # Two clients fire chat requests against different model ids in parallel.

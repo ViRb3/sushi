@@ -21,6 +21,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const transformer_mod = @import("transformer.zig");
+const depth_bounds = @import("mtp_depth_bounds.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;
@@ -926,11 +927,8 @@ fn qwen4ProfileArmed() bool {
 }
 
 pub fn persistDiagArmed() bool {
-    return qwen4ProfileArmed() or
-        persistDiagArmedFrom(&.{
-            std.c.getenv("SUSHI_MTP_TRACE"),
-            std.c.getenv("SUSHI_MTP_FORCE_DEPTH"),
-        });
+    return qwen4ProfileArmed() or depth_bounds.active.pinned() != null or
+        persistDiagArmedFrom(&.{std.c.getenv("SUSHI_MTP_TRACE")});
 }
 
 pub fn storeShouldWrite(persist_on: bool, diag_armed: bool, key_len: usize) bool {

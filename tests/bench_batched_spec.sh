@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Step-4 measurement gate: per-stream decode tok/s (server `timings`) for
 #   serial N=1, MTP N=1, plain batched N=2, and N=2 with MTP on one/both slots.
 # Usage: BENCH_MODEL=<dir> [SPEC_FLAGS="--mtp"] ./tests/bench_batched_spec.sh [port] [max_tokens]

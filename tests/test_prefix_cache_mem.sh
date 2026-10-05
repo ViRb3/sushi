@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Wave 1.B — `--prefix-cache-mem` memory budget enforcement.
 #
 # Starts the server with a deliberately tiny prefix-cache memory budget and
@@ -60,7 +61,7 @@ fi
 LOGFILE=$(mktemp)
 echo "  starting server (--prefix-cache-entries 8 --prefix-cache-mem ${SHORT_BUDGET_MB}MB)..."
 "$BINARY" --model "$MODEL" --serve --port "$PORT" \
-    --prefix-cache-entries 8 --prefix-cache-mem "${SHORT_BUDGET_MB}MB" \
+    --prefix-cache-entries 8 --prefix-cache-mem "${SHORT_BUDGET_MB}MB" --prefix-cache-disk off \
     ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; rm -f "$LOGFILE"; }

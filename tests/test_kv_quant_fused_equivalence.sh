@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Fused quant-attention equivalence test (Plan ricky Phase 2).
 #
 # Verifies that running the same greedy chat-completion request against the

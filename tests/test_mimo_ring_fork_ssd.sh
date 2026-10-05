@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_mimo_ring_fork_ssd.sh — MiMo's sliding layers keep a ring, so an entry restores only at its
 # end or at a ring checkpoint. A client that sends a side request per turn (the whole conversation
 # plus an appended <system-reminder>) used to leave the next main turn nothing to restore once the
@@ -32,7 +33,7 @@ OWNER="${GPU_LOCK_OWNER:-test_mimo_ring_fork_ssd}"
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
 curl -sf --max-time 2 "$BASE/health" >/dev/null 2>&1 && { echo "fail: port $PORT is busy"; exit 1; }
 
-# The SSD tier lives under $HOME/.sushi/kv-cache: an isolated HOME keeps the user's untouched.
+# The SSD tier lives in the private SUSHI_PREFIX_CACHE_DIR (private_cache.sh); the isolated HOME keeps the rest of the user's untouched.
 DISK_HOME="$(mktemp -d)"
 LOG="$(mktemp)"
 SERVER_PID=""
@@ -49,7 +50,7 @@ boot() {
     "$LOCK" acquire "$OWNER" >/dev/null && LOCKED=1
     : > "$LOG"
     HOME="$DISK_HOME" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 \
-        --prefix-cache-entries 2 --prefix-cache-disk 16GB --log-level info > "$LOG" 2>&1 &
+        --prefix-cache-entries 2 --prefix-cache-mem 8GB --prefix-cache-disk 16GB --log-level info > "$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 900); do
         curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && return 0
@@ -137,9 +138,9 @@ echo "boot 1 persisted $(count '\[disk-cache\] persisted') entries"
 grep '\[hot-cache\]\|\[disk-cache\]' "$LOG" | head -40
 stop
 
-RINGS=$(ls "$DISK_HOME"/.sushi/kv-cache/*/e*/r*.safetensors 2>/dev/null | wc -l | tr -d ' ')
+RINGS=$(ls "$SUSHI_PREFIX_CACHE_DIR"/*/e*/r*.safetensors 2>/dev/null | wc -l | tr -d ' ')
 [ "$RINGS" -gt 0 ] || fail "no ring file on disk"
-grep -lq '"v":9' "$DISK_HOME"/.sushi/kv-cache/*/e*/meta.json 2>/dev/null || fail "no v9 manifest on disk"
+grep -lq '"v":9' "$SUSHI_PREFIX_CACHE_DIR"/*/e*/meta.json 2>/dev/null || fail "no v9 manifest on disk"
 
 # ── Boot 2: a restart restores from the SSD tier ──
 boot

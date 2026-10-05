@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Regression tests for server-side reasoning/content separation (TODO #13).
 #
 # Pins the Qwen 3.6 truncated-thinking leak: the chat template injects the

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: /v1/responses (OpenAI Responses API).
 #
 # Covers MVP non-streaming paths from the implementation plan:

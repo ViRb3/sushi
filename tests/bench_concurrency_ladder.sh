@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Concurrency ladder: client-observed per-stream and aggregate decode tok/s at N
 # concurrent users, MTP on and off. One CSV row per (binary, model, mode, N).
 # Usage: BENCH_MODEL=<dir> [BENCH_LABEL=x] [SUSHI_BINARY=..] ./tests/bench_concurrency_ladder.sh <port> <csv> ["1 2 3 4 6 8"] [max_tokens]

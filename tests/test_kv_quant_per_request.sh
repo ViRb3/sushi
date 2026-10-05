@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Wave 1.A — per-request `kv_quant` body field.
 #
 # Starts the server with `--kv-quant off` (the process-level default) and
@@ -52,8 +53,8 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
 fi
 
 LOGFILE=$(mktemp)
-echo "  starting server (--kv-quant off, --prefix-cache-entries 4)..."
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant off --prefix-cache-entries 4 ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
+echo "  starting server (--kv-quant off, --prefix-cache-entries 4 --prefix-cache-mem 2GB)..."
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant off --prefix-cache-entries 4 --prefix-cache-mem 2GB ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {

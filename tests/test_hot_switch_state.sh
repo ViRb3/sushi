@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: every model answers with ITS OWN tokenizer, template and grammar table.
 #
 # The per-model grammar-table bug (2026-08-11) was exactly this class and showed

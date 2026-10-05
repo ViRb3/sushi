@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # The Mac stays awake only while sushi has work in flight.
 # Usage: ./tests/test_sleep_inhibit.sh [model_dir] [port]
 

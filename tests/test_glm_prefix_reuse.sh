@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_glm_prefix_reuse.sh — GLM-5.3-Flash prefix reuse: KDA checkpoints on the prefill chunk grid
 # and at the prompt end, MLA rows below them (docs/engine-prefix-cache.md#glm). Pins, greedy, one
 # hot entry:
@@ -35,7 +36,7 @@ SERVER_PID=""
 trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; [ -z "${GLM_REUSE_LOG:-}" ] && rm -f "$LOG"; true' EXIT
 
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-    --prefix-cache-entries 1 --log-level info > "$LOG" 2>&1 &
+    --prefix-cache-entries 1 --prefix-cache-mem 1GB --prefix-cache-disk off --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 900); do

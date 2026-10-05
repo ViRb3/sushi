@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_tokenize_cache.sh — Iteration 2 of overnight perf push.
 #
 # Phase 4 #3 plan: pre-tokenize stable prompt content so warm-cache requests

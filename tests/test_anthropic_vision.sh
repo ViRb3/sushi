@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Integration test: /v1/messages (Anthropic) accepts and forwards image content
 # blocks to the vision encoder.
 #

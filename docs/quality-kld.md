@@ -95,8 +95,8 @@ subset. This four-prompt screen is not the sixteen-prompt release reading.
 
 ## The standard reading
 
-- **16 prompts x 512 tokens, scored to the first EOS, for every model** (Flash-Next's 16 wikitext prompts, raw text,
-  no template). 60x64 is a short-context screen only, never a verdict.
+- **16 prompts x 512 tokens, scored to the first EOS** (Flash-Next's 16 wikitext prompts, raw text, no template);
+  GLM reads its 4x512 native teacher with the code 2x512 apart (below). 60x64 is a short-context screen only, never a verdict.
 - Differences under ~1% on ONE pack are inside the ROUNDING-FLIP floor (measured 2026-09-24 on the MiMo MCG pack:
   flipping 0.07-0.13% of attention outputs by one bf16 ulp, no precision loss, moved 16x512 KLD -0.5% .. +0.55%). A
   kernel or storage change that flips bits reads as a KLD change of that size with no quality meaning; each flip
@@ -289,6 +289,10 @@ settings, same binary as the off arm): KLD 0.086674 / top-1 91.78% (7404) / NLL 
 
 
 ## GLM-5.3-Flash: native BF16 teacher, 4x512 (2026-10-04)
+
+GLM's release reading is this 4x512 screen, with the two code prompts (2x512) reported apart: a 16x512 BF16 teacher
+would stream the BF16 experts and is too slow to capture. Shipping config (kv8, FP32 decode attention): KLD 0.0716 /
+top-1 90.3%; code 0.0324 / 95.8%, prose 0.1107 / 84.9%.
 
 Teacher: the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
 standard4 --tokens 512 --no-template --kv-quant off --ssd-budget-gb 100` (streamed BF16 experts, dense prefill in

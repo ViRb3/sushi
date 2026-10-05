@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_mimo_ring_reuse.sh — MiMo's sliding layers keep a ring, and a reply
 # longer than the ring compacts it past the prompt end. The next turn diverges
 # there (the template re-renders the reply), so without a restore point every
@@ -36,7 +37,7 @@ SERVER_PID=""
 trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG"; true' EXIT
 
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 \
-    --prefix-cache-entries 1 --log-level info > "$LOG" 2>&1 &
+    --prefix-cache-entries 1 --prefix-cache-mem 2GB --prefix-cache-disk off --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 900); do

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/private_cache.sh"
 # Vision under SSD expert streaming, live on one pack (GLM-5.3, MiMo or Qwen with a tower):
 #   [1] a streamed boot without --vision names what the tower would cost, answers text and refuses an
 #       image with a 400 naming --vision (SKIP_OFF=1 reuses this port's earlier [1] log);

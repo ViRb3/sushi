@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # test_validator_matrix.sh — API-compliance + agentic matrix across both
 # served architectures (qwen4_exp, mimo_v2).
 #

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Regression test: headless serve mode must honor the CLI's spec-decode flags.
 #
 # `runHeadlessServe` builds its own ServerConfig literal. It shipped with all

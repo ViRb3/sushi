@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Plan 05 Phase F — LRU eviction.
 #
 # Server: --max-resident-models 2 with >=3 models in --model-dir. Hit each

@@ -47,6 +47,7 @@ doc for the area before changing it, and update it in the same landing.
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, ownership, media |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, `__metadata__` stamp, window, g-scale in `suh`, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | roofline, recorded tok/s tables with binaries and settings, ruled-out levers |
+| [docs/bench/v1.2.0-dev/summary.md](docs/bench/v1.2.0-dev/summary.md) | version-pinned release context ladder and individual model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, KLD of every served pack |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
@@ -103,8 +104,8 @@ Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
 
-Flags that matter: `--model --serve --host --port --ctx-size --kv-quant --kv-attn-mode --mtp --no-mtp --mtp-depth
---mtp-head-kv-quant --max-mtp-ctx --ssd-budget-gb --expert-cache-gb --prefix-cache-entries --prefix-cache-mem
+Flags that matter: `--model --serve --host --port --ctx-size --kv-quant --kv-attn-mode --mtp --no-mtp --mtp-min-depth
+--mtp-max-depth --mtp-head-kv-quant --max-mtp-ctx --ssd-budget-gb --expert-cache-gb --prefix-cache-entries --prefix-cache-mem
 --prefix-cache-disk --prefill-chunk --max-concurrent --max-tokens --timeout --reasoning-budget --preserve-thinking
 --wired-margin-gib --skip-mem-preflight --metrics --api-key --model-dir --log-level --log-file --parent-pid`. `--help`
 lists the rest.
@@ -229,7 +230,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
   Under it one A then one B suffices; A B B A only when the expected difference is within a few percent.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
 - Launch flags outrank `model-settings.json`; confirm the load lines (`[kv-cache]`, `[mtp]`) show the intended arm.
-- KLD is 16 prompts x 512 tokens scored to the first EOS, for every model; the teacher carries no lossy step of its own.
+- KLD is 16 prompts x 512 tokens scored to the first EOS (GLM: the 4x512 native teacher, code 2x512 reported apart);
+  the teacher carries no lossy step of its own.
 
 **Coordinator.**
 - Reports partial work to the owner every :00 and :30 while work runs.

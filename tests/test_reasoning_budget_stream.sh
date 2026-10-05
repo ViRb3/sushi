@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # A reasoning BUDGET must SHORTEN the thought, not hide it — and END it: at the
 # budget the server commits the early-stop line and the closer through the
 # model, so the answer (or tool call) still arrives inside max_tokens.

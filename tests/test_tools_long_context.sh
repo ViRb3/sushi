@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # Guard: a tool call still parses at long context, where the sliding-window
 # block trim and speculative verify interact.
 #

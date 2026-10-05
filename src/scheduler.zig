@@ -40,6 +40,7 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
@@ -127,7 +128,7 @@ pub const LoadParams = struct {
     /// `--mtp` / `--no-mtp` was given: `mtp_enabled` then outranks the per-model `mtp`.
     mtp_explicit: bool = false,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// Build the ANE prefill-MLP offload at load (`--ane-prefill`,
@@ -171,6 +172,9 @@ pub const LoadParams = struct {
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.sushi/kv-cache/<fingerprint>`.
     prefix_cache_disk_bytes: u64 = 0,
+    /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
+    /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64 = null,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
@@ -1191,7 +1195,7 @@ pub const LoadRequest = struct {
     mtp_enabled: bool = true,
     mtp_explicit: bool = false,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// `--ane-prefill` survives cold loads (the flag-eater class).
@@ -1211,6 +1215,7 @@ pub const LoadRequest = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64 = null,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
@@ -1308,6 +1313,7 @@ pub const Scheduler = struct {
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64,
     expert_cache_bytes: u64,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
@@ -1315,7 +1321,7 @@ pub const Scheduler = struct {
     ssm_checkpoint_max: u32,
     /// Launch-flag MTP settings, retained (same rationale as the prefix-cache
     /// fields above) so COLD-LOADED models — on-demand `/v1/load-model`, model
-    /// switches — honor `--no-mtp` / `--mtp-depth` like the `--model` primary.
+    /// switches — honor `--no-mtp` / `--mtp-max-depth` like the `--model` primary.
     /// Pre-plumbing, the cold-load `LoadRequest` used its struct defaults
     /// (mtp on, default depth), silently ignoring these flags on every
     /// on-demand load and model switch.
@@ -1353,6 +1359,9 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Host bytes every resident model's SSD writer holds or may hold (`LoadedModel.disk_stats`
+    /// summed), outside MLX's accounting; read through `diskWriterHostBytes`.
+    disk_writer_host_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// KV + recurrent state the live slots own beyond what the hot caches bill, once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -1519,6 +1528,7 @@ pub const Scheduler = struct {
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
+            .prefix_cache_disk_resolver = params.prefix_cache_disk_resolver,
             .expert_cache_bytes = params.expert_cache_bytes,
             .ssd_budget_bytes = params.ssd_budget_bytes,
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
@@ -1913,7 +1923,9 @@ pub const Scheduler = struct {
         )) blk: {
             if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
-            switch (mtpStreamingVerdict(mtp)) {
+            const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(self.io, self.allocator, owned.config, entry.path));
+            switch (verdict) {
+                .keep => owned.config.stream_mtp_head = true,
                 .refuse => return error.ExpertStreamingMtpUnsupported,
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
@@ -2028,6 +2040,7 @@ pub const Scheduler = struct {
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+            .prefix_cache_disk_resolver = self.prefix_cache_disk_resolver,
             .expert_cache_bytes = self.expert_cache_bytes,
             .ssd_budget_bytes = self.ssd_budget_bytes,
             .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
@@ -2035,7 +2048,7 @@ pub const Scheduler = struct {
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             // Cold loads honor the launch-flag MTP settings too (same reason
             // as prefix-cache above) — pre-plumbing these were LoadRequest
-            // defaults, so --no-mtp / --mtp-depth were silently dropped on
+            // defaults, so --no-mtp / --mtp-max-depth were silently dropped on
             // every on-demand load and model switch.
             .mtp_enabled = self.mtp_enabled,
             .mtp_explicit = self.mtp_explicit,
@@ -2328,8 +2341,10 @@ pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
     return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode() or cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows();
 }
 
-/// MiMo and GLM batching are certified (and GLM measured) for up to four independent slots.
+/// MiMo and GLM batching are certified (and GLM measured) for up to four independent slots; qwen4 rows
+/// share kernels up to the joined hyper-connection and expert width of eight.
 pub fn batchGroupCap(cfg: *const model_mod.ModelConfig) usize {
+    if (cfg.supportsBatchedQwen4Rows()) return 8;
     return if (cfg.supportsBatchedMimoDecode() or cfg.supportsBatchedGlmRows()) 4 else MAX_BATCH_GROUP;
 }
 
@@ -2387,6 +2402,26 @@ pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
     if (sum == 0 or kv_lens_asc.len == 0) return 1.0;
     const padded: f64 = @floatFromInt(@as(u64, kv_lens_asc.len) * kv_lens_asc[kv_lens_asc.len - 1]);
     return padded / @as(f64, @floatFromInt(sum));
+}
+
+/// A group whose longest billed slot is at most this long pads a small tensor, and splitting it sends a slot
+/// through a whole serial forward instead: under the qwen4 gather arm every long slot bills at the indexer
+/// budget, so a short sub-agent beside long streams reads as a 2x pad.
+pub const PAD_FREE_KV: u32 = 4096;
+
+/// The floor only engages once a slot holds this much context: below it the serial forward it saves is cheap.
+pub const PAD_FREE_MIN_CTX: u32 = 131072;
+
+/// `batchedKvKeepCount` for a group whose longest TRUE context is `ctx_max`.
+pub fn groupKeepCount(kv_lens_asc: []const u32, ctx_max: u32) usize {
+    if (kv_lens_asc.len >= 2 and ctx_max >= PAD_FREE_MIN_CTX and kv_lens_asc[kv_lens_asc.len - 1] <= PAD_FREE_KV) return kv_lens_asc.len;
+    return batchedKvKeepCount(kv_lens_asc);
+}
+
+fn groupCtxMax(caches: []const *const KVCache) u32 {
+    var m: usize = 0;
+    for (caches) |c| m = @max(m, c.kvLenForBatching());
+    return @intCast(@min(m, std.math.maxInt(u32)));
 }
 
 /// One source for the length the batched group is sorted and capped by. `cache.step`
@@ -2617,21 +2652,6 @@ fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
     sch.load_failed.store(true, .release);
 }
 
-/// Heap-allocate `T`, run `init_fn`, return owning pointer. On `init_fn`
-/// failure, the heap slot is freed before the error propagates so the
-/// scheduler never holds a half-initialized struct.
-fn boxInit(
-    allocator: std.mem.Allocator,
-    comptime T: type,
-    init_fn: anytype,
-    args: anytype,
-) !*T {
-    const ptr = try allocator.create(T);
-    errdefer allocator.destroy(ptr);
-    ptr.* = try @call(.auto, init_fn, args);
-    return ptr;
-}
-
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
 pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
@@ -2740,22 +2760,29 @@ pub fn mtpChoiceFor(mtp_enabled: bool, mtp_explicit: bool, config: *const ModelC
 
 /// The streaming gate's verdict on a load's MTP choice (`expert_stream.mtpUnderStreaming`). The gate
 /// runs before the load marks its config streamed.
-fn mtpStreamingVerdict(choice: model_settings.MtpChoice) expert_stream_mod.MtpUnderStreaming {
+fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: bool) expert_stream_mod.MtpUnderStreaming {
     const c = choice.streamed();
-    return expert_stream_mod.mtpUnderStreaming(c.on, c.source == .model_settings, c.source == .default);
+    return expert_stream_mod.mtpUnderStreaming(c.on, c.source == .model_settings, c.source == .default, head_supported);
+}
+
+fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
+    const geometry = config.expertGeometry();
+    const layout = expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer) catch return false;
+    return expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), layout);
 }
 
 /// An engine-default MTP under expert streaming resolves off (`expert_stream.mtpUnderStreaming`):
 /// the head is not loaded and the load log reads `off (streaming; default)`.
-pub fn mtpDefaultOffUnderStreaming(choice: model_settings.MtpChoice, expert_streaming: bool) bool {
-    return expert_streaming and choice.on and choice.source == .default;
+pub fn mtpDefaultOffUnderStreaming(choice: model_settings.MtpChoice, expert_streaming: bool, head_kept: bool) bool {
+    return expert_streaming and !head_kept and choice.on and choice.source == .default;
 }
 
 test "a streamed load drops only the engine-default MTP, never an asked-for one" {
-    try testing.expect(mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, true));
-    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, false));
-    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .flag }, true));
-    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true));
+    try testing.expect(mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, true, false));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, true, true));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .default }, false, false));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = true, .source = .flag }, true, false));
+    try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true, false));
 }
 
 /// What a load line and `/props` read for the four keys `--fast` sets, under the launch globals.
@@ -2841,13 +2868,13 @@ test "--fast: its preset, named --fast, outranks model-settings.json; an explici
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
 }
 
-test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp still refuses" {
+test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp keeps the head" {
     const saved = LaunchGlobals.save();
     defer saved.restore();
     model_settings.fast = true;
     const gate = mtpChoiceFor(true, false, &ModelConfig{});
     try testing.expect(gate.on);
-    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.off, mtpStreamingVerdict(gate));
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.off, mtpStreamingVerdict(gate, true));
     var streamed = ModelConfig{};
     streamed.expert_streaming = true;
     const loaded = mtpChoiceFor(true, false, &streamed);
@@ -2855,7 +2882,8 @@ test "--fast drops its MTP on a streamed load, before and after the load marks i
     try testing.expectEqualStrings("--fast", loaded.sourceName());
     try testing.expect(!loaded.forced());
     const asked = mtpChoiceFor(true, true, &ModelConfig{});
-    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked));
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.keep, mtpStreamingVerdict(asked, true));
+    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked, false));
     try testing.expect(mtpChoiceFor(true, true, &streamed).on);
 }
 
@@ -2959,9 +2987,14 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     const geometry = config.expertGeometry();
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
+    if (config.stream_mtp_head and !expert_stream_mod.streamedMtpHeadSupported(config.isQwen4(), streamed.expert_layout)) {
+        log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
+        return error.ExpertStreamingMtpUnsupported;
+    }
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
     split.trunk +|= mimoCoarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry);
     if (!config.has_vision) split.vision = 0;
+    if (!config.stream_mtp_head) split.mtp = 0;
     const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
     const picked = resolveStreamedVision(explicit_cache_bytes, budget_bytes, config, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
@@ -2980,9 +3013,9 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
 pub fn resolveStreamedVision(explicit_bytes: u64, budget_bytes: u64, config: *const ModelConfig, split: model_mod.ResidentSplit, per_expert: u64, want: bool) !struct { resolved: ExpertCacheResolution, cost: VisionCost } {
     var text = split;
     text.vision = 0;
-    const without = try resolveExpertCache(explicit_bytes, budget_bytes, config, text, false, per_expert);
+    const without = try resolveExpertCache(explicit_bytes, budget_bytes, config, text, config.stream_mtp_head, per_expert);
     if (split.vision == 0) return .{ .resolved = without, .cost = .{} };
-    const with: ?ExpertCacheResolution = resolveExpertCache(explicit_bytes, budget_bytes, config, split, false, per_expert) catch |err| switch (err) {
+    const with: ?ExpertCacheResolution = resolveExpertCache(explicit_bytes, budget_bytes, config, split, config.stream_mtp_head, per_expert) catch |err| switch (err) {
         error.SsdBudgetBelowResident => null,
         else => return err,
     };
@@ -3791,6 +3824,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
         "prefix_cache_mem_resolver", "expert_cache_bytes",    "expert_cache_fit_resolver",
         "ssd_budget_bytes",          "kv_quant_explicit",     "mtp_explicit",
+        "prefix_cache_disk_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -4168,10 +4202,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
         if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
-        switch (mtpStreamingVerdict(mtp)) {
+        const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(sch.io, sch.allocator, params.config, params.model_dir));
+        switch (verdict) {
             .refuse => {
                 log.err("[expert-stream] {s}; MTP is on ({s}), pass --no-mtp\n", .{ expert_stream_mod.MTP_UNSUPPORTED, mtp.sourceName() });
                 return error.ExpertStreamingMtpUnsupported;
+            },
+            .keep => {
+                log.info("[expert-stream] MTP head resident ({s}); routed experts stream\n", .{mtp.sourceName()});
+                params.config.stream_mtp_head = true;
             },
             .drop_settings => {
                 log.info("[expert-stream] model-settings mtp=true ignored: {s}\n", .{expert_stream_mod.MTP_UNSUPPORTED});
@@ -4366,7 +4405,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     });
     const kv_quant_config = kv_cache.config;
     const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
-    const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming);
+    const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
     const acceptance = generate_mod.mtpAcceptanceFor(params.config.mtp_acceptance_override);
     const greedy_tail = generate_mod.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
     log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
@@ -5013,6 +5052,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.mtp_depth = @min(entry.mtp_depth, @min(@as(u32, @intCast(h.heads)), rows_max));
         xfm_ptr.mtp_depth_free = @min(xfm_ptr.mtp_depth_free, @min(@as(u32, @intCast(h.heads)), rows_max));
     }
+    if (entry.mtp != null) log.info("[mtp] depth range {d}..{d} ({s})\n", .{
+        depth_bounds.floorFor(depth_bounds.active, entry.mtp_depth),
+        entry.mtp_depth,
+        if (depth_bounds.active.explicit()) "--mtp-min-depth/--mtp-max-depth" else "default",
+    });
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
     // must not disagree about the same sidecar.
@@ -5037,10 +5081,43 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // full reset, so we keep the legacy single-slot path for hybrid.
     const enable_ssm_cps = params.ssm_checkpoint_stride > 0;
     const ram_prefix_cache = params.prefix_cache_ram_enabled;
-    const disk_prefix_cache = params.prefix_cache_disk_bytes > 0;
-    if (params.prefix_cache_capacity > 0 and (ram_prefix_cache or disk_prefix_cache) and
-        prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
-    {
+    // Phase 3 persists hybrid recurrent state too: the disk tier is allowed whenever the RAM tier
+    // accepts the arch — pure-attention always, hybrid iff SSM checkpoints are enabled.
+    const has_ssm_layers = params.config.has_hybrid_layers or
+        params.config.full_attention_interval > 0;
+    const disk_ok = !has_ssm_layers or enable_ssm_cps;
+    const cache_applies = params.prefix_cache_capacity > 0 and
+        prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps);
+    // The SSD tier comes up BEFORE anything is sized for it: whether this model has one decides its
+    // RAM semantics (SSD-first or not), its bills and its checkpoint capture. A tier that was wanted
+    // and did not come up (no room, an unreadable fingerprint, a failed init) is recorded on the config,
+    // so every bill reads the same answer as `--prefix-cache-disk off`.
+    var disk_tier: ?kv_disk_cache.DiskTier = null;
+    if (cache_applies and params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
+        const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+            log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
+            break :attach;
+        };
+        defer sch.allocator.free(fp);
+        const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
+        defer sch.allocator.free(base);
+        const disk_budget = if (params.prefix_cache_disk_resolver) |resolve| resolve(params.config, base) else params.prefix_cache_disk_bytes;
+        if (disk_budget == 0) break :attach;
+        disk_tier = kv_disk_cache.DiskTier.init(
+            sch.allocator,
+            sch.io,
+            base,
+            fp,
+            disk_budget,
+            kv_disk_cache.DEFAULT_CHUNK_TOKENS,
+        ) catch |err| {
+            log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
+            break :attach;
+        };
+    }
+    params.config.prefix_cache_disk_declined = params.prefix_cache_disk_bytes > 0 and disk_tier == null;
+    const disk_prefix_cache = disk_tier != null;
+    if (cache_applies and (ram_prefix_cache or disk_prefix_cache)) {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
@@ -5052,6 +5129,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
+        if (ram_prefix_cache) {
+            // On an SSD-first arch `--prefix-cache-mem` is the idle allowance beside the live session.
+            const ram_bytes = if (prefix_cache_mod.ssdFirstActive(params.config, disk_prefix_cache, ram_prefix_cache)) ssd_idle_mem else clamped_prefix_mem;
+            log.info("Allocating {d:.1} GB RAM for the prefix cache (--prefix-cache-mem)\n", .{@as(f64, @floatFromInt(ram_bytes)) / (1024.0 * 1024.0 * 1024.0)});
+        }
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
             if (ram_prefix_cache) params.prefix_cache_capacity else 0,
@@ -5062,35 +5144,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5()) .min_span_recency else .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
-        // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
-        // state too: the disk tier is allowed whenever the RAM tier accepted
-        // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
-        // are enabled (`enable_ssm_cps`, the same gate `shouldUse` applied).
-        // Every failure mode is caught: persistence silently stays off, the
-        // RAM cache is unaffected.
-        const has_ssm_layers = params.config.has_hybrid_layers or
-            params.config.full_attention_interval > 0;
-        const disk_ok = !has_ssm_layers or enable_ssm_cps;
         entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5();
-        if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
-                log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
-                break :attach;
-            };
-            defer sch.allocator.free(fp);
-            const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
-            defer sch.allocator.free(base);
-            entry.prefix_cache.?.disk = kv_disk_cache.DiskTier.init(
-                sch.allocator,
-                sch.io,
-                base,
-                fp,
-                params.prefix_cache_disk_bytes,
-                kv_disk_cache.DEFAULT_CHUNK_TOKENS,
-            ) catch |err| {
-                log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
-                break :attach;
-            };
+        if (disk_tier) |tier| {
+            entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5()) .min_span_recency else .oldest;
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isGlm5())
@@ -5100,16 +5156,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
         }
-        // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
-        // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
+        // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
             params.config,
             entry.prefix_cache.?.disk != null,
             ram_prefix_cache,
         );
+        // Every tier writes off the inference thread, so a commit lands whole after the response.
+        if (entry.prefix_cache.?.disk) |*d| d.enableBackgroundWriter();
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
-            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
             // Startup sweep of strays + root-wide LRU across sibling fingerprints.
             entry.prefix_cache.?.disk.?.sweepSiblings();
         }
@@ -5201,6 +5257,7 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    publishDiskStats(sch);
     publishHotCacheDigests(sch);
     if (sch.metrics != null) publishCachedSessions(sch);
 }
@@ -6138,6 +6195,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
     sch.registry.mutex.unlock(sch.io);
+    publishDiskStats(sch);
 
     // Shrink `fit` capacity back to the surviving live set — leaving the
     // freed model's headroom in place is exactly the per-transient-commit
@@ -6320,31 +6378,50 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     _ = finish_st;
 }
 
-/// GLM: the request's MLA rows through the newest checkpoint its destination tier keeps serve every
-/// KDA checkpoint at or below it; without one nothing restores. Ownership of `cps` passes to the cache.
+/// GLM: the request's MLA rows through the newest checkpoint a tier keeps serve every KDA checkpoint
+/// at or below it; without one nothing restores. The RAM tier copies the rows its budget keeps; the
+/// SSD tier shares every row through the newest checkpoint, read by the flush after the response.
+/// Ownership of `cps` passes to the cache.
 fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request: *const glm5_forward_mod.Request, tokens: []const u32, cps_opt: ?[]transformer_mod.SSMCheckpoint, dflash: ?prefix_cache_mod.DflashCommit, prompt_len: usize) void {
     const cps_all = cps_opt orelse return;
     const glm5_prefix = @import("glm5_prefix.zig");
-    // The rows are chosen before the copy: only what the destination tier keeps, never a full copy followed by a trim.
+    const s = slot.model.transformer.?.s;
+    // The rows are chosen before the copy: only what the RAM tier keeps, never a full copy followed by a trim.
     const window: u64 = if (dflash) |d| prefix_cache_mod.HotPrefixCache.liveCacheBytes(d.cache) else 0;
-    const len = hc.glmCommitLen(cps_all, request.offset, glm5_prefix.rowBytesOf(request), window) orelse {
-        log.debug("[hot-cache] GLM commit keeps no rows within its destination's budget; not committed\n", .{});
+    const row_bytes = glm5_prefix.rowBytesOf(request);
+    const ram_len = hc.glmCommitLen(cps_all, request.offset, row_bytes, window);
+    const disk_len = hc.glmDiskLen(cps_all, request.offset, row_bytes, window);
+    const len = @max(ram_len orelse 0, disk_len orelse 0);
+    if (len == 0) {
+        log.debug("[hot-cache] GLM commit keeps no rows within either tier's budget; not committed\n", .{});
         for (cps_all) |*cp| cp.deinit(hc.allocator);
         hc.allocator.free(cps_all);
         return;
-    };
+    }
     const cps = glm5_prefix.keepThrough(hc.allocator, cps_all, len);
-    const rows = glm5_prefix.MlaRows.capture(hc.allocator, request, len, slot.model.transformer.?.s) catch |err| {
-        log.warn("[hot-cache] GLM MLA rows not captured: {s}; not committed\n", .{@errorName(err)});
+    const ram_rows: ?glm5_prefix.MlaRows = if (ram_len) |n| glm5_prefix.MlaRows.capture(hc.allocator, request, n, s) catch |err| blk: {
+        log.warn("[hot-cache] GLM MLA rows not captured: {s}; the RAM tier keeps nothing\n", .{@errorName(err)});
+        break :blk null;
+    } else null;
+    const disk_rows: ?glm5_prefix.MlaRows = if (disk_len) |n| glm5_prefix.MlaRows.shareLive(hc.allocator, request, n, s) catch |err| blk: {
+        log.warn("[disk-cache] GLM MLA rows not shared: {s}; the SSD tier gets the RAM tier's rows\n", .{@errorName(err)});
+        break :blk null;
+    } else null;
+    if (ram_rows == null and disk_rows == null) {
         for (cps) |*cp| cp.deinit(hc.allocator);
         hc.allocator.free(cps);
         return;
-    };
-    const st = hc.commitGlm(&slot.cache, tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, cps, rows, dflash, prompt_len) catch |err| {
+    }
+    const n_cps = cps.len;
+    const st = hc.commitGlmTiers(&slot.cache, tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, cps, ram_rows, disk_rows, dflash, prompt_len) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         return;
     };
-    if (st == .ok) log.info("[hot-cache] committed {d}/{d} GLM tokens ({d} KDA checkpoints)\n", .{ st.ok, tokens.len, cps.len });
+    switch (st) {
+        .ok => |n| log.info("[hot-cache] committed {d}/{d} GLM tokens ({d} KDA checkpoints)\n", .{ n, tokens.len, n_cps }),
+        .disk_only => log.info("[disk-cache] captured {d}/{d} GLM tokens for the SSD tier ({d} KDA checkpoints)\n", .{ disk_len orelse 0, tokens.len, n_cps }),
+        else => {},
+    }
 }
 
 /// Logical committed length for a cancelled-prefill commit: the tokens
@@ -6638,6 +6715,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             // already has a complete copy to spill into.
             hc.spillIdleEntries(s);
             publishHotCacheResidency(sch);
+            logDiskUsage(slot.model);
         }
     }
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
@@ -6646,6 +6724,41 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // so without this a short turn hands everything it stranded to the next one
     // and the process footprint ratchets across a session (issue #110).
     _ = mlx.mlx_clear_cache();
+}
+
+/// Publish every resident model's SSD tier (budget, bytes in use, entries, writer bytes) onto its own
+/// `LoadedModel`, and the writers' total for admission. Inference thread.
+fn publishDiskStats(sch: *Scheduler) void {
+    var writer_total: u64 = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        var snap: model_registry_mod.DiskStats.Snapshot = .{};
+        if (entry.state == .ready) {
+            if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
+                snap = .{ .budget = d.operator_cap, .used = d.total_bytes, .entries = d.entryCount(), .writer_bytes = d.writerHostBytes() };
+            };
+        }
+        entry.disk_stats.publish(snap);
+        writer_total +|= snap.writer_bytes;
+    }
+    sch.disk_writer_host_bytes.store(writer_total, .monotonic);
+}
+
+/// The one reading admission bills for the SSD writers: host bytes every resident model's writer
+/// holds or may hold, which `mlx_get_active_memory` never counts. Safe from any thread.
+pub fn diskWriterHostBytes(sch: *const Scheduler) u64 {
+    return sch.disk_writer_host_bytes.load(.monotonic);
+}
+
+/// One `[disk-cache] usage` line per finished turn, from the finishing model's own tier.
+fn logDiskUsage(model: *const LoadedModel) void {
+    const snap = model.disk_stats.snapshot();
+    if (snap.budget == 0) return;
+    var buf: [128]u8 = undefined;
+    log.info("{s}\n", .{kv_disk_cache.diskUsageLine(&buf, snap.used, snap.budget, snap.entries)});
 }
 
 /// Free finished slots on the inference thread. The request-end clear ran before this, so a
@@ -7820,7 +7933,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
         const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
         // Per-row attention reads each slot's own cache: nothing pads.
-        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() and !t.supportsBatchedGlmRows() else true;
+        const pads = if (group[0].model.transformer) |t| !t.supportsBatchedMimoDecode() and !t.supportsBatchedGlmRows() and !t.supportsBatchedQwen4Rows() else true;
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
@@ -7828,6 +7941,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // how many still fit; the tail decodes serially this tick.
         if (pads and group.len >= 2) {
             var kv_lens: [32]u32 = undefined;
+            var ctx_max: u32 = 0;
             // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
             // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
             if (gate_batch_kv_len) {
@@ -7836,6 +7950,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                     caches_buf[i] = &g.cache;
                 }
                 fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, kv_lens[0..group.len]);
+                ctx_max = groupCtxMax(caches_buf[0..group.len]);
                 // Stable insertion sort, ascending, slots and lengths moving together.
                 var i: usize = 1;
                 while (i < group.len) : (i += 1) {
@@ -7857,7 +7972,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                 }.lt);
                 for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
             }
-            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            const keep = groupKeepCount(kv_lens[0..group.len], ctx_max);
             if (keep < group.len) {
                 if (!kv_skew_split_logged) {
                     kv_skew_split_logged = true;
@@ -9010,10 +9125,14 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         probe = true;
         recovering = true;
     }
-    if (Generator.mtpForcedDepth()) |depth| {
-        for (rows[0..active.len], 0..) |row, i| decision.widths[i] = @intCast(@min(depth, row.cap));
-        probe = false;
-        recovering = false;
+    // A width the range moves no longer matches what a probe was meant to price.
+    for (rows[0..active.len], 0..) |row, i| {
+        const width: u8 = @intCast(depth_bounds.plannerWidth(decision.widths[i], row.cap, depth_bounds.active));
+        if (width != decision.widths[i] or depth_bounds.active.pinned() != null) {
+            decision.widths[i] = width;
+            probe = false;
+            recovering = false;
+        }
     }
     var stale: [Planner.MAX_ROWS]bool = undefined;
     for (active, 0..) |slot, row| stale[row] = slot.legacy_gen.?.mtp_hidden_stale;
@@ -9262,6 +9381,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 caches_buf[i] = &g.cache;
             }
             fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, kv_lens[0..group.len]);
+            const ctx_max = groupCtxMax(caches_buf[0..group.len]);
             var i: usize = 1;
             while (i < group.len) : (i += 1) {
                 const slot_i = group[i];
@@ -9274,7 +9394,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 group[j] = slot_i;
                 kv_lens[j] = len_i;
             }
-            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            const keep = groupKeepCount(kv_lens[0..group.len], ctx_max);
             for (group[keep..]) |s| {
                 noteSerial(sch, s, .pad_waste);
                 try runSingleDecodeTick(sch, s);
@@ -9788,6 +9908,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
     const use_mimo = xfm_ptr.supportsBatchedMimoDecode();
     const use_glm = xfm_ptr.supportsBatchedGlmRows();
+    const use_qwen4_rows = use_gdn and xfm_ptr.supportsBatchedQwen4Rows();
     // Position source is per PATH: a GDN trunk positions from the slot's
     // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
     // linear layer there, so it reads 0 forever and every batched token was
@@ -9818,6 +9939,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     };
     const logits_arr = if (use_glm)
         try glmRowsForward(sch, allocator, xfm_ptr, &batch, next_tokens)
+    else if (use_qwen4_rows)
+        try xfm_ptr.forwardQwen4DecodeRows(next_tokens, ctxs, if (want_hidden) &hidden_rows else null)
     else if (use_gdn)
         try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else if (use_mimo)
@@ -9844,7 +9967,9 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // The batched forward advances only its scratch offset; each slot's own
     // position moves here so a slot leaving the batch resumes serial from
     // the right place (qwen4's QSA reads it for kv length + tail rule).
-    for (batch) |slot| slot.moe_seq_offset += 1;
+    if (!use_qwen4_rows) {
+        for (batch) |slot| slot.moe_seq_offset += 1;
+    }
 
     // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
     // the initWithOptions chokepoint and carries the model's
@@ -9985,6 +10110,16 @@ test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical w
     try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
 }
 
+test "a resident qwen4_exp decodes rows of one forward without padding; a streamed one keeps the padded batch" {
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "qwen4_exp";
+    try testing.expect(cfg.supportsBatchedQwen4Rows());
+    try testing.expectEqual(@as(usize, 8), batchGroupCap(&cfg));
+    cfg.expert_streaming = true;
+    try testing.expect(!cfg.supportsBatchedQwen4Rows());
+    try testing.expectEqual(MAX_BATCH_GROUP, batchGroupCap(&cfg));
+}
+
 test "modelBatchable: a PARSED deepseek_v4 config can never route to batched decode" {
     // dsv4 is serial-only (module-owned per-request state); its exclusion
     // from `forwardBatchedDecode` rides isMoe(), so the parse arm must never
@@ -10047,6 +10182,54 @@ test "batchedKvKeepCount: padding waste caps the group, and the long slots are t
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{ 1, 200_000 }));
 }
 
+test "groupKeepCount: the small-pad floor keeps a group whole only at long context" {
+    // A long stream billed at the gather arm's 2052-row cap beside two short sub-agents: 3x pad.
+    const billed = [_]u32{ 10, 10, 2052 };
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, PAD_FREE_MIN_CTX - 1));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&billed, PAD_FREE_MIN_CTX));
+    // Past the floor's billed bound the cap holds at any context.
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV + 1 }, 300_000));
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV }, 300_000));
+    // A group of one never batches.
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{2052}, 300_000));
+}
+
+test "a 137k stream beside two fresh sub-agents stays one group on the gather bill" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    var q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .indexer_budget = 2048, .indexer_compress_ratio = 4 };
+    const lens = [_]usize{ 10, 12, 137_000 };
+    var caches: [3]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    var ptrs: [3]*const KVCache = undefined;
+    for (lens, 0..) |len, i| {
+        caches[i] = try KVCache.init(testing.allocator, 32);
+        built += 1;
+        caches[i].entries[3].initialized = true;
+        caches[i].entries[3].offset = len;
+        ptrs[i] = &caches[i];
+    }
+    var billed: [3]u32 = undefined;
+    fillGroupPadWasteKvLens(&ptrs, &q4, 1, &billed);
+    try testing.expectEqual(@as(u32, 2052), billed[2]);
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&billed));
+    try testing.expectEqual(@as(u32, 137_000), groupCtxMax(&ptrs));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&billed, groupCtxMax(&ptrs)));
+    // Below the context floor the serial forward is cheap and the plain cap splits the stream off.
+    caches[2].entries[3].offset = 100_000;
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, groupCtxMax(&ptrs)));
+}
+
 test "the batched group is capped by padding waste before it is dispatched" {
     // Source-scan class guard: the grouping loop must consult the cap. Without
     // it a single long-context stream makes every short neighbour materialize
@@ -10056,7 +10239,7 @@ test "the batched group is capped by padding waste before it is dispatched" {
     const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
     const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
     const body = src[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "groupKeepCount(") != null);
     // ...and the dropped slots must still be ticked, or they never advance.
     try testing.expect(std.mem.indexOf(u8, body, "noteSerial(sch, s, .pad_waste)") != null);
 }

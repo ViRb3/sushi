@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
 # bench.sh — the performance bench. llmprobe measures; this drives sushi.
 #
 # One `llmprobe --bench-only` run per model gives the decode/prefill/TTFT
