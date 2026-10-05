@@ -26,6 +26,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **More reliable under memory pressure and restarts**: memory admission, the SSD prompt cache and request metrics
   were hardened across the board, long GLM sessions no longer hang, leak or overrun memory, and the SSD prompt cache
   saves a long prompt whole on its first turn, so the next turn restores all of it.
+- **An idle streamed server no longer burns CPU**: its SSD-read workers park instead of spinning while no request is
+  running.
 
 ---
 

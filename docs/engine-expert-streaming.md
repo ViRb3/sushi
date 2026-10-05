@@ -158,6 +158,8 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 - `FillPool` = F_NOCACHE + F_RDAHEAD 0 positioned preads, fd cache validated by (dev, ino, size, mtime), spans sorted
   and coalesced to 64 MiB, page-aligned bounce otherwise.
+- `FillPool` workers park on their condition without broadcasting: `submit` signals after every push, and a
+  broadcast before the wait makes idle workers wake each other forever.
 - `PageSlab` epoch leases (`free → filling → ready → leased → readers_complete → reclaimable`, CPU writes only in
   `filling`).
 - `importSlab` = `mlx_array_new_data_managed_payload` verified by pointer identity (`ExpertSlabImportCopied`

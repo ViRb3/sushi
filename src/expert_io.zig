@@ -676,7 +676,8 @@ pub const FillPool = struct {
                     self.cv.broadcast(io);
                     break;
                 }
-                self.cv.broadcast(io);
+                // Park under the lock; `submit` broadcasts after every push, so a
+                // broadcast here only wakes idle siblings into broadcasting again.
                 self.cv.wait(io, &self.mu) catch {};
             }
             const files = self.files;
@@ -1199,6 +1200,29 @@ test "expert io fill keeps a worker fed while it is reading" {
     try pool.run(&.{fd}, &plan);
     try t.expectEqualSlices(u8, file.bytes, dst[0 .. chunk * 2]);
     try t.expectEqual(@as(usize, 2), pool.maxQueueDepth());
+}
+
+/// Process CPU time (user + system) in nanoseconds.
+fn processCpuNs() u64 {
+    const ru = std.posix.getrusage(0); // RUSAGE_SELF
+    const sec: i64 = @as(i64, ru.utime.sec) + @as(i64, ru.stime.sec);
+    const usec: i64 = @as(i64, ru.utime.usec) + @as(i64, ru.stime.usec);
+    return @intCast(sec * std.time.ns_per_s + usec * std.time.ns_per_us);
+}
+
+test "expert io idle fill workers do not spin" {
+    // Parked workers must not burn CPU; process CPU time bars the idle window.
+    const t = std.testing;
+    const pool = try FillPool.create(t.allocator, .{ .workers = 4 });
+    defer pool.destroy();
+
+    var ts = std.c.timespec{ .sec = 1, .nsec = 0 };
+    const before = processCpuNs();
+    _ = std.c.nanosleep(&ts, null);
+    const delta = processCpuNs() - before;
+
+    // A spinning pool burns one core per worker; parked, ~0.
+    try t.expect(delta < 400 * std.time.ns_per_ms);
 }
 
 test "expert io file cache reopens a replaced shard and reuses a stable one" {
