@@ -236,6 +236,9 @@ Decode and verify:
 - Draft head shortlists (3-bit top-32 over 7 rows; A3 top-32 over 2 rows): −26% readout, decode gain inside drift,
   +265–278 MiB resident; removed. The A4 assistant leaves the premise: the 2-row readout is 1.3 of a 5.3 ms draft,
   at most 2.2% of an 8K round (BF16, `11566d93`).
+- A measured-cost round planner (serial / N2 tree / lookup per request, hysteresis, probes): byte-identical, within
+  noise of the fixed plan at 8K and 128K (2.5bpw kv8 A4). Prose lands 1.7-2.3 tokens per round against a ~1.9
+  break-even, so the always-on tree leaves at most a few percent.
 - Narrower trees: N1 (one draft node) loses to N2 at 1K and 30K (37.5–38.4 vs 32.2–33.6 ms per token; BF16, A4,
   arms rotated every 16 rounds in one request, contended box); N2 beats a serial step above ~1.1 accepted per round.
 - Wider trees: N3 with every T4 kernel optimized 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`, 1.46% drift);
