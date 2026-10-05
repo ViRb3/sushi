@@ -407,7 +407,8 @@ fn treeScoresTail(scope: *Scope, pooled: Arr, tail: Arr, tail_base: c_int, index
     const sh = mlx.getShape(index_q);
     const rows = sh[0];
     if (sh[1] > 32 or sh[2] > 128) return error.InvalidGlmAttentionShape;
-    const row_group = @min(rows, 16);
+    // Non-NAX pipelines can cap this kernel below 512 threads.
+    const row_group = @min(rows, if (@import("glm5_model.zig").naxArms()) @as(c_int, 16) else 8);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, pools }, 2, .float32));
