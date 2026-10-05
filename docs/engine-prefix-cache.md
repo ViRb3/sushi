@@ -148,7 +148,8 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
   OUT so the first append donates.
 - **The free-space probe runs only before an actual store** (after the superseded check): the idle spill commits every
   idle entry at each request finish, so a copy already on disk must cost no probe; below the store floor it still
-  counts as persisted.
+  counts as persisted. The probe's budget GC swap-removes entries, so the extend/SSM-only candidate is selected
+  AGAIN after it (`selectStoreTarget`); an index held across a probe names another entry.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,
   below every refusal; `releaseCheckout` hands an undonated entry back intact).
 - **Off SSD-first, a warm share that does not fit is taken over, not refused** (`checkoutRestored`, qwen4_exp's
