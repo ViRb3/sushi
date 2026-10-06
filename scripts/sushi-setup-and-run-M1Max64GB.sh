@@ -43,8 +43,8 @@ RELEASE_TAR_URL="https://github.com/beamivalice/sushi/releases/latest/download/s
 RELEASES_API_URL="https://api.github.com/repos/beamivalice/sushi/releases/latest"
 
 # Model configuration
-DEFAULT_MODEL_NAME="Qwen3.8-Flash-Next"
-DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-3bpw"
+DEFAULT_MODEL_NAME="Qwen3.8-Flash-Next-Sushi-2.6bpw"
+DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw"
 MODEL_NAME="${MODEL_NAME:-${DEFAULT_MODEL_NAME}}"
 MODEL_REPO="${MODEL_REPO:-${DEFAULT_MODEL_REPO}}"
 MODEL_PATH="${MODEL_PATH:-}"
