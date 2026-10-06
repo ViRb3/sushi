@@ -384,6 +384,24 @@ pub const Hc = struct {
         return self.collapseReference(ops, x, cfg);
     }
 
+    /// Collapse and normalize the verifier's three-row branch input in one dispatch.
+    pub fn collapseAndNorm(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, weight: Arr) !primitive.HcResult {
+        const cooperative = @import("glm5_hc_collapse_simd32.zig");
+        var result = blk: {
+            if (cooperative.enabled() and naxArms() and std.mem.eql(c_int, mlx.getShape(x), &.{ 1, 3, 4, 4096 })) {
+                const mixes = try self.mixReference(ops, x, cfg);
+                if (try cooperative.collapseNormalized(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s, .{ .weight = weight, .epsilon = cfg.rms_norm_eps })) |result| return result;
+                break :blk try primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
+            }
+            break :blk try self.collapse(ops, x, cfg);
+        };
+        errdefer result.deinit();
+        const normalized = try ops.result(try ops.rms(result.mixed, weight, cfg.rms_norm_eps));
+        _ = mlx.mlx_array_free(result.mixed);
+        result.mixed = normalized;
+        return result;
+    }
+
     pub fn collapseReference(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
         const mixes = try self.mixReference(ops, x, cfg);
         return primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);
@@ -1116,7 +1134,8 @@ test "GLM NAX arms and their bills follow the one NAX gate" {
         try std.testing.expectEqual(on, cluster.enabled());
         const bills = [_]usize{
             try index_nax.transientBudget(2048, 2),
-            try cluster.transientBudget(2048, 2),    try dense_once.transientBudget(2048, 2),
+            try cluster.transientBudget(2048, 2),
+            try dense_once.transientBudget(2048, 2),
             try mla_prefill.transientBudget(2048, 2),
         };
         for (bills) |bill| try std.testing.expectEqual(on, bill > 0);

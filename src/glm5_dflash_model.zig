@@ -376,6 +376,7 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
     }
     const rows: c_int = @intCast(total);
     const cadence = async_layers;
+    const fold_norm = rows == 3 and base.naxArms() and @import("glm5_hc_collapse_simd32.zig").enabled();
     var h: Arr = undefined;
     {
         var ops = Ops{ .s = target.s };
@@ -388,9 +389,9 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
     for (target.layers, 0..) |*layer, index| {
         var ops = Ops{ .s = target.s };
         defer ops.deinit();
-        const pre = try layer.hc_attn.collapse(&ops, h, &target.cfg);
+        const pre = if (fold_norm) try layer.hc_attn.collapseAndNorm(&ops, h, &target.cfg, layer.norm_attn) else try layer.hc_attn.collapse(&ops, h, &target.cfg);
         defer pre.deinit();
-        const x = try ops.rms(pre.mixed, layer.norm_attn, target.cfg.rms_norm_eps);
+        const x = if (fold_norm) pre.mixed else try ops.rms(pre.mixed, layer.norm_attn, target.cfg.rms_norm_eps);
         const attended = switch (layer.attn) {
             .kda => |weights| blk: {
                 const p = try kda.project(weights, &ops, x, mode);
@@ -413,9 +414,9 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
             },
         };
         const joined = try ops.own(try primitive.hcExpand(h, attended, pre.post, pre.comb, target.s));
-        const ff = try layer.hc_ffn.collapse(&ops, joined, &target.cfg);
+        const ff = if (fold_norm) try layer.hc_ffn.collapseAndNorm(&ops, joined, &target.cfg, layer.norm_ffn) else try layer.hc_ffn.collapse(&ops, joined, &target.cfg);
         defer ff.deinit();
-        const fx = try ops.rms(ff.mixed, layer.norm_ffn, target.cfg.rms_norm_eps);
+        const fx = if (fold_norm) ff.mixed else try ops.rms(ff.mixed, layer.norm_ffn, target.cfg.rms_norm_eps);
         const ffout = if (mode == .affine_rows_ffn) try @import("glm5_dflash_ffn.zig").apply(target, index, &ops, fx) else blk: {
             var outputs: [max_rows]Arr = undefined;
             var done: usize = 0;

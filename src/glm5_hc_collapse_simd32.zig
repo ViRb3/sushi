@@ -18,7 +18,7 @@ pub fn geometry(x: []const c_int, mixes: []const c_int, scale: []const c_int, ba
     return x.len == 4 and x[0] == 1 and x[1] >= 1 and x[1] <= 4 and std.mem.eql(c_int, x[2..], &.{ 4, 4096 }) and std.mem.eql(c_int, mixes, &.{ 1, x[1], 24 }) and
         std.mem.eql(c_int, scale, &.{3}) and std.mem.eql(c_int, base, &.{24}) and iters == 20 and std.math.isFinite(epsilon) and epsilon > 0;
 }
-const SOURCE: [:0]const u8 =
+const COEFFICIENTS: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\#pragma clang fp reassociate(off)
     \\const uint row=threadgroup_position_in_grid.x;
@@ -56,26 +56,67 @@ const SOURCE: [:0]const u8 =
     \\  if(lane<16u) {matrix[lane]=value;comb[row*16u+lane]=value;}
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
+;
+const SOURCE = COEFFICIENTS ++
     \\for(uint d=tid;d<4096u;d+=256u) {
     \\  float value=0.0f;
     \\  for(uint j=0u;j<4u;++j) value+=pre[j]*float(x[(row*4u+j)*4096u+d]);
     \\  mixed[row*4096u+d]=OutT(value);
     \\}
 ;
-var kernel: ?mlx.mlx_fast_metal_kernel = null;
+// Match MLX rms_single_row: 1024 threads, four consecutive values per thread.
+const NORMALIZED_SOURCE = COEFFICIENTS ++
+    \\float vals[4];
+    \\for(uint i=0;i<4;++i) {
+    \\ uint d=tid*4+i;float value=0.0f;
+    \\ for(uint j=0;j<4;++j)value+=pre[j]*float(x[(row*4u+j)*4096u+d]);
+    \\ vals[i]=float(bfloat(value));
+    \\}
+    \\{
+    \\#pragma clang fp contract(on)
+    \\#pragma clang fp reassociate(on)
+    \\ threadgroup float sums[32];
+    \\ threadgroup float inv[1];
+    \\ float acc=0.0f;
+    \\ for(uint i=0;i<4;++i)acc+=vals[i]*vals[i];
+    \\ acc=simd_sum(acc);
+    \\ if(sg==0)sums[lane]=0;
+    \\ threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\ if(lane==0)sums[sg]=acc;
+    \\ threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\ if(sg==0){acc=simd_sum(sums[lane]);if(lane==0)inv[0]=metal::precise::rsqrt(acc/4096.0f+float(norm_eps));}
+    \\ threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\ for(uint i=0;i<4;++i)mixed[row*4096+tid*4+i]=norm_w[tid*4+i]*bfloat(vals[i]*inv[0]);
+    \\}
+;
+var kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
+pub const Norm = struct { weight: Arr, epsilon: f32 };
 pub fn collapse(x: Arr, mixes: Arr, scale: Arr, base: Arr, iters: c_int, epsilon: f32, s: mlx.mlx_stream) !?Result {
+    return run(x, mixes, scale, base, iters, epsilon, s, null);
+}
+pub fn collapseNormalized(x: Arr, mixes: Arr, scale: Arr, base: Arr, iters: c_int, epsilon: f32, s: mlx.mlx_stream, norm: Norm) !?Result {
+    return run(x, mixes, scale, base, iters, epsilon, s, norm);
+}
+fn run(x: Arr, mixes: Arr, scale: Arr, base: Arr, iters: c_int, epsilon: f32, s: mlx.mlx_stream, norm: ?Norm) !?Result {
     if (!mlx.streamIsGpu(s)) return null;
     for ([_]Arr{ x, mixes, scale, base }) |a| if (a.ctx == null) return null;
     if (!geometry(mlx.getShape(x), mlx.getShape(mixes), mlx.getShape(scale), mlx.getShape(base), iters, epsilon) or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     for ([_]Arr{ mixes, scale, base }) |a| if (mlx.mlx_array_dtype(a) != .float32) return null;
-    if (kernel == null) {
-        const ins = mlx.mlx_vector_string_new_data(&.{ "x", "mixes", "scale", "base", "eps" }, 5);
+    if (norm) |n| {
+        if (!enabled() or !@import("glm5_model.zig").naxArms() or mlx.getShape(x)[1] != 3 or n.weight.ctx == null or
+            mlx.mlx_array_dtype(n.weight) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(n.weight), &.{4096}) or
+            !std.math.isFinite(n.epsilon) or n.epsilon <= 0) return null;
+    }
+    const kernel = &kernels[@intFromBool(norm != null)];
+    if (kernel.* == null) {
+        const names = [_][*:0]const u8{ "x", "mixes", "scale", "base", "eps", "norm_w", "norm_eps" };
+        const ins = mlx.mlx_vector_string_new_data(&names, if (norm != null) 7 else 5);
         defer _ = mlx.mlx_vector_string_free(ins);
         const outs = mlx.mlx_vector_string_new_data(&.{ "mixed", "post", "comb" }, 3);
         defer _ = mlx.mlx_vector_string_free(outs);
-        const k = mlx.mlx_fast_metal_kernel_new("sushi_glm_hc_collapse_simd32", ins, outs, SOURCE, "", true, false);
+        const k = mlx.mlx_fast_metal_kernel_new(if (norm != null) "sushi_glm_hc_collapse_norm" else "sushi_glm_hc_collapse_simd32", ins, outs, if (norm != null) NORMALIZED_SOURCE else SOURCE, "", true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
-        kernel = k;
+        kernel.* = k;
     }
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -83,16 +124,22 @@ pub fn collapse(x: Arr, mixes: Arr, scale: Arr, base: Arr, iters: c_int, epsilon
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, 4096 }, 3, .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, 4 }, 3, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ 1, rows, 4, 4 }, 4, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * 256, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    const threads: c_int = if (norm != null) 1024 else 256;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * threads, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, threads, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OutT", .bfloat16));
     const eps = mlx.mlx_array_new_float(epsilon);
     defer _ = mlx.mlx_array_free(eps);
-    const inputs = mlx.mlx_vector_array_new_data(&.{ x, mixes, scale, base, eps }, 5);
+    const norm_eps = if (norm) |n| mlx.mlx_array_new_float(n.epsilon) else Arr{ .ctx = null };
+    defer if (norm_eps.ctx != null) {
+        _ = mlx.mlx_array_free(norm_eps);
+    };
+    const arrays = [_]Arr{ x, mixes, scale, base, eps, if (norm) |n| n.weight else x, norm_eps };
+    const inputs = mlx.mlx_vector_array_new_data(&arrays, if (norm != null) 7 else 5);
     defer _ = mlx.mlx_vector_array_free(inputs);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel.?, inputs, cfg, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel.*.?, inputs, cfg, s));
     if (mlx.mlx_vector_array_size(outputs) != 3) return error.MetalKernelBadOutputCount;
     var result = Result{ .mixed = mlx.mlx_array_new(), .post = mlx.mlx_array_new(), .comb = mlx.mlx_array_new() };
     errdefer result.deinit();
@@ -134,6 +181,16 @@ fn check(ops: *Ops, x: Arr, mix: Arr, scale: Arr, base: Arr, expected_calls: usi
     try exact(ops, reference.mixed, new.mixed);
     try exact(ops, reference.post, new.post);
     try exact(ops, reference.comb, new.comb);
+    if (mlx.mlx_array_dtype(x) == .bfloat16 and mlx.getShape(x)[1] == 3 and @import("glm5_model.zig").naxArms()) {
+        const weight = try ops.own(try @import("dflash.zig").TinyFix.bf16ArrShaped(&.{4096}, 997, ops.s));
+        for ([_]f32{ 1e-6, 1e-5 }) |eps| {
+            const normalized = (try collapseNormalized(x, mix, scale, base, 20, 1e-6, ops.s, .{ .weight = weight, .epsilon = eps })) orelse return error.TestExpectedHcNorm;
+            defer normalized.deinit();
+            try exact(ops, try ops.rms(new.mixed, weight, eps), normalized.mixed);
+            try exact(ops, new.post, normalized.post);
+            try exact(ops, new.comb, normalized.comb);
+        }
+    }
 }
 fn fixtureTensor(comptime name: []const u8) ![]const u8 {
     const bytes = @embedFile("fixtures/glm5_layers.safetensors");

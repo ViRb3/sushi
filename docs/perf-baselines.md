@@ -1324,6 +1324,33 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-three-value-norm"></a>
+## GLM DFlash2: three-row value reuse and normalized residual mixing
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8, async-four schedule.
+Extend the `0fb194b9` verifier with exact three-row reuse in the MLA value projection and a fused HC collapse/RMS
+kernel. The value projection retains the serial A6 dot order. The normalization retains the intermediate BF16
+rounding and MLX's four-values-per-thread RMS reduction. Both new paths are restricted to three-row NAX verification;
+other shapes and device paths retain their existing operations. Drafting and draft depth are unchanged.
+
+One fresh model load, 60 rotated samples per arm/width/context after two warmups; fixed prefixes and token chains.
+Compare original `f40fa548`, current `0fb194b9`, each new component alone, and both. Interactive QoS, maximum fans,
+GPU lock `codex-glm-five-verify`; diagnostic binary SHA256 prefix `89f620e8db05d383`. Timings include the vocabulary head
+and replay/capture arrays, excluding drafting and commit.
+
+| Context | Original ms | `0fb194b9` ms | Value only | Norm only | Both | Total reduction | Increment |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 43.148 | 41.229 | 41.181 | 40.851 | 40.566 | 5.98% | 1.61% |
+| 8192 | 45.107 | 43.217 | 42.979 | 42.785 | 42.739 | 5.25% | 1.10% |
+
+Approximate paired 95% CI half-widths for total savings are 0.244 and 0.219 ms (savings 2.582 and 2.368 ms);
+for the increment, 0.282 and 0.265 ms (savings 0.664 and 0.477 ms). Thus the measured means meet the additional 5%
+verification target at both prefixes; individual runs remain noisy. One-, two- and four-row controls stayed within
+0.3%. Complete logits, captures and replay arrays matched byte for byte at every width and context. Counters proved
+11 value projections and 90 fused normalizations per three-row round. Clean GLM tests include weighted RMS,
+NaN/Inf and captured-coefficient cases, serial value-projection parity, and explicit projection engagement.
+The clean GLM suites passed 313 tests, with 3 skipped and zero failures.
+
 <a id="glm-three-output-tiles"></a>
 ## GLM DFlash2: two output tiles in the three-member expert path
 

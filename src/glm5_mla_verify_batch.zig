@@ -15,6 +15,10 @@ pub fn run(ops: *Ops, in: Input, dir: Direction) !?Arr {
         mlx.mlx_array_dtype(in.scales) != .bfloat16 or mlx.mlx_array_dtype(in.biases) != .bfloat16 or
         !std.mem.eql(c_int, &.{ 64, 256, 96 }, mlx.getShape(in.w)) or !std.mem.eql(c_int, &.{ 64, 256, 4 }, mlx.getShape(in.scales)) or
         !std.mem.eql(c_int, mlx.getShape(in.scales), mlx.getShape(in.biases))) return null;
+    if (dir == .value and xs[0] == 3) {
+        const linear = @import("glm5_model.zig").Linear{ .w = in.w, .scales = in.scales, .biases = in.biases, .input = 512, .output = 256 };
+        if (try @import("glm5_dflash_a6_hoist.zig").project(ops.s, in.x, linear)) |out| return try ops.own(out);
+    }
     return try ops.qmm(in.x, in.w, in.scales, in.biases, dir == .value);
 }
 fn fixture(ops: *Ops, dir: Direction, rows: c_int) !Input {
@@ -40,7 +44,10 @@ test "GLM MLA verify batch matches each serial row projection" {
         var ops = Ops{ .s = mlx.gpuStream() };
         defer ops.deinit();
         const in = try fixture(&ops, dir, rows);
+        const hoist = @import("glm5_dflash_a6_hoist.zig");
+        const before = hoist.dispatchCount();
         const got = (try run(&ops, in, dir)) orelse return error.SkipZigTest;
+        try std.testing.expectEqual(before + @as(usize, if (dir == .value and rows == 3) 1 else 0), hoist.dispatchCount());
         try mlx.check(mlx.mlx_array_eval(got));
         for (0..@intCast(rows)) |row| {
             const r: c_int = @intCast(row);
