@@ -4527,6 +4527,14 @@ fn thinkFlagArm(model_type: []const u8) ?EffortArm {
     return armForWord(effortArms(model_type) orelse return null, @tagName(e));
 }
 
+/// The budget `--think` selects on this arch; fallback leaves the server on its own default.
+pub fn thinkFlagBudget(model_type: []const u8, fallback: i32) i32 {
+    if (thinkFlagArm(model_type)) |arm| {
+        if (arm.budget) |b| return b;
+    }
+    return fallback;
+}
+
 pub fn defaultEffortWord(config: *const ModelConfig) ?[]const u8 {
     if (thinkFlagArm(config.model_type)) |arm| return @tagName(arm.effort);
     return if (config.isGlm5()) "high" else null;
@@ -9646,6 +9654,29 @@ test "thinking policy: default_reasoning_effort is the word a request naming non
     try testing.expectEqualStrings("high", defaultReasoningEffort(&glm).?);
     try testing.expectEqualStrings("on", defaultReasoningEffort(&mimo_off).?);
     try testing.expectEqualStrings("xhigh", defaultReasoningEffort(&qwen).?);
+}
+
+test "thinking policy: thinkFlagBudget uses current arch caps and preserves uncapped fallbacks" {
+    const saved = think_effort_flag;
+    defer think_effort_flag = saved;
+    think_effort_flag = null;
+    try testing.expectEqual(@as(i32, 321), thinkFlagBudget("qwen4_exp", 321));
+    think_effort_flag = .medium;
+    try testing.expectEqual(@as(i32, 8192), thinkFlagBudget("qwen4_exp", -1));
+    think_effort_flag = .low;
+    try testing.expectEqual(@as(i32, 2048), thinkFlagBudget("qwen4_exp", -1));
+    for ([_]Effort{ .off, .xhigh }) |effort| {
+        think_effort_flag = effort;
+        try testing.expectEqual(@as(i32, -1), thinkFlagBudget("qwen4_exp", -1));
+        try testing.expectEqual(@as(i32, 321), thinkFlagBudget("qwen4_exp", 321));
+    }
+    for ([_]Effort{ .low, .high, .max }) |effort| {
+        think_effort_flag = effort;
+        try testing.expectEqual(@as(i32, 123), thinkFlagBudget("glm5_next", 123));
+    }
+    think_effort_flag = .on;
+    try testing.expectEqual(@as(i32, 456), thinkFlagBudget("mimo_v2", 456));
+    try testing.expectEqual(@as(i32, 789), thinkFlagBudget("unknown", 789));
 }
 
 test "GLM vision config rejects unsupported tower geometry and accepts a text-only checkpoint" {

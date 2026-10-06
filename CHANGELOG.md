@@ -24,7 +24,8 @@ earlier history is mlx-serve's, in that project's changelog.
   Fixed-depth DFlash2 drafting takes about 12% less time with the A4 g64 assistant, preserving proposals and acceptance.
 - **Better agent and API behaviour**: `sushi launch grok` is new and opencode 2.x works again; stop sequences end
   generation as soon as they complete; streamed and non-streamed answers match byte for byte; presence, frequency and
-  repeat penalties take effect; `ignore_eos` works on `/v1/completions`; experimental logit biases load from a file.
+  repeat penalties take effect; `ignore_eos` works on `/v1/completions`; experimental logit biases load from a file. Chat and legacy completions accept the `repetition_penalty` alias,
+  and requests that omit effort inherit the configured `--think` budget.
 - **New and changed flags**: `--mtp-min-depth`/`--mtp-max-depth` bound the MTP planner so each Mac can calibrate its
   own range (they replace `--mtp-depth`), `--no-mtp-lookup` turns off prompt-lookup drafts inside MTP rounds,
   `--gpu-warm-secs` keeps the GPU awake between requests, and `--wired-margin-gib` now defaults to 4 GiB.

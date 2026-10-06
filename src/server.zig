@@ -9541,8 +9541,8 @@ fn handleChatCompletions(
     if (!try checkThinkingSupport(allocator, stream, config, enable_thinking, false)) return;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
-    // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
-    const effort_budget: i32 = if (effort_cfg) |e| e.budget else server_config.default_reasoning_budget;
+    const default_effort_budget = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
+    const effort_budget: i32 = if (effort_cfg) |e| e.budget else default_effort_budget;
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
         else => effort_budget,
@@ -13989,6 +13989,8 @@ fn formatLogprobsObject(
 fn parseRepeatPenalty(root: std.json.ObjectMap) f32 {
     const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
     if (rp > 0.0) return rp;
+    const rep_p = parseJsonFloat(root, "repetition_penalty", 0.0, 0.0, 10.0);
+    if (rep_p > 0.0) return rep_p;
     const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
     return if (fp > 0.0) 1.0 + fp else 1.0;
 }
@@ -16351,7 +16353,7 @@ fn handleAnthropicMessages(
         config.defaultEnableThinking(root.get("tools") != null)
     else
         false;
-    var reasoning_budget: i32 = server_config.default_reasoning_budget;
+    var reasoning_budget: i32 = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
     var budget_explicit = false;
     if (root.get("thinking")) |think_val| {
         if (think_val == .object) {
@@ -18094,7 +18096,7 @@ fn handleResponsesInner(
     var reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
     if (root.get("reasoning") == null) reasoning_cfg.effort = model_mod.defaultEffortWord(config);
     var enable_thinking = reasoning_cfg.enable;
-    var effort_budget: i32 = server_config.default_reasoning_budget;
+    var effort_budget: i32 = model_mod.thinkFlagBudget(config.model_type, server_config.default_reasoning_budget);
     if (reasoning_cfg.effort) |word| {
         const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok), model_mod.effortArms(config.model_type)) catch {
             const msg = try effortRefusalFor(allocator, lm, word);
@@ -20322,6 +20324,12 @@ test "repeat_penalty: 0 or below is unset, then frequency_penalty, then off, on 
         .{ .body = "{\"repeat_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.1 },
         .{ .body = "{\"frequency_penalty\":0.1}", .want = 1.1 },
         .{ .body = "{\"repeat_penalty\":50}", .want = 10.0 },
+        .{ .body = "{\"repetition_penalty\":1.3}", .want = 1.3 },
+        .{ .body = "{\"repetition_penalty\":0}", .want = 1.0 },
+        .{ .body = "{\"repetition_penalty\":-2,\"frequency_penalty\":0.5}", .want = 1.5 },
+        .{ .body = "{\"repetition_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.1 },
+        .{ .body = "{\"repetition_penalty\":50}", .want = 10.0 },
+        .{ .body = "{\"repeat_penalty\":1.2,\"repetition_penalty\":1.5}", .want = 1.2 },
     };
     for (cases) |c| {
         const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
