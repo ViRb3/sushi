@@ -101,6 +101,12 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
   pooled buffer and never written into it ([kernels](engine-glm5-kernels.md#dflash2-verification)); MLA reads the
   committed prefix plus the ancestry tail. Commit publishes target state and assistant context together; a commit that fails after
   taking over the request's MLA buffers leaves the request failed.
+- **Draft execution**: the fixed two-node tree keeps all eight noise rows as attention keys and values, but the
+  final layer computes only the anchor and two required output rows. Two-tap BF16 convolutions preserve the original
+  multiply/add rounding in one kernel, and sliding layers share a block mask. On M5 Max, the A4 g64 assistant's
+  eight-row FFN projections reuse weights across the full block with MLX's original reduction order.
+  [Paired measurements](perf-baselines.md#glm-draft-ten-percent) show about 12% lower draft time; depth and acceptance
+  are unchanged.
 - **Decisions**: greedy follows the target argmax; sampled requests draw only the visited target path with the
   request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included). Both
   verify through the same batched rows, whose logits equal per-row serial projections bit for bit.

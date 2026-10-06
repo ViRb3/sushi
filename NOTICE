@@ -405,6 +405,12 @@ The row-identical 8-bit projection kernel in `src/mtp_qmv.zig` adapts
 It shares packed weights across input rows while preserving each serial
 row's lane assignment, reduction order and output rounding.
 
+The eight-row DFlash FFN kernel in `src/dflash_qmv.zig` adapts
+`qmv_wide_impl` and affine four-bit `dequantize` from MLX
+`backend/metal/kernels/quantized.h`. It specializes the two A4 group-64
+FFN geometries and shares decoded weights across eight input rows while
+retaining MLX's subchunk accumulation and lane-shuffle reduction order.
+
 The HC RMS kernel in `src/glm5_hc_prefill.zig` adapts the four-value-per-thread
 `rms_looped` reduction from MLX `backend/metal/kernels/rms_norm.metal`
 (Copyright 2024 Apple Inc.), also reflected in oMLX's HC normalization helper.

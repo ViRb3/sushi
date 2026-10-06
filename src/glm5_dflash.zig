@@ -234,9 +234,12 @@ pub fn proposeTreeWithChildren(assistant: *draft.DflashModel, context: *const dr
     noise[0] = pending;
     const ids = try ops.own(mlx.mlx_array_new_data(&noise, &[_]c_int{ 1, @intCast(assistant.config.block_size) }, 2, .uint32));
     const embeds = try ops.own(try target.rawEmbedding(ids));
-    const hidden = try ops.own(try draft.forwardBlock(assistant, &work, embeds, context.absLen()));
-    // A two-node tree reads only the first two draft rows.
+    // A two-node tree reads only the first two draft rows, plus their anchor.
     const bounded = max_nodes == 2 and assistant.config.block_size == 8;
+    const hidden = try ops.own(if (bounded)
+        try draft.forwardBlockPrefix(assistant, &work, embeds, context.absLen(), 3)
+    else
+        try draft.forwardBlock(assistant, &work, embeds, context.absLen()));
     const readout_input = if (bounded) try ops.slice(hidden, 1, 1, 3) else hidden;
     const projected = try ops.own(try target.projectHead(readout_input));
     const transformed = try ops.own(try draft.applyLogitTransforms(projected, assistant.config.output_multiplier, assistant.config.logit_softcap, assistant.s));
