@@ -9729,7 +9729,7 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
     const target = xfm.glm5.?;
     target.s = xfm.s;
     target.suppress_mask = xfm.suppress_mask;
-    const schedule = try verifier.bindSchedule(4);
+    const schedule = verifier.bindDefaultSchedule();
     defer schedule.restore();
     var timer = io_util.Stopwatch.init(sch.io);
     // The drafter with the best landing rate; its tree takes the rows the plain slots leave.

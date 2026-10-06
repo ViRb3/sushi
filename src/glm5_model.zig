@@ -402,6 +402,12 @@ pub const Hc = struct {
         return result;
     }
 
+    /// The expansion kernel already rounded the residual and normalized its FP32 view.
+    pub fn collapseFromNormalized(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig, weight: Arr, normalized: Arr) !primitive.HcResult {
+        const mixes = try hcMixExact(ops, normalized, self.w);
+        return (try @import("glm5_hc_collapse_simd32.zig").collapseNormalized(x, mixes, self.scale, self.base, @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s, .{ .weight = weight, .epsilon = cfg.rms_norm_eps })) orelse error.InvalidGlmHc;
+    }
+
     pub fn collapseReference(self: Hc, ops: *Ops, x: Arr, cfg: *const model.ModelConfig) !primitive.HcResult {
         const mixes = try self.mixReference(ops, x, cfg);
         return primitive.hcCollapse(x, mixes, try ops.cast(self.scale, .float32), try ops.cast(self.base, .float32), @intCast(cfg.glm_hc_sinkhorn_iters), cfg.glm_hc_eps, ops.s);

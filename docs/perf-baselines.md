@@ -1366,6 +1366,35 @@ Verification time stayed within 0.2% across these paired live cases. The isolate
 0.8–1.4% higher end-to-end decode throughput in this run, since verification dominates the round.
 The clean ReleaseFast suite passed 3,425 tests, with 108 skipped and zero failures.
 
+<a id="glm-three-prepared-input"></a>
+## GLM DFlash2: prepared A6 inputs and HC expansion normalization
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant and kv8.
+Baseline is `35feabc1` (1.2.0-dev2). Three-row NAX verification prepares the A6 input's power-of-two
+coefficients and BF16 group sums once, then reuses them across output tiles. HC expansion also emits the
+next collapse's FP32 normalized input, preserving the intervening BF16 rounding and native RMS reduction.
+The default three-row schedule uses two-layer asynchronous groups; explicit schedules and other widths
+retain their existing behavior. Draft depth stays fixed at two draft tokens plus the root.
+
+A fresh model load after 180 seconds of cooling at maximum fans, interactive QoS and an exclusive GPU lock;
+160 rotated measurements per arm and context, with two warmups and a repeated baseline. Fixed token chains
+and prefixes. Timing includes the vocabulary head, captures and replay arrays, excluding drafting and commit.
+Diagnostic binary SHA256 prefix `d3cc2364000bec64`.
+
+| Context | Baseline ms | Candidate ms | Repeated baseline ms | Reduction | Paired savings, approximate 95% CI |
+|---|---:|---:|---:|---:|---:|
+| 1024 | 40.5360 | 38.9679 | 40.6239 | 3.87% | 1.5681 ± 0.0878 ms |
+| 8192 | 42.9172 | 41.3030 | 42.9044 | 3.76% | 1.6142 ± 0.1295 ms |
+| 32768 | 44.7481 | 43.1758 | 44.7137 | 3.51% | 1.5723 ± 0.0782 ms |
+
+**The additional 5% target was not reached.** Earlier hotter multi-arm runs sometimes approached 5%;
+the cooler repeat above is the retained result. Complete logits, captures and replay arrays matched exactly
+for one through four rows at all three prefixes. The three-row path engaged 89 expansion/normalization
+fusions and 157 prepared affine projections per round. Vectorized prepared inputs did not establish a
+repeatable additional gain and were removed, as were configuration caches, fused QKV, fused preparation
+inside HC collapse, alternate layer boundaries and the other unproductive experiments.
+The clean full native suite passed 3431 tests, with 108 skipped and zero failures.
+
 <a id="glm-three-value-norm"></a>
 ## GLM DFlash2: three-row value reuse and normalized residual mixing
 

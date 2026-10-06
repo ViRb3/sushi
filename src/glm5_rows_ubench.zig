@@ -40,7 +40,7 @@ pub fn run(allocator: std.mem.Allocator, target: *forward.Model, latent_bits: u8
     }
     var serial_ns: [widths + 1]u64 = @splat(0);
     var rows_ns: [widths + 1]u64 = @splat(0);
-    const binding = try verifier.bindSchedule(4);
+    const binding = verifier.bindDefaultSchedule();
     defer binding.restore();
     // Round 0 compiles every shape and is not counted.
     for (0..rounds + 1) |round| for (1..widths + 1) |width| {

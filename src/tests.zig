@@ -77,6 +77,7 @@ test {
     _ = @import("glm5_model.zig");
     _ = @import("glm5_hc_prefill.zig");
     _ = @import("glm5_hc_collapse_simd32.zig");
+    _ = @import("glm5_hc_expand_norm.zig");
     _ = @import("glm5_decode.zig");
     _ = @import("glm5_kda_fused.zig");
     _ = @import("glm5_kda_prework.zig");

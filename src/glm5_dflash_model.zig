@@ -11,11 +11,11 @@ const adapter = @import("glm5_dflash.zig");
 const Arr = mlx.mlx_array;
 const Ops = base.Ops;
 // Layers per asynchronous evaluation group; zero settles every layer synchronously.
-threadlocal var async_layers: usize = 0;
+threadlocal var async_layers: ?usize = 0;
 var async_dispatches: usize = 0;
 var sync_dispatches: usize = 0;
 pub const ScheduleBinding = struct {
-    previous: usize,
+    previous: ?usize,
     pub fn restore(self: ScheduleBinding) void {
         async_layers = self.previous;
     }
@@ -25,6 +25,15 @@ pub fn bindSchedule(layers: usize) !ScheduleBinding {
     const old = ScheduleBinding{ .previous = async_layers };
     async_layers = layers;
     return old;
+}
+/// Choose the measured schedule after the grouped verification width is known.
+pub fn bindDefaultSchedule() ScheduleBinding {
+    const old = ScheduleBinding{ .previous = async_layers };
+    async_layers = null;
+    return old;
+}
+fn evaluationCadence(rows: usize, mode: kda.ProjectionMode) usize {
+    return async_layers orelse if (rows == 3 and mode == .affine_rows_ffn and base.naxArms()) @as(usize, 2) else 4;
 }
 pub fn asyncDispatchCount() usize {
     return async_dispatches;
@@ -375,7 +384,7 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
         made += 1;
     }
     const rows: c_int = @intCast(total);
-    const cadence = async_layers;
+    const cadence = evaluationCadence(total, mode);
     const fold_norm = rows == 3 and base.naxArms() and @import("glm5_hc_collapse_simd32.zig").enabled();
     var h: Arr = undefined;
     {
@@ -386,10 +395,13 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
         h = try ops.result(try ops.contiguous(try ops.broadcast(try ops.reshape(embedding, &.{ 1, rows, 1, @intCast(target.cfg.hidden_size) }), &.{ 1, rows, 4, @intCast(target.cfg.hidden_size) })));
     }
     defer _ = mlx.mlx_array_free(h);
+    var h_normalized = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(h_normalized);
+    var have_normalized = false;
     for (target.layers, 0..) |*layer, index| {
         var ops = Ops{ .s = target.s };
         defer ops.deinit();
-        const pre = if (fold_norm) try layer.hc_attn.collapseAndNorm(&ops, h, &target.cfg, layer.norm_attn) else try layer.hc_attn.collapse(&ops, h, &target.cfg);
+        const pre = if (have_normalized) try layer.hc_attn.collapseFromNormalized(&ops, h, &target.cfg, layer.norm_attn, h_normalized) else if (fold_norm) try layer.hc_attn.collapseAndNorm(&ops, h, &target.cfg, layer.norm_attn) else try layer.hc_attn.collapse(&ops, h, &target.cfg);
         defer pre.deinit();
         const x = if (fold_norm) pre.mixed else try ops.rms(pre.mixed, layer.norm_attn, target.cfg.rms_norm_eps);
         const attended = switch (layer.attn) {
@@ -413,8 +425,10 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
                 break :blk try mlaFinish(weights, &ops, projected, outputs[0..total], &target.cfg, mode);
             },
         };
-        const joined = try ops.own(try primitive.hcExpand(h, attended, pre.post, pre.comb, target.s));
-        const ff = if (fold_norm) try layer.hc_ffn.collapseAndNorm(&ops, joined, &target.cfg, layer.norm_ffn) else try layer.hc_ffn.collapse(&ops, joined, &target.cfg);
+        const expanded_attn = if (fold_norm) try @import("glm5_hc_expand_norm.zig").apply(target.s, h, attended, pre.post, pre.comb, target.cfg.rms_norm_eps) else null;
+        defer if (expanded_attn) |value| value.deinit();
+        const joined = try ops.own(if (expanded_attn) |value| try ops.result(value.expanded) else try primitive.hcExpand(h, attended, pre.post, pre.comb, target.s));
+        const ff = if (expanded_attn) |value| try layer.hc_ffn.collapseFromNormalized(&ops, joined, &target.cfg, layer.norm_ffn, value.normalized) else if (fold_norm) try layer.hc_ffn.collapseAndNorm(&ops, joined, &target.cfg, layer.norm_ffn) else try layer.hc_ffn.collapse(&ops, joined, &target.cfg);
         defer ff.deinit();
         const fx = if (fold_norm) ff.mixed else try ops.rms(ff.mixed, layer.norm_ffn, target.cfg.rms_norm_eps);
         const ffout = if (mode == .affine_rows_ffn) try @import("glm5_dflash_ffn.zig").apply(target, index, &ops, fx) else blk: {
@@ -431,7 +445,11 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
             }
             break :blk try ops.concat(outputs[0..done], 1);
         };
-        const next = try ops.own(try primitive.hcExpand(joined, ffout, ff.post, ff.comb, target.s));
+        const expanded_ffn = if (fold_norm and index + 1 < target.layers.len) try @import("glm5_hc_expand_norm.zig").apply(target.s, joined, ffout, ff.post, ff.comb, target.cfg.rms_norm_eps) else null;
+        defer if (expanded_ffn) |value| value.deinit();
+        const next = try ops.own(if (expanded_ffn) |value| try ops.result(value.expanded) else try primitive.hcExpand(joined, ffout, ff.post, ff.comb, target.s));
+        have_normalized = expanded_ffn != null;
+        if (expanded_ffn) |value| try mlx.check(mlx.mlx_array_set(&h_normalized, value.normalized));
         for (taps, 0..) |id, tap| if (id == index) {
             const mean = try ops.reduce(next, 2, true, false);
             for (out, 0..) |*v, g| {
@@ -816,6 +834,26 @@ test "GLM plain rows of several requests advance each exactly as its serial deco
             try commitPlainRow(v, row, s);
             try std.testing.expectEqual(ref.offset, row.offset);
             token.* = v.targets[0];
+        }
+    }
+}
+
+test "GLM default verification schedule selects only three NAX rows" {
+    const transformer = @import("transformer.zig");
+    const saved = transformer.vqmm_nax_probe_override;
+    defer transformer.vqmm_nax_probe_override = saved;
+    for ([_]bool{ false, true }) |nax| {
+        transformer.vqmm_nax_probe_override = nax;
+        const automatic = bindDefaultSchedule();
+        defer automatic.restore();
+        for ([_]usize{ 1, 2, 3, 4, 16 }) |rows| {
+            try std.testing.expectEqual(@as(usize, if (nax and rows == 3) 2 else 4), evaluationCadence(rows, .affine_rows_ffn));
+            try std.testing.expectEqual(@as(usize, 4), evaluationCadence(rows, .serial_rows));
+        }
+        for ([_]usize{ 0, 2, 4 }) |cadence| {
+            const explicit = try bindSchedule(cadence);
+            try std.testing.expectEqual(cadence, evaluationCadence(3, .affine_rows_ffn));
+            explicit.restore();
         }
     }
 }

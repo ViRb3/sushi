@@ -120,6 +120,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 
 ## DFlash2 verification
 
+- **Prepared three-row inputs**: large A6 projections reuse the input's original BF16 group sums and exact
+  power-of-two coefficients across output tiles. HC expansion emits both the rounded residual and its FP32
+  normalized view for the next collapse. The default NAX three-row path uses two-layer asynchronous groups;
+  explicit schedules and other widths are unchanged. Together these save
+  [3.5–3.9% versus the dev2 baseline](perf-baselines.md#glm-three-prepared-input), below the additional 5% target.
+
 - **Three-row MLA value and normalization**: on the NAX path, the A6 value bank reuses its weights across all
   three rows, and HC collapse emits the normalized branch input directly. The latter preserves the intermediate
   BF16 value and native RMS reduction order. Together with expert reuse/tiling, measured verification is

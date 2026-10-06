@@ -21,6 +21,7 @@ earlier history is mlx-serve's, in that project's changelog.
   Sushi-2.6bpw decodes 12–15% faster per forward than v1.1.1 (a regression that shipped in v1.1.1 is fixed). GLM
   DFlash2 verification takes about 11% less time on M5 Max with the 2.5bpw pack and A4 g64 assistant. Three-row
   expert reuse/tiling, MLA value reuse and fused normalization save a further 5–6% at the measured prefixes.
+  Prepared A6 inputs and fused HC expansion save another 3.5–3.9% of verification time on that M5 setup.
   Fixed-depth DFlash2 drafting takes about 12% less time with the A4 g64 assistant, preserving proposals and acceptance.
 - **Better agent and API behaviour**: `sushi launch grok` is new and opencode 2.x works again; stop sequences end
   generation as soon as they complete; streamed and non-streamed answers match byte for byte; presence, frequency and

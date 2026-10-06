@@ -96,6 +96,85 @@ const HEAD_SOURCE: [:0]const u8 = blk: {
     body = replace(body, "(token0 + m) * N", "((token0 + m)*64+head) * N");
     break :blk body;
 };
+// Preserve qmv_fast's BF16 sum boundaries and power-of-two scaling once per input.
+const INPUT_PREP_SOURCE =
+    \\const uint group=thread_position_in_grid.x;
+    \\if(group>=uint(M*K/8))return;
+    \\const uint at=group*8;
+    \\float sum=0.0f;
+    \\for(uint i=0;i<8;i+=4) {
+    \\ sum+=x[at+i]+x[at+i+1]+x[at+i+2]+x[at+i+3];
+    \\ px[at+i]=float(x[at+i]);
+    \\ px[at+i+1]=float(x[at+i+1])/64.0f;
+    \\ px[at+i+2]=float(x[at+i+2])/16.0f;
+    \\ px[at+i+3]=float(x[at+i+3])/4.0f;
+    \\}
+    \\ps[group]=sum;
+;
+const PREPARED_SOURCE: [:0]const u8 = blk: {
+    const start = std.mem.indexOf(u8, SOURCE, "  for (int m = 0; m < R; ++m) {\n    sum[m]").?;
+    const end = std.mem.indexOfPos(u8, SOURCE, start, "  for (int r = 0; r < 2;").?;
+    break :blk SOURCE[0..start] ++
+        "  for(int m=0;m<R;++m){sum[m]=ps[m*(K/8)+k/8+lane];for(int i=0;i<8;++i)local[m][i]=px[m*K+k+lane*8+i];}\n" ++ SOURCE[end..];
+};
+var prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const PrepConfig = struct { k: c_int, config: mlx.mlx_fast_metal_kernel_config };
+var prepare_configs: [8]?PrepConfig = @splat(null);
+const Prepared = struct {
+    scaled: Arr,
+    sums: Arr,
+    fn deinit(self: Prepared) void {
+        _ = mlx.mlx_array_free(self.scaled);
+        _ = mlx.mlx_array_free(self.sums);
+    }
+};
+fn prepare(stream: mlx.mlx_stream, x: Arr, k: c_int) !Prepared {
+    if (prepare_kernel == null) {
+        const iv = mlx.mlx_vector_string_new_data(&.{"x"}, 1);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&.{ "px", "ps" }, 2);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const kernel = mlx.mlx_fast_metal_kernel_new("sushi_a6_prepare_three", iv, ov, INPUT_PREP_SOURCE, "", true, false);
+        if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+        prepare_kernel = kernel;
+    }
+    var cached: ?mlx.mlx_fast_metal_kernel_config = null;
+    for (prepare_configs) |entry| if (entry) |v| {
+        if (v.k == k) {
+            cached = v.config;
+            break;
+        }
+    };
+    const config = cached orelse mlx.mlx_fast_metal_kernel_config_new();
+    var retained = cached != null;
+    defer if (!retained) {
+        _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    };
+    if (cached == null) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &.{ 1, 3, k }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &.{ 1, 3, @divExact(k, 8) }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 3 * @divExact(k, 8), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "M", 3));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", k));
+        for (&prepare_configs) |*entry| if (entry.* == null) {
+            entry.* = .{ .k = k, .config = config };
+            retained = true;
+            break;
+        };
+    }
+    const iv = mlx.mlx_vector_array_new_value(x);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, prepare_kernel.?, iv, config, stream));
+    var result = Prepared{ .scaled = mlx.mlx_array_new(), .sums = mlx.mlx_array_new() };
+    errdefer result.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&result.scaled, ov, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&result.sums, ov, 1));
+    return result;
+}
+
 var dispatch_count: usize = 0;
 pub fn dispatchCount() usize {
     return dispatch_count;
@@ -103,8 +182,8 @@ pub fn dispatchCount() usize {
 pub fn resetDispatchCount() void {
     dispatch_count = 0;
 }
-var kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
-const Key = struct { m: c_int, n: c_int, k: c_int, bits: c_int, headed: bool };
+var kernels: [3]?mlx.mlx_fast_metal_kernel = @splat(null);
+const Key = struct { m: c_int, n: c_int, k: c_int, bits: c_int, headed: bool, prepared: bool };
 const Cached = struct { key: Key, config: mlx.mlx_fast_metal_kernel_config };
 var configs: [32]?Cached = @splat(null);
 
@@ -137,21 +216,23 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
     for ([_]Arr{ linear.scales, linear.biases }) |grid| {
         if (mlx.mlx_array_dtype(grid) != .bfloat16 or !std.mem.eql(c_int, if (headed) &grid_shape else grid_shape[1..], mlx.getShape(grid)) or !(try rowMajorReady(grid))) return null;
     }
-    const kernel = &kernels[@intFromBool(headed)];
+    const prepared = if (@import("glm5_model.zig").naxArms() and !headed and sh[1] == 3 and n >= 4096 and k >= 4096) try prepare(stream, x, k) else null;
+    defer if (prepared) |value| value.deinit();
+    const kernel = &kernels[if (prepared != null) @as(usize, 2) else @intFromBool(headed)];
     if (kernel.* == null) {
-        const ins = [_][*:0]const u8{ "x", "w", "scales", "biases" };
+        const ins = [_][*:0]const u8{ "x", "w", "scales", "biases", "px", "ps" };
         const outs = [_][*:0]const u8{"y"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        const iv = mlx.mlx_vector_string_new_data(&ins, if (prepared != null) 6 else 4);
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        kernel.* = mlx.mlx_fast_metal_kernel_new(if (headed) "sushi_glm_value_three_rows" else "sushi_glm_dflash_affine6_hoisted", iv, ov, if (headed) HEAD_SOURCE else SOURCE, "", true, false);
+        kernel.* = mlx.mlx_fast_metal_kernel_new(if (prepared != null) "sushi_glm_a6_prepared" else if (headed) "sushi_glm_value_three_rows" else "sushi_glm_dflash_affine6_hoisted", iv, ov, if (prepared != null) PREPARED_SOURCE else if (headed) HEAD_SOURCE else SOURCE, "", true, false);
         if (kernel.*.?.ctx == null) {
             kernel.* = null;
             return error.MetalKernelCompileFailed;
         }
     }
-    const key = Key{ .m = if (headed) sh[0] else sh[1], .n = n, .k = k, .bits = bits, .headed = headed };
+    const key = Key{ .m = if (headed) sh[0] else sh[1], .n = n, .k = k, .bits = bits, .headed = headed, .prepared = prepared != null };
     var cached: ?mlx.mlx_fast_metal_kernel_config = null;
     for (configs) |item| if (item) |entry| if (std.meta.eql(key, entry.key)) {
         cached = entry.config;
@@ -180,8 +261,8 @@ pub fn project(stream: mlx.mlx_stream, x: Arr, linear: Linear) !?Arr {
             break;
         };
     }
-    const arrays = [_]Arr{ x, linear.w, linear.scales, linear.biases };
-    const iv = mlx.mlx_vector_array_new_data(&arrays, arrays.len);
+    const arrays = [_]Arr{ x, linear.w, linear.scales, linear.biases, if (prepared) |v| v.scaled else .{ .ctx = null }, if (prepared) |v| v.sums else .{ .ctx = null } };
+    const iv = mlx.mlx_vector_array_new_data(&arrays, if (prepared != null) 6 else 4);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);

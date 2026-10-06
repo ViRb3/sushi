@@ -5552,7 +5552,7 @@ pub const Generator = struct {
 
     fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (!try self.glmRoundReady()) return null;
-        const schedule = try @import("glm5_dflash_model.zig").bindSchedule(4);
+        const schedule = @import("glm5_dflash_model.zig").bindDefaultSchedule();
         defer schedule.restore();
         var timer = io_util.Stopwatch.init(self.timer.io);
         const lookup = try self.glmLookupChain(allocator);
