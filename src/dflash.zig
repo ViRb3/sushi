@@ -499,6 +499,12 @@ pub const DflashLinear = struct {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
             return out;
         }
+        if (self.bits == 4 and self.group_size == 64) {
+            if (try @import("dflash_qmv.zig").matmul(s, x, self.w, self.scales, self.biases)) |fused| {
+                _ = mlx.mlx_array_free(out);
+                return fused;
+            }
+        }
         try mlx.check(mlx.mlx_quantized_matmul(
             &out,
             x,
@@ -1370,7 +1376,12 @@ fn buildBlockMask(
 /// `[1, L, ksize, groups]`, each coefficient broadcasting over `group_size`
 /// channels. Two separate multiply-adds per tap keep the reference's bf16
 /// rounding order.
-pub fn groupedDynConv(
+pub fn groupedDynConv(hidden: mlx.mlx_array, dynamic: mlx.mlx_array, base: mlx.mlx_array, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (try @import("dflash_conv.zig").apply(s, hidden, dynamic, base, group_size)) |out| return out;
+    return groupedDynConvReference(hidden, dynamic, base, group_size, s);
+}
+
+pub fn groupedDynConvReference(
     hidden: mlx.mlx_array, // [1, L, H]
     dynamic: mlx.mlx_array, // [1, L, ksize, groups]
     base: mlx.mlx_array, // [ksize, H]
@@ -1927,7 +1938,15 @@ pub fn forwardBlock(
     noise_embeds: mlx.mlx_array,
     anchor_pos: usize,
 ) !mlx.mlx_array {
-    return forwardBlockMode(model, ctx, noise_embeds, anchor_pos, blockTailEligible(model, ctx, noise_embeds));
+    return forwardBlockMode(model, ctx, noise_embeds, anchor_pos, blockTailEligible(model, ctx, noise_embeds), @intCast(mlx.getShape(noise_embeds)[1]));
+}
+
+/// Return only the requested leading outputs. Every layer still attends to
+/// the entire noise block; only the final layer's queries and row-local MLP
+/// are shortened. Causal convolutions cannot read discarded later rows.
+pub fn forwardBlockPrefix(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: mlx.mlx_array, anchor_pos: usize, rows: u32) !mlx.mlx_array {
+    if (rows == 0 or rows > mlx.getShape(noise_embeds)[1]) return error.InvalidDflashPrefix;
+    return forwardBlockMode(model, ctx, noise_embeds, anchor_pos, blockTailEligible(model, ctx, noise_embeds), rows);
 }
 
 fn blockTailEligible(model: *const DflashModel, ctx: *const DflashCtx, noise: mlx.mlx_array) bool {
@@ -1938,13 +1957,23 @@ fn blockTailEligible(model: *const DflashModel, ctx: *const DflashCtx, noise: ml
     return true;
 }
 
-fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: mlx.mlx_array, anchor_pos: usize, block_tail: bool) !mlx.mlx_array {
+fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: mlx.mlx_array, anchor_pos: usize, block_tail: bool, output_rows: u32) !mlx.mlx_array {
     const s = model.s;
     const cfg = &model.config;
     const q_len_c = mlx.getShape(noise_embeds)[1];
     const q_len: u32 = @intCast(q_len_c);
     std.debug.assert(anchor_pos == ctx.absLen()); // block starts one past context
     const ctx_len = ctx.cache.step;
+    const tail_len = if (block_tail) @min(ctx_len, cfg.sliding_window - 1) else ctx_len;
+    const dropped = ctx_len - tail_len;
+    var sliding_mask: ?mlx.mlx_array = null;
+    defer if (sliding_mask) |mask| {
+        _ = mlx.mlx_array_free(mask);
+    };
+    for (model.layers) |layer| if (layer.layer_type == .sliding_attention) {
+        sliding_mask = try buildBlockMask(.sliding_attention, ctx.base_pos + dropped, tail_len, anchor_pos, q_len, cfg.sliding_window, s);
+        break;
+    };
     const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
     const perm_back = [_]c_int{ 0, 2, 1, 3 };
     const none_mask = mlx.mlx_array_new();
@@ -1955,6 +1984,9 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
     errdefer _ = mlx.mlx_array_free(x);
 
     for (model.layers, 0..) |*lw, li| {
+        const rows: c_int = if (li + 1 == model.layers.len) @intCast(output_rows) else q_len_c;
+        var tail_ops = @import("glm5_model.zig").Ops{ .s = s };
+        defer tail_ops.deinit();
         const normed = try rmsNormFn(x, lw.input_norm, cfg.rms_norm_eps, s);
         defer _ = mlx.mlx_array_free(normed);
 
@@ -1972,17 +2004,14 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         };
         const attn_in = if (attn_prep) |*cp| cp.hidden else normed;
 
-        const q = try projectHeads(attn_in, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
+        const query_in = if (rows < q_len_c) try tail_ops.slice(attn_in, 1, 0, rows) else attn_in;
+        const q = try projectHeads(query_in, &lw.q, lw.q_norm, cfg.num_attention_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(q);
         const bk = try projectHeads(attn_in, &lw.k, lw.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, anchor_pos, true, cfg.rope_traditional, s);
         defer _ = mlx.mlx_array_free(bk);
         const bv = try projectHeadsNoNorm(attn_in, &lw.v, cfg.num_key_value_heads, cfg.head_dim, s);
         defer _ = mlx.mlx_array_free(bv);
 
-        var tail_ops = @import("glm5_model.zig").Ops{ .s = s };
-        defer tail_ops.deinit();
-        const tail_len = if (block_tail) @min(ctx_len, cfg.sliding_window - 1) else ctx_len;
-        const dropped = ctx_len - tail_len;
         const view = if (block_tail) blk: {
             const entry = &ctx.cache.entries[li];
             const k = try tail_ops.slice(entry.keys, 2, @intCast(dropped), @intCast(ctx_len));
@@ -1990,10 +2019,8 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
             break :blk transformer_mod.DenseKVView{ .k = try tail_ops.concat(&.{ k, bk }, 2), .v = try tail_ops.concat(&.{ v, bv }, 2), .owned = false };
         } else try ctx.cache.update(@intCast(li), bk, bv, s, 0);
 
-        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos + dropped, tail_len, anchor_pos, q_len, cfg.sliding_window, s);
-        defer if (mask) |m| {
-            _ = mlx.mlx_array_free(m);
-        };
+        const full_mask = if (lw.layer_type == .sliding_attention) sliding_mask else null;
+        const mask = if (full_mask) |m| (if (rows < q_len_c) try tail_ops.slice(m, 2, 0, rows) else m) else null;
 
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
@@ -2008,7 +2035,7 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, s));
         var attn_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_flat);
-        const flat_shape = [_]c_int{ 1, q_len_c, @intCast(cfg.num_attention_heads * cfg.head_dim) };
+        const flat_shape = [_]c_int{ 1, rows, @intCast(cfg.num_attention_heads * cfg.head_dim) };
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
         const o_out = try lw.o.apply(attn_flat, s);
         defer _ = mlx.mlx_array_free(o_out);
@@ -2018,12 +2045,14 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         };
         var attn_add = o_out;
         if (lw.attention_conv) |*cv| {
-            attn_fin = try convFinish(cv, o_out, attn_prep.?.finish_dyn, cfg.conv_group_size, s);
+            const finish_dyn = if (rows < q_len_c) try tail_ops.slice(attn_prep.?.finish_dyn, 1, 0, rows) else attn_prep.?.finish_dyn;
+            attn_fin = try convFinish(cv, o_out, finish_dyn, cfg.conv_group_size, s);
             attn_add = attn_fin;
         }
 
         var h_new = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&h_new, x, attn_add, s));
+        const residual = if (rows < q_len_c) try tail_ops.slice(x, 1, 0, rows) else x;
+        try mlx.check(mlx.mlx_add(&h_new, residual, attn_add, s));
         _ = mlx.mlx_array_free(x);
         x = h_new;
 
@@ -3873,4 +3902,44 @@ test "DFlash block tail engages only for the native GLM drafter" {
     try testing.expect(!blockTailEligible(&model, &ctx, noise));
     model.native_glm_serving = true;
     try testing.expect(blockTailEligible(&model, &ctx, noise));
+}
+
+test "dflash2: prefix outputs preserve full block attention and causal convolution" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try TinyFix.writeAssistant2(io, tmp.dir, path, s);
+    for ([_]u32{ 0, 4 }) |bits| {
+        var m = try loadDflashQuant(io, allocator, s, path, bits);
+        defer m.deinit();
+        var ctx = try DflashCtx.init(allocator, &m, 0);
+        defer ctx.deinit();
+        const c0 = try TinyFix.capArr(10, 600, s);
+        defer _ = mlx.mlx_array_free(c0);
+        const c1 = try TinyFix.capArr(10, 601, s);
+        defer _ = mlx.mlx_array_free(c1);
+        try appendContext(&m, &ctx, &.{ c0, c1 }, 0);
+        const noise = try TinyFix.capArr(TinyFix.BLOCK, 700, s);
+        defer _ = mlx.mlx_array_free(noise);
+        const full = try forwardBlock(&m, &ctx, noise, 10);
+        defer _ = mlx.mlx_array_free(full);
+        const expected = try TinyFix.readF32(full, allocator, s);
+        defer allocator.free(expected);
+        for ([_]u32{ 1, 2, 3, TinyFix.BLOCK }) |rows| {
+            const prefix = try forwardBlockPrefix(&m, &ctx, noise, 10, rows);
+            defer _ = mlx.mlx_array_free(prefix);
+            try testing.expectEqualSlices(c_int, &.{ 1, @intCast(rows), TinyFix.HIDDEN }, mlx.getShape(prefix));
+            const actual = try TinyFix.readF32(prefix, allocator, s);
+            defer allocator.free(actual);
+            try testing.expectEqualSlices(f32, expected[0 .. rows * TinyFix.HIDDEN], actual);
+            try testing.expectEqual(@as(usize, 10), ctx.cache.step);
+        }
+        try testing.expectError(error.InvalidDflashPrefix, forwardBlockPrefix(&m, &ctx, noise, 10, 0));
+        try testing.expectError(error.InvalidDflashPrefix, forwardBlockPrefix(&m, &ctx, noise, 10, TinyFix.BLOCK + 1));
+    }
 }

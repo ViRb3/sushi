@@ -1324,6 +1324,48 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-draft-ten-percent"></a>
+## GLM DFlash2: faster fixed-depth drafting
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8, async-four verification.
+Compare the unchanged drafter at `2b70132a` against fused BF16 two-tap convolutions, a shared sliding mask, final-layer
+output trimming and eight-row A4 FFN weight reuse. The two draft nodes plus root are unchanged. Every layer still
+sees the entire eight-row noise block; only the final layer's queries, output projection and MLP stop after row two.
+The FFN specialization admits only eight rows, BF16 activations, A4 g64 weights and the 4096→12288 / 12288→4096
+geometries on M5 Max. Other shapes and devices use MLX.
+
+One fresh load; 60 rotated samples per arm/context after two warmups, with an unchanged control repeated in each
+rotation. Times cover a full proposal, including readout and host tree selection, at immutable serving contexts.
+Interactive QoS (`taskpolicy -a`), maximum fans, GPU lock `codex-glm-draft-qmv`; diagnostic binary SHA256 prefix
+`fdaa9e3ef7a7b030`. Prompt lookup is disabled so every measured round runs the assistant.
+
+| Actual context | Original ms | Convolution/mask/prefix ms | FFN reuse only ms | Combined ms | Original control ms | Reduction |
+|---|---:|---:|---:|---:|---:|---:|
+| 1048 | 4.5653 | 4.1851 | 4.3955 | 4.0322 | 4.5812 | 11.68% |
+| 8215 | 5.0677 | 4.5990 | 4.8353 | 4.4737 | 5.0393 | 11.72% |
+
+Paired savings are 0.5331 ± 0.0146 ms and 0.5940 ± 0.0439 ms (approximate 95% CI). All 12,288 retained hidden values
+and all proposed tokens/parents match exactly at each context. Engagement counters show 20 fused convolutions and
+12 eight-row FFN projections per three-row round; the final layer uses three-row MLX projections. At 8K the five
+sliding masks become one. Convolution/mask changes alone saved 3–4%; adding final-layer trimming reached about
+8.5%, and FFN reuse crossed the 10% target. Smaller attention/kernel projections did not show a useful microbenchmark
+win and retain MLX.
+
+Live greedy comparisons used a 32-token warmup per arm and four 256-token runs per prompt, alternating A/B order.
+Every response message and every `(verification rows, accepted drafts)` trace matched exactly. The table reports
+medians of per-request three-row means; end-to-end decode rates include verification and commit.
+
+| Prompt | Original draft ms | Tuned draft ms | Draft reduction | Decode tok/s before → after |
+|---|---:|---:|---:|---:|
+| code-short | 4.6974 | 4.1752 | 11.12% | 50.85 → 51.25 |
+| code-8k | 5.5645 | 4.8943 | 12.04% | 42.07 → 42.49 |
+| copy-8k | 5.5972 | 4.9528 | 11.51% | 54.14 → 54.81 |
+| novel-short | 4.8651 | 4.2492 | 12.66% | 40.17 → 40.73 |
+
+Verification time stayed within 0.2% across these paired live cases. The isolated draft saving translates to about
+0.8–1.4% higher end-to-end decode throughput in this run, since verification dominates the round.
+The clean ReleaseFast suite passed 3,425 tests, with 108 skipped and zero failures.
+
 <a id="glm-three-value-norm"></a>
 ## GLM DFlash2: three-row value reuse and normalized residual mixing
 

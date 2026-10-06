@@ -48,6 +48,8 @@ test {
     _ = @import("model_settings.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
+    _ = @import("dflash_conv.zig");
+    _ = @import("dflash_qmv.zig");
     _ = @import("mtp.zig");
     _ = @import("mtp_qmv.zig");
     _ = @import("mimo_mtp.zig");
