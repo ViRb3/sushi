@@ -18,7 +18,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Faster**: MiMo 2.3bpw decodes about 12% and prefills about 15% faster, Qwen3.8-Flash-Next prefills faster, and
   Sushi-2.6bpw decodes 12–15% faster per forward than v1.1.1 (a regression that shipped in v1.1.1 is fixed). GLM
   DFlash2 verification takes about 11% less time on M5 Max with the 2.5bpw pack and A4 g64 assistant. Three-row
-  shared-expert reuse saves a further 1.8–2.3% at the measured prefixes.
+  shared-expert reuse and two-output tiles save a further 4.0–4.7% at the measured prefixes.
 - **Better agent and API behaviour**: `sushi launch grok` is new and opencode 2.x works again; stop sequences end
   generation as soon as they complete; streamed and non-streamed answers match byte for byte; presence, frequency and
   repeat penalties take effect; `ignore_eos` works on `/v1/completions`; experimental logit biases load from a file.

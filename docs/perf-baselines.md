@@ -1324,6 +1324,47 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-three-output-tiles"></a>
+## GLM DFlash2: two output tiles in the three-member expert path
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8, async-four schedule.
+The three-row, 24-route lane kernel computes two 16-column output tiles per threadgroup, reusing each member's
+input loads. Dot accumulation and F16 reduction order are unchanged; other verification widths retain their
+existing kernels. This extends the three-member reuse in `83585178`.
+
+One fresh load, fixed source-text prefixes and token chains, 40 rotated samples per arm/width/context after two
+warmups. Compare original `f40fa548`, three-member reuse alone, and the final tiled kernel, plus a repeated original
+control. Timings include head and replay/capture arrays, excluding drafting and commit. Interactive QoS, maximum
+fans, GPU lock `codex-glm-three-final-model`, diagnostic binary SHA256 prefix `d31f5b24ac2e4c91`.
+
+| Context tokens | Original ms/round | Three-member reuse | Final ms/round | Total reduction | Tile increment |
+|---|---:|---:|---:|---:|---:|
+| 1024 | 41.394 | 40.297 | 39.463 | 4.67% | 2.07% |
+| 8192 | 43.307 | 42.796 | 41.570 | 4.01% | 2.86% |
+
+Approximate paired 95% confidence intervals for total savings: 1.931 ± 0.141 ms and 1.737 ± 0.281 ms; for the tile
+increment: 0.834 ± 0.137 ms and 1.226 ± 0.270 ms. The repeated original control differed by −0.126 ms at 1K and
++0.300 ms at 8K. All arms matched complete logits, captures and replay arrays by byte hash at widths 1–4 and both
+contexts; engagement counters confirmed the selected expert path. Clean GLM suites: 313 passed, 3 skipped, zero failures.
+
+### Actual three-row draft rounds
+
+Greedy generation, lookup disabled to isolate three-row verification, one 32-token warmup and four 256-token runs
+per workload and arm. The statistic is the median of each request's mean verification time over its full three-row
+rounds. Every arm produced identical messages and acceptance paths. Both code workloads ran in the first boot;
+copying and novel writing ran together in a later boot after an interruption. Comparisons stay within each boot;
+partial interrupted copying runs are excluded. All completed runs used the original vision setting.
+
+| Workload | Original verify ms | Final verify ms | Reduction | Decode tok/s, original → final |
+|---|---:|---:|---:|---:|
+| Short code | 45.431 | 43.535 | 4.17% | 48.32 → 50.16 |
+| Code, 8035 prompt tokens | 45.930 | 44.160 | 3.85% | 41.18 → 42.61 |
+| Copy, 8042 prompt tokens | 45.573 | 43.263 | 5.07% | 54.28 → 56.89 |
+| Novel writing | 44.626 | 43.235 | 3.12% | 39.92 → 40.90 |
+
+The extra 5% target is reached on copying, with 4.0–4.7% at the fixed prefixes and 3.1–5.1% across these live cases.
+No depth policy changed. Separate shared-FFN streams, four-output tiles, and hybrid tile layouts were rejected.
+
 <a id="glm-three-expert-reuse"></a>
 ## GLM DFlash2: reuse an expert across three verification rows
 

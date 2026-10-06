@@ -71,6 +71,33 @@ const EPILOGUE =
     \\ threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
 ;
+// Carry two output tiles through the same k-loop to reuse each member's input loads.
+fn tileKLoops(comptime source: []const u8) [:0]const u8 {
+    @setEvalBranchQuota(1000000);
+    const loop = "for (uint tk = tk0 + sg; tk < tk1; tk += SGS) {";
+    const at = std.mem.indexOf(u8, source, loop) orelse return source ++ "";
+    const begin = at + loop.len;
+    var depth: usize = 1;
+    var end = begin;
+    while (depth != 0) : (end += 1) {
+        if (source[end] == '{') depth += 1;
+        if (source[end] == '}') depth -= 1;
+    }
+    return source[0..begin] ++ "\nfor(uint tile=0;tile<uint(TILES);++tile){\nconst uint ot=ot0+tile;\n" ++
+        replace(source[begin .. end - 1], "acc[", "acc[tile][") ++ "\n}\n}" ++ tileKLoops(source[end..]);
+}
+fn outputTiles(comptime source: []const u8, comptime members: usize) [:0]const u8 {
+    @setEvalBranchQuota(1000000);
+    const marker = if (members == 1) "for (uint si = 0u; si < 8u; si++)" else "if constexpr(SERIAL_REDUCTION)";
+    const cut = std.mem.indexOf(u8, source, marker).?;
+    var body = replace(source[0..cut], "uint ot = uint(threadgroup_position_in_grid.x);", "uint ot0=uint(threadgroup_position_in_grid.x)*uint(TILES);");
+    body = if (members == 1)
+        replace(body, "float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};", "float acc[TILES][8] = {};")
+    else
+        replace(body, std.fmt.comptimePrint("float acc[{d}][8] = {{}};", .{members}), std.fmt.comptimePrint("float acc[TILES][{d}][8] = {{}};", .{members}));
+    return tileKLoops(body) ++ "\nfor(uint tile=0;tile<uint(TILES);++tile){\nconst uint ot=ot0+tile;\n" ++
+        replace(source[cut..], "acc[", "acc[tile][") ++ "\nthreadgroup_barrier(mem_flags::mem_threadgroup);\n}\n";
+}
 fn groupedSource(comptime triples: bool) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     const original = replace(support.cooperative_source, "threadgroup float partial[4 * 256];", "");
@@ -98,7 +125,7 @@ fn groupedSource(comptime triples: bool) [:0]const u8 {
     triple = replace(triple, "acc[1][p*2u]=fma(ins[p*2u].y,w.x,acc[1][p*2u]);", "acc[1][p*2u]=fma(ins[p*2u].y,w.x,acc[1][p*2u]); acc[2][p*2u]=fma(ins[p*2u].z,w.x,acc[2][p*2u]);");
     triple = replace(triple, "acc[1][p*2u+1u]=fma(ins[p*2u+1u].y,w.y,acc[1][p*2u+1u]);", "acc[1][p*2u+1u]=fma(ins[p*2u+1u].y,w.y,acc[1][p*2u+1u]); acc[2][p*2u+1u]=fma(ins[p*2u+1u].z,w.y,acc[2][p*2u+1u]);");
     const epilogue = replace(replace(replace(EPILOGUE, "j<2u", "j<3u"), "j==0u?first:partner", "j==0u?first:(j==1u?partner:third)"), "if(lid<32u)", "if(lid<48u)");
-    return THREE_MEMBERS ++ "\nif(partner==first) {\n" ++ original ++ "\n} else if(third==first) {\n" ++ paired ++ EPILOGUE ++ "\n} else {\n" ++ triple ++ epilogue ++ "\n}\n";
+    return THREE_MEMBERS ++ "\nif(partner==first) {\n" ++ outputTiles(original, 1) ++ "\n} else if(third==first) {\n" ++ outputTiles(paired ++ EPILOGUE, 2) ++ "\n} else {\n" ++ outputTiles(triple ++ epilogue, 3) ++ "\n}\n";
 }
 const SOURCE = groupedSource(false);
 const THREE_SOURCE = groupedSource(true);
@@ -138,7 +165,7 @@ var single_lane_kernels: support.Slots = support.empty;
 var pair_lane_kernels: support.Slots = support.empty;
 var single_kernels: support.Slots = support.empty;
 var pair_kernels: support.Slots = support.empty;
-const Key = struct { input: c_int, output: c_int, slots: c_int, rate: c_int, paired: bool, reduction: Reduction };
+const Key = struct { input: c_int, output: c_int, slots: c_int, rate: c_int, paired: bool, reduction: Reduction, tiles: c_int = 1 };
 const Entry = struct { key: Key, config: mlx.mlx_fast_metal_kernel_config };
 var cache: [64]?Entry = @splat(null);
 
@@ -148,9 +175,10 @@ fn config(key: Key) !struct { value: mlx.mlx_fast_metal_kernel_config, cached: b
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
     const sh = [_]c_int{ key.slots, key.output };
     for (0..if (key.paired) @as(usize, 2) else 1) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &sh, 2, .float16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(key.output, 16) * 128, key.slots, if (key.paired) 2 else 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(key.output, 16 * key.tiles) * 128, key.slots, if (key.paired) 2 else 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
     inline for (.{ "IDIM", "ODIM", "NSLOTS", "NHW", "SERIAL_REDUCTION" }, .{ key.input, key.output, key.slots, key.rate, @as(c_int, @intFromBool(key.reduction == .serial)) }) |name, v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TILES", key.tiles));
     for (&cache) |*entry| if (entry.* == null) {
         entry.* = .{ .key = key, .config = c };
         return .{ .value = c, .cached = true };
@@ -178,11 +206,11 @@ pub fn projectLayout(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: 
     if (!mlx.streamIsGpu(s) or !eligible(x, bank, ids)) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(bank);
-    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = false, .reduction = reduction });
+    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = false, .reduction = reduction, .tiles = if (layout == .lane and xs[0] == 24) 2 else 1 });
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_lane_kernels, "sushi_glm_exl3_group3_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_THREE_SOURCE) else if (layout == .lane) try support.makeKernel(&single_lane_kernels, "sushi_glm_exl3_group2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_SOURCE) else try support.makeKernel(&single_kernels, "sushi_glm_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
+    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_lane_kernels, "sushi_glm_exl3_group3_tile2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_THREE_SOURCE) else if (layout == .lane) try support.makeKernel(&single_lane_kernels, "sushi_glm_exl3_group2_lane", &.{ "x", "trellis", "slots" }, &.{"y"}, LANE_SOURCE) else try support.makeKernel(&single_kernels, "sushi_glm_exl3_group2", &.{ "x", "trellis", "slots" }, &.{"y"}, SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ x, bank, ids }, 3);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -200,11 +228,11 @@ pub fn pairLayout(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Ar
     if (!mlx.streamIsGpu(s) or !eligible(xg, tg, ids) or !eligible(xu, tu, ids) or !std.mem.eql(c_int, mlx.getShape(tg), mlx.getShape(tu)) or !std.mem.eql(c_int, mlx.getShape(xg), mlx.getShape(xu))) return null;
     const xs = mlx.getShape(xg);
     const ws = mlx.getShape(tg);
-    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = true, .reduction = reduction });
+    const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = true, .reduction = reduction, .tiles = if (layout == .lane and xs[0] == 24) 2 else 1 });
     defer if (!cfg.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg.value);
     };
-    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_pair_lane_kernels, "sushi_glm_exl3_pair_group3_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_THREE_PAIR_SOURCE) else if (layout == .lane) try support.makeKernel(&pair_lane_kernels, "sushi_glm_exl3_pair_group2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_PAIR_SOURCE) else try support.makeKernel(&pair_kernels, "sushi_glm_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
+    const kernel = if (layout == .lane and xs[0] == 24) try support.makeKernel(&three_pair_lane_kernels, "sushi_glm_exl3_pair_group3_tile2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_THREE_PAIR_SOURCE) else if (layout == .lane) try support.makeKernel(&pair_lane_kernels, "sushi_glm_exl3_pair_group2_lane", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, LANE_PAIR_SOURCE) else try support.makeKernel(&pair_kernels, "sushi_glm_exl3_pair_group2", &.{ "xg", "xu", "tg", "tu", "slots" }, &.{ "yg", "yu" }, PAIR_SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ xg, xu, tg, tu, ids }, 5);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();

@@ -121,9 +121,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 ## DFlash2 verification
 
 - **Shared-expert rows serve every even n 32–64** (`glm_group2.servesRate`), never one pack's rate. The three-row,
-  24-slot lane path reuses each expert's decoded weights across up to three matching routes; other widths retain
-  two-member reuse. Mixed gate/up and down rates are exact, and the engagement test runs `apply` at each rate.
-  The three-member path saves [1.8–2.3% of full verification time](perf-baselines.md#glm-three-expert-reuse) at the measured prefixes.
+  24-slot lane path reuses each expert's decoded weights across up to three matching routes and computes two
+  output tiles per threadgroup. Other widths retain two-member reuse and one output tile. Mixed gate/up and down
+  rates are exact, and the engagement test runs `apply` at each rate. Together these changes save
+  [4.0–4.7% of full verification time](perf-baselines.md#glm-three-output-tiles) at the measured prefixes.
 - **Groups**: `verifyGroups` runs several requests' trees (≤ 16 rows) in one layer loop. KDA `project`/`finish` and
   MLA `mlaProject`/`mlaFinish` take every row; `recur` and `mlaAttend` take one request's rows and state. Each group
   equals its solo `verify` bit for bit; `SUSHI_GLM_ROWS_UBENCH=N` (`_CTX`, `_TEXT`) times grouped against serial rows.
