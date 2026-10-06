@@ -1324,6 +1324,29 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-three-expert-reuse"></a>
+## GLM DFlash2: reuse an expert across three verification rows
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8, async-four schedule.
+Against `f40fa548` (including the earlier verification optimizations), reuse the cooperative expert dot's decoded
+weights across up to three matching routes in the three-row, 24-slot lane path. Other widths keep two-member reuse.
+Each member retains the original F16 dot accumulation and reduction order. The benefit depends on routing overlap.
+
+One fresh model load, fixed source-text prefixes and token chains, 40 rotated samples per arm/width/context after
+two warmups, with the unchanged baseline repeated as a control. Timings include the head and replay/capture arrays;
+drafting and commit are excluded. Interactive QoS, maximum fans, GPU lock `codex-glm-three-group-model`.
+Diagnostic binary SHA256 prefix `6ec70806ece6814c`.
+
+| Context tokens | Verify rows | Baseline ms/round | Three-member reuse ms/round | Reduction | Paired saving, approximate 95% CI |
+|---|---:|---:|---:|---:|---:|
+| 1024 | 3 | 41.297 | 40.331 | 2.34% | 0.966 ± 0.115 ms |
+| 8192 | 3 | 43.884 | 43.104 | 1.78% | 0.780 ± 0.247 ms |
+
+All arms matched complete logits, captures and replay arrays by byte hash at widths 1–4 and both contexts.
+The repeated baseline differed by 0.033 ms at 1K and −0.026 ms at 8K for three rows. Draft depth and quantization
+are unchanged. Fused gate/up activation and larger asynchronous evaluation groups were measured and rejected:
+neither reduced full verification time. The clean GLM suites passed 313 tests, with 3 skipped and zero failures.
+
 <a id="glm-verify-final"></a>
 ## GLM DFlash2: three/four-row verification, final combined result
 
