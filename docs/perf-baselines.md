@@ -1324,6 +1324,159 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-three-value-norm"></a>
+## GLM DFlash2: three-row value reuse and normalized residual mixing
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8, async-four schedule.
+Extend the `0fb194b9` verifier with exact three-row reuse in the MLA value projection and a fused HC collapse/RMS
+kernel. The value projection retains the serial A6 dot order. The normalization retains the intermediate BF16
+rounding and MLX's four-values-per-thread RMS reduction. Both new paths are restricted to three-row NAX verification;
+other shapes and device paths retain their existing operations. Drafting and draft depth are unchanged.
+
+One fresh model load, 60 rotated samples per arm/width/context after two warmups; fixed prefixes and token chains.
+Compare original `f40fa548`, current `0fb194b9`, each new component alone, and both. Interactive QoS, maximum fans,
+GPU lock `codex-glm-five-verify`; diagnostic binary SHA256 prefix `89f620e8db05d383`. Timings include the vocabulary head
+and replay/capture arrays, excluding drafting and commit.
+
+| Context | Original ms | `0fb194b9` ms | Value only | Norm only | Both | Total reduction | Increment |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 43.148 | 41.229 | 41.181 | 40.851 | 40.566 | 5.98% | 1.61% |
+| 8192 | 45.107 | 43.217 | 42.979 | 42.785 | 42.739 | 5.25% | 1.10% |
+
+Approximate paired 95% CI half-widths for total savings are 0.244 and 0.219 ms (savings 2.582 and 2.368 ms);
+for the increment, 0.282 and 0.265 ms (savings 0.664 and 0.477 ms). Thus the measured means meet the additional 5%
+verification target at both prefixes; individual runs remain noisy. One-, two- and four-row controls stayed within
+0.3%. Complete logits, captures and replay arrays matched byte for byte at every width and context. Counters proved
+11 value projections and 90 fused normalizations per three-row round. Clean GLM tests include weighted RMS,
+NaN/Inf and captured-coefficient cases, serial value-projection parity, and explicit projection engagement.
+The clean GLM suites passed 313 tests, with 3 skipped and zero failures.
+
+<a id="glm-three-output-tiles"></a>
+## GLM DFlash2: two output tiles in the three-member expert path
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8, async-four schedule.
+The three-row, 24-route lane kernel computes two 16-column output tiles per threadgroup, reusing each member's
+input loads. Dot accumulation and F16 reduction order are unchanged; other verification widths retain their
+existing kernels. This extends the three-member reuse in `83585178`.
+
+One fresh load, fixed source-text prefixes and token chains, 40 rotated samples per arm/width/context after two
+warmups. Compare original `f40fa548`, three-member reuse alone, and the final tiled kernel, plus a repeated original
+control. Timings include head and replay/capture arrays, excluding drafting and commit. Interactive QoS, maximum
+fans, GPU lock `codex-glm-three-final-model`, diagnostic binary SHA256 prefix `d31f5b24ac2e4c91`.
+
+| Context tokens | Original ms/round | Three-member reuse | Final ms/round | Total reduction | Tile increment |
+|---|---:|---:|---:|---:|---:|
+| 1024 | 41.394 | 40.297 | 39.463 | 4.67% | 2.07% |
+| 8192 | 43.307 | 42.796 | 41.570 | 4.01% | 2.86% |
+
+Approximate paired 95% confidence intervals for total savings: 1.931 ± 0.141 ms and 1.737 ± 0.281 ms; for the tile
+increment: 0.834 ± 0.137 ms and 1.226 ± 0.270 ms. The repeated original control differed by −0.126 ms at 1K and
++0.300 ms at 8K. All arms matched complete logits, captures and replay arrays by byte hash at widths 1–4 and both
+contexts; engagement counters confirmed the selected expert path. Clean GLM suites: 313 passed, 3 skipped, zero failures.
+
+### Actual three-row draft rounds
+
+Greedy generation, lookup disabled to isolate three-row verification, one 32-token warmup and four 256-token runs
+per workload and arm. The statistic is the median of each request's mean verification time over its full three-row
+rounds. Every arm produced identical messages and acceptance paths. Both code workloads ran in the first boot;
+copying and novel writing ran together in a later boot after an interruption. Comparisons stay within each boot;
+partial interrupted copying runs are excluded. All completed runs used the original vision setting.
+
+| Workload | Original verify ms | Final verify ms | Reduction | Decode tok/s, original → final |
+|---|---:|---:|---:|---:|
+| Short code | 45.431 | 43.535 | 4.17% | 48.32 → 50.16 |
+| Code, 8035 prompt tokens | 45.930 | 44.160 | 3.85% | 41.18 → 42.61 |
+| Copy, 8042 prompt tokens | 45.573 | 43.263 | 5.07% | 54.28 → 56.89 |
+| Novel writing | 44.626 | 43.235 | 3.12% | 39.92 → 40.90 |
+
+The extra 5% target is reached on copying, with 4.0–4.7% at the fixed prefixes and 3.1–5.1% across these live cases.
+No depth policy changed. Separate shared-FFN streams, four-output tiles, and hybrid tile layouts were rejected.
+
+<a id="glm-three-expert-reuse"></a>
+## GLM DFlash2: reuse an expert across three verification rows
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8, async-four schedule.
+Against `f40fa548` (including the earlier verification optimizations), reuse the cooperative expert dot's decoded
+weights across up to three matching routes in the three-row, 24-slot lane path. Other widths keep two-member reuse.
+Each member retains the original F16 dot accumulation and reduction order. The benefit depends on routing overlap.
+
+One fresh model load, fixed source-text prefixes and token chains, 40 rotated samples per arm/width/context after
+two warmups, with the unchanged baseline repeated as a control. Timings include the head and replay/capture arrays;
+drafting and commit are excluded. Interactive QoS, maximum fans, GPU lock `codex-glm-three-group-model`.
+Diagnostic binary SHA256 prefix `6ec70806ece6814c`.
+
+| Context tokens | Verify rows | Baseline ms/round | Three-member reuse ms/round | Reduction | Paired saving, approximate 95% CI |
+|---|---:|---:|---:|---:|---:|
+| 1024 | 3 | 41.297 | 40.331 | 2.34% | 0.966 ± 0.115 ms |
+| 8192 | 3 | 43.884 | 43.104 | 1.78% | 0.780 ± 0.247 ms |
+
+All arms matched complete logits, captures and replay arrays by byte hash at widths 1–4 and both contexts.
+The repeated baseline differed by 0.033 ms at 1K and −0.026 ms at 8K for three rows. Draft depth and quantization
+are unchanged. Fused gate/up activation and larger asynchronous evaluation groups were measured and rejected:
+neither reduced full verification time. The clean GLM suites passed 313 tests, with 3 skipped and zero failures.
+
+<a id="glm-verify-final"></a>
+## GLM DFlash2: three/four-row verification, final combined result
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8 latent, async-four schedule.
+One ReleaseFast binary and model load, 40 alternating samples per width and arm after two warmups; fixed source-text
+prefixes and token chains. Timings include the vocabulary head and replay/capture arrays, exclude drafting and commit.
+GPU lock `codex-glm-final-model`, interactive QoS, maximum fans. Instrumented binary SHA256 prefix `c252977fe9625d03`.
+
+The original arm restores the pre-`83e1d799` QKV-only A6 hoist and its dynamic row offset. The final arm includes `83e1d799`, `d08b6ed1`,
+three/four-row FP32 attention batching, direct FP32 gathers, four-row value projections, and two-output A6 SIMD tiles.
+
+| Context tokens | Verify rows | Original ms/round | Final ms/round | Reduction |
+|---|---:|---:|---:|---:|
+| 1024 | 3 | 46.861 | 41.476 | 11.49% |
+| 8192 | 3 | 49.005 | 43.578 | 11.07% |
+| 1024 | 4 | 57.764 | 51.277 | 11.23% |
+| 8192 | 4 | 62.199 | 54.916 | 11.71% |
+
+One- and two-row controls stayed within 0.4%. Every arm matched complete logits, captures and replay arrays by byte
+hash at all four widths and both contexts. No draft-depth policy or quantization changed. Scratch remains capped at
+32 MiB per native MLA layer; the FP32 gather removes the intervening BF16 bank while preserving its rounding.
+The clean ReleaseFast build passed the complete suite: 3420 tests passed, 108 skipped, zero failures.
+
+### Wider drafting remains workload-dependent
+
+A separate live pilot used the preceding four-row candidate (before the final FP32-gather/tile combination), greedy
+sampling, lookup disabled, one warmup and four 256-token runs per cell. N2 means two drafts plus the root; N3 adds
+one draft. The bounded N3 readout projected only its three usable draft positions. All generated messages matched.
+
+| Workload | N2 tok/s | N3, full readout | N3, bounded readout |
+|---|---:|---:|---:|
+| Short code | 48.01 | 47.29 | 48.35 |
+| Code, 8035 prompt tokens | 40.32 | 35.81 | 36.45 |
+| Copy, 8042 prompt tokens | 52.18 | 52.11 | 53.03 |
+| Novel writing | 38.84 | 36.11 | 36.85 |
+
+Bounding readout saved about 1.1 ms of drafting, but N3 still lost on the longer code and novel-writing cells. The
+three-row default remains; the faster four-row verifier also serves existing lookup chains and mixed-request ticks.
+The N3 policy/readout experiment and benchmark switches were removed from production code.
+
+<a id="glm-three-row-a6-offset"></a>
+## GLM DFlash2: specialize the complete three-row A6 tile
+
+2026-10-06, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.5bpw (W12), A4 g64 assistant, kv8 latent.
+Parent `83e1d799` against `d08b6ed1`'s constant row offset. The helper admits exactly three rows and dispatches one
+complete row tile; fixing its offset at zero lets Metal remove unreachable masked loads without changing arithmetic.
+
+One ReleaseFast instrumented binary, one model load, fixed source-text prefixes and token chains, async-four schedule.
+Forty alternating samples per depth after two warmups; includes the vocabulary head and all replay/capture arrays,
+excludes drafting and commit. GPU lock `codex-glm-bounds-model`, `taskpolicy -a`, maximum fans, no concurrent build
+or GPU job. Timing run began 02:13 Asia/Bangkok at 45°C. Instrumented binary SHA256 prefix: `f12465f57a687268`.
+
+| Context tokens | Original verify ms/round | Constant offset ms/round | Reduction | Paired saving, 95% CI (ms) |
+|---|---:|---:|---:|---:|
+| 1024 | 44.505 | 42.077 | 5.46% | 2.428 ± 0.033 |
+| 8192 | 46.166 | 43.661 | 5.43% | 2.505 ± 0.152 |
+
+Unaffected one-, two- and four-row controls stayed within 0.6%. Full-model logits, captures and replay tapes matched
+by byte hash at every measured depth in both contexts; the 128-token greedy response also matched the earlier baseline.
+The clean build passed 310 GLM/EXL3 tests with 3 skips. This is an additional verification-time gain over the preceding
+A6 coefficient-reuse change below; no end-to-end throughput gain is inferred from this table.
+
 <a id="glm-three-row-a6"></a>
 ## GLM DFlash2: three-row A6 coefficient reuse beyond QKV
 

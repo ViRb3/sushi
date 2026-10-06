@@ -17,8 +17,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 | `glm5_attention.zig` | IndexPool state, absorbed latent attention, packed prefill orchestration |
 | `glm5_latent.zig` | latent storage view (BF16 or kv8), the `SUSHI_LATENT` kernel helper, kv8 row bytes |
 | `glm5_attention_nax_packed.zig` / `glm5_indexpool_nax.zig` | head-packed native sparse attention (B16/B32); NAX prefill index scores |
-| `glm5_attention_decode_batch.zig` / `glm5_attention_overlay.zig` | native B1/B3 decode and verify attention; verify latent overlays |
-| `glm5_mla_prefill_batch.zig` / `glm5_mla_verify_batch.zig` | head-batched MLA prefill projections; three-row verify projections |
+| `glm5_attention_decode_batch.zig` / `glm5_attention_overlay.zig` | native B1/B3/B4 decode and verify attention; verify latent overlays |
+| `glm5_mla_prefill_batch.zig` / `glm5_mla_verify_batch.zig` | head-batched MLA prefill projections; three-row query and three/four-row value verification |
 | `glm5_kda_prework.zig` / `glm5_kda_value_rows.zig` / `glm5_kda_fused.zig` / `glm5_kda_prefill_cluster.zig` | KDA prework, R4 recurrence, one-token body and output epilogue, FA/GA/beta cluster |
 | `glm5_a6_dense_once.zig` / `glm5_decode.zig` / `glm5_router.zig` / `glm5_activation.zig` | T2048 A6 expansion; copy-free QKV; router; dense/shared activation |
 | `glm5_hc_prefill.zig` / `glm5_hc_collapse_simd32.zig` | RMS-fused HC prefill projection; SIMD32 verify collapse |
@@ -103,10 +103,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   recurrence, gated output norm. Its unary math variants are chosen by probe at first use.
 - Router: FP32 GEMV with sigmoid and correction, then stable top-8 and unbiased normalization (two dispatches; BF16
   weights widened locally). Dense/shared activation: one dispatch over the exhaustive BF16 sigmoid table (128 KiB).
-- Attention: B1 per decode row and B3 for three verify branches, from one gather source (`[B,2051,512]` bank,
+- Attention: B1 per decode row and B3/B4 for verification branches, from one gather source (`[B,2051,512]` bank,
   Q `[B,1,64,512]`), through FP32 GEMMs and a precise softmax on every GPU. A NAX GPU multiplies with MLX's
-  block-masked GEMM, which never takes the TF32 path, so the bits do not depend on `MLX_ENABLE_TF32`. B3 runs three B1
-  (equal bit for bit), and DFlash2 greedy output equals serial. Every cell sits within one BF16 ulp of an FP64 oracle;
+  block-masked GEMM, which never takes the TF32 path, so the bits do not depend on `MLX_ENABLE_TF32`. Its fixed
+  32×32×16 tiles let B3/B4 run together with every B1 bit preserved. Ordinary GEMM still runs each branch separately.
+  Multi-row gathers write FP32 directly after the BF16/kv8 read, retaining its rounding boundary and the 32 MiB
+  scratch cap. Every cell sits within one BF16 ulp of an FP64 oracle;
   the fused D512 NAX SDPA it replaced missed that on ~70% of cells (rel L2 1.2e-2 against 1.6e-3). Gate (`cc56be2b`
   diag arms, Sushi-2.5bpw, kv8, 4x512 teacher): KLD 0.071569 against the fused arm's 0.071762 (−0.27%), top-1 90.33%
   against 89.70%. Serial decode 34.07 → 32.54 ms/token at 8K and 33.84 → 32.66 at 32K, arms interleaved in one
@@ -118,8 +120,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 
 ## DFlash2 verification
 
-- **Group-two rows serve every even n 32–64** (`glm_group2.servesRate`), never one pack's rate; mixed gate/up and down rates
-  are exact, and the engagement test runs `apply` at each rate.
+- **Three-row MLA value and normalization**: on the NAX path, the A6 value bank reuses its weights across all
+  three rows, and HC collapse emits the normalized branch input directly. The latter preserves the intermediate
+  BF16 value and native RMS reduction order. Together with expert reuse/tiling, measured verification is
+  [5.25–5.98% lower verification time](perf-baselines.md#glm-three-value-norm) than `f40fa548`; draft depth is unchanged.
+- **Shared-expert rows serve every even n 32–64** (`glm_group2.servesRate`), never one pack's rate. The three-row,
+  24-slot lane path reuses each expert's decoded weights across up to three matching routes and computes two
+  output tiles per threadgroup. Other widths retain two-member reuse and one output tile. Mixed gate/up and down
+  rates are exact, and the engagement test runs `apply` at each rate. Together these changes save
+  [4.0–4.7% of full verification time](perf-baselines.md#glm-three-output-tiles) at the measured prefixes.
 - **Groups**: `verifyGroups` runs several requests' trees (≤ 16 rows) in one layer loop. KDA `project`/`finish` and
   MLA `mlaProject`/`mlaFinish` take every row; `recur` and `mlaAttend` take one request's rows and state. Each group
   equals its solo `verify` bit for bit; `SUSHI_GLM_ROWS_UBENCH=N` (`_CTX`, `_TEXT`) times grouped against serial rows.
@@ -128,22 +137,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   aliased on a hit (4 MiB per layer; −25%; 59% hits at 8K, break-even 21%).
 - **MLA**: trees of at most four nodes read the committed buffer plus a ≤4-row ancestry tail instead of a replaced
   latent buffer (1.97× at 32K); the native gather and the overlay both read four-row tails (`max_tail`), exact against
-  those rows committed. Query and value projections broadcast the one-row geometry over three rows (exact, −3.6%).
+  those rows committed. Query projections broadcast the one-row geometry over three rows; value projections do so
+  over three or four rows.
   Accepted rows append at commit. An overlay branch writes no shared buffer: the pools its ancestry completes stay in
   `State.pool_tail`, and the tree scorer reads pools from `tail_base` on from it (same per-pool arithmetic, exact).
   Writing them into the reserved pooled buffer copied the whole reservation per branch and MLA layer: at 32K with a
   512K-token budget verify cost 56.27 vs 54.90 ms per round at a 287-token budget; branch-local, 54.97 vs 55.17 (kv8,
   Sushi-2.5bpw + A4, `da9882fb` without and with it, same greedy bytes). Live branch scratch is capped at 256 MiB;
-  overlay branches bill no buffer copy, so every branch fits beside the B1/B3 scratch at any reservation, while wider trees
-  still bill a latent and pooled copy per branch. Branch groups that do not fit settle in turn and B3 falls back to
+  overlay branches bill no buffer copy, so every branch fits beside the B1/B3/B4 scratch at any reservation, while wider trees
+  still bill a latent and pooled copy per branch. Branch groups that do not fit settle in turn and B3/B4 fall back to
   per-node B1.
 - **Commit**: the commit hands the request's latent (kv8: codes, scales, biases) and pooled buffers to the accepted
   state before evaluating, so MLX appends in place; a buffer the committed request still shares is copied whole,
   reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,
   `194351a3`). A failure after the hand-over leaves the request failed.
-- **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order; three-row A6
-  projections hoist coefficient decode out of the row loop (QKV component −12.4%; extending to the other supported
-  projections cuts whole verification by about 2%, [measurement](perf-baselines.md#glm-three-row-a6)); the retained BF16 KDA projections run as column
+- **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order. The A6
+  three/four-row specialization uses complete row tiles and two outputs per SIMD subgroup, reducing per-thread
+  accumulators. Combined with batched FP32 attention, verification takes about 11% less time on M5 Max with
+  Sushi-2.5bpw/A4 g64 ([measurement](perf-baselines.md#glm-verify-final)). Retained BF16 KDA projections run as column
   GEMVs with rows in the batch grid (exact; stock multi-row `Linear` is not); the router batches up to 16 rows.
   Sampled rounds use the same batched rows: their logits equal per-row serial projections bit for bit (215 real 8K
   rounds, every tape and capture too); per-row projections cost 64.2 vs 54.2 ms of verify per round and sampled 8K
@@ -164,11 +175,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   turns it off on an M5. The load line `[glm] NAX arms on|off` names the result.
 - MLX has no fused D512 SDPA without NAX and `force_fused` throws there, so the fused arms may never run on a wrong
   gate. Off NAX the packed sparse tiles send the same gathered bank through FP32 GEMMs and a precise softmax, as
-  B1/B3 do on every GPU (`[glm-attn] FP32 composite sparse|B1/B3 ... engaged`), held per element to an FP64 oracle no worse than
+  native decode does on every GPU (`[glm-attn] FP32 composite sparse|native ... engaged`), held per element to an FP64 oracle no worse than
   the scalar arm plus a store flip and 2^-11 of max|V|. At 16K: 0.628 vs 1.845 ms per 8-row tile, 0.505 vs 1.045 ms
   per decode row against the scalar latent attention, the same error ([perf-baselines](perf-baselines.md#glm-nonnax)).
-- Packed tiles take eight rows (67 MB, inside the 128 MiB tile bill). B3 runs its three rows as three B1 GEMMs:
-  MLX picks GEMM tiles and split-K by batch size, so a batched B3 differed from B1 in the last bit. B1/B3 bill
+- Packed tiles take eight rows (67 MB, inside the 128 MiB tile bill). B3 and B4 run each branch through a B1 GEMM:
+  MLX picks GEMM tiles and split-K by batch size, so a batched B3 differed from B1 in the last bit. B1/B3/B4 bill
   32 MiB per pending layer.
 - MLX runs FP32 GEMMs as TF32 on a NAX GPU (`MLX_ENABLE_TF32` defaults on), so the sparse composite rehearsed on the
   stock libmlx is looser than on an M1–M4; its tests widen the bar only when a probe GEMM shows TF32. Another GLM
