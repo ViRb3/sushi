@@ -1648,3 +1648,7 @@ quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
+
+## v1.2.0-dev2 GLM context ladders
+
+[Version summary and both GLM reports](bench/v1.2.0-dev2/summary.md), runtime commit `6731e2db5cace6c2c090dac0305d54a90ec10fb9`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-06. llmprobe 0.6.15, three measured runs, 2K–128K, default A4 g64 DFlash2 and kv8. Interactive QoS, one model per GPU-lock run, maximum fans, 60 s between servers. Full reports retain scenario samples, acceptance, speculative ceilings and probe notes.

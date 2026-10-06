@@ -8,11 +8,12 @@
 
 ## Decode tok/s by release
 
-| Model | v1.0.0 | v1.0.4 | v1.0.5 | v1.1.0 | v1.2.0-dev | speedup |
-|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-3bpw (MTP) | · | 98 mtp | · | · | · | · |
-| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | · | · | 83 mtp | 89 mtp | 92.7 mtp (2 runs) | · |
-| MiMo-V2.6-Flash-Sushi-2.3bpw (MTP) | · | · | · | · | 42.8 mtp (2 runs) | · |
-| GLM-5.3-Flash-Sushi-2.5bpw | · | · | · | · | 44.7 dflash (3 runs) | · |
-| Qwen3.8-Flash-Next-Sushi-2bpw | · | · | · | · | 108.8 mtp (2 runs) | · |
-| Qwen3.8-Flash-Next-Sushi-2.6bpw | · | · | · | · | 95.3 mtp (2 runs) | · |
+| Model | v1.0.0 | v1.0.4 | v1.0.5 | v1.1.0 | v1.2.0-dev | v1.2.0-dev2 | speedup |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-3bpw (MTP) | · | 98 mtp | · | · | · | · | · |
+| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | · | · | 83 mtp | 89 mtp | 92.7 mtp (2 runs) | · | · |
+| MiMo-V2.6-Flash-Sushi-2.3bpw (MTP) | · | · | · | · | 42.8 mtp (2 runs) | · | · |
+| GLM-5.3-Flash-Sushi-2.5bpw | · | · | · | · | 44.7 dflash (3 runs) | 55.4 dflash (3 runs) | · |
+| Qwen3.8-Flash-Next-Sushi-2bpw | · | · | · | · | 108.8 mtp (2 runs) | · | · |
+| Qwen3.8-Flash-Next-Sushi-2.6bpw | · | · | · | · | 95.3 mtp (2 runs) | · | · |
+| GLM-5.3-Flash-Sushi-2.3bpw | · | · | · | · | · | 51.1 dflash (3 runs) | · |
