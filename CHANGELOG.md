@@ -35,6 +35,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **An idle streamed server no longer burns CPU**: its SSD-read workers park instead of spinning while no request is
   running.
 
+Thanks @cnsiva for the request-budget defaults and repetition-penalty alias, and @jasontitus for unique response IDs
+and portable GLM regression tests.
+
 ---
 
 ## v1.1.1 — Long MiMo prompts and agent sessions
