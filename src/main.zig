@@ -293,8 +293,7 @@ fn printUsage(io: std.Io) void {
         \\                        entries with this KV-bytes budget (default:
         \\                        off; prefixes live on the SSD tier).
         \\                      Evicts LRU entries until the budget fits.
-        \\                      Pass 0 to leave the byte budget to the
-        \\                        machine's headroom.
+        \\                      Pass 0 (or off) to keep RAM retention off.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
         \\                      SSD tier byte budget for the prefix cache
         \\                        (default: on, min(entries x context x bytes
@@ -851,15 +850,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and i + 1 < args.len) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
             // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
-            // insensitive), or `0`/`off` to disable the byte budget entirely
-            // (count cap from --prefix-cache-entries still applies).
+            // insensitive); `0`/`off` keeps RAM retention off.
             i += 1;
             server_mod.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
             server_mod.prefix_cache_mem_explicit = true;
-            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionFor(true, no_prefix_cache_ram);
+            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionForMemArg(server_mod.prefix_cache_mem_bytes, no_prefix_cache_ram);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
@@ -1034,10 +1032,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     const effective_decode_share = scheduler_mod.prefillDecodeShare();
-    log.info("[prefill] decode share: configured={d}, effective={d} ({s})\n", .{
-        scheduler_mod.prefill_decode_share,                                                                                                     effective_decode_share,
-        if (decode_share_flag != null) "--prefill-decode-share" else if (decode_share_env != null) "SUSHI_PREFILL_DECODE_SHARE" else "default",
-    });
+    if (decode_share_flag != null or decode_share_env != null) {
+        log.info("[prefill] decode share: configured={d}, effective={d} ({s})\n", .{
+            scheduler_mod.prefill_decode_share, effective_decode_share,
+            if (decode_share_flag != null) "--prefill-decode-share" else "SUSHI_PREFILL_DECODE_SHARE",
+        });
+    }
 
     transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
@@ -1145,24 +1145,26 @@ pub fn main(init: std.process.Init) !void {
             break :blk null;
         };
         if (discovery_storage) |*d| {
-            if (roots.len == 1) {
-                log.info("Discovered {d} model(s) under {s}:\n", .{ d.models.len, root });
-            } else {
-                log.info("Discovered {d} model(s) under {d} folders:\n", .{ d.models.len, roots.len });
-                for (roots) |r| log.info("  (scanning {s})\n", .{r});
-            }
-            for (d.models) |m| {
-                if (m.bytes_on_disk) |b| {
-                    log.info("  - {s} ({d:.1} GB)\n", .{ m.id, @as(f64, @floatFromInt(b)) / 1_073_741_824.0 });
+            if (d.models.len > 0) {
+                if (roots.len == 1) {
+                    log.info("Discovered {d} model(s) under {s}:\n", .{ d.models.len, root });
                 } else {
-                    log.info("  - {s}\n", .{m.id});
+                    log.info("Discovered {d} model(s) under {d} folders:\n", .{ d.models.len, roots.len });
+                    for (roots) |r| log.info("  (scanning {s})\n", .{r});
                 }
+                for (d.models) |m| {
+                    if (m.bytes_on_disk) |b| {
+                        log.info("  - {s} ({d:.1} GB)\n", .{ m.id, @as(f64, @floatFromInt(b)) / 1_073_741_824.0 });
+                    } else {
+                        log.info("  - {s}\n", .{m.id});
+                    }
+                }
+                // No auto-select: when `--model` is omitted but `--model-dir` is
+                // present, the server starts HEADLESS (no primary model). All
+                // discovered models are registered as stubs and load on demand via
+                // `/v1/load-model` — chat OR media. The headless branch in the
+                // serve block below handles this.
             }
-            // No auto-select: when `--model` is omitted but `--model-dir` is
-            // present, the server starts HEADLESS (no primary model). All
-            // discovered models are registered as stubs and load on demand via
-            // `/v1/load-model` — chat OR media. The headless branch in the
-            // serve block below handles this.
         }
     }
     // In serve mode, check if the port is already in use before loading the model
@@ -1235,14 +1237,13 @@ pub fn main(init: std.process.Init) !void {
             if (draft_block_size_explicit) "" else ", auto",
         });
     } else {
-        log.info("[args] drafter: <none>\n", .{});
+        log.debug("[args] drafter: <none>\n", .{});
     }
     if (serve_mode) {
-        log.info("[args] serve: {s}:{d}, ctx-size={d}, pld={s}, vision={s}, prevent-sleep={}\n", .{
+        log.info("[args] serve: {s}:{d}, ctx-size={d}, vision={s}, prevent-sleep={}\n", .{
             host,
             port,
             ctx_size,
-            if (enable_pld) "on" else "off",
             if (vision) "--vision" else if (no_vision) "--no-vision" else "default",
             sleep_inhibit_mod.isEnabled(),
         });

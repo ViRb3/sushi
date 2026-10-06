@@ -1095,6 +1095,17 @@ test "ramRetentionFor: off unless --prefix-cache-mem names it, and --no-prefix-c
     try testing.expect(!ramRetentionFor(false, true));
 }
 
+/// `--prefix-cache-mem 0` (or `off`) is "no RAM retention", the same as `--no-prefix-cache-ram`.
+pub fn ramRetentionForMemArg(mem_bytes: u64, no_ram_flag: bool) bool {
+    return ramRetentionFor(mem_bytes > 0, no_ram_flag);
+}
+
+test "ramRetentionForMemArg: a zero budget keeps RAM retention off" {
+    try testing.expect(!ramRetentionForMemArg(0, false));
+    try testing.expect(ramRetentionForMemArg(1 << 30, false));
+    try testing.expect(!ramRetentionForMemArg(1 << 30, true));
+}
+
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
 /// Every post-load reserve reads it through `resolvedPrefixCacheMem()`. Atomic: written on the
 /// inference thread, read from connection threads. `maxInt(u64)` is the unresolved sentinel,

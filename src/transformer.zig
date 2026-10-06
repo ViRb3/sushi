@@ -5023,7 +5023,7 @@ fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_ar
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_score_engaged_bits.take(qsaWidthBucket(rows))) {
-        log.info(
+        log.debug(
             "[qsa-score] engaged (S={d} nb={d} layout={s} nsg={d} nsh={d}) — SUSHI_QSA_SCORE_FUSED=0 restores the composed chain\n",
             .{ rows, nb, if (layout == .h4) "h4" else "base", nsg, nsh },
         );

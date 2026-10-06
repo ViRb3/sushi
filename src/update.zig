@@ -387,7 +387,7 @@ pub fn startDailyCheck(io: std.Io, flag_off: bool, env_off: bool) void {
     const exe_dir = selfDir(io, &ebuf) orelse "";
     homebrew.store(isHomebrewKeg(exe_dir), .release);
     const choice = checkChoice(flag_off, env_off, isSourceBuild(io, exe_dir));
-    log.info("[update] daily check {s} ({s})\n", .{ if (choice.on) "on" else "off", choice.source });
+    if (choice.on or !std.mem.eql(u8, choice.source, "source build")) log.info("[update] daily check {s} ({s})\n", .{ if (choice.on) "on" else "off", choice.source });
     if (!choice.on) return;
     const t = std.Thread.spawn(.{}, checkLoop, .{io}) catch |err| {
         log.debug("[update] check thread: {t}\n", .{err});

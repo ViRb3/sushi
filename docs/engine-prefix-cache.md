@@ -123,7 +123,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 ## Defaults: SSD tier on, RAM tier off
 
 - **RAM retention is opt-in.** Unnamed, `server.prefix_cache_ram_enabled` is false and the RAM budget is 0 bytes for
-  every served model; `--prefix-cache-mem <n>` turns it on (`0` = the machine's headroom) and `--no-prefix-cache-ram`
+  every served model; `--prefix-cache-mem <n>` turns it on (`0` or `off` keeps it off, like `--no-prefix-cache-ram`) and `--no-prefix-cache-ram`
   wins over it. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
   SSD-first (`prefix_cache.ssdFirstActive`: a disk tier and RAM off).
 - **The SSD tier is on and sized per model at load** (`server.prefixCacheDiskForLoad` through

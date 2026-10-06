@@ -6,7 +6,7 @@
 # never revisited: a model loaded beside a large one kept a ~0 budget for
 # life, and unloading the neighbour did not give it back. Model A boots with
 # no --prefix-cache-mem (budget = headroom, so every change is visible), B
-# loads beside it, then unloads (`--prefix-cache-mem 0` = the uncapped ask):
+# loads beside it, then unloads (`--prefix-cache-mem 1024GB` = an ask the machine clamps):
 #   [1] A's budget is revised DOWN when B loads, and A's warm turn still hits
 #   [2] A's budget is revised UP once B is unloaded and its pages are back
 #
@@ -29,7 +29,7 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
 fi
 LOG=$(mktemp)
 "$BIN" --serve --model "$MODEL_A" --model-dir "$HOME/.sushi/models" --host 127.0.0.1 --port "$PORT" \
-    --ctx-size 8192 --prefix-cache-mem 0 --prefix-cache-disk off --log-level info >"$LOG" 2>&1 &
+    --ctx-size 8192 --prefix-cache-mem 1024GB --prefix-cache-disk off --log-level info >"$LOG" 2>&1 &
 SRV=$!
 cleanup() { kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; rm -f "$LOG"; }
 trap cleanup EXIT

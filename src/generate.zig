@@ -1136,7 +1136,7 @@ pub fn installThinkMarkers(xfm: *Transformer, tok: *const Tokenizer) void {
         log.warn("[think-penalty] mask build failed ({s}); penalty off\n", .{@errorName(err)});
         return;
     };
-    log.info("[think-penalty] {d} marker tokens from {d} words (multi-token spellings skipped)\n", .{ ids.len, think_penalty.WORDS.len });
+    log.debug("[think-penalty] {d} marker tokens from {d} words (multi-token spellings skipped)\n", .{ ids.len, think_penalty.WORDS.len });
 }
 
 /// `out = where(mask, -inf, logits)` — the masked lanes get EXACTLY -inf

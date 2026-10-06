@@ -4408,8 +4408,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
     const acceptance = generate_mod.mtpAcceptanceFor(params.config.mtp_acceptance_override);
     const greedy_tail = generate_mod.mtpGreedyTailFor(params.config.mtp_greedy_tail_override);
-    log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
-        if (mtp_streaming_off or params.config.isGlm5()) "off" else mtp.label(), if (params.config.isGlm5()) "GLM unavailable; " else if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
+    // GLM has no MTP head; the server's `MTP: off` line already says so.
+    if (!params.config.isGlm5()) log.info("[mtp] {s} ({s}{s}); acceptance {s} ({s}); greedy tail {s} ({s})\n", .{
+        if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
         mtp_acceptance_mod.name(acceptance.value),     model_settings.sourceLabel(acceptance.source, model_settings.acceptanceFlagName(acceptance.value)),
         if (greedy_tail.value) "on" else "off",        model_settings.sourceLabel(greedy_tail.source, "--mtp-greedy-tail"),
     });
@@ -4426,7 +4427,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", model_settings.sourceLabel(keep.source, "--preserve-thinking") });
     }
     const think = model_settings.pick(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, 0);
-    log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, model_settings.sourceLabel(think.source, "--think-penalty") });
+    if (think.value > 0) log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, model_settings.sourceLabel(think.source, "--think-penalty") });
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
