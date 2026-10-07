@@ -297,21 +297,34 @@ settings, same binary as the off arm): KLD 0.086674 / top-1 91.78% (7404) / NLL 
 ## GLM-5.3-Flash: native BF16 teacher, 4x512 (2026-10-04)
 
 GLM's release reading is this 4x512 screen, with the two code prompts (2x512) reported apart: a 16x512 BF16 teacher
-would stream the BF16 experts and is too slow to capture. Shipping config (kv8, FP32 decode attention): KLD 0.0716 /
-top-1 90.3%; code 0.0324 / 95.8%, prose 0.1107 / 84.9%.
+would stream the BF16 experts and is too slow to capture. Shipped Sushi-2.4bpw (K2.25/K2.5 W14 experts, A6 g128 trunk)
+against the NAX-path teacher: KLD 0.0742 / top-1 90.3%; code 0.0429, prose 0.1055. The same
+screen on Sushi-2.5bpw (kv8, FP32 decode attention, first teacher): KLD 0.0716 / top-1 90.3%; code 0.0324 / 95.8%,
+prose 0.1107 / 84.9%.
 
-Teacher (every row below was scored against the reference-arm capture, whose `identity.json` has no `nax_arms`): the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
+Teacher (every row of the table below was scored against the reference-arm capture, whose `identity.json` has no `nax_arms`): the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
 standard4 --tokens 512 --no-template --kv-quant off --ssd-budget-gb 100` (streamed BF16 experts, dense prefill in
 chunks of at most 512, synchronous layers, BF16 MLA cache, FP32 KDA state). Native prompt lengths 242/261/190/183; no
-EOS in the 2,048 rows, so first-EOS and all-positions readings are the same. Students carry W12 MCG EXL3
-experts (K2.25 unless the row says K2.5), BF16 MLA and FP32 KDA state, one resident target, MTP and DFlash2 off.
+EOS in the 2,048 rows, so first-EOS and all-positions readings are the same. Students carry MCG EXL3
+experts at W12 (K2.25 unless the row says K2.5; the shipped row is W14), BF16 MLA and FP32 KDA state, one resident target, MTP and DFlash2 off.
 
 | Pack | Trunk | KLD | Top-1 | NLL | Code / prose KLD | Peak active | Commit, settings |
 |---|---|---:|---:|---:|---:|---:|---|
 | Sushi-2.3bpw | A6 g128 | 0.092950 | 88.96% | 0.4323 | 0.0468 / 0.1391 | 94.08 GB | `3ed533d7`+WIP, TF32 on, fast target kernels |
-| Sushi-2.4bpw | A8 g128 | 0.091519 | 88.87% | 0.4318 | 0.0441 / 0.1389 | 96.30 GB | same binary |
+| A8 experiment (not shipped) | A8 g128 | 0.091519 | 88.87% | 0.4318 | 0.0441 / 0.1389 | 96.30 GB | same binary |
 | Sushi-2.45bpw | raw FP8 block-128 | 0.091266 | 88.62% | 0.4304 | 0.0439 / 0.1386 | 102.51 GB | `56017748`, TF32 off, `sushi kld compare` |
 | Sushi-2.5bpw (K2.5) | A6 g128 | 0.072071 | 89.94% | 0.4075 | 0.0314 / 0.1127 | 103.59 GB | `00668fcb`, `sushi kld compare` defaults; 2.3bpw reproduces its row bit for bit there |
+
+Against the NAX-path teacher (`glm5_model.enterTeacher()`, binary `177c526f`, TF32 off; decode attention is the only
+arm that changes this capture), students at BF16 latent, same 4x512 prompts:
+
+| Pack | Experts | Trunk | KLD | Top-1 | NLL | Code / prose KLD | Peak active | Commit, settings |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| Sushi-2.3bpw | K2.25 L3-45, W14 | A6 g128 | 0.078609 | 89.94% | 0.4147 | 0.0460 / 0.1112 | 94.07 GB | `177c526f`, `sushi kld compare --kv-quant 16` |
+| **Sushi-2.4bpw (shipped)** | K2.25 L3-36 + MTP, K2.5 L37-44, W14 | A6 g128 | 0.074213 | 90.33% | 0.4160 | 0.0429 / 0.1055 | 95.88 GB | same |
+| Sushi-2.5bpw | K2.5 L3-45, W14 | A6 g128 | 0.057151 | 91.06% | 0.3920 | 0.0316 / 0.0827 | 103.58 GB | same |
+
+The rows above were scored against the first teacher, so they do not rank against this one.
 
 K2.5 experts cut KLD 22.5% from K2.25 on the same A6 trunk (byte-identical trunk tensors). The three trunks sit within 2% of each other under two numerical profiles; this four-prompt screen does not rank them
 and is not the 16x512 release reading. Code scores about 3x lower than prose on every pack.

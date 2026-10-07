@@ -72,7 +72,8 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
 <a id="glm"></a>
 ## GLM clamped experts
 
-GLM-5.3 routes 288 experts top-8 (hidden 4096, expert width 2048, MCG K2.25/K2.5 at W12 or W14 in the served packs) through
+GLM-5.3 routes 288 experts top-8 (hidden 4096, expert width 2048; the shipped Sushi-2.4bpw is MCG W14, K2.25 (n36) in most layers and K2.5 (n40) in
+layers 37–44; every path serves any window) through
 `moeClamped`: the gate upper clamp and symmetric up clamp (limit 10) apply in FP32 before SwiGLU, at every packed rate
 from 2 to 4 bpw in eighth-bit steps. Bank geometry (H128 alignment, matching gate/up/down shapes and expert counts, U16
 trellises, F16 scale grids, routed input/score shapes) is checked before dispatch; router IDs inside the expert range

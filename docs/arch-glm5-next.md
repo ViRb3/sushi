@@ -48,10 +48,12 @@ checkpoint stores the HC mixing matrices, router `[288,4096]` and the small KDA 
 
 ## Packs and loading
 
-A served pack carries MCG EXL3 routed experts (K2.25 or K2.5, search window 12) and a trunk stored as affine 6-bit group-128
-(Sushi-2.3bpw, the served recipe), affine 8-bit group-128 (Sushi-2.4bpw), or the source FP8 E4M3FN block-128 trunk
-kept raw (Sushi-2.45bpw). Small BF16/FP32 tensors keep their source precision. The consumer contract is
-[pack-format](pack-format.md); how packs are made lives in the private converter repo.
+The shipped pack, GLM-5.3-Flash-Sushi-2.4bpw (97.8 GB), carries MCG EXL3 routed experts at window 14 (K2.25 in MoE
+layers 3–36 and the MTP layer, K2.5 in layers 37–44) and an affine 6-bit group-128 trunk. Earlier packs, none shipped:
+Sushi-2.3bpw (K2.25 everywhere, A6 g128, window 12), Sushi-2.5bpw (K2.5 everywhere, A6 g128, window 12), an A8 g128
+trunk experiment (earlier "Sushi-2.4bpw") and a raw FP8 E4M3FN block-128 trunk (Sushi-2.45bpw). Small BF16/FP32 tensors
+keep their source precision. The consumer contract is [pack-format](pack-format.md); how packs are made lives in the
+private converter repo.
 
 - `model.loadWeightsForConfig` reads only indexed text tensors, plus the tower when vision is on. It uploads one shard
   at a time (a 566-shard pack once exhausted the 256-descriptor limit) and preserves every stored dtype.
@@ -85,8 +87,9 @@ lattice edges. It has no embedding or head and uses the target's. Its input is t
 target layers 5, 14, 24, 33 and 42, before the final norm.
 
 - **Discovery**: `--drafter <dir>` wins, `--no-drafter` disables; otherwise a valid `dflash2/` inside the pack, then
-  legacy `drafter/`. One resolved path feeds both the bill and the loader.
-- **First-load cache**: when only the shipped BF16 `GLM-5.3-Flash-DFlash2/` exists, `serve` and `run` quantize its
+  legacy `drafter/`, then `GLM-5.3-Flash-DFlash2/` (the user's own download; the pack does not ship it). One resolved path feeds
+  both the bill and the loader.
+- **First-load cache**: when only the released BF16 `GLM-5.3-Flash-DFlash2/` exists, `serve` and `run` quantize its
   matrices once to A4 group-64 with MLX's affine quantizer into `dflash2/` (selector codebooks, selector hidden
   projection and non-matrix tensors stay BF16), under a per-pack lock, staged and synced before publication, and
   invalidated by source/config identity. 2.18 GiB → 0.721 GiB. No space or no write permission
@@ -176,6 +179,8 @@ inside 1.46% drift) because verification per round grew 20.6%.
   102.51 GB peak while scoring KLD. Sushi-2.5bpw with the A6 assistant and vision is 104.56 GB active, leaving
   `max_safe_context` 746,036 tokens (A4 assistant: 104.32 GB, 758,793; BF16 cache with no assistant, no vision and
   `--wired-margin-gib 2`: 955,781) under `iogpu.wired_limit_mb=120000` (margin 4 GiB): 1M context fits only at kv8.
+- Shipped Sushi-2.4bpw (91.1 GiB on disk) with the A4 assistant and vision: {{ACTIVE_2P4}} GB active, `max_safe_context`
+  {{MAXCTX_2P4}} under `iogpu.wired_limit_mb=120000`. The figures above are other packs'.
 - An explicit `--ctx-size` is not checked against that bill at load (GLM is outside the load-time serving bill), so
   `n_ctx` can advertise more than a request may use; request admission refuses past the affordable context.
 
@@ -202,10 +207,11 @@ open; verification dominates a speculative round (about 60 of 70 ms at 16K–32K
 ## Quality
 
 A pack is scored with `sushi kld compare --model <pack> --fixture <teacher>` against the native BF16 teacher
-(`sushi kld capture --prompts standard4`, streamed BF16 experts, TF32 off). Four prompts × 512 (2026-10-04):
-Sushi-2.3bpw 0.0930, Sushi-2.4bpw 0.0915, Sushi-2.45bpw 0.0913 mean KLD (code ~0.045, prose ~0.139); Sushi-2.5bpw
-(K2.5 experts, A6 trunk) 0.0721. Not yet the 16x512
-release reading; table and settings in [quality-kld](quality-kld.md#glm-53-flash-native-bf16-teacher-4x512-2026-10-04).
+(`sushi kld capture --prompts standard4`, streamed BF16 experts). Shipped Sushi-2.4bpw, four prompts × 512 against the
+NAX-path teacher: KLD 0.0742, top-1 90.3%, code 0.0429 / prose 0.1055. Earlier packs against the
+first teacher, four prompts × 512 (2026-10-04, TF32 off): Sushi-2.3bpw 0.0930, the A8 experiment 0.0915, Sushi-2.45bpw
+0.0913 mean KLD (code ~0.045, prose ~0.139); Sushi-2.5bpw (K2.5 experts, A6 trunk) 0.0721. Not yet the 16x512 release
+reading; tables and settings in [quality-kld](quality-kld.md#glm-53-flash-native-bf16-teacher-4x512-2026-10-04).
 The M1–M4 path rehearsed on the M5 scores the first prompt at 0.0457 against the stock path's 0.0446, top-1 equal
 ([perf-baselines](perf-baselines.md#glm-nonnax)).
 

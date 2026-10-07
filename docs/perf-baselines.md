@@ -1701,3 +1701,6 @@ quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
 ## v1.2.0-dev2 GLM context ladders
 
 [Version summary and both GLM reports](bench/v1.2.0-dev2/summary.md), runtime commit `6731e2db5cace6c2c090dac0305d54a90ec10fb9`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-06. llmprobe 0.6.15, three measured runs, 2K–128K, default A4 g64 DFlash2 and kv8. Interactive QoS, one model per GPU-lock run, maximum fans, 60 s between servers. Full reports retain scenario samples, acceptance, speculative ceilings and probe notes.
+
+The two reports above are Sushi-2.3bpw and Sushi-2.5bpw (W12), both earlier packs. Shipped Sushi-2.4bpw (K2.25/K2.5 W14,
+A6 trunk), same ladder: {{SPEED_2P4}}.
