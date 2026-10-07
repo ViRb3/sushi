@@ -34,7 +34,7 @@ mlx-serve's build on its next bump; add new names instead, and say so in the CHA
 | `format.Decode`, `format.Codebook.mcg` | the decode spec passed to `moe` |
 | `kernels.DECODE_ROWS_MAX`, `kernels.usesPrefillArm`, `kernels.rowsOfShape` | the host's own row planning around `moe` |
 
-Added since mlx-serve's pin (44315136) and not called by it yet; each is additive, so the names above keep their
+Added since mlx-serve's old pin (44315136) and not called by it yet; each is additive, so the names above keep their
 meaning:
 
 | name | what it does | since |
@@ -69,7 +69,8 @@ mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does
 
 ## Recommended pin
 
-At least d1408a57 (mlx-serve pins 44315136, 42 commits behind it; sushi v1.1.1 is 711572e9):
+sushi v1.2.0 (ae63f880). mlx-serve's submodule still pins 44315136 (`ddalcu/sushi`, `exl3-module`) until that branch
+fetches v1.2.0; ddalcu/mlx-serve#761 moves `lib/sushi` to it. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
 - d1408a57 (after v1.1.1) adds the branch-free NAX prefill GEMM body: each expert GEMM runs in x0.73-0.75 of its time,
