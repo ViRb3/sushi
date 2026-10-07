@@ -155,7 +155,7 @@ The load line reports the file, entry count, expanded ids and skipped spellings.
 
 `/v1/chat/completions` and `/v1/completions` accept OpenAI `logit_bias`, a map such as `{"1234":-2}`. These deltas
 apply to all positions and add to file entries and the optional think-penalty preset. Invalid ids, nonnumeric or
-out-of-range biases return 400. `think_penalty: 0` disables the preset only; file and request biases still apply.
+out-of-range biases return 400; `null` and `[]` mean no bias. `think_penalty: 0` disables the preset only; file and request biases still apply.
 Overlapping entries add. Sampling uses shifted logits; returned logprobs remain raw.
 
 Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
@@ -327,6 +327,9 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   It works from `localhost` or `127.0.0.1`, not a remote browser or wildcard bind. File tools are confined to
   the chat's selected folder, with the existing hidden/secret-file and symlink checks; network tools keep
   the REPL's public-address restrictions. No MCP configuration is added.
+- Same-origin rule: `POST /v1/load-model`, `/v1/unload-model`, `/v1/models/rescan` and the `/v1/responses` WebSocket
+  upgrade answer 403 when the request carries an Origin other than this server's own page (`crossOriginRefused`);
+  requests without an Origin (curl, SDKs) pass, and the inference routes stay CORS-open.
 - Image workflow: `web_search` finds pages, `fetch_url` exposes up to 20 resolved image URLs from `img src`
   or `data-src`, and vision models use `view_image` to inspect them. This is page-based discovery, not a
   dedicated image-search index. Tool image results are visible when expanded; the answer can show a direct

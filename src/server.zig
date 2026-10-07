@@ -933,6 +933,19 @@ const ROUTE_PATHS = [_][]const u8{
 /// The browser chat page: one self-contained file that talks to this server's own API.
 const chat_page_html = @embedFile("webui/index.html");
 
+/// Model load/unload/rescan and the Responses WebSocket change server state, so a request that carries an
+/// Origin (a browser) must come from this server's own page; clients that send none (curl, SDKs) pass.
+fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const u8, host: []const u8, port: u16) bool {
+    const guarded = if (std.mem.eql(u8, path, "/v1/responses"))
+        std.mem.eql(u8, method, "GET") and ws_mod.isUpgrade(headers)
+    else
+        std.mem.eql(u8, path, "/v1/load-model") or std.mem.eql(u8, path, "/v1/unload-model") or
+            std.mem.eql(u8, path, "/v1/models/rescan");
+    if (!guarded) return false;
+    const origin = findHeaderValueCI(headers, "origin") orelse return false;
+    return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
+}
+
 /// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
 fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, body: []const u8) !void {
     const origin = findHeaderValueCI(headers, "origin") orelse "";
@@ -2526,6 +2539,11 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "OPTIONS")) {
         log.debug("OPTIONS {s} -> 204\n", .{path});
         try sendResponse(stream, "204 No Content", "text/plain", "");
+        return;
+    }
+    if (crossOriginRefused(method, path, request[0..header_end_pos], listen_host, listen_port)) {
+        log.debug("{s} {s} -> 403 (foreign Origin)\n", .{ method, path });
+        try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "This route accepts browser requests from this server's own page only", 403);
         return;
     }
     if (std.mem.eql(u8, path, "/v1/update")) {
@@ -26446,6 +26464,52 @@ test "web tools: list, confined execution, and browser origin guard" {
         defer t.allocator.free(response);
         try t.expect(std.mem.indexOf(u8, response, c.status) != null);
         try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
+    }
+}
+
+test "cross-origin policy: a foreign Origin is refused on the state-changing routes only" {
+    const t = std.testing;
+    const ws = "Upgrade: websocket\r\nConnection: Upgrade\r\n";
+    const Case = struct { method: []const u8, path: []const u8, headers: []const u8, host: []const u8 = "127.0.0.1", refused: bool };
+    for ([_]Case{
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/unload-model", .headers = "Origin: null\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/models/rescan", .headers = "ORIGIN: http://127.0.0.1:12346\r\n", .refused = true },
+        .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
+        .{ .method = "POST", .path = "/v1/models/rescan", .headers = "Origin: http://127.0.0.1:12345\r\n", .refused = false },
+        .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://127.0.0.1:12345\r\n", .refused = false },
+        .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .host = "0.0.0.0", .refused = false },
+        .{ .method = "POST", .path = "/v1/unload-model", .headers = "Host: x\r\n", .refused = false },
+        .{ .method = "GET", .path = "/v1/responses", .headers = ws, .refused = false },
+        // The inference routes stay open to any page.
+        .{ .method = "POST", .path = "/v1/chat/completions", .headers = "Origin: http://evil.test\r\n", .refused = false },
+        .{ .method = "GET", .path = "/v1/responses", .headers = "Origin: http://evil.test\r\n", .refused = false },
+    }) |c| try t.expectEqual(c.refused, crossOriginRefused(c.method, c.path, c.headers, c.host, 12345));
+}
+
+test "cross-origin policy: the routes answer 403 over the wire before any model resolves" {
+    const t = std.testing;
+    const old_host = listen_host;
+    const old_port = listen_port;
+    defer {
+        listen_host = old_host;
+        listen_port = old_port;
+    }
+    listen_host = "127.0.0.1";
+    listen_port = 12345;
+    const Case = struct { request: []const u8, status: []const u8 };
+    for ([_]Case{
+        .{ .request = "POST /v1/load-model HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 403 " },
+        .{ .request = "POST /v1/unload-model HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Length: 2\r\n\r\n{}", .status = "HTTP/1.1 403 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 " },
+        .{ .request = "GET /v1/responses HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: http://evil.test\r\n\r\n", .status = "HTTP/1.1 403 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\nOrigin: http://localhost:12345\r\n\r\n", .status = "HTTP/1.1 200 " },
+        .{ .request = "POST /v1/models/rescan HTTP/1.1\r\n\r\n", .status = "HTTP/1.1 200 " },
+    }) |c| {
+        const response = try serveOneForTest(c.request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, c.status));
     }
 }
 

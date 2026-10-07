@@ -204,6 +204,8 @@ test "logit bias CPU: malformed entries fail by name" {
 
 pub fn request(a: std.mem.Allocator, value: ?std.json.Value, vocab: usize) ![]Bias {
     const v = value orelse return a.alloc(Bias, 0);
+    // OpenAI clients send `null` (and some SDKs `[]`) for "no bias".
+    if (v == .null or (v == .array and v.array.items.len == 0)) return a.alloc(Bias, 0);
     if (v != .object) return error.LogitBiasInvalidRequest;
     var out = std.ArrayList(Bias).empty;
     errdefer out.deinit(a);
@@ -233,6 +235,22 @@ test "logit bias CPU: request map validates ids and bias range" {
     const invalid = try std.json.parseFromSlice(std.json.Value, a, "{\"1\":101}", .{});
     defer invalid.deinit();
     try std.testing.expectError(error.LogitBiasInvalidDelta, request(a, invalid.value, 3));
+}
+
+test "logit bias CPU: request treats null and an empty array as no bias" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "null", "[]", "{}" }) |text| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        const biases = try request(a, parsed.value, 3);
+        defer a.free(biases);
+        try std.testing.expectEqual(@as(usize, 0), biases.len);
+    }
+    for ([_][]const u8{ "[1]", "\"x\"", "3" }) |text| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.LogitBiasInvalidRequest, request(a, parsed.value, 3));
+    }
 }
 
 test "logit bias CPU: scopes and overlapping entries add rewards and penalties" {
