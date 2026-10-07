@@ -72,7 +72,7 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
 <a id="glm"></a>
 ## GLM clamped experts
 
-GLM-5.3 routes 288 experts top-8 (hidden 4096, expert width 2048, K2.25/W12 MCG in the served packs) through
+GLM-5.3 routes 288 experts top-8 (hidden 4096, expert width 2048, MCG K2.25/K2.5 at W12 or W14 in the served packs) through
 `moeClamped`: the gate upper clamp and symmetric up clamp (limit 10) apply in FP32 before SwiGLU, at every packed rate
 from 2 to 4 bpw in eighth-bit steps. Bank geometry (H128 alignment, matching gate/up/down shapes and expert counts, U16
 trellises, F16 scale grids, routed input/score shapes) is checked before dispatch; router IDs inside the expert range
@@ -83,12 +83,12 @@ are the router's precondition, never synced to the CPU. Every path below is bit-
   outside simdgroup g=0..3 before the F16 store; MiMo's grouped epilogue (XOR shuffles, K-split planes) rounds
   differently, so a MiMo kernel is never a GLM oracle. Gate and up share one dispatch (grid Z picks the projection).
 - **Decode** keeps slots in top-k order and prepares both gate/up input planes from token rows in one kernel, stored
-  in GEMV lane order (tile rows 2q, 2q+1, 2q+8, 2q+9) so each lane loads one `half4` (rows 1–16, equal-shaped MCG/W12
-  banks; component −17% at 1 row, −29% at 16). The middle is prepared separately in lane order and the down reads it
-  by `half4` (`downLanePrepare` + `downLaneCoop`: even n 32–64, MCG/W12, BF16 out; −10–15% against the fused
+  in GEMV lane order (tile rows 2q, 2q+1, 2q+8, 2q+9) so each lane loads one `half4` (rows 1–16, equal-shaped MCG
+  banks at any window; component −17% at 1 row, −29% at 16). The middle is prepared separately in lane order and the down reads it
+  by `half4` (`downLanePrepare` + `downLaneCoop`: even n 32–64, MCG at any window, BF16 out; −10–15% against the fused
   middle/down, which now serves only what the lane path declines).
 - **Verification rows share weight reads** (`src/exl3/glm_group2.zig`, 3–4 BF16 rows, 4096/2048, top-8, clamp 10,
-  MCG/W12, every even n 32–64, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
+  MCG at any window, every even n 32–64, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
   feeds two independent FP32 accumulator sets, and a serial 4 KiB member reduction keeps the r-then-simdgroup order.
   Singleton leaders run the unchanged body. Routed-chain replay −20% on layers with expert overlap; DFlash2 N2 512/64
   decode 42.43 → 45.45 tok/s at n36 (`ba106e5e`); at n40 (Sushi-2.5bpw, kv8, A4 DFlash2, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) +3.2% at 512/64 (4/4 pairs) and +5.0% at 8K/128, same bytes. Real 8K verify rounds are singleton-heavy (70% of assignments). The gate is `glm_group2.servesRate`; a guard test enumerates every admitted n.
@@ -97,7 +97,7 @@ are the router's precondition, never synced to the CPU. Every path below is bit-
   fallback scatters. WIN32 already skips its second 16-row MMA for runs of at most 16 rows (512-token prompts touch a
   median 230 of 288 experts).
 - **Full T2048 chunks transpose the grid** (`src/exl3/glm_prefill_grid.zig`, B1, H4096/I2048, E288, top-8, every admitted
-  n including mixed per-projection rates, MCG/W12, clamp 10): physical X walks routing windows and Y the 128-column output stripes; logical IDs, dot body and
+  n including mixed per-projection rates, MCG/W12 only (its NAX header is built for W12), clamp 10): physical X walks routing windows and Y the 128-column output stripes; logical IDs, dot body and
   stores are unchanged. Actual L20 chain 19.64 → 17.96 ms at n36 (−8.6%, 11/11); at n40 (Sushi-2.5bpw, kv8, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) prefill +4.5% at 8K and +2.7% at 32K, same bytes. A test enumerates every admitted n against the sorted chain. The T2048 routed chain is GEMM-bound
   (gate/up ≈60%, down ≈30%; sort/prepare/middle/finish ≈1.75 of 17.35 ms).
 - **MCG/W12 decode is pure ALU** (mask, multiply/mask/xor, half adds): there is no codebook table or expanded weight

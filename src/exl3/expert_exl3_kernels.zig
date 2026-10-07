@@ -3201,11 +3201,12 @@ pub fn moeSwigluClamped(
             const gs = mlx.getShape(gate_t);
             const us = mlx.getShape(up_t);
             const ds = mlx.getShape(down_t);
-            if (out_dtype == .bfloat16 and active_decode.codebook == .mcg and active_decode.window == .w12 and
+            if (out_dtype == .bfloat16 and active_decode.codebook == .mcg and
                 gs[3] == us[3] and gs[3] == ds[3] and gs[3] >= 32 and gs[3] <= 64 and @mod(gs[3], 2) == 0)
             {
                 const prepared = try downLanePrepare(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
                 defer _ = mlx.mlx_array_free(prepared);
+                lane_decode_dispatches += 1;
                 break :blk try downLaneCoop(s, prepared, down_t, slots);
             }
             const prepared = try midSwigluPrepWithLimit(s, gate, up, gate_svh, up_svh, down_suh, slots, mlx.getShape(gate)[1], nslots, limit);
@@ -9561,10 +9562,10 @@ test "exl3 clamped routing preserves staged bytes at every 2 to 4 bpw rate" {
 
 test "exl3 clamped routing preserves GLM production width bytes" {
     const s = mlx.gpuStream();
-    const dec = exl3.Decode{ .codebook = .mcg, .window = .w12 };
-    setDecodeParams(dec);
     defer setDecodeParams(.mul1);
-    for ([_]usize{ 1, 2, 4, 8, 16, 17 }) |rows| {
+    for ([_]exl3.Window{ .w12, .w14 }) |window| for ([_]usize{ 1, 2, 4, 8, 16, 17 }) |rows| {
+        const dec = exl3.Decode{ .codebook = .mcg, .window = window };
+        setDecodeParams(dec);
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         var f = try mimoMoeFixture(arena.allocator(), .{
@@ -9586,8 +9587,11 @@ test "exl3 clamped routing preserves GLM production width bytes" {
         try mlx.check(mlx.mlx_astype(&x, a[8], .bfloat16, s));
         const old = try clampedSortedReference(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(old);
+        const lanes = lane_decode_dispatches;
         const got = try moeSwigluClamped(s, x, a[0], a[3], a[4], a[1], a[3], a[4], a[2], a[5], a[6], a[7], a[9], 8, 10, .bfloat16);
         defer _ = mlx.mlx_array_free(got);
+        // Decode widths take the lane gate/up and lane down kernels at every window.
+        try std.testing.expectEqual(lanes + @as(usize, if (rows <= DECODE_ROWS_MAX) 2 else 0), lane_decode_dispatches);
         var old32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(old32);
         var got32 = mlx.mlx_array_new();
@@ -9595,7 +9599,7 @@ test "exl3 clamped routing preserves GLM production width bytes" {
         try mlx.check(mlx.mlx_astype(&old32, old, .float32, s));
         try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
         try std.testing.expectEqualSlices(u8, try gemvOutBytes(old32), try gemvOutBytes(got32));
-    }
+    };
 }
 
 test "exl3 unsorted paired prepare preserves distinct scale planes at GLM widths" {
@@ -10151,14 +10155,17 @@ pub const PrefillGridSupport = struct {
     }
 };
 
+var lane_decode_dispatches: usize = 0;
 fn laneClampedPair(s: mlx.mlx_stream, x: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, sg: mlx.mlx_array, su: mlx.mlx_array, slots: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int) !?[2]mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or active_decode.codebook != .mcg or active_decode.window != .w12 or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
+    if (!mlx.streamIsGpu(s) or active_decode.codebook != .mcg or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
     const gs = mlx.getShape(tg);
     if (gs.len != 4 or !std.mem.eql(c_int, gs, mlx.getShape(tu)) or gs[3] < 32 or gs[3] > 64 or @mod(gs[3], 2) != 0) return null;
     const prepared = try lanePairPrepare(s, x, sg, su, slots, null, hidden, rows * topk, topk);
     defer _ = mlx.mlx_array_free(prepared[0]);
     defer _ = mlx.mlx_array_free(prepared[1]);
-    return lanePairCoop(s, prepared[0], prepared[1], tg, tu, slots);
+    const pair = try lanePairCoop(s, prepared[0], prepared[1], tg, tu, slots);
+    if (pair != null) lane_decode_dispatches += 1;
+    return pair;
 }
 
 // Lane-ordered half4 reads for the clamped middle and the down projection.

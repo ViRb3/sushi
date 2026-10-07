@@ -9,6 +9,7 @@ const Arr = mlx.mlx_array;
 const Ops = base.Ops;
 
 var group2_batches: usize = 0;
+var group2_logged = false;
 pub fn group2BatchCount() usize {
     return group2_batches;
 }
@@ -63,12 +64,14 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             };
             const dec = api.format.Decode{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window };
             const gs = mlx.getShape(layer.bank.gate.trellis);
-            const candidate = if (shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and dec.window == .w12 and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]))
+            const candidate = if (shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]))
                 try api.glm_group2.moeLayout(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane)
             else
                 null;
             const routed = try ops.own(if (candidate) |value| reused: {
                 group2_batches += 1;
+                if (!group2_logged and !@import("builtin").is_test) @import("log.zig").info("[glm-dflash] batched expert rows engaged (window {d})\n", .{dec.window.bits()});
+                group2_logged = true;
                 break :reused value;
             } else try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, dec, @intFromFloat(target.cfg.glm_swiglu_limit)));
             routed_batches += 1;
@@ -183,6 +186,10 @@ test "GLM DFlash FFN batch matches each target FFN row" {
 }
 
 fn expectGroup2Rows(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int) !void {
+    return expectGroup2RowsAt(allocator, rate, down_rate, .w12);
+}
+
+fn expectGroup2RowsAt(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int, window: api.format.Window) !void {
     const stream = mlx.gpuStream();
     var fixtures = Ops{ .s = stream };
     defer fixtures.deinit();
@@ -201,7 +208,7 @@ fn expectGroup2Rows(allocator: std.mem.Allocator, rate: c_int, down_rate: c_int)
     target.layers[3].ffn.moe.correction = bias;
     target.layers[3].ffn.moe.bank = try bank(&fixtures, 4096, 2048, rate, down_rate);
     target.cfg.expert_quant_codebook = .mcg;
-    target.cfg.expert_quant_window = .w12;
+    target.cfg.expert_quant_window = window;
     target.cfg.glm_swiglu_limit = 10;
     target.layers[3].ffn.moe.shared = null;
     try mlx.check(mlx.mlx_array_eval(w));
@@ -229,4 +236,8 @@ test "GLM DFlash FFN integrates production-width batched routing at every group-
     var n: c_int = 32;
     while (n <= 64) : (n += 2) try expectGroup2Rows(std.testing.allocator, n, n);
     for ([_][2]c_int{ .{ 40, 36 }, .{ 36, 40 }, .{ 48, 32 }, .{ 32, 64 } }) |mixed| try expectGroup2Rows(std.testing.allocator, mixed[0], mixed[1]);
+}
+
+test "GLM DFlash FFN batches expert rows at every pack window" {
+    for ([_]api.format.Window{ .w14, .w16 }) |window| try expectGroup2RowsAt(std.testing.allocator, 36, 36, window);
 }

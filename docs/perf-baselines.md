@@ -1366,6 +1366,26 @@ Verification time stayed within 0.2% across these paired live cases. The isolate
 0.8–1.4% higher end-to-end decode throughput in this run, since verification dominates the round.
 The clean ReleaseFast suite passed 3,425 tests, with 108 skipped and zero failures.
 
+<a id="glm-w14-lanes"></a>
+## GLM DFlash2: W14 packs take the lane and batched-row expert paths
+
+2026-10-07, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.4bpw (MCG W14, K2.25 on L03–L36, K2.5 on L37–L44), A4 g64
+DFlash2, kv8, default flags. llmprobe 0.6.15 `--bench-only --runs 2`, one boot per arm, 180 s fans-max idle before
+each boot, `taskpolicy -a`, GPU lock per boot (`glm-bisect-*`), AC power. `177c526f` (release binary) against the
+same tree with the W12-only gates on the decode lane, lane down and three/four-row expert paths removed (binary
+SHA256 prefix `5e7c14f922a0`). Decode tok/s (llmprobe tokens per step) and the server's median verify ms per round:
+
+| Context | `177c526f` decode | fix decode | `177c526f` verify ms | fix verify ms |
+|---|---:|---:|---:|---:|
+| 2K | 37.2 (2.29) | 48.4 (2.36) | 55.04 | 42.13 |
+| 8K | 37.6 (2.36) | 49.1 (2.43) | 56.00 | 42.98 |
+| 16K | 37.7 (2.38) | 43.5 (2.19) | 57.06 | 43.81 |
+| 64K | 34.4 (2.29) | 45.5 (2.43) | 60.00 | 46.78 |
+
+Verify per round drops 22–24%; draft, replay and commit are unchanged, and a 384-token greedy answer is
+byte-identical. The W14 verify times match the dev2 W12 packs' (2.3bpw: 43.6–47.6 ms at 2K–64K), so the mixed-rate
+layout costs nothing measurable. One arm each (owner call: the effect is many times the run-to-run spread).
+
 <a id="glm-three-prepared-input"></a>
 ## GLM DFlash2: prepared A6 inputs and HC expansion normalization
 

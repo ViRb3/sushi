@@ -215,6 +215,9 @@ layer's experts once, with byte-identical output ([quality-kld](quality-kld.md#l
 
 ## Lessons
 
+- A fast path gates on what its kernel needs, never on the served pack's value: W12-only expert gates sent the W14
+  Sushi-2.4bpw through the generic chain at +30% verify per round with no error. Diff engagement lines when a pack
+  changes ([measurement](perf-baselines.md#glm-w14-lanes)).
 - mHC expansion contracts the residual streams first, then adds the separately rounded FP32 branch product; the
   reverse order changes BF16 results.
 - SiLU rounds its sigmoid to BF16 before the multiply; an FP32 HC mix through generic matmul may pick TF32, so the
