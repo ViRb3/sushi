@@ -112,6 +112,7 @@ test {
     _ = @import("kld.zig");
     _ = @import("cli.zig");
     _ = @import("repl_tools.zig");
+    _ = @import("repl_input.zig");
     _ = @import("launch.zig");
     _ = @import("mlx.zig");
     _ = @import("test_models.zig");

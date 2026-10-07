@@ -23,6 +23,7 @@ const log = @import("log.zig");
 const dflash = @import("dflash.zig");
 const status = @import("status.zig");
 const repl_tools = @import("repl_tools.zig");
+const repl_input = @import("repl_input.zig");
 const update = @import("update.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
@@ -1228,12 +1229,16 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     } else |_| {}
     const vision = if (models_info) |m| m.vision else false;
 
+    var input: repl_input.Input = .{ .tty = std.Io.File.stdin().isTty(io) catch false };
+    defer input.deinit(allocator);
+
     // File tools start confined to the folder `sushi run` started in; `/cd` moves them.
     var driver: ReplDriver = .{
         .allocator = allocator,
         .io = io,
         .url = chat_url,
         .w = w,
+        .input = &input,
         .tools = .{ .allocator = allocator, .io = io, .root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator), .vision = vision },
     };
     defer allocator.free(driver.tools.root);
@@ -1254,14 +1259,10 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
         pending_images.deinit(allocator);
     }
 
-    var stdin_buf: [16 * 1024]u8 = undefined;
-    var stdin_r = std.Io.File.stdin().reader(io, &stdin_buf);
-    const r = &stdin_r.interface;
-
     while (true) {
         try writePrompt(w, formatPromptStatus(&state_buf, driver.tools.root, homeDir(), opts.tools));
         try w.flush();
-        const line = r.takeDelimiter('\n') catch break orelse break;
+        const line = input.readLine(allocator, w) catch break orelse break;
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "/bye") or std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) break;
@@ -1418,8 +1419,11 @@ const ReplDriver = struct {
     io: std.Io,
     url: []const u8,
     w: *std.Io.Writer,
+    input: *repl_input.Input,
     tools: repl_tools.Context,
     requests: usize = 0,
+    /// Set once a file tool has run: from then on a `fetch_url` that can carry data out needs the user's yes.
+    file_content_seen: bool = false,
 
     fn complete(ptr: *anyopaque, body: []const u8) anyerror!Reply {
         const d: *ReplDriver = @ptrCast(@alignCast(ptr));
@@ -1434,6 +1438,14 @@ const ReplDriver = struct {
         defer d.allocator.free(trace);
         try d.w.print("\n\x1b[2m  {s}\x1b[0m", .{trace});
         try d.w.flush();
+        if (try repl_tools.fetchNeedingApproval(d.allocator, name, args_json, d.file_content_seen)) |url| {
+            defer d.allocator.free(url);
+            const question = try std.fmt.allocPrint(d.allocator, "\nThe model wants to fetch {s}\nThis URL can carry what it read from your files to that site. Allow?", .{url});
+            defer d.allocator.free(question);
+            if (!try d.input.confirm(d.allocator, d.w, question))
+                return .{ .text = try d.allocator.dupe(u8, "refused: the user did not allow this fetch because the URL could send file contents out; use a URL without a query string and with a short path") };
+        }
+        if (repl_tools.isFileTool(name)) d.file_content_seen = true;
         return repl_tools.run(d.tools, name, args_json);
     }
 
@@ -1468,7 +1480,10 @@ fn streamOneTurn(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body
     if (response.head.status != .ok) {
         const detail = try r.allocRemaining(allocator, .limited(64 * 1024));
         defer allocator.free(detail);
-        try w.print("[server error HTTP {d}: {s}]\n", .{ @backingInt(response.head.status), detail });
+        try w.print("[server error HTTP {d}: ", .{@backingInt(response.head.status)});
+        var detail_filter: repl_tools.TermFilter = .{};
+        try detail_filter.write(w, detail);
+        try w.writeAll("]\n");
         try w.flush();
         return error.ReplHttpStatus;
     }
@@ -1484,6 +1499,9 @@ fn streamOneTurn(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body
     // The thought prints dim so a thinking turn never looks frozen.
     var in_thought = false;
     defer if (in_thought) w.writeAll("\x1b[0m") catch {};
+    // The model's text reaches the terminal only through these: a page it read can steer what it emits.
+    var thought_filter: repl_tools.TermFilter = .{};
+    var answer_filter: repl_tools.TermFilter = .{};
 
     while (true) {
         const line = r.takeDelimiter('\n') catch break orelse break;
@@ -1491,7 +1509,10 @@ fn streamOneTurn(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body
         const delta = parseReplLine(allocator, line) orelse continue;
         defer delta.deinit(allocator);
         if (delta.err) |e| {
-            try w.print("[server error: {s}]", .{e});
+            var err_filter: repl_tools.TermFilter = .{};
+            try w.writeAll("[server error: ");
+            try err_filter.write(w, e);
+            try w.writeAll("]");
             try w.flush();
             break;
         }
@@ -1499,13 +1520,13 @@ fn streamOneTurn(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body
         if (delta.reasoning) |t| {
             if (!in_thought) try w.writeAll("\x1b[2m");
             in_thought = true;
-            try w.writeAll(t);
+            try thought_filter.write(w, t);
             try w.flush();
         }
         if (delta.content.len > 0) {
             if (in_thought) try w.writeAll("\x1b[0m\n");
             in_thought = false;
-            try w.writeAll(delta.content);
+            try answer_filter.write(w, delta.content);
             try w.flush();
             try full.appendSlice(allocator, delta.content);
         }

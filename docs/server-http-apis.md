@@ -381,5 +381,14 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - **Web tools reach public hosts only**: http/https, no userinfo, local names refused, EVERY resolved address and the
   connected peer (`getpeername`, defeats DNS rebinding) must classify public (`classifyIp4/6`; mapped, NAT64 and 6to4
   judged by their IPv4); each redirect hop re-checked; no cookies, auth headers or POST.
+- **Once a file tool has run in the session, a `fetch_url` whose URL has a query string or a path over 80 characters asks
+  the user y/N** with the sanitized full URL (`fetchNeedingApproval`; a non-tty stdin answers no): a page-steered model
+  must not carry file content out in a URL.
+- **Everything the model chose reaches the terminal through `TermFilter`** (trace lines, thought, answer, server
+  errors): ESC/CSI/OSC sequences, C0 other than `\n` `\t`, DEL, C1 and invalid UTF-8 are dropped, with state across
+  stream deltas, so a tool argument or a fetched page cannot rewrite the trace line.
+- **The prompt reads a tty line with ICANON off** (`repl_input.zig`): a canonical line stops at 1024 bytes on macOS, so a
+  pasted stack trace never submitted. Echo, backspace and Ctrl-U are ours; raw mode is held only while a line is read,
+  and an `atexit` hook restores the terminal when Ctrl-C ends the process mid-read.
 - Every failure is a short tool-result string; results are data, never executed. A DuckDuckGo bot check (HTTP 202,
   `anomaly-modal`) reads as "search unavailable", never as zero results.

