@@ -131,3 +131,89 @@ test "GLM MLA dense prefill eligibility excludes decode and sparse boundary" {
     unsupported.mla_qk_nope_head_dim = 512;
     try std.testing.expect(!forward.Mla.densePrefillEligible(true, 33, 0, &unsupported, .bfloat16));
 }
+
+fn putRandom(weights: *model.Weights, ops: *base.Ops, name: []const u8, shape: []const c_int, seed: u64, deviation: f32) !void {
+    const key = try ops.slot();
+    try mlx.check(mlx.mlx_random_key(key, seed));
+    var value = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(value);
+    try mlx.check(mlx.mlx_random_normal(&value, shape.ptr, shape.len, .bfloat16, 1, deviation, key.*, ops.s));
+    try mlx.check(mlx.mlx_array_eval(value));
+    try weights.map.put(try std.testing.allocator.dupe(u8, name), value);
+}
+
+test "GLM BF16 MLA layer takes the head-batched projections after the dense window and tracks the staged chain" {
+    if (!base.naxArms()) return error.SkipZigTest;
+    const batch = @import("glm5_mla_prefill_batch.zig");
+    var weights = model.Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    var prep = base.Ops{ .s = mlx.gpuStream() };
+    defer prep.deinit();
+    const hidden = 128;
+    const shapes = [_]struct { []const u8, []const c_int, f32 }{
+        .{ "m.kv_b_proj.weight", &.{ 64 * 512, 512 }, 0.04 },
+        .{ "m.q_a_proj.weight", &.{ 128, hidden }, 0.1 },
+        .{ "m.q_b_proj.weight", &.{ 64 * 256, 128 }, 0.1 },
+        .{ "m.kv_a_proj_with_mqa.weight", &.{ 512, hidden }, 0.1 },
+        .{ "m.o_proj.weight", &.{ hidden, 64 * 256 }, 0.02 },
+        .{ "m.indexer.wq_b.weight", &.{ 2 * 32, 128 }, 0.1 },
+        .{ "m.indexer.wk.weight", &.{ 32, hidden }, 0.1 },
+        .{ "m.indexer.weights_proj.weight", &.{ 2, hidden }, 0.1 },
+        .{ "m.indexer.index_kpool_compress_gate", &.{ 32, hidden }, 0.1 },
+        .{ "m.indexer.index_kpool_compress_ape", &.{ 4, 32 }, 0.1 },
+        .{ "m.q_a_layernorm.weight", &.{128}, 0.1 },
+        .{ "m.kv_a_layernorm.weight", &.{512}, 0.1 },
+        .{ "m.indexer.k_norm.weight", &.{32}, 0.1 },
+        .{ "m.indexer.k_norm.bias", &.{32}, 0.1 },
+    };
+    for (shapes, 0..) |entry, i| try putRandom(&weights, &prep, entry[0], entry[1], 100 + i, entry[2]);
+    const cfg = model.ModelConfig{
+        .model_type = "glm5_next",
+        .hidden_size = hidden,
+        .num_attention_heads = 64,
+        .mla_q_lora_rank = 128,
+        .mla_kv_lora_rank = 512,
+        .mla_qk_nope_head_dim = 256,
+        .mla_v_head_dim = 256,
+        .indexer_n_heads = 2,
+        .indexer_head_dim = 32,
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+        .rms_norm_eps = 1e-5,
+    };
+    var layer = try forward.Mla.load(&weights, "m", &cfg, mlx.gpuStream());
+    defer layer.deinit();
+    const rows: c_int = 130;
+    var outputs: [2]Arr = undefined;
+    var made: usize = 0;
+    defer for (outputs[0..made]) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    defer base.leaveTeacher();
+    for ([_]bool{ false, true }) |reference| {
+        base.reference_numerics = reference;
+        var state = attention.State.init();
+        defer state.deinit();
+        var ops = base.Ops{ .s = mlx.gpuStream() };
+        defer ops.deinit();
+        const key = try ops.slot();
+        try mlx.check(mlx.mlx_random_key(key, 7));
+        const x = try ops.slot();
+        try mlx.check(mlx.mlx_random_normal(x, &.{ 1, rows, hidden }, 3, .bfloat16, 0, 1, key.*, ops.s));
+        const before = batch.dispatchCount();
+        const y = try layer.applyMode(&ops, x.*, &cfg, &state, false);
+        outputs[made] = try ops.result(try ops.contiguous(try ops.cast(y, .float32)));
+        made += 1;
+        try mlx.check(mlx.mlx_array_eval(outputs[made - 1]));
+        try std.testing.expectEqual(before + @as(usize, if (reference) 0 else 2), batch.dispatchCount());
+    }
+    var num: f64 = 0;
+    var den: f64 = 0;
+    const n = mlx.mlx_array_size(outputs[0]);
+    for (mlx.mlx_array_data_float32(outputs[0]).?[0..n], mlx.mlx_array_data_float32(outputs[1]).?[0..n]) |got, want| {
+        try std.testing.expect(std.math.isFinite(got));
+        num += (@as(f64, got) - want) * (@as(f64, got) - want);
+        den += @as(f64, want) * want;
+    }
+    try std.testing.expect(den > 0 and @sqrt(num / den) <= 0.01);
+}

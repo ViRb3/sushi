@@ -151,6 +151,20 @@ fn auditHeaders(a: std.mem.Allocator, io: std.Io, directory: []const u8, cfg: *c
     return audit;
 }
 
+/// Dispatches of every arm a NAX capture can take, so a fixture states which route made it.
+fn armDispatches() struct { hc_prefill: usize, hc_collapse_simd32: usize, kda_value_rows: usize, kda_prefill_cluster: usize, mla_head_batch: usize, packed_attention: usize, index_scores_nax: usize, decode_b1: usize } {
+    return .{
+        .hc_prefill = @import("glm5_hc_prefill.zig").dispatchCount(),
+        .hc_collapse_simd32 = @import("glm5_hc_collapse_simd32.zig").dispatchCount(),
+        .kda_value_rows = @import("glm5_kda_value_rows.zig").dispatchCount(),
+        .kda_prefill_cluster = @import("glm5_kda_prefill_cluster.zig").dispatchCount(),
+        .mla_head_batch = @import("glm5_mla_prefill_batch.zig").dispatchCount(),
+        .packed_attention = @import("glm5_attention_nax_packed.zig").dispatchCount(),
+        .index_scores_nax = @import("glm5_indexpool_nax.zig").dispatchCount(),
+        .decode_b1 = @import("glm5_attention_decode_batch.zig").b1Calls(),
+    };
+}
+
 fn json(a: std.mem.Allocator, io: std.Io, directory: []const u8, name: []const u8, value: anytype) !void {
     const raw = try std.json.Stringify.valueAlloc(a, value, .{ .whitespace = .indent_2 });
     defer a.free(raw);
@@ -174,7 +188,7 @@ fn normalizeTeacherTf32() !void {
 fn teacherEnvironment() !void {
     try normalizeTeacherTf32();
     if (model.getConfigOverrides() != null) return error.NativeGlmTeacherOverrides;
-    @import("glm5_model.zig").reference_numerics = true;
+    @import("glm5_model.zig").enterTeacher();
 }
 
 /// Widening BF16 to F32 is exact. Any other native dtype is refused, never repaired.
@@ -611,6 +625,7 @@ const BatchSink = struct {
 
 fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kld.Options, out: *kld.Out) !void {
     try teacherEnvironment();
+    out.print("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: B1 decode attention, HC and KDA fused prefill, MLA head batches, packed sparse attention and NAX index scores past 2051 tokens" else "off: reference arms (scalar latent attention, staged HC and KDA)"});
     const cwd = std.Io.Dir.cwd();
     if (cwd.access(io, opts.out_dir, .{})) |_| return error.NativeGlmTeacherOutputExists else |err| if (err != error.FileNotFound) return err;
     const staging = try std.fmt.allocPrint(a, "{s}.partial", .{opts.out_dir});
@@ -637,7 +652,7 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
     }
     const chunk = @min(@as(usize, 512), max_tokens);
     const reserve_floor: u64 = if (@import("builtin").is_test) reserve_floor_for_test else 8 << 30;
-    const reserve = @max(reserve_floor, try streaming.minimumReserve(cfg, max_tokens, chunk));
+    const reserve = @max(reserve_floor, try streaming.minimumReserve(cfg, max_tokens, chunk) + try streaming.armsReserve(cfg, chunk));
     const config_sha = try metadataHash(a, io, opts.model_dir, "config.json");
     const index_sha = try metadataHash(a, io, opts.model_dir, "model.safetensors.index.json");
     const tokenizer_sha = try metadataHash(a, io, opts.model_dir, "tokenizer.json");
@@ -727,7 +742,7 @@ fn run(a: std.mem.Allocator, io: std.Io, cfg: *const model.ModelConfig, opts: kl
     if (!std.mem.eql(u8, &headers.shard_stat_sha256, &final_shards.shard_stat_sha256)) return error.NativeGlmTeacherSourceChanged;
     try completeBaseline(a, io, staging, records.items.len, opts.tokens);
     if (cached != 0 or peak > limit) return error.GlmResidentBudgetExceeded;
-    try json(a, io, staging, "identity.json", .{ .schema = "sushi-native-glm-capture-v1", .complete = true, .engine = "sushi-native-glm", .model = opts.model_dir, .source_storage = "indexed BF16/F32 trunk; individual BF16 experts, as stored", .config_sha256 = &config_sha, .index_sha256 = &index_sha, .tokenizer_sha256 = &tokenizer_sha, .kda_unary_modes = try @import("glm5_kda_fused.zig").unaryModes(s), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .kda_post_dispatches = @import("glm5_kda_fused.zig").postDispatchCount(), .kda_prework_dispatches = @import("glm5_kda_prework.zig").dispatchCount(), .trunk_header_audit = headers, .shard_stat_sha256 = &headers.shard_stat_sha256, .logits_dtype = @tagName(logits_dtype.?), .logits_export = "exact full-vocabulary little-endian float32", .vocab_size = cfg.vocab_size, .tokens_per_prompt = opts.tokens, .prompt_count = records.items.len, .prefix_chunk = chunk, .final_request_offset = final_offset, .kv_cache_format = "bf16", .kda_state_format = "float32", .dense_prefill = true, .synchronous_layers = true, .mtp = false, .dflash = false, .tf32 = false, .template = false, .prefix_reuse = false, .layer_major = opts.layer_major, .batch_windows = batch, .hidden_out = opts.hidden_out, .hidden_width = if (hidden != null) kld.hiddenCaptureWidth(cfg) else 0, .stream_budget = budget, .stream_cache_slots = engine.plan.slots_per_layer, .stream_fill_bytes = engine.fill_bytes_total, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = limit, .wired_limit_bytes = limit, .allocator_cache_bytes = cached, .elapsed_seconds = elapsed });
+    try json(a, io, staging, "identity.json", .{ .schema = "sushi-native-glm-capture-v1", .complete = true, .engine = "sushi-native-glm", .model = opts.model_dir, .source_storage = "indexed BF16/F32 trunk; individual BF16 experts, as stored", .config_sha256 = &config_sha, .index_sha256 = &index_sha, .tokenizer_sha256 = &tokenizer_sha, .kda_unary_modes = try @import("glm5_kda_fused.zig").unaryModes(s), .kda_body_dispatches = @import("glm5_kda_fused.zig").dispatchCount(), .kda_post_dispatches = @import("glm5_kda_fused.zig").postDispatchCount(), .kda_prework_dispatches = @import("glm5_kda_prework.zig").dispatchCount(), .trunk_header_audit = headers, .shard_stat_sha256 = &headers.shard_stat_sha256, .logits_dtype = @tagName(logits_dtype.?), .logits_export = "exact full-vocabulary little-endian float32", .vocab_size = cfg.vocab_size, .tokens_per_prompt = opts.tokens, .prompt_count = records.items.len, .prefix_chunk = chunk, .final_request_offset = final_offset, .kv_cache_format = "bf16", .kda_state_format = "float32", .dense_prefill = true, .synchronous_layers = true, .mtp = false, .dflash = false, .tf32 = false, .nax_arms = @import("glm5_model.zig").naxArms(), .reference_numerics = @import("glm5_model.zig").reference_numerics, .arm_dispatches = armDispatches(), .template = false, .prefix_reuse = false, .layer_major = opts.layer_major, .batch_windows = batch, .hidden_out = opts.hidden_out, .hidden_width = if (hidden != null) kld.hiddenCaptureWidth(cfg) else 0, .stream_budget = budget, .stream_cache_slots = engine.plan.slots_per_layer, .stream_fill_bytes = engine.fill_bytes_total, .loaded_active_bytes = loaded_active, .active_bytes = active, .peak_bytes = peak, .memory_limit_bytes = limit, .wired_limit_bytes = limit, .allocator_cache_bytes = cached, .elapsed_seconds = elapsed });
     try json(a, io, staging, "progress.json", .{ .complete = true, .phase = "complete", .completed_prompts = records.items.len, .completed_rows = records.items.len * opts.tokens });
     try cwd.renamePreserve(staging, cwd, opts.out_dir, io);
     out.print("[kld] native GLM captured {d} prompts x {d} full-vocabulary rows into {s}\n", .{ records.items.len, opts.tokens, opts.out_dir });
@@ -893,32 +908,40 @@ test "GLM native KLD capture CPU rejects zero norm logits" {
     try std.testing.expectError(error.NativeGlmTeacherZeroNormLogits, exportRow(s, x, &row));
 }
 
-test "GLM teacher capture selects reference numerics with TF32 off" {
+test "GLM teacher capture takes the NAX arms on a NAX GPU and the reference arms without one" {
     const a = std.testing.allocator;
     const base = @import("glm5_model.zig");
+    const transformer = @import("transformer.zig");
     const saved = if (std.c.getenv("MLX_ENABLE_TF32")) |value| try a.dupeSentinel(u8, std.mem.span(value), 0) else null;
+    const gate = transformer.vqmm_nax_probe_override;
     defer {
+        transformer.vqmm_nax_probe_override = gate;
         if (saved) |value| {
             _ = setenv("MLX_ENABLE_TF32", value, 1);
             a.free(value);
         } else _ = unsetenv("MLX_ENABLE_TF32");
-        base.reference_numerics = false;
+        base.leaveTeacher();
     }
-    _ = unsetenv("MLX_ENABLE_TF32");
-    try std.testing.expect(!base.reference_numerics);
-    try teacherEnvironment();
-    try std.testing.expect(base.reference_numerics);
-    try std.testing.expectEqualStrings("0", std.mem.span(std.c.getenv("MLX_ENABLE_TF32").?));
-    const reference_switches = [_]bool{
-        @import("glm5_hc_prefill.zig").enabled(),
-        @import("glm5_hc_collapse_simd32.zig").enabled(),
-        @import("glm5_kda_prefill_cluster.zig").enabled(),
-        @import("glm5_attention_nax_packed.zig").enabled(),
-        @import("glm5_indexpool_nax.zig").enabled(),
-        @import("glm5_attention_decode_batch.zig").enabled(),
-    };
-    for (reference_switches) |fast| try std.testing.expect(!fast);
-    base.reference_numerics = false;
+    for ([_]?bool{ gate, false }) |nax| {
+        transformer.vqmm_nax_probe_override = nax;
+        _ = unsetenv("MLX_ENABLE_TF32");
+        try std.testing.expect(!base.teacher);
+        try teacherEnvironment();
+        try std.testing.expect(base.teacher);
+        try std.testing.expectEqual(!base.naxArms(), base.reference_numerics);
+        try std.testing.expectEqualStrings("0", std.mem.span(std.c.getenv("MLX_ENABLE_TF32").?));
+        const arms = [_]bool{
+            @import("glm5_hc_prefill.zig").enabled(),
+            @import("glm5_hc_collapse_simd32.zig").enabled(),
+            @import("glm5_kda_prefill_cluster.zig").enabled(),
+            @import("glm5_attention_nax_packed.zig").enabled(),
+            @import("glm5_indexpool_nax.zig").enabled(),
+            @import("glm5_attention_decode_batch.zig").enabled(),
+        };
+        for (arms) |on| try std.testing.expectEqual(base.naxArms(), on);
+        base.leaveTeacher();
+        try std.testing.expect(!base.teacher and !base.reference_numerics);
+    }
     _ = setenv("MLX_ENABLE_TF32", "1", 1);
     try std.testing.expectError(error.NativeGlmTeacherRequiresTf32Off, teacherEnvironment());
 }
@@ -1029,7 +1052,7 @@ const TinyCapture = struct {
     fn capture(self: *TinyCapture, a: std.mem.Allocator, opts_value: kld.Options) !void {
         _ = self;
         var out = kld.Out{ .silent = true };
-        defer @import("glm5_model.zig").reference_numerics = false;
+        defer @import("glm5_model.zig").leaveTeacher();
         // The tiny checkpoint needs no production-sized floor; all computed bills and Metal limits still apply.
         const prior = reserve_floor_for_test;
         reserve_floor_for_test = 128 << 20;
@@ -1069,7 +1092,7 @@ test "GLM native teacher refuses a budget above Metal's recommended working set"
     var opts = try tiny.opts("above-wired", 0);
     opts.ssd_budget_bytes = @max(@as(u64, 10) << 30, @as(u64, mlx.maxRecommendedWorkingSet()) + 1);
     var out = kld.Out{ .silent = true };
-    defer @import("glm5_model.zig").reference_numerics = false;
+    defer @import("glm5_model.zig").leaveTeacher();
     try std.testing.expectError(error.InvalidGlmWiredLimit, tryRun(a, std.testing.io, opts, &out));
 }
 
@@ -1095,6 +1118,23 @@ test "GLM layer-major capture writes window-major's fixture and boundaries byte 
     try std.testing.expectEqual(@as(usize, 3), committed);
     try tiny.capture(a, try tiny.opts("resumed", 2));
     try tiny.expectSame("window-major", "resumed");
+}
+
+test "GLM capture identity records whether the NAX arms were on and what each dispatched" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tiny = try TinyCapture.init(a);
+    defer tiny.deinit();
+    try tiny.capture(a, try tiny.opts("identity", 0));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, try tiny.read("identity/identity.json"), .{});
+    defer parsed.deinit();
+    const nax = @import("glm5_model.zig").naxArms();
+    try std.testing.expectEqual(nax, parsed.value.object.get("nax_arms").?.bool);
+    try std.testing.expectEqual(!nax, parsed.value.object.get("reference_numerics").?.bool);
+    const arms = parsed.value.object.get("arm_dispatches").?.object;
+    for ([_][]const u8{ "hc_prefill", "hc_collapse_simd32", "kda_value_rows", "kda_prefill_cluster", "mla_head_batch", "packed_attention", "index_scores_nax", "decode_b1" }) |name| {
+        try std.testing.expect(arms.get(name).? == .integer);
+    }
 }
 
 test "GLM layer-major resume refuses a changed committed window or a different run" {

@@ -139,6 +139,11 @@ Both are heavy GPU jobs: take the lock per run (CLAUDE.md, Team process).
 - A biased reference is refused regardless of size: a MiMo teacher captured through an affine-8 trunk and a kv8 cache
   differed from the lossless one by 0.0076 nats (the whole engine-to-engine gap mlx-lm had measured). A pack's
   stored-affine trunk (served packs only) leaves the teacher untouched.
+- **GLM teacher arms**: a NAX GPU captures through the arms served packs take, BF16 weights, BF16 latent and FP32 KDA
+  state as stored; any other GPU keeps the reference arms. The capture prints `[glm] NAX arms on|off` and
+  `identity.json` records `nax_arms`, `reference_numerics` and each arm's dispatch count.
+- A teacher's continuations depend on its arms: compare packs only against the fixture they were scored on, and recapture
+  the teacher before comparing rows scored on another route.
 - `SUSHI_NGRAM_BF16_DIR=<hf checkpoint>` serves a Flash-Next pack with the original bf16 n-gram table to isolate
   the PLE table's cost.
 
@@ -295,7 +300,7 @@ GLM's release reading is this 4x512 screen, with the two code prompts (2x512) re
 would stream the BF16 experts and is too slow to capture. Shipping config (kv8, FP32 decode attention): KLD 0.0716 /
 top-1 90.3%; code 0.0324 / 95.8%, prose 0.1107 / 84.9%.
 
-Teacher: the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
+Teacher (every row below was scored against the reference-arm capture, whose `identity.json` has no `nax_arms`): the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
 standard4 --tokens 512 --no-template --kv-quant off --ssd-budget-gb 100` (streamed BF16 experts, dense prefill in
 chunks of at most 512, synchronous layers, BF16 MLA cache, FP32 KDA state). Native prompt lengths 242/261/190/183; no
 EOS in the 2,048 rows, so first-EOS and all-positions readings are the same. Students carry W12 MCG EXL3

@@ -7,8 +7,21 @@ const exl3 = @import("sushi_exl3");
 const Arr = mlx.mlx_array;
 const fp8_block = @import("fp8_block.zig");
 
-/// Set by the BF16 teacher capture: every GLM fast kernel defers to its reference arm.
+/// Every GLM fast kernel defers to its reference arm.
 pub var reference_numerics = false;
+/// The lossless BF16 teacher is running: its latent cache stays BF16.
+pub var teacher = false;
+
+/// The one teacher decision: a NAX GPU runs the arms served packs run; any other GPU keeps the reference arms.
+pub fn enterTeacher() void {
+    teacher = true;
+    reference_numerics = !naxArms();
+}
+
+pub fn leaveTeacher() void {
+    teacher = false;
+    reference_numerics = false;
+}
 
 /// The one device decision for GLM arms built on MLX's NAX kernels (fused D512 SDPA, NAX GEMM/QMM
 /// tiles). Qwen's and MiMo's gate, so `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` rehearses an M1–M4.
@@ -1136,6 +1149,8 @@ test "GLM NAX arms and their bills follow the one NAX gate" {
         try std.testing.expectEqual(on, (try dense_once.tryPrefill(&ops, a6[0], a6[1], a6[2], a6[2])) != null);
         const bank = [_]Arr{ try ops.zeros(&.{ 64, 256, 96 }, .uint32), try ops.zeros(&.{ 64, 256, 4 }, .bfloat16) };
         try std.testing.expectEqual(on, (try mla_prefill.run(&ops, .{ .x = try ops.zeros(&.{ 128, 64, 1, 256 }, .bfloat16), .w = bank[0], .scales = bank[1], .biases = bank[1] }, .query)) != null);
+        const stored = try ops.zeros(&.{ 64, 256, 512 }, .bfloat16);
+        try std.testing.expectEqual(on, (try mla_prefill.run(&ops, .{ .x = try ops.zeros(&.{ 128, 64, 1, 256 }, .bfloat16), .w = stored }, .query)) != null);
         try std.testing.expectEqual(on, (try mla_verify.run(&ops, .{ .x = try ops.zeros(&.{ 3, 64, 1, 256 }, .bfloat16), .w = bank[0], .scales = bank[1], .biases = bank[1] }, .query)) != null);
         try std.testing.expectEqual(on, cluster.enabled());
         const bills = [_]usize{

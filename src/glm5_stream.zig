@@ -81,6 +81,25 @@ pub fn minimumReserve(cfg: *const model.ModelConfig, tokens: usize, chunk: usize
     return std.math.cast(u64, prepared + recurrent * 2 + caches + activations + attention_scratch + 64 * 1024 * 1024) orelse error.InvalidGlmStreamBudget;
 }
 
+/// What the NAX arms a capture takes add to `minimumReserve`: the KDA cluster banks resident from load and each
+/// arm's scratch for the one layer a synchronous capture keeps pending. Zero under the reference arms.
+pub fn armsReserve(cfg: *const model.ModelConfig, chunk: usize) !u64 {
+    if (cfg.full_attention_interval == 0) return error.InvalidGlmStreamBudget;
+    const cluster = @import("glm5_kda_prefill_cluster.zig");
+    const attention = @import("glm5_attention.zig");
+    const layers = cfg.num_hidden_layers;
+    const mla_layers = layers / cfg.full_attention_interval;
+    const resident = if (cluster.enabled()) (layers - mla_layers) * cluster.weight_bytes else 0;
+    const scratch = (try @import("glm5_a6_dense_once.zig").transientBudget(chunk, 1)) +
+        (try @import("glm5_mla_prefill_batch.zig").transientBudget(chunk, 1)) +
+        (try @import("glm5_attention_nax_packed.zig").transientBudget(chunk, 1)) +
+        (try attention.packedCadenceTransientBudget(chunk, 1)) +
+        (try @import("glm5_indexpool_nax.zig").transientBudget(chunk, 1)) +
+        (try cluster.transientBudget(chunk, 1)) +
+        (try @import("glm5_attention_decode_batch.zig").transientBudget(1));
+    return std.math.add(u64, resident, scratch) catch error.InvalidGlmStreamBudget;
+}
+
 /// The BF16 HC residual one window carries between layers.
 fn carriedPerWindow(cfg: *const model.ModelConfig, max_tokens: usize) !u64 {
     return std.math.mul(u64, max_tokens, @as(u64, cfg.hc_count) * cfg.hidden_size * 2) catch error.InvalidGlmStreamBudget;
@@ -105,6 +124,26 @@ pub fn layerMajorWindows(cfg: *const model.ModelConfig, total: u64, trunk: u64, 
     const one = try layerMajorBudget(cfg, total, trunk, reserve, max_tokens, max_chunk, 1);
     const fits = (total - one.fixed - one.cache) / one.carried + 1;
     return @intCast(@min(fits, cap));
+}
+
+test "GLM teacher reserve bills the NAX arms it takes and nothing under the reference arms" {
+    const base = @import("glm5_model.zig");
+    const transformer = @import("transformer.zig");
+    const gate = transformer.vqmm_nax_probe_override;
+    defer {
+        transformer.vqmm_nax_probe_override = gate;
+        base.leaveTeacher();
+    }
+    const cfg = model.ModelConfig{ .model_type = "glm5_next", .num_hidden_layers = 45, .full_attention_interval = 4 };
+    transformer.vqmm_nax_probe_override = true;
+    base.enterTeacher();
+    const on = try armsReserve(&cfg, 512);
+    // 34 KDA layers keep a prepared 320x4096 BF16 cluster bank; the 512-row MLA head batches and B1 decode scratch are live.
+    try std.testing.expect(on >= 34 * 320 * 4096 * 2 + 512 * 196608 + (32 << 20));
+    try std.testing.expectEqual(on, try armsReserve(&cfg, 512));
+    transformer.vqmm_nax_probe_override = false;
+    base.enterTeacher();
+    try std.testing.expectEqual(@as(u64, 0), try armsReserve(&cfg, 512));
 }
 
 test "GLM layer-major CPU budget bills every batch window's HC residual and refuses by name" {

@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     defer cfg.deinit(a);
     if (!cfg.isGlm5() or cfg.hc_count != 4) return error.InvalidGlmConfig;
     const stream = mlx.gpuStream();
-    base.reference_numerics = cfg.expert_layout == .bf16_individual;
+    if (cfg.expert_layout == .bf16_individual) base.enterTeacher();
     var weights = try native.loadWeightsBounded(io, a, pack, stream, true, 8 << 30);
     defer weights.deinit();
     var replay = try forward.FfnPrefixReplay.load(cfg, &weights, index, stream);

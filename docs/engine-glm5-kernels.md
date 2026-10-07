@@ -18,7 +18,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 | `glm5_latent.zig` | latent storage view (BF16 or kv8), the `SUSHI_LATENT` kernel helper, kv8 row bytes |
 | `glm5_attention_nax_packed.zig` / `glm5_indexpool_nax.zig` | head-packed native sparse attention (B16/B32); NAX prefill index scores |
 | `glm5_attention_decode_batch.zig` / `glm5_attention_overlay.zig` | native B1/B3/B4 decode and verify attention; verify latent overlays |
-| `glm5_mla_prefill_batch.zig` / `glm5_mla_verify_batch.zig` | head-batched MLA prefill projections; three-row query and three/four-row value verification |
+| `glm5_mla_prefill_batch.zig` / `glm5_mla_verify_batch.zig` | head-batched MLA prefill projections (affine or BF16 banks); three-row query and three/four-row value verification |
 | `glm5_kda_prework.zig` / `glm5_kda_value_rows.zig` / `glm5_kda_fused.zig` / `glm5_kda_prefill_cluster.zig` | KDA prework, R4 recurrence, one-token body and output epilogue, FA/GA/beta cluster |
 | `glm5_a6_dense_once.zig` / `glm5_decode.zig` / `glm5_router.zig` / `glm5_activation.zig` | T2048 A6 expansion; copy-free QKV; router; dense/shared activation |
 | `glm5_hc_prefill.zig` / `glm5_hc_collapse_simd32.zig` | RMS-fused HC prefill projection; SIMD32 verify collapse |
@@ -34,7 +34,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   plain NAX rounding on same-pack forced-logit drift checks that predate the frozen screen below (MLA projections at
   4K/64: mean KL 0.0116, max 0.396; the prefill trio at 16K/32: mean 0.0040, max 0.068). B1 decode attention runs
   inside the 4x512 teacher KLD; the three prefill paths engage only past the KLD prompts' lengths, so none of them has
-  a long-context teacher KLD.
+  a long-context teacher KLD. The BF16 teacher takes all four on a NAX GPU ([below](#teacher-nax)).
 - **Drift screen** for a numerics change: two frozen nonrepeated 16,384-ID prompts (code, prose), 24 late-prefix plus
   192 forced rows each; per prompt mean KL ≤ 0.01, max KL ≤ 0.15, top-1 ≥ 95%, mean NLL increase ≤ 0.02, no new
   nonfinite. Bounds are fixed before results; late-prefix rows are far more sensitive than forced continuation.
@@ -62,7 +62,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   (64 MiB each at T2048) into native causal SDPA D256, `force_fused`.
 - **Absorbed MLA projections**: query absorption (256→512) and value unembed (512→256) run head-batched (`[64,T,D]`)
   as native affine NAX QMM on A6 g128 banks, T128–2048. T2048 query 13.69 → 1.69 ms, value 19.45 → 1.64 ms; rel L2
-  0.26%/0.32%; 4K/64 drift mean KL 0.0116. 768 MiB of copies at async2.
+  0.26%/0.32%; 4K/64 drift mean KL 0.0116. 768 MiB of copies at async2. A BF16 `kv_b_proj` (the teacher) takes the same
+  `[64,T,D]` layout as a stored-dtype batched GEMM, within one BF16 ulp of an FP64 oracle like the per-row staged chain.
 - **Index scores, tree scorer** (decode, verify, and prefill outside the NAX window): one lane per head forms the
   32 lane partials of the old 32-lane scorer (each sequential over d = l, l+32, l+64, l+96) and joins them in
   `simd_sum`'s order, an xor butterfly over 1, 2, 4, 8, 16 lanes, i.e. balanced pairs in lane order (200000/200000
@@ -191,7 +192,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   stock libmlx is looser than on an M1–M4; its tests widen the bar only when a probe GEMM shows TF32. Another GLM
   decode op still follows that default: with the fused decode attention, `MLX_ENABLE_TF32=0` moved the 4x512 KLD
   0.071762 → 0.071636 (op not yet identified).
-- The scalar latent attention stays the teacher's arm and serves every shape the native arms decline
+- The scalar latent attention is the non-NAX teacher's arm and serves every shape the native arms decline
   (`[glm-attn] scalar dense|sparse latent attention engaged`).
 - Also off: NAX index scores (the tree scorer serves them), the KDA cluster (three GEMMs), A6 dense-once and MLA head/verify batches
   (affine QMM). Their transient bills drop with the gate.
@@ -205,6 +206,24 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - MLX picks its own NAX kernels from the device, so the env lever covers only Sushi's arms. A full M1–M4 rehearsal on
   an M5 also loads a NAX-less libmlx (the same pins built at deployment target 26.0, so `MLX_METAL_NO_NAX`) through
   `DYLD_LIBRARY_PATH`. Every GLM unit test passes on both.
+
+<a id="teacher-nax"></a>
+## BF16 teacher on NAX
+
+- One decision, `glm5_model.enterTeacher()`: `reference_numerics = !naxArms()`, so a NAX GPU runs the arms a served pack
+  runs and any other GPU the reference arms (`SUSHI_FORCE_GPU_FAMILY_FALLBACK=1` reproduces the old teacher). The
+  `teacher` flag, not `reference_numerics`, keeps the latent BF16 (`GlmTeacherLatentMustBeBf16`).
+- Weights stay as stored: the BF16 trunk needs no A6 dense-once (its linears are dense GEMMs already) and the KDA cluster
+  banks are BF16 for every pack; only the MLA head batches had an affine-only guard, now `run` takes BF16 `[64,256,512]` banks.
+- At standard4's lengths (chunk 512 dense prefill, ctx 2048) the capture engages HC prefill, KDA value rows, SIMD32 HC
+  collapse (all bit-exact against the staged chain) and B1 decode attention (the only changed numerics: FP32 composite
+  with block-masked GEMM instead of the scalar latent kernel).
+- Unreachable by shape, covered by arm tests only: KDA cluster and A6 dense-once need a 2048-row chunk (the capture's
+  chunk is at most 512), packed attention and NAX index scores need history past 2051, MLA head batches need a
+  non-dense chunk (also past 2051).
+- The capture's reserve bills the arms it takes (`glm5_stream.armsReserve`: cluster banks resident, each arm's scratch for
+  one pending layer); it is zero under the reference arms.
+- Routed BF16 experts are MLX `gather_mm` on every GPU; MLX picks its own kernel from the device.
 
 ## Ruled out
 
