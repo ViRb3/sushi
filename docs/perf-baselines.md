@@ -1709,3 +1709,7 @@ A6 trunk), same ladder: [v1.2.0 release bench](bench/v1.2.0/summary.md), decode 
 ## v1.2.0 release context ladder
 
 [Version summary and per-model reports](bench/v1.2.0/summary.md), 2026-10-07, Apple M5 Max 128 GB. llmprobe 0.6.15, `--bench-only` 2K–128K, 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, 3 minutes idle before each server. Qwen 2.6bpw/4bpw and MiMo 2.3bpw on `177c526f`, GLM 2.4bpw on `e26fd471`.
+
+## v1.2.1 release context ladder
+
+[Version summary and per-model reports](bench/v1.2.1/summary.md), 2026-10-08, Apple M5 Max 128 GB. llmprobe 0.6.15, `--bench-only` 2K–128K, 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, 3 minutes idle before each server. All four on `975a7694`.
