@@ -3372,3 +3372,33 @@ test "format corpus: GLM-5.3 gives a reasoning-less assistant turn an empty thin
     try testing.expect(std.mem.indexOf(u8, rendered, "<think></think>final answer") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "EARLIER_THOUGHT"));
 }
+
+test "format corpus: a history call whose arguments are not an object still renders its own template" {
+    // A template iterates `tool_call.arguments|items`; a non-object value raises, and the raise is a
+    // SILENT fallback that drops the call from the prompt.
+    const allocator = testing.allocator;
+    const templates = [_]struct { name: []const u8, tpl: []const u8 }{
+        .{ .name = "glm5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
+        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
+        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
+    };
+    const bad_args = [_][]const u8{ "", "null", "[]", "[1,2]", "5", "\"text\"", "not json", "{\"a\":" };
+    const before = chat.template_fallbacks.load(.monotonic);
+    for (templates) |t| {
+        var config = chat.ChatConfig{ .chat_template = t.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
+        for (bad_args) |args| {
+            const calls = [_]chat.ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = args }};
+            const messages = [_]chat.Message{
+                .{ .role = "user", .content = "Weather?" },
+                .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "r" },
+                .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
+            };
+            const rendered = try chat.renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+            defer allocator.free(rendered);
+            errdefer std.debug.print("\n[{s}] arguments={s}\n{s}\n", .{ t.name, args, rendered });
+            try testing.expectEqual(before, chat.template_fallbacks.load(.monotonic));
+            try testing.expect(std.mem.indexOf(u8, rendered, "get_weather") != null);
+        }
+    }
+}

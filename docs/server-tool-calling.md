@@ -46,7 +46,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A `chat_template` value can be a POINTER** (`{% include 'chat_template.jinja' %}`): `chat.isIncludeStub` reads it
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
 - A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`
-  stay OBJECTS; history tool_calls carry `"id"`; only a refusing template gets `noThinkTailSuffix`.
+  stay OBJECTS (a history call whose arguments are empty, null, an array, a scalar or malformed text embeds `{}`:
+  `arguments|items` on anything else raises into the silent fallback); history tool_calls carry `"id"`; only a refusing template gets `noThinkTailSuffix`.
 - **A system turn past index 0 renders where the template allows it**: a template that raises on it or drops it gets
   it folded into the leading system (`templateProbeRendersLateSystem`, every surface); MiMo's role loop keeps it in
   place, byte for byte. The fold rewrites every earlier byte of the prompt, so the two byte-pinned stock Qwen3.8
@@ -85,6 +86,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A `</think>` inside a tool ARGUMENT is payload** (`thinkCloseIsToolCallPayload`): decline a close whose nearest
   preceding tool opener is still OPEN AND whose block closes afterwards.
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched).
+  A property's types resolve through `type` arrays, `anyOf`/`oneOf` (every branch), `allOf` (first typed branch) and
+  a local `$ref` into `$defs`/`definitions` (depth-bounded); a value already fitting one candidate stays, else the
+  candidates are tried in declaration order (`collectJsonTypes`).
   Buried required params hoist only on all-schema-read unanimity. A container string with a key repeated at the SAME
   value still coerces (`parseContainerAllowingRepeats`). Heuristic raw-JSON inference must name a DECLARED tool
   (`filterInferredBySchema`).

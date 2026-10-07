@@ -1102,21 +1102,14 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
                 try buf.appendSlice(allocator, "\"function\":{\"name\":");
                 try appendJsonString(allocator, &buf, tc.name);
                 try buf.appendSlice(allocator, ",\"arguments\":");
-                // Embed arguments as a JSON OBJECT when it parses cleanly — Qwen
-                // 3.5/3.6 templates do `tool_call.arguments|items` which requires
-                // a dict. Templates that need a string (e.g. Gemma 4 with `tojson`
-                // or `string`) still get a usable value. Falls back to a string
-                // for malformed arguments so downstream still sees something.
-                if (std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{})) |parsed| {
+                // Templates iterate `arguments|items`, so anything but a JSON object
+                // (empty, null, an array, scalar or malformed text) would raise and
+                // silently drop the call from the prompt: embed `{}` instead.
+                const is_object = if (std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{})) |parsed| blk: {
                     defer parsed.deinit();
-                    if (parsed.value == .object) {
-                        try buf.appendSlice(allocator, tc.arguments);
-                    } else {
-                        try appendJsonString(allocator, &buf, tc.arguments);
-                    }
-                } else |_| {
-                    try appendJsonString(allocator, &buf, tc.arguments);
-                }
+                    break :blk parsed.value == .object;
+                } else |_| false;
+                try buf.appendSlice(allocator, if (is_object) tc.arguments else "{}");
                 try buf.appendSlice(allocator, "}}");
             }
             try buf.append(allocator, ']');
@@ -3934,11 +3927,14 @@ fn toolParametersFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMa
     return null;
 }
 
-fn toolPropertiesFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMap {
-    const params = toolParametersFor(tools, name) orelse return null;
+fn propertiesOf(params: std.json.ObjectMap) ?std.json.ObjectMap {
     const props = params.get("properties") orelse return null;
     if (props != .object) return null;
     return props.object;
+}
+
+fn toolPropertiesFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMap {
+    return propertiesOf(toolParametersFor(tools, name) orelse return null);
 }
 
 /// The types a misplaced value may be hoisted on. A required OBJECT/ARRAY param
@@ -3948,24 +3944,69 @@ fn isScalarJsonType(want: []const u8) bool {
         std.mem.eql(u8, want, "number") or std.mem.eql(u8, want, "boolean");
 }
 
-/// The JSON type a property declares. `"type"` may be a union array
-/// (`["string","null"]`) — the first non-null entry wins. Absent/odd → null,
-/// which means "leave the value alone".
-fn declaredJsonType(prop: std.json.Value) ?[]const u8 {
-    if (prop != .object) return null;
-    const t = prop.object.get("type") orelse return null;
-    switch (t) {
-        .string => |s| return s,
-        .array => |arr| {
-            for (arr.items) |item| {
-                if (item != .string) continue;
-                if (std.mem.eql(u8, item.string, "null")) continue;
-                return item.string;
-            }
-            return null;
-        },
-        else => return null,
+const SchemaTypes = struct {
+    items: [4][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *SchemaTypes, t: []const u8) void {
+        if (std.mem.eql(u8, t, "null") or self.len == self.items.len) return;
+        for (self.items[0..self.len]) |have| if (std.mem.eql(u8, have, t)) return;
+        self.items[self.len] = t;
+        self.len += 1;
     }
+
+    fn slice(self: *const SchemaTypes) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+const schema_ref_depth = 8;
+
+/// The non-null JSON types a property declares, in declaration order. `"type"` may be a union
+/// array; without one, `anyOf`/`oneOf` contribute every branch, `allOf` its first typed branch,
+/// and a local `$ref` into `$defs`/`definitions` of `root` its target. Odd/absent → empty,
+/// which means "leave the value alone".
+fn collectJsonTypes(prop: std.json.Value, root: std.json.ObjectMap, out: *SchemaTypes, depth: u8) void {
+    if (prop != .object or depth > schema_ref_depth) return;
+    if (prop.object.get("type")) |t| {
+        switch (t) {
+            .string => |s| out.add(s),
+            .array => |arr| for (arr.items) |item| if (item == .string) out.add(item.string),
+            else => {},
+        }
+        return;
+    }
+    if (prop.object.get("$ref")) |r| {
+        if (r != .string) return;
+        inline for (.{ "#/$defs/", "#/definitions/" }) |prefix| {
+            if (std.mem.startsWith(u8, r.string, prefix)) {
+                const defs = root.get(prefix[2 .. prefix.len - 1]) orelse return;
+                if (defs != .object) return;
+                if (defs.object.get(r.string[prefix.len..])) |target| collectJsonTypes(target, root, out, depth + 1);
+                return;
+            }
+        }
+        return;
+    }
+    inline for (.{ "anyOf", "oneOf" }) |key| {
+        if (prop.object.get(key)) |branches| {
+            if (branches == .array) for (branches.array.items) |b| collectJsonTypes(b, root, out, depth + 1);
+            return;
+        }
+    }
+    if (prop.object.get("allOf")) |branches| {
+        if (branches == .array) for (branches.array.items) |b| {
+            collectJsonTypes(b, root, out, depth + 1);
+            if (out.len > 0) return;
+        };
+    }
+}
+
+/// The first type a property declares (see `collectJsonTypes`), or null.
+fn declaredJsonType(prop: std.json.Value, root: std.json.ObjectMap) ?[]const u8 {
+    var types = SchemaTypes{};
+    collectJsonTypes(prop, root, &types, 0);
+    return if (types.len > 0) types.items[0] else null;
 }
 
 /// Tolerant boolean spelling — the union of what weak models actually emit:
@@ -4140,7 +4181,8 @@ pub fn toolCallConformsToSchema(
 ) bool {
     var tools = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return true;
     defer tools.deinit();
-    const props = toolPropertiesFor(tools.value, call.name) orelse return true;
+    const params = toolParametersFor(tools.value, call.name) orelse return true;
+    const props = propertiesOf(params) orelse return true;
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch return true;
     defer parsed.deinit();
@@ -4149,8 +4191,12 @@ pub fn toolCallConformsToSchema(
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         const prop = props.get(entry.key_ptr.*) orelse continue;
-        const want = declaredJsonType(prop) orelse continue;
-        if (!jsonTypeMatches(entry.value_ptr.*, want)) return false;
+        var types = SchemaTypes{};
+        collectJsonTypes(prop, params, &types, 0);
+        if (types.len == 0) continue;
+        for (types.slice()) |want| {
+            if (jsonTypeMatches(entry.value_ptr.*, want)) break;
+        } else return false;
     }
     return true;
 }
@@ -4182,7 +4228,7 @@ pub fn requiredParamIsBuried(
         if (req_v != .string) continue;
         const name = req_v.string;
         if (parsed.value.object.get(name) != null) continue;
-        const want = declaredJsonType(props.get(name) orelse continue) orelse continue;
+        const want = declaredJsonType(props.get(name) orelse continue, params) orelse continue;
         if (!isScalarJsonType(want)) continue;
 
         var it = parsed.value.object.iterator();
@@ -4230,7 +4276,8 @@ pub fn coerceToolArgsToSchema(
     if (tools.value != .array) return;
 
     for (calls) |*call| {
-        const props = toolPropertiesFor(tools.value, call.name) orelse continue;
+        const params = toolParametersFor(tools.value, call.name) orelse continue;
+        const props = propertiesOf(params) orelse continue;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch continue;
         defer parsed.deinit();
@@ -4253,8 +4300,19 @@ pub fn coerceToolArgsToSchema(
         var it = parsed.value.object.iterator();
         while (it.next()) |entry| {
             const prop = props.get(entry.key_ptr.*) orelse continue;
-            const want = declaredJsonType(prop) orelse continue;
-            const new_val = try coerceValueToType(allocator, entry.value_ptr.*, want, &owned, &docs) orelse continue;
+            var types = SchemaTypes{};
+            collectJsonTypes(prop, params, &types, 0);
+            if (types.len == 0) continue;
+            // Among several candidates a value that already fits one is kept.
+            if (types.len > 1) {
+                const fits = for (types.slice()) |want| {
+                    if (jsonTypeMatches(entry.value_ptr.*, want)) break true;
+                } else false;
+                if (fits) continue;
+            }
+            const new_val = for (types.slice()) |want| {
+                if (try coerceValueToType(allocator, entry.value_ptr.*, want, &owned, &docs)) |nv| break nv;
+            } else continue;
             entry.value_ptr.* = new_val;
             changed = true;
         }
@@ -4384,7 +4442,7 @@ pub fn hoistMisplacedRequiredParams(
             const name = req_v.string; // borrows from `tools`, which outlives the Stringify
             if (parsed.value.object.get(name) != null) continue; // present — nothing misplaced
 
-            const want = declaredJsonType(props.get(name) orelse continue) orelse continue;
+            const want = declaredJsonType(props.get(name) orelse continue, params) orelse continue;
             if (!isScalarJsonType(want)) continue;
 
             // Probe every declared container WITHOUT mutating: a value found in
@@ -10913,7 +10971,7 @@ test "serializeMessagesJson embeds valid-JSON arguments as object (not string)" 
     try testing.expect(std.mem.indexOf(u8, result, "\"arguments\":\"{") == null);
 }
 
-test "serializeMessagesJson keeps malformed arguments as string" {
+test "serializeMessagesJson embeds an empty object for malformed arguments" {
     const allocator = testing.allocator;
     const tool_calls = [_]ToolCall{
         .{ .id = "call_1", .name = "shell", .arguments = "not valid json" },
@@ -10923,7 +10981,7 @@ test "serializeMessagesJson keeps malformed arguments as string" {
     };
     const result = try serializeMessagesJson(allocator, &messages);
     defer allocator.free(result);
-    try testing.expect(std.mem.indexOf(u8, result, "\"arguments\":\"not valid json\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"arguments\":{}") != null);
 }
 
 test "serializeMessagesJson tool response has tool_call_id and content" {
@@ -12762,6 +12820,64 @@ test "coerceToolArgsToSchema: an unmodelled declared type leaves the value alone
     defer allocator.free(before);
     try coerceToolArgsToSchema(allocator, calls, tools);
     try testing.expectEqualStrings(before, calls[0].arguments);
+}
+
+test "coerceToolArgsToSchema: anyOf, oneOf, allOf and a local $ref resolve to a concrete type" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"S","parameters":{"type":"object","properties":{
+        \\"limit":{"anyOf":[{"type":"integer"},{"type":"null"}]},
+        \\"ratio":{"oneOf":[{"type":"null"},{"type":"number"}]},
+        \\"tags":{"allOf":[{"type":"array","items":{"type":"string"}}]},
+        \\"cfg":{"$ref":"#/$defs/Cfg"},
+        \\"deep":{"$ref":"#/definitions/Wrap"},
+        \\"flag":{"anyOf":[{"type":"boolean"},{"type":"string"}]},
+        \\"plain":{"type":"integer"},
+        \\"loop":{"$ref":"#/$defs/Loop"}},
+        \\"$defs":{"Cfg":{"type":"object"},"Loop":{"$ref":"#/$defs/Loop"}},
+        \\"definitions":{"Wrap":{"anyOf":[{"$ref":"#/$defs/Cfg"},{"type":"null"}]}}}}}]
+    ;
+    const raw = "<tool_call>S<arg_key>limit</arg_key><arg_value>5</arg_value>" ++
+        "<arg_key>ratio</arg_key><arg_value>0.5</arg_value>" ++
+        "<arg_key>tags</arg_key><arg_value>[\"a\",\"b\"]</arg_value>" ++
+        "<arg_key>cfg</arg_key><arg_value>{\"k\":1}</arg_value>" ++
+        "<arg_key>deep</arg_key><arg_value>{\"k\":2}</arg_value>" ++
+        "<arg_key>flag</arg_key><arg_value>no</arg_value>" ++
+        "<arg_key>plain</arg_key><arg_value>7</arg_value>" ++
+        "<arg_key>loop</arg_key><arg_value>5</arg_value></tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqual(@as(i64, 5), o.get("limit").?.integer);
+    try testing.expect(o.get("ratio").? == .float);
+    try testing.expectEqual(@as(usize, 2), o.get("tags").?.array.items.len);
+    try testing.expectEqual(@as(i64, 1), o.get("cfg").?.object.get("k").?.integer);
+    try testing.expectEqual(@as(i64, 2), o.get("deep").?.object.get("k").?.integer);
+    // A value the first branch cannot take but a later one matches is kept.
+    try testing.expectEqualStrings("no", o.get("flag").?.string);
+    try testing.expectEqual(@as(i64, 7), o.get("plain").?.integer);
+    // A self-referencing $ref terminates and leaves the value alone.
+    try testing.expect(o.get("loop") != null);
+}
+
+test "toolCallConformsToSchema: a value matching any anyOf branch conforms" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"S","parameters":{"type":"object","properties":{"v":{"anyOf":[{"type":"integer"},{"type":"string"}]}}}}}]
+    ;
+    const ok = ParsedToolCall{ .name = "S", .arguments = "{\"v\":\"abc\"}" };
+    try testing.expect(toolCallConformsToSchema(allocator, ok, tools));
+    const bad = ParsedToolCall{ .name = "S", .arguments = "{\"v\":[1]}" };
+    try testing.expect(!toolCallConformsToSchema(allocator, bad, tools));
 }
 
 test "convertGemma4 dedups a repeated key + escapes a key with special chars (valid JSON)" {
