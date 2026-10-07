@@ -1807,6 +1807,9 @@ pub const Scheduler = struct {
                 break;
             }
         }
+        // No new pass can take it (cancelled); wait out the one that has it. It stays in `decoding`
+        // meanwhile, so exclusive admission sees it until it reaches the cleanup queue.
+        waitPassesOut(self.io, &self.queue_mu, &slot.in_pass);
         i = 0;
         while (i < self.decoding.items.len) : (i += 1) {
             if (self.decoding.items[i] == slot) {
@@ -1814,9 +1817,6 @@ pub const Scheduler = struct {
                 break;
             }
         }
-
-        // Out of every list, so no new pass can take it; wait out the one that has it.
-        waitPassesOut(self.io, &self.queue_mu, &slot.in_pass);
 
         self.cleanup_queue.append(self.allocator, slot) catch {
             // OOM on the cleanup list — fall back to inline deinit. This
@@ -2509,6 +2509,25 @@ fn slotExclusiveDecode(slot: *const Slot) bool {
         slot.enable_mtp,
         if (slot.legacy_gen) |*g| g.mtpModuleHeadReleased() else false,
     );
+}
+
+/// A cancel can land after the tick's cull, and `complete()` moves a slot from `decoding` to
+/// `cleanup_queue` without a cull in between: until the inference thread has released it, the slot
+/// still owns its native state and keeps blocking exclusive admission.
+fn slotHoldsAdmission(slot: *const Slot) bool {
+    return !slot.finished and slot.error_code == null;
+}
+
+/// Exclusive slots in `lists` (decoding, then queued for cleanup) that still hold admission.
+fn heldExclusive(out: []AdmitCand, lists: []const []const *Slot, exclusive: *const fn (*const Slot) bool) usize {
+    var n: usize = 0;
+    for (lists) |list| for (list) |s| {
+        if (n >= out.len) return n;
+        if (!slotHoldsAdmission(s) or !exclusive(s)) continue;
+        out[n] = .{ .model = @intFromPtr(s.model), .exclusive = true };
+        n += 1;
+    };
+    return n;
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
@@ -5617,14 +5636,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // so a held slot admits on the first tick after the active one
             // is culled (step 5, same mutex).
             var live_buf: [32]AdmitCand = undefined;
-            var n_live: usize = 0;
-            for (sch.decoding.items) |s| {
-                if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
-                if (!slotExclusiveDecode(s)) continue;
-                if (n_live >= live_buf.len) break;
-                live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
-                n_live += 1;
-            }
+            const n_live = heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slotExclusiveDecode);
             var cand_buf: [32]AdmitCand = undefined;
             const n_cands = @min(sch.pending.items.len, cand_buf.len);
             for (sch.pending.items[0..n_cands], 0..) |s, i| {
@@ -10704,6 +10716,75 @@ test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
         try testing.expectEqual(@as(usize, 0), small[0]);
         try testing.expectEqual(@as(usize, 1), small[1]);
     }
+}
+
+test "a cancelled or queued-for-cleanup slot still blocks exclusive admission until released" {
+    const Fake = struct {
+        fn exclusive(_: *const Slot) bool {
+            return true;
+        }
+    };
+    var model: LoadedModel = undefined;
+    var live: Slot = undefined;
+    var cancelled: Slot = undefined;
+    var queued: Slot = undefined;
+    var finished: Slot = undefined;
+    for ([_]*Slot{ &live, &cancelled, &queued, &finished }) |s| {
+        s.model = &model;
+        s.finished = false;
+        s.error_code = null;
+        s.cancelled = .init(false);
+    }
+    cancelled.cancelled.store(true, .release);
+    finished.finished = true;
+    var out: [8]AdmitCand = undefined;
+    const decoding = [_]*Slot{ &live, &cancelled, &finished };
+    const cleanup = [_]*Slot{&queued};
+    try testing.expectEqual(@as(usize, 3), heldExclusive(&out, &.{ &decoding, &cleanup }, Fake.exclusive));
+    try testing.expectEqual(@as(usize, 0), heldExclusive(&out, &.{ &.{}, &.{} }, Fake.exclusive));
+}
+
+test "complete keeps a slot in decoding until its pass is out, so admission never misses it" {
+    const allocator = testing.allocator;
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    defer sch.pending.deinit(allocator);
+    defer sch.decoding.deinit(allocator);
+    defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
+    var cfg = try model_mod.parseConfigFromJson(allocator, @embedFile("fixtures/glm5_config.json"));
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    model.prefix_cache = null;
+    const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
+    _ = sch.pending.orderedRemove(0);
+    try sch.decoding.append(allocator, slot);
+    _ = slot.in_pass.fetchAdd(1, .acq_rel);
+    const t = try std.Thread.spawn(.{}, Scheduler.complete, .{ &sch, slot });
+    std.Io.sleep(testing.io, .fromMilliseconds(30), .real) catch {};
+    sch.queue_mu.lockUncancelable(sch.io);
+    const visible = sch.decoding.items.len + sch.cleanup_queue.items.len;
+    sch.queue_mu.unlock(sch.io);
+    _ = slot.in_pass.fetchSub(1, .acq_rel);
+    t.join();
+    try testing.expectEqual(@as(usize, 1), visible);
+    try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
+    try testing.expectEqual(@as(usize, 1), sch.cleanup_queue.items.len);
+    while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
 }
 
 test "inferenceLoop pending drain routes through admitPendingTick" {

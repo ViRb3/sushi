@@ -184,6 +184,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A GLM slot owns its `glm5_forward.Request`** (`Slot.glm5_request`, handed to the forward as
   `ForwardCtx.glm5_request`; a GLM forward without one is `GlmRequestMissing`), so GLM requests share a model; only a
   streamed GLM load stays exclusive. The boot line and `/props batching.reason` (`ok` vs `exclusive`) say which.
+- **An exclusive slot blocks admission until the inference thread releases it** (`heldExclusive`: `decoding` plus
+  `cleanup_queue`; `complete()` keeps a slot in `decoding` until its pass is out): a disconnect must not let the next
+  request prefill while the slot still owns the stream (`GlmStreamRequestBusy`).
 - **A plain batched tick stop-checks a slot with no pipeline state** (`batchEntryStops`) before forwarding its pending
   token: a fresh DFlash2 slot whose prefill sampled EOS finishes `stop` with nothing published, as solo does.
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel
