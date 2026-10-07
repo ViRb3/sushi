@@ -196,9 +196,18 @@ pub const Grammar = struct {
         return self.dead;
     }
 
-    /// True once the root value has been fully parsed. (Trailing whitespace allowed.)
+    /// True once the root value has been fully parsed. A root number has no
+    /// closing byte, so it is complete as soon as it could end.
     pub fn isComplete(self: *const Grammar) bool {
-        return self.stack.items.len == 1 and self.stack.items[0].sub == .accepted;
+        if (self.stack.items.len != 1) return false;
+        return switch (self.stack.items[0].sub) {
+            .accepted => true,
+            .in_number => |n| switch (n.phase) {
+                .leading_zero, .int_digits, .frac_digits, .exp_digits => true,
+                .after_minus, .after_dot, .after_exp, .after_exp_sign => false,
+            },
+            else => false,
+        };
     }
 
     /// Bytes still admissible in the string body the next byte lands in
@@ -456,6 +465,8 @@ fn stepString(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
                 return .consumed;
             }
             if (byte == '\\') {
+                // An escape counts as one byte: none fits once the body is full.
+                if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
                 s.phase = .after_backslash;
                 g.top().sub = .{ .in_string = s };
                 return .consumed;
@@ -653,6 +664,8 @@ fn stepObject(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
                 return .consumed;
             }
             if (byte != '"') return .reject;
+            // A key with no property left to match and no free-form keys is a dead end.
+            if (!schema.obj_additional and allPropertiesSeen(schema, o.seen)) return .reject;
             o.phase = .in_key;
             o.key_len = 0;
             g.top().sub = .{ .in_object = o };
@@ -800,6 +813,7 @@ fn stepArray(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
         },
         .after_value => {
             if (byte == ',') {
+                if (schema.arr_max_items) |max| if (a.count >= max) return .reject;
                 a.phase = .expect_value;
                 g.top().sub = .{ .in_array = a };
                 return .consumed;
@@ -1186,4 +1200,153 @@ test "free whitespace is capped so a masked model cannot idle forever" {
 
     try feed(&g, "\"x\":1}");
     try testing.expect(g.isComplete());
+}
+
+fn expectLegal(g: *Grammar, byte: u8, legal: bool) !void {
+    const mask = try g.allowedBytes();
+    try testing.expectEqual(legal, mask.contains(byte));
+}
+
+// A number has no closing byte: its end is the stream's end, so a terminable
+// root number must accept EOS or the mask leaves only more digits.
+test "a terminable root number is complete" {
+    var integer = try parseSchema(testing.allocator, "{\"type\":\"integer\"}");
+    defer integer.deinit();
+    var g = try Grammar.init(testing.allocator, &integer);
+    defer g.deinit();
+    try testing.expect(!g.isComplete());
+    try feed(&g, "-");
+    try testing.expect(!g.isComplete());
+    try feed(&g, "4");
+    try testing.expect(g.isComplete());
+    try feed(&g, "2");
+    try testing.expect(g.isComplete());
+    try expectLegal(&g, '.', false);
+
+    var number = try parseSchema(testing.allocator, "{\"type\":\"number\"}");
+    defer number.deinit();
+    inline for (.{ "0", "12", "1.5", "-1.5e3", "2E+10" }) |text| {
+        var n = try Grammar.init(testing.allocator, &number);
+        defer n.deinit();
+        try feed(&n, text);
+        try testing.expect(n.isComplete());
+    }
+    inline for (.{ "-", "1.", "1e", "1e+" }) |text| {
+        var n = try Grammar.init(testing.allocator, &number);
+        defer n.deinit();
+        try feed(&n, text);
+        try testing.expect(!n.isComplete());
+    }
+}
+
+test "a nested number is not complete before its parent closes" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"array\",\"items\":{\"type\":\"integer\"}}");
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "[42");
+    try testing.expect(!g.isComplete());
+    try feed(&g, "]");
+    try testing.expect(g.isComplete());
+}
+
+test "root keyword and string values complete on their last byte" {
+    inline for (.{
+        .{ "{\"type\":\"boolean\"}", "true" },
+        .{ "{\"type\":\"boolean\"}", "false" },
+        .{ "{\"type\":\"null\"}", "null" },
+        .{ "{\"type\":\"string\"}", "\"hi\"" },
+    }) |case| {
+        var schema = try parseSchema(testing.allocator, case[0]);
+        defer schema.deinit();
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, case[1]);
+        try testing.expect(g.isComplete());
+    }
+}
+
+test "a full array offers only its closing bracket" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"array","items":{"type":"integer"},"maxItems":3}
+    );
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "[1,2,3");
+    try expectLegal(&g, ',', false);
+    try feed(&g, "]");
+    try testing.expect(g.isComplete());
+}
+
+test "an object with no admissible key offers only its closing brace" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{");
+    try expectLegal(&g, '"', false);
+    try feed(&g, "}");
+    try testing.expect(g.isComplete());
+}
+
+test "a string at maxLength offers only its closing quote" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"string","maxLength":2}
+    );
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "\"a\\n");
+    try expectLegal(&g, '\\', false);
+    try expectLegal(&g, 'b', false);
+    try feed(&g, "\"");
+    try testing.expect(g.isComplete());
+}
+
+// Every state the grammar can reach has a legal byte or is a finished root.
+test "no reachable grammar state is a dead end" {
+    const schemas = [_][]const u8{
+        "{\"type\":\"integer\"}",
+        "{\"type\":\"number\"}",
+        "{\"type\":\"object\"}",
+        "{\"type\":\"object\",\"additionalProperties\":true}",
+        "{\"type\":\"array\",\"maxItems\":2}",
+        "{\"type\":\"array\",\"items\":{\"type\":\"object\"},\"minItems\":1,\"maxItems\":2}",
+        "{\"type\":\"string\",\"minLength\":1,\"maxLength\":3}",
+        "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"maxLength\":2},\"b\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"maxItems\":2}},\"required\":[\"a\"]}",
+        "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"object\"},\"b\":{\"type\":\"boolean\"}},\"required\":[\"a\",\"b\"]}",
+        "{\"type\":\"array\",\"items\":{\"enum\":[\"x\",\"yz\",3]},\"maxItems\":3}",
+        "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"},\"ab\":{\"type\":\"null\"}},\"required\":[\"a\",\"ab\"]}",
+        "{\"type\":\"array\",\"items\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"maxLength\":1},\"maxItems\":1},\"minItems\":1}",
+        "{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"string\"}]}",
+    };
+    for (schemas) |src| {
+        var schema = try parseSchema(testing.allocator, src);
+        defer schema.deinit();
+        var seed: u64 = 0;
+        while (seed < 200) : (seed += 1) {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            var g = try Grammar.init(testing.allocator, &schema);
+            defer g.deinit();
+            var steps: usize = 0;
+            while (steps < 300 and !g.isComplete()) : (steps += 1) {
+                const mask = try g.allowedBytes();
+                var legal: [256]u8 = undefined;
+                var n: usize = 0;
+                for (0..256) |b| {
+                    if (mask.contains(@intCast(b)) and !isWs(@intCast(b))) {
+                        legal[n] = @intCast(b);
+                        n += 1;
+                    }
+                }
+                if (n == 0) {
+                    std.debug.print("dead end: schema {s} seed {d} step {d}\n", .{ src, seed, steps });
+                    return error.GrammarDeadEnd;
+                }
+                try testing.expect(try g.acceptByte(legal[rnd.uintLessThan(usize, n)]));
+            }
+        }
+    }
 }

@@ -11882,7 +11882,14 @@ pub const Generator = struct {
             }
         }
         if (allowed == 0) {
-            log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+            // 0 legal bytes is a grammar dead end; otherwise the vocabulary lacks a token for them.
+            const legal_bytes = blk: {
+                const m = constraint.grammar.allowedBytes() catch break :blk 0;
+                var n: u32 = 0;
+                for (m.bits) |w| n += @popCount(w);
+                break :blk n;
+            };
+            log.warn("[grammar] no token satisfies the schema at this position ({d} legal bytes) — disabling further mask enforcement\n", .{legal_bytes});
             constraint.grammar.dead = true;
             @memset(constraint.mask_buf, true);
         }

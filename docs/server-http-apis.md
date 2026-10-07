@@ -186,6 +186,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - The payload offset is AUTHORITATIVE (`reasoning_protocol.Delivery`, all surfaces, stream + non-stream).
 - The grammar mask never walks the whole vocabulary (`token_mask.buildMask`); every grammar state has a legal byte;
   no whitespace OUTSIDE the root value, the model's OWN layout inside (`MAX_FREE_WS` 16).
+- A root number ends only at EOS, so it is complete once terminable; the empty-mask disable in `nextConstrainedToken`
+  is the logged last resort (a new dead end gets a schema in the `no reachable grammar state is a dead end` test).
 - Every schema-mask surface uses ONE thinking policy (`schemaMasksThinking`); tools present = no mask. Per-model
   grammar table lives on `LoadedModel`.
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
