@@ -4,11 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-  # PR builds run the FULL packaging pipeline — sign, notarize, tarball — and
-  # upload the result as a workflow artifact. They never tag and never create
-  # a GitHub release (step gates below). Fork PRs skip the whole job (no
-  # access to signing secrets — job-level `if`).
-  pull_request:
   workflow_dispatch:
     inputs:
       dry_run:
@@ -20,17 +15,13 @@ on:
         type: boolean
         default: false
 
-# A PR force-push mid-notarization should cancel the stale run; release runs
-# (tag push / dispatch) are never cancelled.
+# Pull requests run ci.yml only. Release runs (tag push / dispatch) are never cancelled.
 concurrency:
-  group: release-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    # Fork PRs have no signing/notarization secrets — skip cleanly instead of
-    # dying at the certificate import.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # macos-26 (Tahoe): the runner SDK the shipped binary is built against.
     runs-on: macos-26
     permissions:
@@ -138,13 +129,6 @@ jobs:
             fi
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            # PR package: never tagged, never released; only names the
-            # artifact and --version output. The g keeps an all-digit short
-            # sha a valid SemVer identifier.
-            VERSION="${BASE}-pr${{ github.event.pull_request.number }}.g$(git rev-parse --short HEAD)"
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "tag=" >> "$GITHUB_OUTPUT"
           else
             VERSION="${GITHUB_REF_NAME#v}"
             tag_version_ok "$VERSION" "$BASE" \
@@ -178,9 +162,6 @@ jobs:
         run: bash tests/test_mlx_staged_nax.sh
 
       - name: Run Zig tests
-        # PR commits already run the identical suite in ci.yml — don't pay for
-        # it twice; releases keep the belt-and-braces run.
-        if: github.event_name != 'pull_request'
         run: zig build test -Doptimize=ReleaseFast --summary all
 
       # ── CLI tarball (standalone binary + libs) ──
@@ -286,7 +267,7 @@ jobs:
       # matches what we already wrote by hand instead of GitHub's auto-generated
       # commit list.
       - name: Extract changelog entry
-        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
+        if: ${{ !inputs.dry_run }}
         id: changelog
         run: |
           ENTRY=$(awk '
@@ -303,7 +284,7 @@ jobs:
       # The release is created as a DRAFT so its assets can be checked before
       # anyone can download them.
       - name: Create Release
-        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -314,12 +295,10 @@ jobs:
             sushi-bin-macos-arm64.tar.gz
             sushi-bin-macos-arm64.tar.gz.sha256
 
-      - name: Upload PR / dry-run artifacts
-        if: ${{ inputs.dry_run || github.event_name == 'pull_request' }}
+      - name: Upload dry-run artifacts
+        if: ${{ inputs.dry_run }}
         uses: actions/upload-artifact@v4
         with:
-          # PR versions embed the PR number + SHA, so the name is unambiguous
-          # either way (e.g. package-1.0.0-pr12.gabc1234 / package-1.0.0).
           name: package-${{ steps.version.outputs.version }}
           path: |
             sushi-bin-macos-arm64.tar.gz

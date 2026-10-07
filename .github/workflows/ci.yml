@@ -1,6 +1,6 @@
 name: CI
 
-# Build + test on every PR, plus manual dispatch. A direct push to main does
+# Build + test on every PR (the only workflow a PR runs), plus manual dispatch. A direct push to main does
 # NOT trigger it: that path gates nobody, and it is worth a 90-minute macOS
 # runner. Add `workflow_dispatch` runs from the Actions tab when a push needs
 # the suite. Mirrors the build/test portion of release.yml (same macos-26

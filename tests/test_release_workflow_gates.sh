@@ -1,12 +1,10 @@
 #!/bin/bash
 # Static guard for .github/workflows/release.yml event gating.
 #
-# The release workflow triples as (1) the tag/dispatch RELEASE pipeline,
-# (2) the dry-run packaging check, and (3) the PR packaging build that
-# signs + notarizes the CLI tarball WITHOUT releasing. The class of bug this
-# pins: someone edits a step's `if:` and a PR suddenly creates a tag or a
-# GitHub release — or the opposite, PR builds silently stop notarizing and
-# the artifact regresses to unsigned.
+# The release workflow doubles as (1) the tag/dispatch RELEASE pipeline and
+# (2) the dry-run packaging check. Pull requests run ci.yml alone, one macOS
+# job per PR. The class of bug this pins: someone edits a step's `if:` and a
+# dry run creates a tag or a GitHub release.
 #
 # Hermetic — parses the YAML, no network, no runners.
 set -euo pipefail
@@ -28,16 +26,11 @@ wf = yaml.safe_load(open(".github/workflows/release.yml"))
 
 # YAML 1.1 parses the bare key `on` as boolean True.
 triggers = wf.get("on", wf.get(True, {}))
-check("pull_request" in triggers, "pull_request trigger present")
+check("pull_request" not in triggers, "no pull_request trigger: a PR runs ci.yml alone")
 check("push" in triggers and "workflow_dispatch" in triggers,
       "tag-push + workflow_dispatch triggers still present")
 
 job = wf["jobs"]["build"]
-
-# Fork PRs have no secrets — the job must skip itself, not fail at cert import.
-job_if = str(job.get("if", ""))
-check("github.event.pull_request.head.repo.full_name == github.repository" in job_if,
-      "job-level fork-PR guard present")
 
 steps = {s.get("name", ""): s for s in job["steps"]}
 
@@ -45,10 +38,9 @@ def step_if(name):
     check(name in steps, f"step exists: {name}")
     return str(steps.get(name, {}).get("if", ""))
 
-# Release-only steps must be OFF for PRs.
+# Release-only steps must be OFF for a dry run.
 rel_if = step_if("Create Release")
-check("pull_request" in rel_if and "!=" in rel_if,
-      "Create Release gated off for pull_request")
+check("!inputs.dry_run" in rel_if, "Create Release gated off for a dry run")
 check("workflow_dispatch" in step_if("Create tag (manual dispatch)"),
       "tag creation restricted to workflow_dispatch")
 
@@ -73,10 +65,6 @@ check(rel_with.get("draft") in (True, "true"),
       "the release is still created as a draft")
 check("prerelease" not in rel_with,
       "the workflow never sets the prerelease flag itself (manual, by design)")
-
-# Notarization must RUN on PRs — its gate may exclude dry_run but never PRs.
-check("pull_request" not in step_if("Notarize CLI"),
-      "Notarize CLI not excluded on pull_request")
 
 # Without the Apple secrets the release ships ad-hoc signed: every Developer ID step is gated on the
 # secrets being present, and packaging falls back to an ad-hoc signature instead of failing.
@@ -107,20 +95,22 @@ nax_steps = [s for s in job["steps"]
              if "test_mlx_staged_nax.sh" in str(s.get("run", ""))]
 check(len(nax_steps) == 1, "NAX metallib static guard step present")
 check(nax_steps and "if" not in nax_steps[0],
-      "NAX guard unconditional (runs on every event incl. PRs)")
+      "NAX guard unconditional (runs on every event)")
 
 # A public release must not ship a tracked file naming a development box's directories.
 path_steps = [s for s in job["steps"]
               if "test_no_local_paths.sh" in str(s.get("run", ""))]
 check(len(path_steps) == 1, "local-path guard step present")
 check(path_steps and "if" not in path_steps[0],
-      "local-path guard unconditional (runs on every event incl. PRs)")
+      "local-path guard unconditional (runs on every event)")
 
-# The PR build's output must be uploaded as an artifact.
+# A dry run's output must be uploaded as an artifact.
 upload = [s for s in job["steps"]
           if s.get("uses", "").startswith("actions/upload-artifact")]
-check(any("pull_request" in str(s.get("if", "")) for s in upload),
-      "artifact upload covers pull_request")
+check(any("inputs.dry_run" in str(s.get("if", "")) for s in upload),
+      "artifact upload covers a dry run")
+check("pull_request" not in open(".github/workflows/release.yml").read(),
+      "release.yml has no pull_request branch left")
 
 # ── SemVer. build.zig.zon's `.version` is the one version source; the version
 # step sources release.sh so a dispatch and a tag push apply the same checks
@@ -185,7 +175,7 @@ sha_steps = [s for s in job["steps"]
 check(len(sha_steps) == 1 and "if" not in sha_steps[0], "every build writes the tarball's .sha256")
 check(f"{tarball}.sha256" in str(rel_with.get("files", "")), "the release publishes the .sha256")
 check(any(f"{tarball}.sha256" in str(s.get("with", {}).get("path", "")) for s in upload),
-      "PR / dry-run artifacts carry the .sha256")
+      "dry-run artifacts carry the .sha256")
 
 # The packaging step copies them, so a tree without them cannot cut a release.
 for f in ("LICENSE", "LICENSE-APACHE-2.0", "NOTICE"):
