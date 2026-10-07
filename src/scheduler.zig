@@ -4272,7 +4272,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         streaming_resident_bytes = streaming_resident_bytes.? +| assistant_bytes;
         if (assistant_bytes > 0) log.info("[glm-dflash] resident assistant {d:.3} GiB; window {d} MiB; BF16 context; verification scratch billed per request\n", .{ @as(f64, @floatFromInt(assistant_bytes)) / (1024 * 1024 * 1024), params.config.glm_dflash_window_bytes >> 20 });
         if (drafter_dir.len == 0 and !params.no_drafter and !params.config.expert_streaming)
-            log.warn("[glm-dflash] off: no assistant found (expected {s}/{s}); re-run `sushi pull` to fetch it\n", .{ params.model_dir, dflash_mod.SHIPPED_GLM_SUBDIR });
+            log.warn("[glm-dflash] off: no assistant found (expected {s}/{s}, or an intact {s}/{s} cache); re-run `sushi pull` to fetch it\n", .{ params.model_dir, dflash_mod.SHIPPED_GLM_SUBDIR, params.model_dir, dflash_mod.DFLASH2_IN_DIR_SUBDIR });
     }
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup

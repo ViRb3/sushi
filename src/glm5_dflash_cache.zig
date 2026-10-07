@@ -101,9 +101,13 @@ pub fn cacheValid(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, direc
     if (format != .string or !std.mem.eql(u8, format.string, schema) or saved != .string or bytes != .integer or mtime != .integer) return false;
     const source = std.fs.path.join(a, &.{ model_dir, draft.SHIPPED_GLM_SUBDIR }) catch return false;
     defer a.free(source);
-    const identity = sourceIdentity(io, a, source) catch return false;
     const stat = dir.statFile(io, "model.safetensors", .{}) catch return false;
-    return std.mem.eql(u8, saved.string, &identity) and bytes.integer == stat.size and mtime.integer == stat.mtime.nanoseconds;
+    if (bytes.integer != stat.size or mtime.integer != stat.mtime.nanoseconds) return false;
+    // A deleted source cannot be re-checked: the intact cache is the assistant.
+    var source_dir = std.Io.Dir.openDirAbsolute(io, source, .{}) catch |err| return err == error.FileNotFound;
+    source_dir.close(io);
+    const identity = sourceIdentity(io, a, source) catch return false;
+    return std.mem.eql(u8, saved.string, &identity);
 }
 
 pub const Prepared = struct { path: []u8, generated: bool = false, fallback: bool = false };
@@ -405,4 +409,63 @@ test "GLM runtime cache uses unchanged BF16 when disk space cannot fit the cache
     try std.testing.expect(result.fallback and !result.generated);
     try std.testing.expectEqualStrings(source, result.path);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "dflash2", .{}));
+}
+
+test "GLM runtime cache stays valid after the source folder is deleted" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const parent = path_buf[0..n];
+    const s = mlx.gpuStream();
+    const source = try tinySource(io, a, tmp.dir, parent, s);
+    defer a.free(source);
+    const made = try prepare(io, a, source, s);
+    defer a.free(made.path);
+    try tmp.dir.deleteTree(io, draft.SHIPPED_GLM_SUBDIR);
+    try std.testing.expect(cacheValid(io, a, parent, made.path));
+    const found = draft.resolveInDirDrafter(io, a, parent) orelse return error.TestExpectedInDirDrafter;
+    defer a.free(found);
+    try std.testing.expectEqualStrings(made.path, found);
+}
+
+test "GLM runtime cache is invalid when a present source changed" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const parent = path_buf[0..n];
+    const s = mlx.gpuStream();
+    const source = try tinySource(io, a, tmp.dir, parent, s);
+    defer a.free(source);
+    const made = try prepare(io, a, source, s);
+    defer a.free(made.path);
+    var from = try std.Io.Dir.openDirAbsolute(io, source, .{});
+    defer from.close(io);
+    try from.writeFile(io, .{ .sub_path = "config.json", .data = "{\"architectures\":[\"DFlash2DraftModel\"],\"hidden_size\":128,\"changed\":true,\"dflash_config\":{\"block_size\":8,\"mask_token_id\":31,\"target_layer_ids\":[1,3]}}" });
+    try std.testing.expect(!cacheValid(io, a, parent, made.path));
+}
+
+test "GLM runtime cache with damaged weights is invalid even when the source is gone" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const parent = path_buf[0..n];
+    const s = mlx.gpuStream();
+    const source = try tinySource(io, a, tmp.dir, parent, s);
+    defer a.free(source);
+    const made = try prepare(io, a, source, s);
+    defer a.free(made.path);
+    try tmp.dir.deleteTree(io, draft.SHIPPED_GLM_SUBDIR);
+    var cache = try std.Io.Dir.openDirAbsolute(io, made.path, .{});
+    defer cache.close(io);
+    try cache.writeFile(io, .{ .sub_path = "model.safetensors", .data = "truncated" });
+    try std.testing.expect(!cacheValid(io, a, parent, made.path));
 }

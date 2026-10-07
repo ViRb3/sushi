@@ -92,7 +92,8 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **First-load cache**: when only the released BF16 `GLM-5.3-Flash-DFlash2/` exists, `serve` and `run` quantize its
   matrices once to A4 group-64 with MLX's affine quantizer into `dflash2/` (selector codebooks, selector hidden
   projection and non-matrix tensors stay BF16), under a per-pack lock, staged and synced before publication, and
-  invalidated by source/config identity. 2.18 GiB → 0.721 GiB. No space or no write permission
+  invalidated by source/config identity, but an intact cache (size and mtime match its manifest) stays valid once
+  the source folder is deleted. 2.18 GiB → 0.721 GiB. No space or no write permission
   falls back to the BF16 assistant and reruns preflight with its full size. The cache is local only: the assistant's
   CC BY-NC-ND 4.0 license is unchanged and the cache is no redistribution artifact.
 - **Stored formats**: BF16, or one uniform affine format per assistant: A4 g64, A6 g128 or A8 g128 (anything else is
