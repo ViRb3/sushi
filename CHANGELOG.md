@@ -6,36 +6,24 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## v1.2.0 — GLM-5.3-Flash, 32 GB streaming, zero-RAM prompt cache
 
-- **GLM-5.3-Flash joins Qwen3.8 and MiMo**: serve it, chat with `sushi run`, or drive it from the coding-agent
-  launchers. The 2.4bpw Sushi pack targets 128 GB Macs (KLD 0.074 against the BF16 model); up to four requests decode
-  together, a DFlash2 assistant drafts long verbatim spans four tokens per round, image and video input work, and
-  M1–M4 Macs keep its fused kernels.
-- **Streaming with MTP: Qwen3.8 on a 32 GB Mac at about 20 tok/s**: `--ssd-budget-gb` streams any model's experts
-  from the SSD, so GLM-5.3, MiMo and Qwen3.8 run on Macs smaller than the pack, vision included. Streamed Qwen packs
-  now decode with MTP by default, and Sushi-2bpw on a 32 GB Mac decodes about twice as fast as in v1.1.1 — thanks
-  @gomezvd.
-- **The prompt cache needs 0 GB of RAM**: seen prompts are reused across turns from an SSD cache that is on by default
-  and sizes itself (at most 20 GB, always leaving 4 GB of disk free), so every GiB of memory goes to the model and its
-  context. RAM retention is now opt-in with `--prefix-cache-mem`. A long prompt is saved whole on its first turn, so
-  the next turn restores all of it, and the web UI shows the cache's use.
-- **Faster, also under concurrency**: concurrent requests decode together on every model (MiMo and GLM batch up to
-  four streams; concurrent Qwen requests run as one forward with byte-identical answers). MiMo 2.3bpw decodes about
-  12% and prefills about 15% faster, Qwen3.8-Flash-Next prefills faster, and Sushi-2.6bpw decodes 12–15% faster per
-  forward than v1.1.1 (fixing a v1.1.1 regression). On the M5 Max, GLM's DFlash2 verification takes about 11% less
-  time with a further 9% or so from expert reuse and fused kernels, and fixed-depth drafting about 12% less.
-- **Better agent and API behaviour**: `sushi launch grok` is new and opencode 2.x works again; stop sequences end
-  generation as soon as they complete; streamed and non-streamed answers match byte for byte; presence, frequency and
-  repeat penalties take effect (with the `repetition_penalty` alias); `ignore_eos` works on `/v1/completions`;
-  requests that omit effort inherit the configured `--think` budget; GLM conversation history renders exactly as its
-  reference chat template. New flags: `--mtp-min-depth`/`--mtp-max-depth` (replacing `--mtp-depth`),
-  `--no-mtp-lookup`, `--gpu-warm-secs` and experimental logit biases from a file; `--wired-margin-gib` now defaults
-  to 4 GiB.
-- **More reliable**: memory admission, the SSD prompt cache and request metrics were hardened; long GLM sessions no
-  longer hang, leak or overrun memory; GLM index scoring respects M1–M4 threadgroup limits; concurrent responses get
-  distinct IDs; and an idle streamed server no longer burns CPU.
+- **GLM-5.3-Flash**: the new Sushi-2.4bpw pack runs on 128 GB Macs (KLD 0.074 against the BF16 model) with image and
+  video input, the full 1M context and DFlash2 drafting: 42–55 tok/s decode on an M5 Max. Up to four requests decode
+  together.
+- **Streaming with MTP**: `--ssd-budget-gb` streams any model's experts from the SSD, so Qwen3.8 Sushi-2bpw runs on a
+  32 GB Mac at about 20 tok/s.
+- **Prompt cache with 0 GB of RAM**: prompts are reused across turns from an SSD cache that sizes itself (up to 20 GB);
+  keeping them in RAM is now opt-in with `--prefix-cache-mem`.
+- **Faster**: MiMo decodes about 12% and prefills about 15% faster, Qwen3.8-Flash-Next prefills faster, and concurrent
+  requests decode together on every model.
+- **Agents and API**: `sushi launch grok` is new and opencode 2.x works again; streamed and non-streamed answers match
+  byte for byte; penalties, `repetition_penalty` and `ignore_eos` work; GLM history renders exactly as its template.
+- **Flags**: `--mtp-min-depth`/`--mtp-max-depth` replace `--mtp-depth`; new `--no-mtp-lookup` and `--gpu-warm-secs`;
+  `--wired-margin-gib` defaults to 4 GiB.
+- **Reliability**: long GLM sessions, memory pressure and restarts are handled cleanly, and an idle streamed server no
+  longer uses CPU.
 
-Thanks @cnsiva for the request-budget defaults and repetition-penalty alias, @jasontitus for unique response IDs, the
-M1–M4 GLM scorer fix and portable GLM regression tests, and @ShoichiTect for parking idle SSD-read workers.
+Thanks @cnsiva (request-budget defaults, `repetition_penalty`), @jasontitus (unique response IDs, the M1–M4 GLM fix,
+portable GLM tests), @ShoichiTect (idle SSD-read workers) and @gomezvd (MTP on streamed Qwen).
 
 ---
 
