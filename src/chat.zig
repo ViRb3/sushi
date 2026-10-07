@@ -1013,6 +1013,33 @@ fn synthesizeToolFallbackMessages(
 /// everywhere the template branches on it.
 pub const EmptyContent = enum { null_literal, empty_string };
 
+/// Deepest `{`/`[` nesting a JSON request may carry: the recursive consumers (echo, schema, template) have no cap of their own.
+pub const max_json_nesting: usize = 256;
+
+pub fn jsonNestingExceeds(body: []const u8, limit: usize) bool {
+    const first = std.mem.indexOfNone(u8, body, " \t\r\n") orelse return false;
+    if (body[first] != '{' and body[first] != '[') return false;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (body[first..]) |c| {
+        if (in_string) {
+            if (escaped) escaped = false else if (c == '\\') escaped = true else if (c == '"') in_string = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{', '[' => {
+                depth += 1;
+                if (depth > limit) return true;
+            },
+            '}', ']' => depth -|= 1,
+            else => {},
+        }
+    }
+    return false;
+}
+
 pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message) ![]const u8 {
     return serializeMessagesJsonOpts(allocator, messages, .null_literal);
 }
@@ -1103,9 +1130,10 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
                 try appendJsonString(allocator, &buf, tc.name);
                 try buf.appendSlice(allocator, ",\"arguments\":");
                 // Templates iterate `arguments|items`, so anything but a JSON object
-                // (empty, null, an array, scalar or malformed text) would raise and
-                // silently drop the call from the prompt: embed `{}` instead.
-                const is_object = if (std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{})) |parsed| blk: {
+                // (empty, null, an array, scalar, malformed or over-nested text) would
+                // raise or recurse unbounded: embed `{}` instead.
+                const is_object = !jsonNestingExceeds(tc.arguments, max_json_nesting) and
+                    if (std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{})) |parsed| blk: {
                     defer parsed.deinit();
                     break :blk parsed.value == .object;
                 } else |_| false;
@@ -15558,4 +15586,37 @@ test "a template that raises counts one generic fallback" {
     const rendered = try renderChatTemplate(testing.allocator, &.{.{ .role = "user", .content = "hi" }}, &config, null, null, true, null, false);
     defer testing.allocator.free(rendered);
     try testing.expectEqual(before + 1, template_fallbacks.load(.monotonic));
+}
+
+test "request nesting limit rejects deep JSON bodies only" {
+    const a = testing.allocator;
+    const deep = try a.alloc(u8, 2 * (max_json_nesting + 1));
+    defer a.free(deep);
+    @memset(deep[0 .. max_json_nesting + 1], '[');
+    @memset(deep[max_json_nesting + 1 ..], ']');
+    try testing.expect(jsonNestingExceeds(deep, max_json_nesting));
+
+    const ok = try a.alloc(u8, 2 * 64);
+    defer a.free(ok);
+    @memset(ok[0..64], '[');
+    @memset(ok[64..], ']');
+    try testing.expect(!jsonNestingExceeds(ok, max_json_nesting));
+
+    try testing.expect(!jsonNestingExceeds("{\"s\":\"[[[[\\\"[[[[\"}", 2));
+    try testing.expect(!jsonNestingExceeds("not json [[[[[[", 2));
+}
+
+test "history tool arguments nested past the limit embed an empty object" {
+    const a = testing.allocator;
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(a);
+    try deep.appendSlice(a, "{\"a\":");
+    try deep.appendNTimes(a, '[', max_json_nesting);
+    try deep.appendNTimes(a, ']', max_json_nesting);
+    try deep.append(a, '}');
+    const calls = [_]ToolCall{.{ .id = "c", .name = "f", .arguments = deep.items }};
+    const msgs = [_]Message{.{ .role = "assistant", .content = "", .tool_calls = &calls }};
+    const json = try serializeMessagesJson(a, &msgs);
+    defer a.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"arguments\":{}") != null);
 }

@@ -84,6 +84,9 @@ pub const Schema = struct {
     }
 };
 
+/// Deepest schema-within-schema nesting `parse` accepts.
+pub const max_schema_depth: usize = 64;
+
 pub const ParseError = error{
     InvalidSchema,
     UnsupportedConstruct,
@@ -100,11 +103,12 @@ pub fn parse(gpa: std.mem.Allocator, value: std.json.Value) ParseError!Schema {
     errdefer schema.arena.deinit();
 
     const arena = schema.arena.allocator();
-    schema.root = try parseNode(arena, value);
+    schema.root = try parseNode(arena, value, 0);
     return schema;
 }
 
-fn parseNode(arena: std.mem.Allocator, value: std.json.Value) ParseError!*const Node {
+fn parseNode(arena: std.mem.Allocator, value: std.json.Value, depth: usize) ParseError!*const Node {
+    if (depth > max_schema_depth) return error.InvalidSchema;
     if (value != .object) {
         // Boolean schema: `true` (any), `false` (none — we don't model "none").
         if (value == .bool) {
@@ -117,8 +121,8 @@ fn parseNode(arena: std.mem.Allocator, value: std.json.Value) ParseError!*const 
     const obj = value.object;
 
     // anyOf / oneOf — branching schemas. Both compile to a Kind.any_of node.
-    if (obj.get("anyOf")) |v| return try parseAnyOf(arena, v);
-    if (obj.get("oneOf")) |v| return try parseAnyOf(arena, v);
+    if (obj.get("anyOf")) |v| return try parseAnyOf(arena, v, depth);
+    if (obj.get("oneOf")) |v| return try parseAnyOf(arena, v, depth);
 
     // enum / const — one or more allowed literal values.
     if (obj.get("const")) |v| {
@@ -152,29 +156,29 @@ fn parseNode(arena: std.mem.Allocator, value: std.json.Value) ParseError!*const 
         for (type_val.array.items, 0..) |t, i| {
             if (t != .string) return error.InvalidSchema;
             // Synthesize a single-type schema by cloning `obj` minus the `type` array.
-            options[i] = try parseSingleType(arena, obj, t.string);
+            options[i] = try parseSingleType(arena, obj, t.string, depth);
         }
         const node = try arena.create(Node);
         node.* = .{ .kind = .any_of, .any_of_options = options };
         return node;
     }
     if (type_val != .string) return error.InvalidSchema;
-    return try parseSingleType(arena, obj, type_val.string);
+    return try parseSingleType(arena, obj, type_val.string, depth);
 }
 
-fn parseAnyOf(arena: std.mem.Allocator, v: std.json.Value) ParseError!*const Node {
+fn parseAnyOf(arena: std.mem.Allocator, v: std.json.Value, depth: usize) ParseError!*const Node {
     if (v != .array) return error.InvalidSchema;
     if (v.array.items.len == 0) return error.InvalidSchema;
     var options = try arena.alloc(*const Node, v.array.items.len);
     for (v.array.items, 0..) |item, i| {
-        options[i] = try parseNode(arena, item);
+        options[i] = try parseNode(arena, item, depth + 1);
     }
     const node = try arena.create(Node);
     node.* = .{ .kind = .any_of, .any_of_options = options };
     return node;
 }
 
-fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const u8) ParseError!*const Node {
+fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const u8, depth: usize) ParseError!*const Node {
     const node = try arena.create(Node);
 
     if (std.mem.eql(u8, t, "null")) {
@@ -214,7 +218,7 @@ fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const
         if (obj.get("items")) |iv| {
             // Tuple form (`items: [a, b]`) is not in our subset.
             if (iv == .array) return error.UnsupportedConstruct;
-            items_node = try parseNode(arena, iv);
+            items_node = try parseNode(arena, iv, depth + 1);
         }
         node.* = .{
             .kind = .array,
@@ -232,7 +236,7 @@ fn parseSingleType(arena: std.mem.Allocator, obj: std.json.ObjectMap, t: []const
             else additional = true;
         }
         const props = if (obj.get("properties")) |pv|
-            try parseProperties(arena, pv, obj.get("required"))
+            try parseProperties(arena, pv, obj.get("required"), depth)
         else
             &[_]Property{};
         node.* = .{
@@ -251,6 +255,7 @@ fn parseProperties(
     arena: std.mem.Allocator,
     properties: std.json.Value,
     required: ?std.json.Value,
+    depth: usize,
 ) ParseError![]Property {
     if (properties != .object) return error.InvalidSchema;
     const map = properties.object;
@@ -270,7 +275,7 @@ fn parseProperties(
     var it = map.iterator();
     while (it.next()) |entry| : (i += 1) {
         const name_owned = try arena.dupe(u8, entry.key_ptr.*);
-        const child = try parseNode(arena, entry.value_ptr.*);
+        const child = try parseNode(arena, entry.value_ptr.*, depth + 1);
         props[i] = .{
             .name = name_owned,
             .schema = child,
@@ -300,11 +305,12 @@ fn makeEnumValues(arena: std.mem.Allocator, items: []const std.json.Value) Parse
 fn canonicalJson(arena: std.mem.Allocator, value: std.json.Value) ParseError![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(arena);
-    try writeCanonical(arena, &buf, value);
+    try writeCanonical(arena, &buf, value, 0);
     return try buf.toOwnedSlice(arena);
 }
 
-fn writeCanonical(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), value: std.json.Value) ParseError!void {
+fn writeCanonical(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), value: std.json.Value, depth: usize) ParseError!void {
+    if (depth > max_schema_depth) return error.InvalidSchema;
     switch (value) {
         .null => try buf.appendSlice(arena, "null"),
         .bool => |b| try buf.appendSlice(arena, if (b) "true" else "false"),
@@ -320,7 +326,7 @@ fn writeCanonical(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), va
             try buf.append(arena, '[');
             for (arr.items, 0..) |item, i| {
                 if (i > 0) try buf.append(arena, ',');
-                try writeCanonical(arena, buf, item);
+                try writeCanonical(arena, buf, item, depth + 1);
             }
             try buf.append(arena, ']');
         },
@@ -341,7 +347,7 @@ fn writeCanonical(arena: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), va
                 if (j > 0) try buf.append(arena, ',');
                 try writeJsonString(arena, buf, k);
                 try buf.append(arena, ':');
-                try writeCanonical(arena, buf, o.get(k).?);
+                try writeCanonical(arena, buf, o.get(k).?, depth + 1);
             }
             try buf.append(arena, '}');
         },
@@ -558,4 +564,23 @@ test "unsupported tuple-form items returns error" {
         \\{"type":"array","items":[{"type":"string"},{"type":"number"}]}
     );
     try testing.expectError(error.UnsupportedConstruct, result);
+}
+
+test "schema nesting beyond the depth limit is refused, ordinary depth parses" {
+    const a = testing.allocator;
+    const deep = max_schema_depth + 8;
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(a);
+    for (0..deep) |_| try src.appendSlice(a, "{\"type\":\"array\",\"items\":");
+    try src.appendSlice(a, "{\"type\":\"string\"}");
+    for (0..deep) |_| try src.append(a, '}');
+    try testing.expectError(error.InvalidSchema, parseStr(a, src.items));
+
+    var ok: std.ArrayListUnmanaged(u8) = .empty;
+    defer ok.deinit(a);
+    for (0..16) |_| try ok.appendSlice(a, "{\"type\":\"array\",\"items\":");
+    try ok.appendSlice(a, "{\"type\":\"string\"}");
+    for (0..16) |_| try ok.append(a, '}');
+    var s = try parseStr(a, ok.items);
+    s.deinit();
 }

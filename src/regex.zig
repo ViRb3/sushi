@@ -28,6 +28,10 @@ pub const Error = error{
 
 const StateIndex = u32;
 
+/// Counted-quantifier bound and NFA size cap: a pattern is untrusted input and each repeat clones its atom.
+const max_repeat: u32 = 1000;
+const max_states: usize = 1 << 15;
+
 const Transition = union(enum) {
     /// Matches a specific byte.
     byte: u8,
@@ -170,6 +174,7 @@ const Builder = struct {
     states: std.ArrayListUnmanaged(State) = .empty,
 
     fn newState(self: *Builder) Error!StateIndex {
+        if (self.states.items.len >= max_states) return error.InvalidPattern;
         try self.states.append(self.arena, .{ .out = &.{}, .accept = false });
         return @intCast(self.states.items.len - 1);
     }
@@ -348,6 +353,7 @@ const Parser = struct {
         }
         if (self.next() != '}') return error.InvalidPattern;
         self.consumeLazyOrPossessive();
+        if (n > max_repeat or (m orelse 0) > max_repeat) return error.InvalidPattern;
 
         // Build n required copies (the first one is the already-parsed atom).
         var result = if (n == 0) try self.b.empty() else atom;
@@ -691,4 +697,15 @@ test "step-by-step matching tracks dead state" {
     var s3 = try nfa.step(&s2, 'x', a);
     defer s3.deinit(a);
     try testing.expect(s3.isEmpty()); // dead
+}
+
+test "repeat counts and NFA size are capped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.InvalidPattern, compile(a, "a{1001}"));
+    try testing.expectError(error.InvalidPattern, compile(a, "a{1,1001}"));
+    try testing.expectError(error.InvalidPattern, compile(a, "a{4000000}"));
+    try testing.expectError(error.InvalidPattern, compile(a, "(((a{100}){100}){100})"));
+    _ = try compile(a, "a{1000}");
 }

@@ -2397,6 +2397,13 @@ fn handleConnectionThread(args: *ConnThreadArgs) void {
     args.allocator.destroy(args);
 }
 
+/// Copies the bytes already read into the request buffer; pipelined bytes past `buf.len` are dropped.
+fn seedRequestBuf(buf: []u8, already_read: []const u8) usize {
+    const n = @min(buf.len, already_read.len);
+    @memcpy(buf[0..n], already_read[0..n]);
+    return n;
+}
+
 fn handleConnection(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -2447,7 +2454,7 @@ fn handleConnection(
 
     const buf = try allocator.alloc(u8, total_size);
     defer allocator.free(buf);
-    @memcpy(buf[0..total_read], hdr_buf[0..total_read]);
+    total_read = seedRequestBuf(buf, hdr_buf[0..total_read]);
 
     while (total_read < total_size) {
         const n = try stream.read(buf[total_read..total_size]);
@@ -2484,6 +2491,11 @@ fn handleConnection(
     {
         log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
         try sendUnauthorized(stream);
+        return;
+    }
+
+    if (chat_mod.jsonNestingExceeds(request_body, chat_mod.max_json_nesting)) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "JSON nesting is too deep", 400);
         return;
     }
 
@@ -19209,6 +19221,10 @@ fn handleResponsesWebSocket(
             else => continue,
         }
 
+        if (chat_mod.jsonNestingExceeds(msg.payload, chat_mod.max_json_nesting)) {
+            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "JSON nesting is too deep");
+            continue;
+        }
         // Parse the request payload — must be {"type":"response.create", ...}
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, msg.payload, .{}) catch {
             try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Invalid JSON in request body");
@@ -27360,4 +27376,12 @@ test "completion IDs stay distinct with a repeated or backwards clock" {
         ids[i] = nextCompletionId(&counter, now_ms);
         for (ids[0..i]) |previous| try std.testing.expect(previous != ids[i]);
     }
+}
+
+test "seedRequestBuf drops bytes past the allocation" {
+    const buf = try std.testing.allocator.alloc(u8, 4);
+    defer std.testing.allocator.free(buf);
+    try std.testing.expectEqual(@as(usize, 4), seedRequestBuf(buf, "abcdefgh"));
+    try std.testing.expectEqualStrings("abcd", buf);
+    try std.testing.expectEqual(@as(usize, 2), seedRequestBuf(buf, "xy"));
 }

@@ -58,13 +58,16 @@ pub fn WsConn(comptime ConnT: type) type {
         pub fn readMessage(self: *Self, allocator: std.mem.Allocator) !Message {
             while (true) {
                 const frame = try readFrame(self.conn, allocator);
-                errdefer allocator.free(frame.payload);
+                // The payload is freed on every exit except the ones that hand it to the caller.
+                var returned = false;
+                defer if (!returned) allocator.free(frame.payload);
 
                 // Control frames (close/ping/pong) cannot be fragmented and
                 // can interleave inside a fragmented data message. Bubble
                 // them up immediately to the caller.
                 if (isControlOpcode(frame.opcode)) {
                     if (!frame.fin or frame.payload.len > 125) return error.WsProtocol;
+                    returned = true;
                     return .{ .opcode = frame.opcode, .payload = frame.payload };
                 }
 
@@ -73,24 +76,20 @@ pub fn WsConn(comptime ConnT: type) type {
                     if (frame.opcode == .continuation) return error.WsProtocol;
                     if (frame.fin) {
                         // Single-frame message — return directly.
+                        returned = true;
                         return .{ .opcode = frame.opcode, .payload = frame.payload };
                     }
                     // First frame of a fragmented message.
                     var buf: std.ArrayList(u8) = .empty;
                     errdefer buf.deinit(allocator);
                     try buf.appendSlice(allocator, frame.payload);
-                    allocator.free(frame.payload);
                     self.in_message = buf;
                     self.in_opcode = frame.opcode;
                 } else {
                     if (frame.opcode != .continuation) return error.WsProtocol;
                     var buf = &self.in_message.?;
-                    if (buf.items.len + frame.payload.len > max_message_bytes) {
-                        allocator.free(frame.payload);
-                        return error.WsTooLarge;
-                    }
+                    if (buf.items.len + frame.payload.len > max_message_bytes) return error.WsTooLarge;
                     try buf.appendSlice(allocator, frame.payload);
-                    allocator.free(frame.payload);
                     if (frame.fin) {
                         const owned = try buf.toOwnedSlice(allocator);
                         const op = self.in_opcode;
@@ -471,4 +470,24 @@ test "fragmented control frame is rejected" {
     defer ws.deinit(a);
 
     try testing.expectError(error.WsProtocol, ws.readMessage(a));
+}
+
+test "a fragmented message over the cap frees each payload once" {
+    const a = testing.allocator;
+    const first_len = max_message_bytes;
+    const bytes = try a.alloc(u8, 14 + first_len + 7);
+    defer a.free(bytes);
+    @memset(bytes, 0);
+    // Masked 127-length text frame (FIN=0, zero mask key), then a masked 1-byte continuation (FIN=1).
+    bytes[0] = 0x01;
+    bytes[1] = 0x80 | 127;
+    std.mem.writeInt(u64, bytes[2..10], first_len, .big);
+    bytes[14 + first_len] = 0x80;
+    bytes[14 + first_len + 1] = 0x80 | 1;
+
+    var mock = MockConn.init(a, bytes);
+    defer mock.deinit();
+    var ws = WsConn(MockConn).init(&mock);
+    defer ws.deinit(a);
+    try testing.expectError(error.WsTooLarge, ws.readMessage(a));
 }
