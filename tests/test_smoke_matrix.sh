@@ -16,9 +16,9 @@
 # --no-drafter). The MiMo EXL3 pack serves resident with its vision tower and MTP heads;
 # MIMO_SSD_BUDGET_GB adds --ssd-budget-gb for a streamed MiMo checkpoint, which skips mtp.
 # Per boot: chat non-stream/stream, thinking on/off, tools, json_schema,
-# logprobs, max_tokens cap, ignore_eos (completions: stream == non-stream; chat: 400), prefix-cache hit, 2-way concurrency, /v1/completions,
+# logprobs, max_tokens cap, ignore_eos (completions: stream == non-stream; chat: 400), 2-way concurrency, /v1/completions,
 # /v1/messages (both modes), /v1/responses (both modes), /v1/models,
-# /metrics.json.
+# /metrics.json. Prefix-cache reuse has its own live tests (test_prefix_cache_ssd_default.sh, test_prefix_cache_mem.sh).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -31,10 +31,9 @@ mkdir -p "$OUT/home"
 
 [[ -x "$BINARY" ]] || { echo "[fatal] $BINARY missing — zig build -Doptimize=ReleaseFast"; exit 1; }
 
-MD="$HOME/.sushi/models"
 # arch|thinking(yes/no)|candidate paths (first that exists wins)
 ARCHES=(
-    "qwen4_exp|yes|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw"
+    "qwen4_exp|yes|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
     "mimo_v2|yes|${MIMO_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,off,kv4,mtp,nospec}"
@@ -94,10 +93,6 @@ run_checks() { # $1 thinking yes/no, $2 has_spec yes/no
     check "chat non-stream: content" "$([[ -n "$c" ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
     check "chat non-stream: no tag leak" "$(echo "$c" | grep -Eq "$TAGS" && echo 1 || echo 0)" "$c"
     check "chat non-stream: usage.cached_tokens present" "$(echo "$r" | grep -q '"cached_tokens"' && echo 0 || echo 1)"
-    # prefix cache: same request again
-    r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"temperature\":0}")
-    rc=$(echo "$r" | J 'd["usage"]["prompt_tokens_details"]["cached_tokens"]')
-    check "prefix cache: repeat reports cached_tokens>0" "$([[ "${rc:-0}" -gt 0 ]] && echo 0 || echo 1)" "cached=$rc"
 
     # 2. chat stream
     r=$(curl -sN --max-time 300 "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
@@ -277,8 +272,6 @@ for entry in "${ARCHES[@]}"; do
             nospec)  flags+=(--no-pld --no-mtp --no-drafter) ;;
             *) skip "$CELL" "unknown config"; continue ;;
         esac
-        # GGUF rides an embedded engine: KV-quant flags are MLX-only
-        if [[ "$model" == *.gguf && "$cfg" != default ]]; then skip "$CELL" "gguf: engine owns its KV"; continue; fi
         echo ""
         echo "=== $CELL  ($(basename "$model"), ${gb} GB) ==="
         t0=$(date +%s)

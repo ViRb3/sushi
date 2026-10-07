@@ -14,7 +14,6 @@
 #   4. Stream + tools (+thinking where supported): answer arrives as CONTENT
 #      deltas, no leak (pins the answer-misfiled-as-reasoning stream bug)
 #   5. Tool-call fidelity, non-stream: write tool, path byte-exact
-#      (pins the unterminated <|"|> brace-swallow bug live)
 #   6. Tool-call fidelity, stream: same via accumulated delta.tool_calls
 #   7. Omitted max_tokens: long answer must NOT truncate at the old 256 default
 #
@@ -46,10 +45,10 @@ YELLOW='\033[0;33m'
 BLUE='\033[1;34m'
 NC='\033[0m'
 
-# logical|display|path|engine|has_thinking|extra server flags
+# logical|display|path|has_thinking|extra server flags
 MODELS=(
-    "qwen4_exp|Qwen3.8 Flash-Next (think tags + XML tools)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|mlx|yes|"
-    "mimo_v2|MiMo-V2.6-Flash (EXL3 experts)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}|mlx|yes|--no-vision"
+    "qwen4_exp|Qwen3.8 Flash-Next (think tags + XML tools)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|yes|"
+    "mimo_v2|MiMo-V2.6-Flash (EXL3 experts)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}|yes|--no-vision"
 )
 
 # FORMAT_MODELS=csv filter of logical names. Unknown names simply match
@@ -90,8 +89,7 @@ no_leak() {
     python3 - "$1" <<'PY'
 import sys
 text = sys.argv[1]
-tags = ["<think>", "</think>", "<|channel>", "<channel|>",
-        "<|tool_call", "<tool_call", '<|"|>']
+tags = ["<think>", "</think>", "<tool_call"]
 for t in tags:
     if t in text:
         print(f"  leaked tag: {t}", file=sys.stderr)
@@ -152,33 +150,11 @@ print(f"{name_ok}|{json_ok}|{path_ok}")
 '
 
 run_model() {
-    local logical="$1" display="$2" path="$3" engine="$4" has_thinking="$5" extra="$6"
+    local logical="$1" display="$2" path="$3" has_thinking="$4" extra="$5"
 
     echo -e "${BLUE}=== [$logical] $display ===${NC}"
 
-    # The table's path is one PLACE the checkpoint may live, not the only one:
-    # the same model is equally at home under ~/.sushi/models (the app's
-    # single download root) or ~/.lmstudio/models. A matrix arm that skips
-    # because a model sits in the other root is silently missing coverage —
-    # the gemma4-e4b arm skipped for exactly that reason while the checkpoint
-    # was present (2026-08-04). Try the sibling root before giving up.
-    if [ ! -e "$path" ]; then
-        case "$path" in
-            "$HOME/.lmstudio/models/"*) alt="$HOME/.sushi/models/${path#$HOME/.lmstudio/models/}" ;;
-            "$HOME/.sushi/models/"*) alt="$HOME/.lmstudio/models/${path#$HOME/.sushi/models/}" ;;
-            *) alt="" ;;
-        esac
-        if [ -n "$alt" ] && [ -e "$alt" ]; then
-            echo -e "${DIM:-}  (found under the sibling model root)${NC}"
-            path="$alt"
-        fi
-    fi
-
-    if [ "$engine" = "gguf" ] && [ ! -f "$path" ]; then
-        echo -e "${YELLOW}SKIP${NC}: GGUF not found: $path"
-        return 0
-    fi
-    if [ "$engine" = "mlx" ] && [ ! -d "$path" ]; then
+    if [ ! -d "$path" ]; then
         echo -e "${YELLOW}SKIP${NC}: model dir not found: $path"
         return 0
     fi
@@ -305,8 +281,7 @@ run_model() {
 
     # ── 8. /v1/messages stream + tools (+thinking): the Claude Code surface.
     #      Tool call must arrive as a tool_use block (name + byte-exact path),
-    #      and no text/thinking delta may carry a raw control tag — pins the
-    #      mid-text re-opened thought channel leak observed live (2026-06-10).
+    #      and no text/thinking delta may carry a raw control tag.
     local ANTH_THINK=""
     [ "$has_thinking" = "yes" ] && ANTH_THINK=',"thinking":{"type":"enabled","budget_tokens":2000}'
     local AV
@@ -336,7 +311,7 @@ if tool:
     try:
         a=json.loads(tool["json"]); json_ok=isinstance(a,dict); path_ok=1 if a.get("path")=="report_v2.html" else 0
     except Exception: pass
-tags=["<think>","</think>","<|channel>","<channel|>","<|tool_call","<tool_call","<|\"|>"]
+tags=["<think>","</think>","<tool_call"]
 text="".join(b["text"] for b in blocks.values() if b["type"]!="tool_use")
 leak=next((t for t in tags if t in text),"")
 print(f"{name_ok}|{int(json_ok)}|{path_ok}|{leak}")')
@@ -364,8 +339,8 @@ SERVER_PID=""
 trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null' EXIT
 
 for entry in "${MODELS[@]}"; do
-    IFS='|' read -r logical display path engine has_thinking extra <<< "$entry"
-    run_model "$logical" "$display" "$path" "$engine" "$has_thinking" "$extra"
+    IFS='|' read -r logical display path has_thinking extra <<< "$entry"
+    run_model "$logical" "$display" "$path" "$has_thinking" "$extra"
     sleep 2
 done
 
