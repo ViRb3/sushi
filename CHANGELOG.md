@@ -4,40 +4,38 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.2.0 — GLM-5.3-Flash, 32 GB streaming, zero-RAM prompt cache
 
-- **Concurrent OpenAI completions and Anthropic messages get distinct response IDs**, including when the wall clock repeats or moves backwards.
-- **GLM-5.3 index scoring respects M1–M4 threadgroup limits without changing score bits**, avoiding a Metal launch failure on wider query groups.
-- GLM capture and admission regression tests run on smaller-memory Macs without lowering production capture limits.
 - **GLM-5.3-Flash joins Qwen3.8 and MiMo**: serve it, chat with `sushi run`, or drive it from the coding-agent
-  launchers. Up to four requests decode together, DFlash2 drafting copies long verbatim spans four tokens per round,
-  prompts are reused across turns from an SSD cache that is on by default and sizes itself (the RAM tier is opt-in with `--prefix-cache-mem`; the web UI shows the cache's use), and image/video input works. The 2.5bpw Sushi pack targets 128 GB
-  Macs (KLD 0.07 against the BF16 model); M1–M4 Macs keep its fused kernels.
-- **Stream any model's experts from SSD**: GLM-5.3, MiMo and Qwen3.8 run on smaller Macs with `--ssd-budget-gb`,
-  including vision. Streamed Qwen packs now decode with MTP by default — thanks @gomezvd.
-- **Concurrent requests decode together on every model**: MiMo and GLM batch up to four streams, and concurrent Qwen
-  requests decode as one forward whose answers are byte-identical to running each alone.
-- **Faster**: MiMo 2.3bpw decodes about 12% and prefills about 15% faster, Qwen3.8-Flash-Next prefills faster, and
-  Sushi-2.6bpw decodes 12–15% faster per forward than v1.1.1 (a regression that shipped in v1.1.1 is fixed). GLM
-  DFlash2 verification takes about 11% less time on M5 Max with the 2.5bpw pack and A4 g64 assistant. Three-row
-  expert reuse/tiling, MLA value reuse and fused normalization save a further 5–6% at the measured prefixes.
-  Prepared A6 inputs and fused HC expansion save another 3.5–3.9% of verification time on that M5 setup.
-  Fixed-depth DFlash2 drafting takes about 12% less time with the A4 g64 assistant, preserving proposals and acceptance.
+  launchers. The 2.4bpw Sushi pack targets 128 GB Macs (KLD 0.074 against the BF16 model); up to four requests decode
+  together, a DFlash2 assistant drafts long verbatim spans four tokens per round, image and video input work, and
+  M1–M4 Macs keep its fused kernels.
+- **Streaming with MTP: Qwen3.8 on a 32 GB Mac at about 20 tok/s**: `--ssd-budget-gb` streams any model's experts
+  from the SSD, so GLM-5.3, MiMo and Qwen3.8 run on Macs smaller than the pack, vision included. Streamed Qwen packs
+  now decode with MTP by default, and Sushi-2bpw on a 32 GB Mac decodes about twice as fast as in v1.1.1 — thanks
+  @gomezvd.
+- **The prompt cache needs 0 GB of RAM**: seen prompts are reused across turns from an SSD cache that is on by default
+  and sizes itself (at most 20 GB, always leaving 4 GB of disk free), so every GiB of memory goes to the model and its
+  context. RAM retention is now opt-in with `--prefix-cache-mem`. A long prompt is saved whole on its first turn, so
+  the next turn restores all of it, and the web UI shows the cache's use.
+- **Faster, also under concurrency**: concurrent requests decode together on every model (MiMo and GLM batch up to
+  four streams; concurrent Qwen requests run as one forward with byte-identical answers). MiMo 2.3bpw decodes about
+  12% and prefills about 15% faster, Qwen3.8-Flash-Next prefills faster, and Sushi-2.6bpw decodes 12–15% faster per
+  forward than v1.1.1 (fixing a v1.1.1 regression). On the M5 Max, GLM's DFlash2 verification takes about 11% less
+  time with a further 9% or so from expert reuse and fused kernels, and fixed-depth drafting about 12% less.
 - **Better agent and API behaviour**: `sushi launch grok` is new and opencode 2.x works again; stop sequences end
   generation as soon as they complete; streamed and non-streamed answers match byte for byte; presence, frequency and
-  repeat penalties take effect; `ignore_eos` works on `/v1/completions`; experimental logit biases load from a file. Chat and legacy completions accept the `repetition_penalty` alias,
-  and requests that omit effort inherit the configured `--think` budget.
-- **New and changed flags**: `--mtp-min-depth`/`--mtp-max-depth` bound the MTP planner so each Mac can calibrate its
-  own range (they replace `--mtp-depth`), `--no-mtp-lookup` turns off prompt-lookup drafts inside MTP rounds,
-  `--gpu-warm-secs` keeps the GPU awake between requests, and `--wired-margin-gib` now defaults to 4 GiB.
-- **More reliable under memory pressure and restarts**: memory admission, the SSD prompt cache and request metrics
-  were hardened across the board, long GLM sessions no longer hang, leak or overrun memory, and the SSD prompt cache
-  saves a long prompt whole on its first turn, so the next turn restores all of it.
-- **An idle streamed server no longer burns CPU**: its SSD-read workers park instead of spinning while no request is
-  running.
+  repeat penalties take effect (with the `repetition_penalty` alias); `ignore_eos` works on `/v1/completions`;
+  requests that omit effort inherit the configured `--think` budget; GLM conversation history renders exactly as its
+  reference chat template. New flags: `--mtp-min-depth`/`--mtp-max-depth` (replacing `--mtp-depth`),
+  `--no-mtp-lookup`, `--gpu-warm-secs` and experimental logit biases from a file; `--wired-margin-gib` now defaults
+  to 4 GiB.
+- **More reliable**: memory admission, the SSD prompt cache and request metrics were hardened; long GLM sessions no
+  longer hang, leak or overrun memory; GLM index scoring respects M1–M4 threadgroup limits; concurrent responses get
+  distinct IDs; and an idle streamed server no longer burns CPU.
 
-Thanks @cnsiva for the request-budget defaults and repetition-penalty alias, and @jasontitus for unique response IDs
-and portable GLM regression tests.
+Thanks @cnsiva for the request-budget defaults and repetition-penalty alias, @jasontitus for unique response IDs, the
+M1–M4 GLM scorer fix and portable GLM regression tests, and @ShoichiTect for parking idle SSD-read workers.
 
 ---
 

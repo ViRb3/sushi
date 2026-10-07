@@ -12,9 +12,9 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 | # | Step | Command | Pass |
 |---|---|---|---|
 | 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
-| 2 | **Perf gate** | `./tests/bench.sh --tag v<ver> --only sushi-4bpw` | within noise of the previous column in `benchmarks.md`, mode suffix present; append this release's column |
+| 2 | **Perf gate** | the `docs/bench/<ver>/` run (below) on Qwen3.8-Flash-Next-Sushi-2.6bpw, Sushi-4bpw, MiMo-V2.6-Flash-Sushi-2.3bpw and GLM-5.3-Flash-Sushi-2.4bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on one Sushi pack and MiMo | within ~1% of its row in `docs/quality-kld.md` |
-| 4 | Live | `test_format_matrix.sh`, `llmprobe --quick`, `test_smoke_matrix.sh`, plus the live test of each area the release changed | all pass |
+| 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh`, plus the live test of each area the release changed (no `llmprobe --quick`: step 2's full bench covers it) | all pass |
 | 5 | CI | `gh workflow run ci.yml --ref main` on the release commit | green (the macOS 26.2 build gate) |
 | 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
 | 7 | Cross-engine (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
@@ -22,17 +22,22 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 **Rules:**
 - **Steps 2 and 7 are different questions.** 2 = "did our code regress", sushi only, every release. 7 = the public
   comparison; re-run it only when another engine's version bumps.
-- **The perf gate is Sushi-4bpw alone.** A cell that lost its mode suffix means MTP stopped engaging: chase it before
-  shipping. A low cell gets one rerun on a quiet box before anyone bisects.
+- **The perf gate is four models: Qwen 2.6bpw, Qwen 4bpw, MiMo 2.3bpw, GLM 2.4bpw.** It is ONE run per model whose
+  output IS the published `docs/bench/v<ver>/` report, in the format of `docs/bench/v1.2.0-dev/` (`summary.md` plus
+  one `<model>.md` per run): pinned `npx llmprobe@<ver> --bench-only --rungs 2k,4k,8k,16k,32k,64k,128k --runs 2`, one
+  model per server, GPU lock per model, fans at max and 3 min idle before the first server and after each one (60 s let heat
+  carry into the next model), commit, binary SHA-256 and mtime in
+  the header. A model whose speculative mode (MTP, DFlash2) did not engage is chased before shipping; a low cell gets
+  one rerun on a quiet box before anyone bisects.
 - **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k.
 - **Never quote a win without naming the engine it is over.**
-- **`benchmarks.md` gets one new column per release**, from the rows step 2 prints. Obey its header rules: tables
+- **`benchmarks.md` gets one new column per release**, from step 2's report. Obey its header rules: tables
   only, M5 Max only.
 
 ## Release artifacts
 
-The release record is `benchmarks.md` plus the llmprobe reports (JSON and HTML) under `~/.sushi/runs/bench-<tag>/`;
-no CSVs or charts land in `docs/`. The working baselines agents inherit between releases live in
+The release record is `docs/bench/v<ver>/` and `benchmarks.md`, plus the raw llmprobe reports (JSON and HTML) under
+`~/.sushi/runs/bench-<tag>/`; no CSVs or charts land in `docs/`. The working baselines agents inherit between releases live in
 `docs/perf-baselines.md` (the release column is also added there as a cited row). A number taken mid-cycle is stale the
 moment another perf round lands: run the gate on the final tree.
 
@@ -58,6 +63,11 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
 3. After the owner (or `./release.sh`) cuts it, the Release workflow leaves a DRAFT. Publishing it fires
    `.github/workflows/homebrew.yml`, which runs the tap's bump and fails unless `Formula/sushi.rb` names the new
    tag (needs the `HOMEBREW_TAP_TOKEN` secret). Confirm with `brew update && brew info beamivalice/tap/sushi`.
+4. Once the GitHub release is published, bump mlx-serve's Sushi pin to the release commit
+   ([mlx-serve-integration](../../../docs/mlx-serve-integration.md#handing-a-new-engine-to-mlx-serve)): make the
+   commit reachable from the submodule url (`ddalcu/sushi`, branch `exl3-module`), then in the mlx-serve checkout
+   `git -C lib/sushi fetch && git -C lib/sushi checkout v<version>`, commit `lib/sushi`, run mlx-serve's tests and open
+   the PR from `beamivalice/mlx-serve`. Update the doc's "Recommended pin" to the release commit.
 
 ### CHANGELOG style
 

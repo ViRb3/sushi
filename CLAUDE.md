@@ -47,7 +47,7 @@ doc for the area before changing it, and update it in the same landing.
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, ownership, media |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, `__metadata__` stamp, window, g-scale in `suh`, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | roofline, recorded tok/s tables with binaries and settings, ruled-out levers |
-| [docs/bench/v1.2.0-dev/summary.md](docs/bench/v1.2.0-dev/summary.md) | version-pinned release context ladder and individual model benchmark reports |
+| [docs/bench/v1.2.0/summary.md](docs/bench/v1.2.0/summary.md) | version-pinned release context ladder and individual model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, KLD of every served pack |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
@@ -104,11 +104,7 @@ Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
 
-Flags that matter: `--model --serve --host --port --ctx-size --kv-quant --kv-attn-mode --mtp --no-mtp --mtp-min-depth
---mtp-max-depth --mtp-head-kv-quant --max-mtp-ctx --ssd-budget-gb --expert-cache-gb --prefix-cache-entries --prefix-cache-mem
---prefix-cache-disk --prefill-chunk --max-concurrent --max-tokens --timeout --reasoning-budget --preserve-thinking
---wired-margin-gib --skip-mem-preflight --metrics --api-key --model-dir --log-level --log-file --parent-pid`. `--help`
-lists the rest.
+Flags: `sushi --help` lists them all; the ones the docs lean on are named in each doc.
 
 ## Building
 
@@ -149,10 +145,11 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 
 ## Releases & benchmarking
 
-`/release` for process, SemVer, CHANGELOG. Perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in
-`benchmarks.md` (ONE new column per release). `/bench` for methodology: same-methodology cells only, spec cells are
-variance (sample across boots), an A/B arm is proven by ENGAGEMENT lines in its log. Interleave A/B kernels in ONE
-process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box.
+`/release` for process, SemVer, CHANGELOG. Perf gate = the `docs/bench/v<ver>/` run on the FINAL tree (Qwen 2.6bpw,
+Qwen 4bpw, MiMo 2.3bpw, GLM 2.4bpw) vs the previous report; ONE new `benchmarks.md` column per release. `/bench` for
+methodology: same-methodology cells only, spec cells are variance (sample across boots), an A/B arm is proven by
+ENGAGEMENT lines in its log. Interleave A/B kernels in ONE process (separate runs drift 15%); same-boot medians per
+cell; sub-2% calls need an IDLE box.
 
 Release notes thank every outside contributor by @handle for each merged PR the release ships (`gh pr list --state
 merged` since the last tag); a credit missed in a shipped release goes into the next one, marked as belated.

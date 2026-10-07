@@ -1703,4 +1703,9 @@ quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
 [Version summary and both GLM reports](bench/v1.2.0-dev2/summary.md), runtime commit `6731e2db5cace6c2c090dac0305d54a90ec10fb9`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-06. llmprobe 0.6.15, three measured runs, 2K–128K, default A4 g64 DFlash2 and kv8. Interactive QoS, one model per GPU-lock run, maximum fans, 60 s between servers. Full reports retain scenario samples, acceptance, speculative ceilings and probe notes.
 
 The two reports above are Sushi-2.3bpw and Sushi-2.5bpw (W12), both earlier packs. Shipped Sushi-2.4bpw (K2.25/K2.5 W14,
-A6 trunk), same ladder: {{SPEED_2P4}}.
+A6 trunk), same ladder: [v1.2.0 release bench](bench/v1.2.0/summary.md), decode 47.0 / 47.9 / 49.5 / 49.0 / 43.4 / 44.9 /
+42.1 and prefill 863 / 831 / 818 / 810 / 790 / 712 / 613 tok/s at 2K–128K (`e26fd471`).
+
+## v1.2.0 release context ladder
+
+[Version summary and per-model reports](bench/v1.2.0/summary.md), 2026-10-07, Apple M5 Max 128 GB. llmprobe 0.6.15, `--bench-only` 2K–128K, 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, 3 minutes idle before each server. Qwen 2.6bpw/4bpw and MiMo 2.3bpw on `177c526f`, GLM 2.4bpw on `e26fd471`.

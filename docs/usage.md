@@ -114,6 +114,24 @@ MTP and the 8-bit KV cache are on by default for MiMo, and thinking is on by def
 - Seen prompt prefixes live on the SSD by default, so a repeated prompt skips its prefill; the budget is sized per model and capped at 20GB, and `--prefix-cache-disk 20GB` sets it.
 - `--prefix-cache-entries 1` keeps one conversation's prefix; raise it to 4-8 when several agents share the server.
 
+**128 GB Mac, GLM-5.3-Flash-Sushi-2.4bpw**
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=120000
+hf download beamster/GLM-5.3-Flash-Sushi-2.4bpw --local-dir ~/.sushi/models/GLM-5.3-Flash-Sushi-2.4bpw
+
+# images and video, 8-bit KV, DFlash2 when present
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/GLM-5.3-Flash-Sushi-2.4bpw
+```
+
+- The pack ships Inco.ai's [DFlash2 assistant](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) unmodified in
+  `GLM-5.3-Flash-DFlash2/`, under its own CC BY-NC-ND 4.0 license (non-commercial, no derivatives). On its first load
+  sushi builds a smaller copy for this Mac in the pack's `dflash2/` folder: a derivative of that work, so keep it local
+  and never share it.
+- `--drafter <dir>` points at an assistant stored elsewhere and `--no-drafter` turns it off; without it GLM decodes
+  one token at a time.
+- Up to four requests decode together.
+
 ## Coding agents
 
 With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, codex, grok, hermes or aider against it:

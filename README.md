@@ -8,12 +8,12 @@ stand-alone and also as a guest engine inside mlx-serve.
 
 ## Model support list
 
-* [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+)
+* [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming-on-a-32-gb-mac))
 * [Qwen3.8-Flash-Next-Sushi-2.6bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
-* GLM-5.3-Flash - coming soon!
+* [GLM-5.3-Flash-Sushi-2.4bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2.4bpw) (requires 128 GB, text, image and video input)
 
 ## Quality
 
@@ -34,16 +34,16 @@ GLM) and the 8-bit KV cache are on by default.
 
 ## Memory
 
-GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on, `--mtp-head-kv-quant`,
-`--prefix-cache-mem 1GB`). The n-gram table stays on the SSD and is not counted.
+GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on, `--mtp-head-kv-quant`). The
+prompt cache and the n-gram table stay on the SSD and are not counted.
 
 | context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw |
 |---|---:|---:|---:|---:|
 | weights only | 35.0 | 44.0 | 63.7 | 83.6 |
-| 128k | 41.7 | 50.7 | 70.4 | 88.3 |
-| 256k | 44.6 | 53.6 | 73.3 | 90.2 |
-| 512k | 49.7 | 58.6 | 78.4 | 93.9 |
-| 1M | 59.8 | 68.8 | 88.5 | 101.4 |
+| 128k | 40.7 | 49.7 | 69.4 | 87.3 |
+| 256k | 43.6 | 52.6 | 72.3 | 89.2 |
+| 512k | 48.7 | 57.6 | 77.4 | 92.9 |
+| 1M | 58.8 | 67.8 | 87.5 | 100.4 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
 the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M:
@@ -59,6 +59,22 @@ A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N`
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
 serves text unless `--vision` loads the vision tower, whose weights then come out of the N GiB.
 
+## Streaming on a 32 GB Mac
+
+Sushi-2bpw streams on a 32 GB Mac with MTP on, at about 20 tok/s decode:
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=27000
+sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-gb 18 --ctx-size 66000 \
+  --expert-pick-tolerance 0.3 --wired-margin-gib 2
+```
+
+`--ssd-budget-gb 18` keeps 18 GiB resident (trunk, KV cache and an expert cache) and reads the remaining experts from
+the SSD. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert
+whose router probability is at least 0.7 of the missed one's, which saves an SSD read; leave it out for replies
+identical to a resident load. `--wired-margin-gib 2` lets the plan come within 2 GiB of the GPU limit (4 by default).
+The GPU limit resets at reboot.
+
 ## Benchmarks
 
 Reported speed using llmprobe `--bench-only`:
@@ -73,6 +89,7 @@ Reported speed using llmprobe `--bench-only`:
 | M5 Max | 128 GB | 3bpw | ~1,900 | ~95 |
 | M5 Max | 128 GB | 4bpw | ~1,750 | ~90 |
 | M5 Max | 128 GB | MiMo 2.3bpw | ~1,130 | ~70 |
+| M5 Max | 128 GB | GLM 2.4bpw | ~860 | ~55 |
 
 ## Usage
 

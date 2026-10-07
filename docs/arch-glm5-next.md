@@ -179,8 +179,8 @@ inside 1.46% drift) because verification per round grew 20.6%.
   102.51 GB peak while scoring KLD. Sushi-2.5bpw with the A6 assistant and vision is 104.56 GB active, leaving
   `max_safe_context` 746,036 tokens (A4 assistant: 104.32 GB, 758,793; BF16 cache with no assistant, no vision and
   `--wired-margin-gib 2`: 955,781) under `iogpu.wired_limit_mb=120000` (margin 4 GiB): 1M context fits only at kv8.
-- Shipped Sushi-2.4bpw (91.1 GiB on disk) with the A4 assistant and vision: {{ACTIVE_2P4}} GB active, `max_safe_context`
-  {{MAXCTX_2P4}} under `iogpu.wired_limit_mb=120000`. The figures above are other packs'.
+- Shipped Sushi-2.4bpw (91.1 GiB on disk) with the A4 assistant and vision: 96.62 GB active, `max_safe_context`
+  1,048,576 under `iogpu.wired_limit_mb=120000` (`e26fd471`). The figures above are other packs'.
 - An explicit `--ctx-size` is not checked against that bill at load (GLM is outside the load-time serving bill), so
   `n_ctx` can advertise more than a request may use; request admission refuses past the affordable context.
 
