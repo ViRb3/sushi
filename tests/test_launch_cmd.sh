@@ -83,9 +83,9 @@ print((r["data"][0].get("meta") or {}).get("context_length") or 0)
 OUT=$("$BIN" launch omp --print --url "$BASE" 2>&1)
 OK=1
 echo "$OUT" | grep -q 'export PI_CODING_AGENT_DIR="$HOME/.sushi/omp"' || OK=0
-echo "$OUT" | grep -q "omp --model sushi/$MODEL_ID" || OK=0
+echo "$OUT" | grep -q "omp --model 'sushi/$MODEL_ID'" || OK=0
 grep -q "contextWindow: $ADV_CTX" ~/.sushi/omp/models.yml || OK=0
-grep -q "baseUrl: $BASE/v1" ~/.sushi/omp/models.yml || OK=0
+grep -q "baseUrl: \"$BASE/v1\"" ~/.sushi/omp/models.yml || OK=0
 grep -q "requiresEffort: false" ~/.sushi/omp/models.yml || OK=0
 if [ "$OK" = 1 ]; then
     run_test "omp script + models.yml carry the advertised context" PASS
@@ -118,7 +118,7 @@ echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=$EXPECT_OUT" || OK=0
 # Without this, Claude Code assumes 200k for an off-catalog model and
 # auto-compacts there — a 786k server driven as a 200k one.
 echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_CONTEXT_TOKENS=$ADV_CTX" || OK=0
-echo "$OUT" | grep -q "claude --model $MODEL_ID" || OK=0
+echo "$OUT" | grep -q "claude --model '$MODEL_ID'" || OK=0
 if [ "$OK" = 1 ]; then
     run_test "claude script is env-only with the advertised context + derived output budget" PASS
 else

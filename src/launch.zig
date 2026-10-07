@@ -117,6 +117,26 @@ pub const zcodeConfigJson = @import("zcode_launch.zig").configJson;
 
 // ── Config builders (pure — unit-tested below) ──────────────────────────
 
+/// `{f}` writes a string's content escaped for a JSON, TOML basic or YAML double-quoted
+/// string; the caller supplies the quotes.
+const Esc = struct {
+    s: []const u8,
+
+    pub fn format(self: Esc, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (self.s) |c| switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            0...9, 11...31, 127 => try w.print("\\u{x:0>4}", .{c}),
+            else => try w.writeByte(c),
+        };
+    }
+};
+
+fn esc(s: []const u8) Esc {
+    return .{ .s = s };
+}
+
 /// pi `models.json`, with every chat-capable model in the array so
 /// in-session `/model` can switch (a launch-time snapshot).
 pub fn piModelsJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry) ![]u8 {
@@ -126,7 +146,7 @@ pub fn piModelsJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\{{
         \\  "providers": {{
         \\    "sushi": {{
-        \\      "baseUrl": "{s}/v1",
+        \\      "baseUrl": "{f}/v1",
         \\      "api": "openai-completions",
         \\      "apiKey": "sushi",
         \\      "compat": {{
@@ -135,16 +155,16 @@ pub fn piModelsJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\        "maxTokensField": "max_tokens"
         \\      }},
         \\      "models": [
-    , .{base_url});
+    , .{esc(base_url)});
     for (entries, 0..) |e, i| {
         try out.print(allocator,
             \\{s}
-            \\        {{"id": "{s}", "name": "{s} (sushi)", "input": [{s}],
+            \\        {{"id": "{f}", "name": "{f} (sushi)", "input": [{s}],
             \\         "contextWindow": {d}, "maxTokens": {d}, "reasoning": true, "thinkingLevelMap":
         , .{
             if (i == 0) "" else ",",
-            e.id,
-            e.id,
+            esc(e.id),
+            esc(e.id),
             if (e.vision) "\"text\", \"image\"" else "\"text\"",
             e.budget.context,
             e.budget.output,
@@ -173,7 +193,7 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\# Regenerated at each launch; edits here are overwritten.
         \\providers:
         \\  sushi:
-        \\    baseUrl: {s}/v1
+        \\    baseUrl: "{f}/v1"
         \\    api: openai-completions
         \\    apiKey: sushi
         \\    compat:
@@ -187,14 +207,14 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\        thinkingFormat: openai
         \\    models:
         \\
-    , .{base_url});
+    , .{esc(base_url)});
     for (entries) |e| {
         try out.print(allocator,
-            \\      - id: "{s}"
-            \\        name: "{s} (sushi)"
+            \\      - id: "{f}"
+            \\        name: "{f} (sushi)"
             \\        reasoning: true
             \\
-        , .{ e.id, e.id });
+        , .{ esc(e.id), esc(e.id) });
         if (e.efforts) |accepted| try writeOmpThinking(allocator, &out, accepted);
         try out.print(allocator,
             \\        input: [{s}]
@@ -236,8 +256,7 @@ fn writeOmpThinking(allocator: std.mem.Allocator, out: *std.ArrayList(u8), accep
 }
 
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
-/// the user's own config, no file writes). Single-quoted in the script, so
-/// the JSON must stay single-quote-free.
+/// the user's own config, no file writes).
 /// `limit.output` is the room opencode keeps free before compacting (it
 /// never sends max_tokens), so it carries the reserve, not the response cap.
 /// opencode 2.x has no `--model` on its default command, so the model rides `model`. A row
@@ -246,16 +265,16 @@ fn writeOmpThinking(allocator: std.mem.Allocator, out: *std.ArrayList(u8), accep
 pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, entries: []const Entry) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "{{\"$schema\": \"https://opencode.ai/config.json\", \"model\": \"sushi/{s}\", ", .{model});
+    try out.print(allocator, "{{\"$schema\": \"https://opencode.ai/config.json\", \"model\": \"sushi/{f}\", ", .{esc(model)});
     // A long prefill plus a buffered tool call outlasts opencode's 5-minute request and chunk defaults.
     try out.print(allocator,
-        \\"provider": {{"sushi": {{"npm": "@ai-sdk/openai-compatible", "name": "sushi (local)", "options": {{"baseURL": "{s}/v1", "timeout": 3600000, "chunkTimeout": 3600000}}, "models": {{
-    , .{base_url});
+        \\"provider": {{"sushi": {{"npm": "@ai-sdk/openai-compatible", "name": "sushi (local)", "options": {{"baseURL": "{f}/v1", "timeout": 3600000, "chunkTimeout": 3600000}}, "models": {{
+    , .{esc(base_url)});
     for (entries, 0..) |e, i| {
-        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (sushi)\", \"tool_call\": true,{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}", .{
+        try out.print(allocator, "{s}\"{f}\": {{\"name\": \"{f} (sushi)\", \"tool_call\": true,{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}", .{
             if (i == 0) "" else ", ",
-            e.id,
-            e.id,
+            esc(e.id),
+            esc(e.id),
             if (e.vision) " \"attachment\": true," else "",
             e.budget.context,
             compactionReserve(e.budget.context),
@@ -325,7 +344,7 @@ pub fn grokConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model:
         try appendTomlString(&out, allocator, e.id);
         try out.appendSlice(allocator, "]\nmodel = ");
         try appendTomlString(&out, allocator, e.id);
-        try out.print(allocator, "\nbase_url = \"{s}/v1\"\nname = ", .{base_url});
+        try out.print(allocator, "\nbase_url = \"{f}/v1\"\nname = ", .{esc(base_url)});
         const label = try std.fmt.allocPrint(allocator, "{s} (sushi)", .{e.id});
         defer allocator.free(label);
         try appendTomlString(&out, allocator, label);
@@ -396,16 +415,16 @@ pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, c
 pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\# written by sushi — dedicated CODEX_HOME, regenerated at each launch.
-        \\model = "{s}"
+        \\model = "{f}"
         \\model_provider = "sushi"
         \\model_context_window = {d}
         \\
         \\[model_providers.sushi]
         \\name = "sushi (local)"
-        \\base_url = "{s}/v1"
+        \\base_url = "{f}/v1"
         \\wire_api = "responses"
         \\
-    , .{ model, budget.context, base_url });
+    , .{ esc(model), budget.context, esc(base_url) });
 }
 
 /// hermes `config.yaml` — mirrors what `hermes setup`'s custom-endpoint flow
@@ -418,22 +437,22 @@ pub fn hermesConfigYaml(allocator: std.mem.Allocator, base_url: []const u8, mode
         \\# `hermes setup`'s custom-endpoint flow saves, so the first run starts
         \\# configured instead of launching the wizard.
         \\model:
-        \\  default: "{s}"
+        \\  default: "{f}"
         \\  provider: custom
-        \\  base_url: "{s}/v1"
+        \\  base_url: "{f}/v1"
         \\  api_key: "sushi"
         \\  api_mode: chat_completions
         \\custom_providers:
         \\  - name: sushi
-        \\    base_url: "{s}/v1"
+        \\    base_url: "{f}/v1"
         \\    api_key: "sushi"
-        \\    model: "{s}"
+        \\    model: "{f}"
         \\    api_mode: chat_completions
         \\    models:
         \\
-    , .{ model, base_url, base_url, model });
+    , .{ esc(model), esc(base_url), esc(base_url), esc(model) });
     for (entries) |e| {
-        try out.print(allocator, "      \"{s}\":\n        context_length: {d}\n", .{ e.id, e.budget.context });
+        try out.print(allocator, "      \"{f}\":\n        context_length: {d}\n", .{ esc(e.id), e.budget.context });
     }
     return out.toOwnedSlice(allocator);
 }
@@ -458,7 +477,7 @@ pub fn aiderMetadataJson(allocator: std.mem.Allocator, entries: []const Entry) !
     try out.appendSlice(allocator, "{\n");
     for (entries, 0..) |e, i| {
         try out.print(allocator,
-            \\{s}  "openai/{s}": {{
+            \\{s}  "openai/{f}": {{
             \\    "max_input_tokens": {d},
             \\    "max_output_tokens": {d},
             \\    "max_tokens": {d},
@@ -467,7 +486,7 @@ pub fn aiderMetadataJson(allocator: std.mem.Allocator, entries: []const Entry) !
             \\    "litellm_provider": "openai",
             \\    "mode": "chat"
             \\  }}
-        , .{ if (i == 0) "" else ",\n", e.id, e.budget.context, e.budget.output, e.budget.output });
+        , .{ if (i == 0) "" else ",\n", esc(e.id), e.budget.context, e.budget.output, e.budget.output });
     }
     try out.appendSlice(allocator, "\n}\n");
     return out.toOwnedSlice(allocator);
@@ -482,6 +501,16 @@ fn appendQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []co
         if (c == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, c);
     }
     try out.append(allocator, '\'');
+}
+
+/// One shell word: `prefix` + `arg` + `suffix`, single-quoted as a whole.
+fn quotedAlloc(allocator: std.mem.Allocator, prefix: []const u8, arg: []const u8, suffix: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const word = try std.mem.concat(allocator, u8, &.{ prefix, arg, suffix });
+    defer allocator.free(word);
+    try appendQuoted(&out, allocator, word);
+    return out.toOwnedSlice(allocator);
 }
 
 fn appendExtras(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: []const []const u8) !void {
@@ -511,10 +540,22 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
     if (budget.context > 0 and budget.context < contextFloor(kind)) {
         try out.print(allocator, "echo 'sushi: the model advertises a {d}-token context; {s} needs {d}+ to work well (raise --ctx-size or Settings > Server > Context size).' >&2\n", .{ budget.context, @tagName(kind), contextFloor(kind) });
     }
+    const q_base = try quotedAlloc(allocator, "", base_url, "");
+    defer allocator.free(q_base);
+    const q_model = try quotedAlloc(allocator, "", model, "");
+    defer allocator.free(q_model);
+    const q_sushi_model = try quotedAlloc(allocator, "sushi/", model, "");
+    defer allocator.free(q_sushi_model);
+    const q_openai_model = try quotedAlloc(allocator, "openai/", model, "");
+    defer allocator.free(q_openai_model);
+    const q_api_base = try quotedAlloc(allocator, "", base_url, "/v1");
+    defer allocator.free(q_api_base);
+    const q_config = try quotedAlloc(allocator, "", opencode_config orelse "", "");
+    defer allocator.free(q_config);
     switch (kind) {
         .claude => {
             try out.print(allocator,
-                \\export ANTHROPIC_BASE_URL='{s}'
+                \\export ANTHROPIC_BASE_URL={s}
                 \\export ANTHROPIC_API_KEY=
                 \\export ANTHROPIC_AUTH_TOKEN=sushi
                 \\export CLAUDE_CODE_ATTRIBUTION_HEADER=0
@@ -529,20 +570,20 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\
-            , .{ base_url, model, model, model, model, budget.output });
+            , .{ q_base, q_model, q_model, q_model, q_model, budget.output });
             // A long prefill and a long think on a local model outlast Claude Code's stream watchdogs; a fallback
             // re-sends the whole prompt as a non-stream request, which then times out and retries.
             // Claude Code assumes 200k for a model outside its catalog; declare the advertised context verbatim.
             if (budget.context > 0) {
                 try out.print(allocator, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS={d}\n", .{budget.context});
             }
-            try out.print(allocator, "claude --model {s}", .{model});
+            try out.print(allocator, "claude --model {s}", .{q_model});
         },
         .pi => {
             try out.print(allocator,
                 \\export PI_CODING_AGENT_DIR="$HOME/.sushi/pi"
                 \\pi --provider sushi --model {s}
-            , .{model});
+            , .{q_model});
         },
         .omp => {
             // omp still reads pi's env spelling (measured on v17 — the OMP_
@@ -550,11 +591,11 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             try out.print(allocator,
                 \\export PI_CODING_AGENT_DIR="$HOME/.sushi/omp"
                 \\export OMP_CODING_AGENT_DIR="$HOME/.sushi/omp"
-                \\omp --model sushi/{s}
-            , .{model});
+                \\omp --model {s}
+            , .{q_sushi_model});
         },
         .opencode => {
-            try out.print(allocator, "export OPENCODE_CONFIG_CONTENT='{s}'\n", .{opencode_config.?});
+            try out.print(allocator, "export OPENCODE_CONFIG_CONTENT={s}\n", .{q_config});
             try appendOpencodeInvocation(&out, allocator, extras);
             try out.append(allocator, '\n');
             return out.toOwnedSlice(allocator);
@@ -566,7 +607,7 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\grok --model
             );
             try out.append(allocator, ' ');
-            try appendQuoted(&out, allocator, model);
+            try out.appendSlice(allocator, q_model);
         },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
@@ -602,10 +643,10 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
         },
         .aider => {
             try out.print(allocator,
-                \\export OPENAI_API_BASE='{s}/v1'
+                \\export OPENAI_API_BASE={s}
                 \\export OPENAI_API_KEY=sushi
-                \\aider --model openai/{s} --weak-model openai/{s} --model-metadata-file ~/.sushi/aider/model-metadata.json
-            , .{ base_url, model, model });
+                \\aider --model {s} --weak-model {s} --model-metadata-file ~/.sushi/aider/model-metadata.json
+            , .{ q_api_base, q_openai_model, q_openai_model });
         },
     }
     try appendExtras(&out, allocator, extras);
@@ -987,7 +1028,7 @@ test "omp models.yml: static per-model entries, no discovery, pi-compat vocabula
     const yml = try ompModelsYml(t.allocator, "http://127.0.0.1:12345", &entries);
     defer t.allocator.free(yml);
     try t.expect(std.mem.indexOf(u8, yml, "discovery") == null);
-    try t.expect(std.mem.indexOf(u8, yml, "baseUrl: http://127.0.0.1:12345/v1") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "baseUrl: \"http://127.0.0.1:12345/v1\"") != null);
     try t.expect(std.mem.indexOf(u8, yml, "contextWindow: 4096") != null);
     try t.expect(std.mem.indexOf(u8, yml, "contextWindow: 262144") != null);
     try t.expect(std.mem.indexOf(u8, yml, "input: [text, image]") != null);
@@ -1235,7 +1276,7 @@ test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONT
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS=786432") != null);
     try t.expect(std.mem.indexOf(u8, script, "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536") != null);
-    try t.expect(std.mem.indexOf(u8, script, "\nclaude --model m1") != null);
+    try t.expect(std.mem.indexOf(u8, script, "\nclaude --model 'm1'") != null);
 
     // An unknown context is not a claim: omit the export rather than pin a
     // number the server never advertised.
@@ -1408,4 +1449,83 @@ test "parseChatEntries reads default_reasoning_effort" {
     defer models.deinit();
     try t.expectEqualStrings("high", models.entries[0].default_effort.?);
     try t.expect(models.entries[1].default_effort == null);
+}
+
+const hostile_id = "x'; touch PWNED #$(id)\"\\";
+const hostile_quoted = "'x'\\''; touch PWNED #$(id)\"\\'";
+
+test "script: a model id with spaces, quotes, ; and $() stays one shell word in every agent" {
+    const b = budgetForContext(786432);
+    const spaced = try scriptFor(t.allocator, .claude, "http://x:1", "My Model (copy)", b, null, &.{});
+    defer t.allocator.free(spaced);
+    try t.expect(std.mem.indexOf(u8, spaced, "\nclaude --model 'My Model (copy)'\n") != null);
+    try t.expect(std.mem.indexOf(u8, spaced, "export ANTHROPIC_DEFAULT_OPUS_MODEL='My Model (copy)'\n") != null);
+
+    const claude = try scriptFor(t.allocator, .claude, "http://x:1", hostile_id, b, null, &.{});
+    defer t.allocator.free(claude);
+    try t.expect(std.mem.indexOf(u8, claude, "export CLAUDE_CODE_SUBAGENT_MODEL=" ++ hostile_quoted ++ "\n") != null);
+    try t.expect(std.mem.indexOf(u8, claude, "\nclaude --model " ++ hostile_quoted ++ "\n") != null);
+
+    const pi = try scriptFor(t.allocator, .pi, "http://x:1", hostile_id, b, null, &.{});
+    defer t.allocator.free(pi);
+    try t.expect(std.mem.indexOf(u8, pi, "\npi --provider sushi --model " ++ hostile_quoted ++ "\n") != null);
+
+    const omp = try scriptFor(t.allocator, .omp, "http://x:1", hostile_id, b, null, &.{});
+    defer t.allocator.free(omp);
+    try t.expect(std.mem.indexOf(u8, omp, "\nomp --model 'sushi/x'\\''; touch PWNED #$(id)\"\\'\n") != null);
+
+    const aider = try scriptFor(t.allocator, .aider, "http://x:1", hostile_id, b, null, &.{});
+    defer t.allocator.free(aider);
+    const oai = "'openai/x'\\''; touch PWNED #$(id)\"\\'";
+    try t.expect(std.mem.indexOf(u8, aider, "\naider --model " ++ oai ++ " --weak-model " ++ oai ++ " --model-metadata-file") != null);
+
+    const hostile_url = try scriptFor(t.allocator, .aider, "http://h'; touch PWNED #", "m1", b, null, &.{});
+    defer t.allocator.free(hostile_url);
+    try t.expect(std.mem.indexOf(u8, hostile_url, "export OPENAI_API_BASE='http://h'\\''; touch PWNED #/v1'\n") != null);
+    const claude_url = try scriptFor(t.allocator, .claude, "http://h'; touch PWNED #", "m1", b, null, &.{});
+    defer t.allocator.free(claude_url);
+    try t.expect(std.mem.indexOf(u8, claude_url, "export ANTHROPIC_BASE_URL='http://h'\\''; touch PWNED #'\n") != null);
+}
+
+test "script: the opencode config is single-quote escaped as one env value" {
+    const script = try scriptFor(t.allocator, .opencode, "http://x:1", "m1", FALLBACK_BUDGET, "{\"model\": \"it's\"}", &.{});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export OPENCODE_CONFIG_CONTENT='{\"model\": \"it'\\''s\"}'\n") != null);
+}
+
+test "config writers escape ids and urls so hostile ones stay data" {
+    const id = "a\"b\\c'd";
+    const entries = [_]Entry{.{ .id = id, .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    const oc = try opencodeJson(t.allocator, "http://h\"x:1", id, &entries);
+    defer t.allocator.free(oc);
+    const oc_parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, oc, .{});
+    defer oc_parsed.deinit();
+    try t.expectEqualStrings("sushi/" ++ id, oc_parsed.value.object.get("model").?.string);
+    try t.expect(oc_parsed.value.object.get("provider").?.object.get("sushi").?.object.get("models").?.object.get(id) != null);
+
+    const pi = try piModelsJson(t.allocator, "http://h\"x:1", &entries);
+    defer t.allocator.free(pi);
+    const pi_parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, pi, .{});
+    defer pi_parsed.deinit();
+    const pi_models = pi_parsed.value.object.get("providers").?.object.get("sushi").?.object.get("models").?.array.items;
+    try t.expectEqualStrings(id, pi_models[0].object.get("id").?.string);
+
+    const aider = try aiderMetadataJson(t.allocator, &entries);
+    defer t.allocator.free(aider);
+    const aider_parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, aider, .{});
+    defer aider_parsed.deinit();
+    try t.expect(aider_parsed.value.object.get("openai/" ++ id) != null);
+
+    const codex = try codexConfigToml(t.allocator, "http://h:1", id, FALLBACK_BUDGET);
+    defer t.allocator.free(codex);
+    try t.expect(std.mem.indexOf(u8, codex, "\nmodel = \"a\\\"b\\\\c'd\"\n") != null);
+
+    const omp = try ompModelsYml(t.allocator, "http://h:1", &entries);
+    defer t.allocator.free(omp);
+    try t.expect(std.mem.indexOf(u8, omp, "      - id: \"a\\\"b\\\\c'd\"\n") != null);
+
+    const hermes = try hermesConfigYaml(t.allocator, "http://h:1", id, &entries);
+    defer t.allocator.free(hermes);
+    try t.expect(std.mem.indexOf(u8, hermes, "  default: \"a\\\"b\\\\c'd\"\n") != null);
+    try t.expect(std.mem.indexOf(u8, hermes, "      \"a\\\"b\\\\c'd\":\n") != null);
 }

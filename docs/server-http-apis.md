@@ -274,6 +274,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 
 - `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
+- Every model id and URL in the zsh script is one single-quoted word (`appendQuoted`) and every config writer escapes
+  them for its format (JSON/TOML/YAML `Esc`): ids come from folder names or a `--url` server, so never interpolate bare.
 - Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long
   prefill plus a long think tripped them, and each fallback re-sent the whole prompt, then timed out and retried.
 - Agent budgets (`launch.budgetForContext` + `compactionReserve`): output share ctx/2, compaction reserve ctx/4

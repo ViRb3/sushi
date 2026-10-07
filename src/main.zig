@@ -1225,6 +1225,17 @@ pub fn main(init: std.process.Init) !void {
     // mode did).
     var cli_pld = server_mod.PldDefaults.fromCli(enable_pld, pld_draft_len, pld_key_len);
     cli_pld.explicit = pld_explicit;
+    const launch_serve = LaunchServe{
+        .ctx_size = ctx_size,
+        .timeout = timeout,
+        .reasoning_budget = reasoning_budget,
+        .max_tokens = serve_default_max_tokens,
+        .temperature = if (temp_explicit) temperature else null,
+        .top_p = top_p_flag,
+        .top_k = top_k_flag,
+        .pld = cli_pld,
+        .kv_attn_mode = kv_attn_mode,
+    };
 
     // Echo the resolved arguments — makes drafter/target mismatches obvious
     // from the log without having to scroll through the whole launch line in
@@ -1291,7 +1302,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, kv_quant_explicit, enable_mtp, mtp_explicit, cli_pld);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, launch_serve, drafter_dir orelse "", no_drafter, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, kv_quant_explicit, enable_mtp, mtp_explicit);
             return;
         }
     }
@@ -1530,22 +1541,10 @@ pub fn main(init: std.process.Init) !void {
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .metrics = server_mod.g_metrics,
         };
-        try server_mod.serve(io, allocator, params, config, host, port, .{
-            .on_ready = if (prompt != null) PromptClient.ready else null,
-            .max_context_size = ctx_size,
-            .request_timeout_sec = timeout,
-            .default_reasoning_budget = reasoning_budget,
-            .default_max_tokens = serve_default_max_tokens,
-            .default_temperature = if (temp_explicit) temperature else null,
-            .default_top_p = top_p_flag,
-            .default_top_k = top_k_flag,
-            .default_enable_pld = cli_pld.enable,
-            .pld_explicit = cli_pld.explicit,
-            .default_pld_draft_len = cli_pld.draft_len,
-            .default_pld_key_len = cli_pld.key_len,
-            .kv_attn_mode = kv_attn_mode,
-            .default_force_mtp = force_mtp,
-        });
+        var serve_cfg = launch_serve.serverConfig();
+        serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
+        serve_cfg.default_force_mtp = force_mtp;
+        try server_mod.serve(io, allocator, params, config, host, port, serve_cfg);
         if (prompt_state.err) |err| return err;
     } else {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
@@ -1713,6 +1712,37 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     return @as(u64, max_rec) * 4 / 5;
 }
 
+/// The ServerConfig fields both boot modes take from the parsed launch flags; a mode
+/// adds only what is its own (`on_ready`, `default_force_mtp`).
+const LaunchServe = struct {
+    ctx_size: u32,
+    timeout: u32,
+    reasoning_budget: i32,
+    max_tokens: u32,
+    temperature: ?f32,
+    top_p: ?f32,
+    top_k: ?u32,
+    pld: server_mod.PldDefaults,
+    kv_attn_mode: server_mod.KvAttnMode,
+
+    fn serverConfig(self: LaunchServe) server_mod.ServerConfig {
+        return .{
+            .max_context_size = self.ctx_size,
+            .request_timeout_sec = self.timeout,
+            .default_reasoning_budget = self.reasoning_budget,
+            .default_max_tokens = self.max_tokens,
+            .default_temperature = self.temperature,
+            .default_top_p = self.top_p,
+            .default_top_k = self.top_k,
+            .default_enable_pld = self.pld.enable,
+            .pld_explicit = self.pld.explicit,
+            .default_pld_draft_len = self.pld.draft_len,
+            .default_pld_key_len = self.pld.key_len,
+            .kv_attn_mode = self.kv_attn_mode,
+        };
+    }
+};
+
 /// Headless serve mode: start with NO primary model. The registry holds all
 /// discovery stubs; chat AND media models load on demand via `/v1/load-model`
 /// (or a request targeting a discovered id), coexisting under one memory
@@ -1724,9 +1754,9 @@ fn runHeadlessServe(
     discovery: ?model_discovery.DiscoveryResult,
     host: []const u8,
     port: u16,
-    ctx_size: u32,
-    timeout: u32,
-    reasoning_budget: i32,
+    launch_serve: LaunchServe,
+    drafter_dir: []const u8,
+    no_drafter: bool,
     max_resident_models: u32,
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
@@ -1735,7 +1765,6 @@ fn runHeadlessServe(
     kv_quant_explicit: bool,
     enable_mtp: bool,
     mtp_explicit: bool,
-    pld: server_mod.PldDefaults,
 ) !void {
     log.info("sushi {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1797,7 +1826,9 @@ fn runHeadlessServe(
         .tok = stub.tok,
         .chat_config = stub.chat_config,
         .model_dir = "",
-        .ctx_size = ctx_size,
+        .ctx_size = launch_serve.ctx_size,
+        .drafter_dir = drafter_dir,
+        .no_drafter = no_drafter,
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
@@ -1832,30 +1863,11 @@ fn runHeadlessServe(
         .metrics = server_mod.g_metrics,
     };
 
-    try server_mod.serve(io, allocator, params, stub.config, host, port, .{
-        .max_context_size = ctx_size,
-        .request_timeout_sec = timeout,
-        .default_reasoning_budget = reasoning_budget,
-        .default_max_tokens = serve_default_max_tokens,
-        .default_temperature = null,
-        .default_top_p = null,
-        .default_top_k = null,
-        // Honor the whole --pld/--pld-draft-len/--pld-key-len trio in headless
-        // mode. All three were hardcoded here, so none of them reached a
-        // headless request — only an explicit per-request "enable_pld": true
-        // did — while MLX Core's own UI describes Auto as "follow the server's
-        // --pld setting". Headless is the mode the app ALWAYS launches, and it
-        // always passes all three flags. Taking them as one `PldDefaults`
-        // is what keeps the next edit from honoring one and dropping two.
-        .default_enable_pld = pld.enable,
-        .pld_explicit = pld.explicit,
-        .default_pld_draft_len = pld.draft_len,
-        .default_pld_key_len = pld.key_len,
-        .kv_attn_mode = .auto,
-        // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
-        // defaults true), so the MoE force flag has to reach this path too.
-        .default_force_mtp = enable_mtp and mtp_explicit,
-    });
+    var serve_cfg = launch_serve.serverConfig();
+    // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
+    // defaults true), so the MoE force flag has to reach this path too.
+    serve_cfg.default_force_mtp = enable_mtp and mtp_explicit;
+    try server_mod.serve(io, allocator, params, stub.config, host, port, serve_cfg);
 }
 
 /// Parse a size-style CLI argument: bare integer = bytes, suffix `KB`/`MB`/
@@ -1890,4 +1902,35 @@ fn parseSizeArg(s: []const u8) !u64 {
     if (end == 0) return error.InvalidSize;
     const n = std.fmt.parseInt(u64, s[0..end], 10) catch return error.InvalidSize;
     return n * mult;
+}
+
+test "both boot modes build their server defaults from the same launch flags" {
+    const launch = LaunchServe{
+        .ctx_size = 32768,
+        .timeout = 77,
+        .reasoning_budget = 512,
+        .max_tokens = 4096,
+        .temperature = 0.3,
+        .top_p = 0.8,
+        .top_k = 20,
+        .pld = server_mod.PldDefaults.fromCli(true, 7, 4),
+        .kv_attn_mode = .dense,
+    };
+    const cfg = launch.serverConfig();
+    try std.testing.expectEqual(@as(?f32, 0.3), cfg.default_temperature);
+    try std.testing.expectEqual(@as(?f32, 0.8), cfg.default_top_p);
+    try std.testing.expectEqual(@as(?u32, 20), cfg.default_top_k);
+    try std.testing.expectEqual(server_mod.KvAttnMode.dense, cfg.kv_attn_mode);
+    try std.testing.expectEqual(@as(u32, 4096), cfg.default_max_tokens);
+    try std.testing.expectEqual(@as(u32, 7), cfg.default_pld_draft_len);
+    try std.testing.expectEqual(@as(u32, 4), cfg.default_pld_key_len);
+    try std.testing.expectEqual(@as(u32, 32768), cfg.max_context_size);
+
+    var unset = launch;
+    unset.temperature = null;
+    unset.top_p = null;
+    unset.top_k = null;
+    const none = unset.serverConfig();
+    try std.testing.expectEqual(@as(?f32, null), none.default_temperature);
+    try std.testing.expectEqual(@as(?u32, null), none.default_top_k);
 }

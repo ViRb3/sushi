@@ -12,6 +12,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - `src/main.zig`: entry, CLI flags + subcommands (`run/pull/list/serve/launch/kld/update`).
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
+- `pull` takes top-level files, `mtp/` and GLM's `GLM-5.3-Flash-DFlash2/` assistant (the loader auto-detects that folder; a
+  pull that skips it serves GLM with DFlash2 off, logged as `[glm-dflash] off: no assistant found`).
+- Headless and `--model` boots build their `ServerConfig` defaults from one `LaunchServe` (sampling, PLD, `--kv-attn-mode`,
+  context, timeout): a flag one mode parses and the other drops is the class. `--no-drafter`/`--drafter` reach both too.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
 - **A served arch must be in `model_discovery.supported_model_types`**: `run` refuses what `classifyModelPath` calls non-chat
@@ -42,7 +46,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   one takes either), `renamex_np(RENAME_SWAP)` (three self-undoing renames where the volume lacks it), then
   `<install>/sushi --version` and `--guest-manifest` must name the tag or the swap is undone; the old install becomes
   the one `<install>.previous`, which `--rollback` swaps back. One line per step to stderr and
-  `~/.sushi/logs/update.log`.
+  `~/.sushi/logs/update.log`; the `--relaunch` line redacts the `--api-key` value.
 - **Every tool runs through `posix_spawn`**, never `std.process.spawn`: Zig 0.17's forks on macOS, and a fork of a
   server copies its whole MLX mapping.
 - **Daily check**: a serving process (`serve`, `--serve`, `run`) asks GitHub at most once a day on a detached thread,

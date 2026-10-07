@@ -20,6 +20,7 @@ const chat = @import("chat.zig");
 const model = @import("model.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
+const dflash = @import("dflash.zig");
 const status = @import("status.zig");
 const repl_tools = @import("repl_tools.zig");
 const update = @import("update.zig");
@@ -77,13 +78,16 @@ pub const Alias = struct {
     gguf_file: []const u8 = "",
 };
 
-/// The published Sushi packs. The bare name picks 3bpw: 2.6bpw needs the same
-/// 64 GB and scores worse on KLD; 4bpw needs 96 GB. MiMo's one pack needs 128 GB.
+/// The published Sushi packs. The bare Qwen name picks 3bpw: 2.6bpw needs the same
+/// 64 GB and scores worse on KLD; 4bpw needs 96 GB. MiMo's and GLM's one pack each
+/// need 128 GB.
 pub const aliases = [_]Alias{
+    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw" },
     .{ .name = "qwen3.8-flash-next", .tag = "2.6bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw" },
     .{ .name = "qwen3.8-flash-next", .tag = "3bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-3bpw", .is_default = true },
     .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw" },
     .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true },
+    .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true },
 };
 
 pub const Resolved = struct {
@@ -230,8 +234,9 @@ pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile
 }
 
 /// Chat-default file selection (mirrors the app's `FileSelection.chatDefault`):
-/// top-level files + the `mtp/` spec-decode sidecar; repo housekeeping and
-/// demo assets are skipped.
+/// top-level files + the `mtp/` spec-decode sidecar + GLM's DFlash2 assistant
+/// folder (the one the loader auto-detects); repo housekeeping and demo assets
+/// are skipped.
 /// `pytorch_model.bin` / `pytorch_model-0000N-of-0000M.bin` — the HF torch
 /// weights that sit beside the safetensors copy. Shared rule with the app's
 /// `DownloadManager.selectNeededFiles`; keep them in sync.
@@ -243,10 +248,14 @@ pub fn isTorchShadowBin(path: []const u8) bool {
         std.ascii.startsWithIgnoreCase(base, "tf_model");
 }
 
-pub fn shouldDownload(path: []const u8) bool {
-    if (path.len == 0 or path[0] == '.') return false;
-    if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-        return std.mem.startsWith(u8, path, "mtp/");
+pub fn shouldDownload(full_path: []const u8) bool {
+    if (full_path.len == 0 or full_path[0] == '.') return false;
+    var path = full_path;
+    if (std.mem.indexOfScalar(u8, path, '/')) |slash| {
+        if (std.mem.startsWith(u8, path, "mtp/")) return true;
+        if (!std.mem.eql(u8, path[0..slash], dflash.SHIPPED_GLM_SUBDIR)) return false;
+        path = path[slash + 1 ..];
+        if (path.len == 0 or path[0] == '.' or std.mem.indexOfScalar(u8, path, '/') != null) return false;
     }
     const skip_exact = [_][]const u8{ "README.md", "LICENSE", "LICENSE.txt", "USE_POLICY.md" };
     for (skip_exact) |s| {
@@ -1560,6 +1569,9 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // MiMo's one published pack, bare or tagged.
     try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("mimo-v2.6-flash").?.repo);
     try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("MiMo-V2.6-Flash:2.3bpw").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2bpw", resolveShortName("qwen3.8-flash-next:2bpw").?.repo);
+    try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("glm-5.3-flash").?.repo);
+    try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("GLM-5.3-Flash:2.4bpw").?.repo);
     // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo:latest").?.repo);
@@ -1573,7 +1585,8 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
 
 test "cli: every short name is a published Sushi pack" {
     for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-") or
-        std.mem.startsWith(u8, a.repo, "beamster/MiMo-V2.6-Flash-Sushi-"));
+        std.mem.startsWith(u8, a.repo, "beamster/MiMo-V2.6-Flash-Sushi-") or
+        std.mem.startsWith(u8, a.repo, "beamster/GLM-5.3-Flash-Sushi-"));
 }
 
 test "cli: modelDestPath layout" {
@@ -1590,6 +1603,12 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(shouldDownload("tokenizer.json"));
     try testing.expect(shouldDownload("chat_template.jinja"));
     try testing.expect(shouldDownload("mtp/weights.safetensors"));
+    try testing.expect(shouldDownload("GLM-5.3-Flash-DFlash2/model.safetensors"));
+    try testing.expect(shouldDownload("GLM-5.3-Flash-DFlash2/config.json"));
+    try testing.expect(!shouldDownload("GLM-5.3-Flash-DFlash2/README.md"));
+    try testing.expect(!shouldDownload("GLM-5.3-Flash-DFlash2/assets/demo.png"));
+    try testing.expect(!shouldDownload("GLM-5.3-Flash-DFlash2-other/model.safetensors"));
+    try testing.expect(!shouldDownload("dflash2/model.safetensors")); // the derived runtime cache is never downloaded
     try testing.expect(!shouldDownload(".gitattributes"));
     try testing.expect(!shouldDownload("README.md"));
     try testing.expect(!shouldDownload("assets/demo.png"));

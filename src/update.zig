@@ -902,6 +902,25 @@ fn rollback(arena: Allocator, io: std.Io, opts: Options) !void {
     log.info("rolled back {s} -> {s}\n", .{ version, first["sushi ".len..] });
 }
 
+/// The argv as one log line with the `--api-key` secret replaced; exec still takes the real argv.
+fn redactedLine(arena: Allocator, argv: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    var hide_next = false;
+    for (argv, 0..) |arg, i| {
+        if (i > 0) try out.append(arena, ' ');
+        if (hide_next) {
+            hide_next = false;
+            try out.appendSlice(arena, "<redacted>");
+        } else if (eql(u8, arg, "--api-key")) {
+            hide_next = true;
+            try out.appendSlice(arena, arg);
+        } else if (std.mem.startsWith(u8, arg, "--api-key=")) {
+            try out.appendSlice(arena, "--api-key=<redacted>");
+        } else try out.appendSlice(arena, arg);
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// The end of `--relaunch`: the outcome goes to the cache for `/props`, then the install's sushi (new, or the old one
 /// restored) replaces this process with the server's own argv.
 fn relaunch(arena: Allocator, io: std.Io, argv: []const []const u8, result: anyerror!void) noreturn {
@@ -920,7 +939,7 @@ fn relaunch(arena: Allocator, io: std.Io, argv: []const []const u8, result: anye
     const bin = std.fmt.allocPrint(arena, "{s}/sushi", .{dir}) catch std.process.exit(1);
     full.append(arena, bin) catch std.process.exit(1);
     full.appendSlice(arena, argv) catch std.process.exit(1);
-    const line = std.mem.join(arena, " ", full.items) catch bin;
+    const line = redactedLine(arena, full.items) catch bin;
     log.info("relaunching {s}\n", .{line});
     log.closeFile();
     execInPlace(arena, full.items);
@@ -930,6 +949,17 @@ fn relaunch(arena: Allocator, io: std.Io, argv: []const []const u8, result: anye
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "update: the relaunch log line never carries the api key" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const spaced = try redactedLine(arena, &.{ "/i/sushi", "--model", "m", "--api-key", "s3cret", "--api-key-strict", "--port", "1" });
+    try testing.expectEqualStrings("/i/sushi --model m --api-key <redacted> --api-key-strict --port 1", spaced);
+    const joined = try redactedLine(arena, &.{ "/i/sushi", "--api-key=s3cret", "--api-key-env", "KEYVAR" });
+    try testing.expectEqualStrings("/i/sushi --api-key=<redacted> --api-key-env KEYVAR", joined);
+    try testing.expectEqualStrings("/i/sushi --api-key", try redactedLine(arena, &.{ "/i/sushi", "--api-key" }));
+}
 
 test "update: SemVer order: a prerelease sorts below its release, and nothing lower is ever newer" {
     try testing.expect(isNewer("1.1.0", "1.0.4"));
