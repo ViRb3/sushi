@@ -4354,19 +4354,21 @@ fn diskContextForLoad(config: *model_mod.ModelConfig) u64 {
 
 /// The SSD budget the model gets at load, in bytes (0 = tier off); logs the `Allocating` line, or why
 /// there is none. Runs on the inference thread beside `prefixCacheMemForLoad`.
-pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8) u64 {
+/// `held` is what this model's tier already occupies under `dir`: it counts as available, or a restart on a
+/// nearly full volume would evict what the last boot stored.
+pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64) ?kv_disk_cache.DefaultDiskBudget {
     const kv_bits = defaultKvBits(config);
     const bpt = diskBytesPerToken(config, kv_bits);
     const ctx = if (prefix_cache_disk_explicit) 0 else diskContextForLoad(config);
     // An unreadable volume is no reason to refuse: the tier re-checks before every store.
     const free: u64 = if (kv_disk_cache.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
     var buf: [384]u8 = undefined;
-    const plan = kv_disk_cache.resolveDiskBudget(prefix_cache_disk_explicit, prefix_cache_disk_bytes, prefix_cache_capacity, ctx, bpt, free) orelse {
+    const plan = kv_disk_cache.resolveDiskBudget(prefix_cache_disk_explicit, prefix_cache_disk_bytes, prefix_cache_capacity, ctx, bpt, free, held) orelse {
         log.info("{s}\n", .{kv_disk_cache.diskOffLine(&buf, free, dir)});
-        return 0;
+        return null;
     };
     log.info("{s}\n", .{kv_disk_cache.allocatingDiskLine(&buf, plan, prefix_cache_capacity, ctx, bpt, dir)});
-    return plan.bytes;
+    return plan;
 }
 
 test "diskBytesPerToken: the serialized geometry, whatever the QSA execution switches say" {

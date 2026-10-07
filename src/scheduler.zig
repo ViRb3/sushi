@@ -174,7 +174,7 @@ pub const LoadParams = struct {
     prefix_cache_disk_bytes: u64 = 0,
     /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64 = null,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
@@ -1215,7 +1215,7 @@ pub const LoadRequest = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64 = null,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
@@ -1313,7 +1313,7 @@ pub const Scheduler = struct {
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
-    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8) u64,
+    prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget,
     expert_cache_bytes: u64,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
@@ -5105,19 +5105,22 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         defer sch.allocator.free(fp);
         const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
         defer sch.allocator.free(base);
-        const disk_budget = if (params.prefix_cache_disk_resolver) |resolve| resolve(params.config, base) else params.prefix_cache_disk_bytes;
-        if (disk_budget == 0) break :attach;
+        const plan: kv_disk_cache.DefaultDiskBudget = if (params.prefix_cache_disk_resolver) |resolve|
+            resolve(params.config, base, kv_disk_cache.tierBytes(sch.io, base, fp)) orelse break :attach
+        else
+            .{ .bytes = params.prefix_cache_disk_bytes, .bound = .flag, .cap = params.prefix_cache_disk_bytes };
         disk_tier = kv_disk_cache.DiskTier.init(
             sch.allocator,
             sch.io,
             base,
             fp,
-            disk_budget,
+            plan.bytes,
             kv_disk_cache.DEFAULT_CHUNK_TOKENS,
         ) catch |err| {
             log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
+        disk_tier.?.operator_cap = plan.cap;
     }
     params.config.prefix_cache_disk_declined = params.prefix_cache_disk_bytes > 0 and disk_tier == null;
     const disk_prefix_cache = disk_tier != null;
@@ -6742,7 +6745,7 @@ fn publishDiskStats(sch: *Scheduler) void {
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.operator_cap, .used = d.total_bytes, .entries = d.entryCount(), .writer_bytes = d.writerHostBytes() };
+                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .writer_bytes = d.writerHostBytes() };
             };
         }
         entry.disk_stats.publish(snap);

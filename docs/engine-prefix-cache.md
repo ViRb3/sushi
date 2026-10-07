@@ -138,6 +138,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
     second history copy are execution state and never count, so no QSA switch moves it. GLM's KDA checkpoints and
     DFlash2 window, Qwen's GDN checkpoints and MiMo's ring files are fixed per entry, not per token; the 2 GB slack is
     all the formula leaves them.
+  - **The tier's own bytes on disk count as free** (`kv_disk_cache.tierBytes` is added to the volume's free space at
+    resolution, as `refreshDiskBudget` adds `total_bytes` live), and `DiskTier.operator_cap` is only the flag or the
+    formula / 20 GB cap, never a free-space number; else a restart on a full volume evicts what the last boot stored.
   - A result of zero or less turns the tier off and one line says why. `--prefix-cache-disk <n>` is the budget as
     given (an operator's cap: the tier still stores no more than the volume leaves) and `0`/`off` disables;
     `--prefix-cache-entries 0` disables both tiers.

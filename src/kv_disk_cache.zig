@@ -140,18 +140,21 @@ pub const DiskBound = enum {
     }
 };
 
-pub const DefaultDiskBudget = struct { bytes: u64, bound: DiskBound };
+/// `bytes` is the budget now; `cap` is the operator's ceiling (the flag, or the formula / 20 GB cap), never
+/// derived from free space, which the tier re-reads before every store.
+pub const DefaultDiskBudget = struct { bytes: u64, bound: DiskBound, cap: u64 };
 
 /// An operator's `--prefix-cache-disk` is the budget as given; unnamed it is
-/// `min(entries x context x bytes_per_token + 2 GB, 20 GB, free - 4 GB)`. Null when that is not positive.
-pub fn resolveDiskBudget(explicit: bool, ask: u64, entries: u32, context: u64, bytes_per_token: u64, free_bytes: u64) ?DefaultDiskBudget {
-    if (explicit) return if (ask == 0) null else .{ .bytes = ask, .bound = .flag };
+/// `min(entries x context x bytes_per_token + 2 GB, 20 GB, free + held - 4 GB)`, where `held` is what the tier
+/// already occupies on the volume. Null when that is not positive.
+pub fn resolveDiskBudget(explicit: bool, ask: u64, entries: u32, context: u64, bytes_per_token: u64, free_bytes: u64, held_bytes: u64) ?DefaultDiskBudget {
+    if (explicit) return if (ask == 0) null else .{ .bytes = ask, .bound = .flag, .cap = ask };
     const formula = @as(u64, entries) *| context *| bytes_per_token +| DEFAULT_DISK_SLACK;
-    const room = freeDiskRoom(free_bytes);
+    const room = freeDiskRoom(free_bytes +| held_bytes);
     if (room == 0) return null;
-    var out: DefaultDiskBudget = .{ .bytes = formula, .bound = .formula };
-    if (DEFAULT_DISK_CAP < out.bytes) out = .{ .bytes = DEFAULT_DISK_CAP, .bound = .cap };
-    if (room < out.bytes) out = .{ .bytes = room, .bound = .free_disk };
+    const cap = @min(formula, DEFAULT_DISK_CAP);
+    var out: DefaultDiskBudget = .{ .bytes = cap, .bound = if (DEFAULT_DISK_CAP < formula) .cap else .formula, .cap = cap };
+    if (room < cap) out = .{ .bytes = room, .bound = .free_disk, .cap = cap };
     return out;
 }
 
@@ -505,7 +508,8 @@ pub const DiskTier = struct {
     /// Background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
-    /// The operator's `--prefix-cache-disk` value; `max_bytes` is re-derived from it before every store.
+    /// The ceiling `max_bytes` is re-derived under before every store: the flag, or the formula / 20 GB cap;
+    /// never a free-space number (`init` seeds it with `max_bytes`; the loader sets the real one).
     operator_cap: u64 = 0,
     /// The free-space probe; tests arm a fixed answer with `armTestSpace`.
     space_probe: SpaceProbeFn = volumeSpace,
@@ -4077,6 +4081,23 @@ fn reapStaleTmp(io: std.Io, dir_abs: []const u8) void {
     }
 }
 
+/// Bytes the tier `<base>/<fingerprint>` already holds on the volume: the files of every `e<id>` directory.
+pub fn tierBytes(io: std.Io, base_dir: []const u8, fingerprint: []const u8) u64 {
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = std.fmt.bufPrint(&root_buf, "{s}/{s}", .{ base_dir, fingerprint }) catch return 0;
+    var d = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'e') continue;
+        var e_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const e_abs = std.fmt.bufPrint(&e_buf, "{s}/{s}", .{ root, dent.name }) catch continue;
+        total +|= dirBytes(io, e_abs);
+    }
+    return total;
+}
+
 /// Total bytes of the regular files directly inside `dir_abs`.
 fn dirBytes(io: std.Io, dir_abs: []const u8) u64 {
     var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return 0;
@@ -7381,26 +7402,26 @@ test "resolveDiskBudget: the formula, the 20 GB cap and free disk - 4 GB bind in
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
     // 2 entries x 1000 tokens x 1 MB + 2 GB: the formula binds.
-    const small = resolveDiskBudget(false, DEFAULT_DISK_CAP, 2, 1000, MB, 500 * GB).?;
+    const small = resolveDiskBudget(false, DEFAULT_DISK_CAP, 2, 1000, MB, 500 * GB, 0).?;
     try testing.expectEqual(@as(u64, 2000 * MB + 2 * GB), small.bytes);
     try testing.expectEqual(DiskBound.formula, small.bound);
     // 32 entries x 262144 tokens x 18.4 kB is far past 20 GB.
-    const big = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 500 * GB).?;
+    const big = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 500 * GB, 0).?;
     try testing.expectEqual(DEFAULT_DISK_CAP, big.bytes);
     try testing.expectEqual(DiskBound.cap, big.bound);
     // 10 GB free leaves 6.
-    const tight = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 10 * GB).?;
+    const tight = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 10 * GB, 0).?;
     try testing.expectEqual(6 * GB, tight.bytes);
     try testing.expectEqual(DiskBound.free_disk, tight.bound);
-    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 4 * GB));
-    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 1 * GB));
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 4 * GB, 0));
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 1 * GB, 0));
     // Overflow saturates to the cap, never wraps.
-    try testing.expectEqual(DEFAULT_DISK_CAP, resolveDiskBudget(false, 0, std.math.maxInt(u32), std.math.maxInt(u64), 1 << 40, 500 * GB).?.bytes);
+    try testing.expectEqual(DEFAULT_DISK_CAP, resolveDiskBudget(false, 0, std.math.maxInt(u32), std.math.maxInt(u64), 1 << 40, 500 * GB, 0).?.bytes);
     // An explicit number is the budget, whatever the formula or the free space say; 0 is off.
-    const flag = resolveDiskBudget(true, 50 * GB, 32, 262144, 18_400, 10 * GB).?;
+    const flag = resolveDiskBudget(true, 50 * GB, 32, 262144, 18_400, 10 * GB, 0).?;
     try testing.expectEqual(@as(u64, 50 * GB), flag.bytes);
     try testing.expectEqual(DiskBound.flag, flag.bound);
-    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(true, 0, 32, 262144, 18_400, 500 * GB));
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(true, 0, 32, 262144, 18_400, 500 * GB, 0));
 }
 
 test "diskUsageLine: used / budget in GB and the entry count" {
@@ -7412,9 +7433,9 @@ test "diskUsageLine: used / budget in GB and the entry count" {
 test "allocatingDiskLine: starts with Allocating and names the terms, the bound and the directory" {
     var buf: [256]u8 = undefined;
     const GB: u64 = 1024 * 1024 * 1024;
-    const line = allocatingDiskLine(&buf, .{ .bytes = 20 * GB, .bound = .cap }, 32, 262144, 18_400, "/c");
+    const line = allocatingDiskLine(&buf, .{ .bytes = 20 * GB, .bound = .cap, .cap = 20 * GB }, 32, 262144, 18_400, "/c");
     try testing.expectEqualStrings("Allocating 20.0 GB SSD for the prefix cache (32 entries x 262144 tokens x 18.0 KB + 2 GB; bound: 20 GB cap) at /c", line);
-    const flag = allocatingDiskLine(&buf, .{ .bytes = 12 * GB, .bound = .flag }, 32, 0, 0, "/c");
+    const flag = allocatingDiskLine(&buf, .{ .bytes = 12 * GB, .bound = .flag, .cap = 12 * GB }, 32, 0, 0, "/c");
     try testing.expectEqualStrings("Allocating 12.0 GB SSD for the prefix cache (--prefix-cache-disk) at /c", flag);
     try testing.expectEqualStrings("SSD prefix cache OFF: 3.0 GB free at /c leaves nothing after the 4 GB reserve", diskOffLine(&buf, 3 * GB, "/c"));
 }
@@ -7433,8 +7454,8 @@ test "diskBudgetFromFreeSpace: the one reserve is 4 GiB, whatever the volume; no
     try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(500 * GB, 2 * GB));
     // Load-time resolution and the store-time bound read the same free space the same way.
     for ([_]u64{ 10 * GB, 5 * GB, 4 * GB + GB / 2, 3 * GB }) |free| {
-        const announced = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 1 << 20, 1 << 20, free);
-        const stored = diskBudgetFromFreeSpace(if (announced) |a| a.bytes else 0, free);
+        const announced = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 1 << 20, 1 << 20, free, 0);
+        const stored = diskBudgetFromFreeSpace(if (announced) |a| a.cap else 0, free);
         try testing.expectEqual(if (announced) |a| @as(?u64, a.bytes) else null, stored);
     }
 }
@@ -7524,7 +7545,7 @@ test "DiskTier: a budget the load line announced is a budget the store honours (
     const base = try tmpRoot(&tmp, io, &buf);
     const free: u64 = 10 * 1024 * 1024 * 1024;
     const total: u64 = 1024 * 1024 * 1024 * 1024;
-    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free).?;
+    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, 0).?;
     try testing.expectEqual(DiskBound.free_disk, plan.bound);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-announced", plan.bytes, 128);
@@ -7542,6 +7563,63 @@ test "DiskTier: a budget the load line announced is a budget the store honours (
     try testing.expectEqual(plan.bytes, tier.max_bytes);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 640), tier.bestMatch(&tokens, false, cache.config).?.usable);
+}
+
+test "DiskTier: a restart on a nearly full volume keeps what the tier already holds" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1024 * 1024 * 1024 * 1024;
+
+    {
+        var first = try DiskTier.init(testing.allocator, io, base, "fp-restart", 0, 128);
+        defer first.deinit();
+        first.ssd_first = true;
+        first.armTestSpace(total / 2, total);
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+        for ([_]u32{ 7, 90_000 }) |off| {
+            var tokens: [640]u32 = undefined;
+            for (&tokens, 0..) |*t, i| t.* = @intCast(i + off);
+            _ = try first.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+        }
+        first.drainWriter();
+        try testing.expectEqual(@as(usize, 2), first.entryCount());
+    }
+    const held = tierBytes(io, base, "fp-restart");
+    try testing.expect(held > 0);
+
+    // Free space is the reserve plus half of what the tier holds: the entries alone are not "free".
+    const free = DISK_FREE_RESERVE + held / 2;
+    const blind = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, 0).?;
+    try testing.expectEqual(held / 2, blind.bytes);
+    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, held).?;
+    try testing.expectEqual(held + held / 2, plan.bytes);
+    try testing.expectEqual(DiskBound.free_disk, plan.bound);
+    try testing.expectEqual(DEFAULT_DISK_CAP, plan.cap);
+
+    var second = try DiskTier.init(testing.allocator, io, base, "fp-restart", plan.bytes, 128);
+    defer second.deinit();
+    second.operator_cap = plan.cap;
+    try testing.expectEqual(@as(usize, 2), second.entryCount());
+    // The live bound holds the entries it was given and follows the free space back up toward the cap.
+    second.armTestSpace(free, total);
+    second.refreshDiskBudget();
+    try testing.expectEqual(free - DISK_FREE_RESERVE + second.total_bytes, second.max_bytes);
+    try testing.expectEqual(@as(usize, 2), second.entryCount());
+    second.armTestSpace(free + 8 * 1024 * 1024 * 1024, total);
+    second.refreshDiskBudget();
+    try testing.expectEqual(free - DISK_FREE_RESERVE + second.total_bytes + 8 * 1024 * 1024 * 1024, second.max_bytes);
+
+    // An explicit flag is the budget as given, whatever the volume holds or leaves.
+    const flag = resolveDiskBudget(true, 3 * held, 32, 262144, 18_400, free, held).?;
+    try testing.expectEqual(3 * held, flag.bytes);
+    try testing.expectEqual(DiskBound.flag, flag.bound);
+    try testing.expectEqual(3 * held, flag.cap);
 }
 
 test "DiskTier: the free-space probe runs only before a store, never for a copy already on disk" {
