@@ -60,9 +60,10 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
 1. Set `build.zig.zon`'s `.version` to the next version and rename the top `## Unreleased` entry to
    `## v<version> — Headline` (check `gh release list --limit 1` first — never reuse an existing tag)
 2. Dont commit or push
-3. After the owner (or `./release.sh`) cuts it, the Release workflow leaves a DRAFT. Publishing it fires
-   `.github/workflows/homebrew.yml`, which runs the tap's bump and fails unless `Formula/sushi.rb` names the new
-   tag (needs the `HOMEBREW_TAP_TOKEN` secret). Confirm with `brew update && brew info beamivalice/tap/sushi`.
+3. After the owner (or `./release.sh`) cuts it, the Release workflow leaves a DRAFT. Check its tarball against the
+   `.sha256` and run its `sushi --version`, then publish it. Right after publishing, run `scripts/bump-tap.sh`: it
+   triggers `beamivalice/homebrew-tap`'s bump with this machine's `gh` login (no repo-secret token) and fails unless
+   `Formula/sushi.rb` names the new tag. The tap's hourly schedule is the fallback.
 4. Once the GitHub release is published, bump mlx-serve's Sushi pin to the release commit
    ([mlx-serve-integration](../../../docs/mlx-serve-integration.md#handing-a-new-engine-to-mlx-serve)): make the
    commit reachable from the submodule url (`ddalcu/sushi`, branch `exl3-module`), then in the mlx-serve checkout
