@@ -18,10 +18,10 @@ fn replace(comptime source: []const u8, comptime old: []const u8, comptime value
     return source[0..at] ++ value ++ source[at + old.len ..] ++ "";
 }
 const SOURCE = replace(replace(support.source, "uint win = uint(threadgroup_position_in_grid.y);", "uint win = uint(threadgroup_position_in_grid.x);"), "uint(threadgroup_position_in_grid.x) * 128u + sg * 32u", "uint(threadgroup_position_in_grid.y) * 128u + sg * 32u");
-var kernel: ?mlx.mlx_fast_metal_kernel = null;
+var kernels: [api.format.Window.count]?mlx.mlx_fast_metal_kernel = @splat(null);
 const Config = struct { input: c_int, output: c_int, rate: c_int, value: mlx.mlx_fast_metal_kernel_config };
 var configs: [8]?Config = @splat(null);
-fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, starts: Arr, live: Arr, windows: c_int) !Arr {
+fn project(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, x: Arr, bank: Arr, ids: Arr, starts: Arr, live: Arr, windows: c_int) !Arr {
     const k = mlx.getShape(x)[1];
     const n = mlx.getShape(bank)[2] * 16;
     const rate = mlx.getShape(bank)[3];
@@ -47,12 +47,11 @@ fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, starts: Arr, live: Ar
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * windows, @divExact(n, 128), 1));
-    if (kernel == null) kernel = try support.makeKernel(SOURCE);
     const iv = mlx.mlx_vector_array_new_data(&.{ x, bank, ids, starts, live }, 5);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel.?, iv, cfg, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, s));
     var output = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(output);
     try mlx.check(mlx.mlx_vector_array_get(&output, ov, 0));
@@ -68,21 +67,21 @@ fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr
     return true;
 }
 pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode, limit: c_int) !?Arr {
-    if (dec.codebook != .mcg or dec.window != .w12 or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
+    if (dec.codebook != .mcg or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
     if (std.c.getenv("SUSHI_EXL3_GEMM_WIN")) |value| if (!std.mem.eql(u8, std.mem.span(value), "32")) return null;
     if (std.c.getenv("SUSHI_EXL3_WIN_ALIGN")) |value| if (value[0] == '0') return null;
     base.setDecodeParams(dec);
     if (!support.available()) return null;
-    if (kernel == null) {
-        kernel = support.makeKernel(SOURCE) catch return null;
-    }
-    const result = try moe(s, x, bank, indices, scores);
+    const result = try moe(s, x, bank, indices, scores, dec);
     if (result != null) calls += 1;
     return result;
 }
-pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr) !?Arr {
-    if (!eligible(s, x, bank, indices, scores)) return null;
-    base.setDecodeParams(.{ .codebook = .mcg, .window = .w12 });
+pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode) !?Arr {
+    if (dec.codebook != .mcg or !eligible(s, x, bank, indices, scores)) return null;
+    base.setDecodeParams(dec);
+    const slot = &kernels[dec.window.index()];
+    if (slot.* == null) slot.* = support.makeKernel(SOURCE, dec.window) catch return null;
+    const kernel = slot.*.?;
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     var ids = mlx.mlx_array_new();
@@ -111,13 +110,13 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr)
     };
     if (metadata.inverse.ctx == null) return error.ExpectedGlmInverseRouting;
     const tab = metadata.table;
-    const gate = try project(s, prep[0], bank.gate.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
+    const gate = try project(s, kernel, prep[0], bank.gate.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
     defer _ = mlx.mlx_array_free(gate);
-    const up = try project(s, prep[1], bank.up.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
+    const up = try project(s, kernel, prep[1], bank.up.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
     defer _ = mlx.mlx_array_free(up);
     const middle = try support.middle(s, gate, up, bank.gate.svh, bank.up.svh, bank.down.suh, sorted, 2048, 16384, 10);
     defer _ = mlx.mlx_array_free(middle);
-    const down = try project(s, middle, bank.down.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
+    const down = try project(s, kernel, middle, bank.down.trellis, sorted, tab.starts, tab.nlives, tab.nwin);
     defer _ = mlx.mlx_array_free(down);
     const result = try support.finish(s, down, metadata.inverse, bank.down.svh, ids, sc, 4096, 2048, 8, .bfloat16);
     defer _ = mlx.mlx_array_free(result);
@@ -181,7 +180,7 @@ fn testProj(o: *Owned, s: mlx.mlx_stream, input: c_int, output: c_int, rate: c_i
 }
 
 /// The grid chain must return the sorted chain's bytes; `skewed` piles half the tokens on eight experts.
-fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool) !void {
+fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, window: api.format.Window) !void {
     const s = mlx.gpuStream();
     if (!support.available()) return error.SkipZigTest;
     // Each rate allocates several GB of trellis; return it before the next case.
@@ -216,7 +215,7 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool) !void {
     }
     const ids = try o.own(mlx.mlx_array_new_data(&id_data, &[_]c_int{ 1, 2048, 8 }, 3, .uint32));
     const scores = try o.own(mlx.mlx_array_new_data(&score_data, &[_]c_int{ 1, 2048, 8 }, 3, .float32));
-    const dec = api.format.Decode{ .codebook = .mcg, .window = .w12 };
+    const dec = api.format.Decode{ .codebook = .mcg, .window = window };
     const want = try o.own(try api.moeClamped(s, x.*, bank, ids.*, scores.*, dec, 10));
     const before = dispatchCount();
     const got = try o.own((try tryMoe(s, x.*, bank, ids.*, scores.*, dec, 10)) orelse return error.TestExpectedGlmGrid);
@@ -232,9 +231,15 @@ test "GLM prefill grid serves every admitted rate, mixed projections included, w
     const expert = @import("expert_exl3.zig");
     var n: c_int = expert.Rate.min_n;
     while (n <= expert.Rate.max_n) : (n += 2) {
-        try gridMatchesSortedChain(.{ n, n, n }, @mod(n, 8) == 0);
+        try gridMatchesSortedChain(.{ n, n, n }, @mod(n, 8) == 0, .w12);
     }
-    try gridMatchesSortedChain(.{ 40, 40, 36 }, true);
-    try gridMatchesSortedChain(.{ 36, 40, 48 }, false);
-    try gridMatchesSortedChain(.{ 32, 64, 40 }, true);
+    try gridMatchesSortedChain(.{ 40, 40, 36 }, true, .w12);
+    try gridMatchesSortedChain(.{ 36, 40, 48 }, false, .w12);
+    try gridMatchesSortedChain(.{ 32, 64, 40 }, true, .w12);
+}
+
+test "GLM prefill grid serves W14 packs with the sorted chain's bytes" {
+    try gridMatchesSortedChain(.{ 36, 36, 36 }, true, .w14);
+    try gridMatchesSortedChain(.{ 40, 40, 40 }, false, .w14);
+    try gridMatchesSortedChain(.{ 40, 40, 36 }, true, .w14);
 }

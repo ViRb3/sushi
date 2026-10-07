@@ -10148,10 +10148,13 @@ pub const PrefillGridSupport = struct {
         _ = getGemmNaxKernel() catch return false;
         return true;
     }
-    pub fn makeKernel(kernel_source: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+    pub fn makeKernel(kernel_source: [:0]const u8, window: exl3.Window) !mlx.mlx_fast_metal_kernel {
+        @setEvalBranchQuota(20_000);
         const had_error = mlx.errorPending();
         defer mlx.dropLatchedErrorUnless(had_error);
-        return buildNaxGemmKernel(kernel_source, naxHeader(.mcg, .w12), "sushi_glm_prefill_grid_transpose") orelse error.MetalKernelCompileFailed;
+        switch (window) {
+            inline else => |win| return buildNaxGemmKernel(kernel_source, naxHeader(.mcg, win), comptime "sushi_glm_prefill_grid_transpose" ++ winSuffix(win)) orelse error.MetalKernelCompileFailed,
+        }
     }
 };
 

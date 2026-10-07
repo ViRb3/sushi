@@ -97,7 +97,7 @@ are the router's precondition, never synced to the CPU. Every path below is bit-
   fallback scatters. WIN32 already skips its second 16-row MMA for runs of at most 16 rows (512-token prompts touch a
   median 230 of 288 experts).
 - **Full T2048 chunks transpose the grid** (`src/exl3/glm_prefill_grid.zig`, B1, H4096/I2048, E288, top-8, every admitted
-  n including mixed per-projection rates, MCG/W12 only (its NAX header is built for W12), clamp 10): physical X walks routing windows and Y the 128-column output stripes; logical IDs, dot body and
+  n including mixed per-projection rates, MCG at every window (one NAX kernel per window, like the GEMM), clamp 10): physical X walks routing windows and Y the 128-column output stripes; logical IDs, dot body and
   stores are unchanged. Actual L20 chain 19.64 → 17.96 ms at n36 (−8.6%, 11/11); at n40 (Sushi-2.5bpw, kv8, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) prefill +4.5% at 8K and +2.7% at 32K, same bytes. A test enumerates every admitted n against the sorted chain. The T2048 routed chain is GEMM-bound
   (gate/up ≈60%, down ≈30%; sort/prepare/middle/finish ≈1.75 of 17.35 ms).
 - **MCG/W12 decode is pure ALU** (mask, multiply/mask/xor, half adds): there is no codebook table or expanded weight
