@@ -2,6 +2,19 @@
 
 [Back to the README](../README.md)
 
+## Install
+
+```bash
+brew install beamivalice/tap/sushi
+```
+
+Or the release binary (ad-hoc signed; curl does not quarantine it):
+```bash
+curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz | tar xz
+```
+A browser download is quarantined by macOS: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`.
+GPU memory and the largest context per Mac for each pack: [README, Memory](../README.md#memory).
+
 ## Recommended launch
 
 **48 GB Mac, Sushi-2bpw**
@@ -17,7 +30,7 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-2bpw --local-dir ~/.sushi/models/Q
 # images, 8-bit KV, 128k context
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw \
   --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 131072 \
-  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --prefix-cache-mem 1GB --temp 1
+  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
 
 **64 GB Mac, Sushi-2.6bpw**
@@ -37,15 +50,32 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw --local-dir ~/.sushi/models
 # 1. images, 8-bit KV — the default quality
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
   --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 250000 \
-  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --prefix-cache-mem 1GB --temp 1
+  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 
 # 2. images, 4-bit KV — 1.8 times the context, at 8% KLD and 0.2 points of next-token agreement
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
   --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 450000 \
-  --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --prefix-cache-mem 1GB --temp 1
+  --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
 
 At 4-bit KV the quality cost: mean KLD 0.1355 at 8-bit KV to 0.1458, and next-token agreement 89.08% to 88.84%.
+
+**64 GB Mac, Sushi-3bpw**
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=59000
+hf download beamster/Qwen3.8-Flash-Next-Sushi-3bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw
+
+# 1. images, 8-bit KV — the default quality
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 128000 \
+  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
+
+# 2. images, 4-bit KV — twice the context, at 9% KLD and 0.7 points of next-token agreement
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
+  --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 256000 \
+  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
+```
 
 **96 GB+ Mac, Sushi-4bpw**
 
@@ -54,7 +84,7 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-4bpw --local-dir ~/.sushi/models/Q
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-4bpw \
   --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 \
   --prefill-chunk 2048 --max-tokens 64000 --prefix-cache-disk 20GB \
-  --prefix-cache-entries 1 --prefix-cache-mem 2GB --temp 1
+  --prefix-cache-entries 1 --temp 1
 ```
 
 Set the GPU memory limit before serving (it resets at reboot):
