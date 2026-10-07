@@ -15294,6 +15294,37 @@ test "jinja: a number after a dot subscripts, as in Jinja2" {
     try testing.expectEqualStrings("a|7|8|h|7|7.5|no|1.5", ptr[0..len]);
 }
 
+fn renderJinjaRaw(tpl: [:0]const u8, messages: [:0]const u8, expect: []const u8) !void {
+    var len: usize = 0;
+    const ptr = jinja_c.jinja_render_chat(tpl, messages, null, null, 0, &len) orelse {
+        std.debug.print("\njinja error: {s}\n", .{std.mem.span(jinja_c.jinja_last_error().?)});
+        return error.RenderFailed;
+    };
+    defer jinja_c.jinja_str_free(ptr);
+    try testing.expectEqualStrings(expect, ptr[0..len]);
+}
+
+test "jinja: a set in a loop body ends with its iteration, as in Jinja2" {
+    try renderJinjaRaw(
+        "{% for m in messages %}{% if m.r is string %}{% set r = m.r %}{% endif %}{% if r is defined %}[{{ r }}]{% else %}[]{% endif %}{% endfor %}",
+        "[{\"r\":\"a\"},{},{\"r\":\"b\"},{}]",
+        "[a][][b][]",
+    );
+    try renderJinjaRaw("{% for i in [1,2] %}{% set z = i %}{% endfor %}{% if z is defined %}Y{% else %}N{% endif %}", "[]", "N");
+    try renderJinjaRaw("{% set a = 1 %}{% for i in [1,2] %}{% set a = a + i %}{{ a }}{% endfor %}{{ a }}", "[]", "231");
+    try renderJinjaRaw("{% for i in [1,2] %}{% set z = i %}{% for j in [10,20] %}{{ z + j }}{% endfor %}{% endfor %}", "[]", "11211222");
+    try renderJinjaRaw("{% for i in [] %}x{% else %}{% set q = 1 %}E{% endfor %}{% if q is defined %}Y{% else %}N{% endif %}", "[]", "EN");
+}
+
+test "jinja: a namespace mutated in a loop body accumulates across iterations" {
+    try renderJinjaRaw("{% set ns = namespace(n=0) %}{% for i in [1,2,3] %}{% set ns.n = ns.n + i %}{% endfor %}{{ ns.n }}", "[]", "6");
+    try renderJinjaRaw(
+        "{% set ns = namespace(s='') %}{% for i in [1,2] %}{% for j in [3,4] %}{% set ns.s = ns.s ~ i ~ j ~ ',' %}{% endfor %}{% endfor %}{{ ns.s }}",
+        "[]",
+        "13,14,23,24,",
+    );
+}
+
 test "GLM-5.3 template renders a tool round-trip itself, never the generic fallback" {
     const a = testing.allocator;
     var config = glm53Config(a);

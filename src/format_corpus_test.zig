@@ -3354,3 +3354,21 @@ test "format corpus: tool traffic renders through every served template, never t
         };
     }
 }
+
+test "format corpus: GLM-5.3 gives a reasoning-less assistant turn an empty think, never the earlier turn's thought" {
+    const a = testing.allocator;
+    var config = chat.ChatConfig{ .chat_template = @embedFile("fixtures/glm53_chat_template.jinja"), .bos_token = null, .eos_token = "<|endoftext|>", .add_bos_token = false, .allocator = a };
+    const calls = [_]chat.ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]chat.Message{
+        .{ .role = "user", .content = "Weather?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls, .reasoning_content = "EARLIER_THOUGHT" },
+        .{ .role = "tool", .content = "Sunny", .tool_call_id = "call_1" },
+        .{ .role = "assistant", .content = "final answer" },
+        .{ .role = "user", .content = "Thanks" },
+    };
+    const rendered = try chat.renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(rendered);
+    errdefer std.debug.print("\n{s}\n", .{rendered});
+    try testing.expect(std.mem.indexOf(u8, rendered, "<think></think>final answer") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "EARLIER_THOUGHT"));
+}

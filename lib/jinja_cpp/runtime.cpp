@@ -579,11 +579,12 @@ value for_statement::execute_impl(context & ctx) {
         loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
         loop_obj->insert("previtem", i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
         loop_obj->insert("nextitem", i < filtered_items.size() - 1 ? filtered_items[i + 1] : mk_val<value_undefined>("nextitem"));
-        scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
+        context iter_scope(scope); // a body `set` ends with its iteration
+        iter_scope.set_val("loop", loop_obj);
+        scope_update_fns[i](iter_scope);
         try {
             for (auto & stmt : body) {
-                value val = stmt->execute(scope);
+                value val = stmt->execute(iter_scope);
                 result->push_back(val);
             }
         } catch (const continue_statement::signal &) {
@@ -597,7 +598,7 @@ value for_statement::execute_impl(context & ctx) {
     JJ_DEBUG("For loop complete, total iterations: %zu", filtered_items.size());
     if (noIteration) {
         for (auto & stmt : default_block) {
-            value val = stmt->execute(ctx);
+            value val = stmt->execute(scope);
             result->push_back(val);
         }
     }

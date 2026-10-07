@@ -40,6 +40,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   counts into `/props.template_fallbacks`: nonzero on a model that ships a template means a broken prompt, so grep
   that line first. A new template ships its fixture and a no-fallback case in the `format corpus` tool-traffic test.
   Cross-check suspect templates against Python Jinja2 on the same JSON before blaming the model.
+- **A loop iteration is its own scope in jinja.cpp, as in Jinja2**: a body `set` (GLM-5.3's per-message `reasoning_content`)
+  neither reaches the next iteration nor leaves the loop; only a `namespace` carries state across. One shared scope
+  rendered an earlier turn's thought into a reasoning-less assistant turn instead of `<think></think>`.
 - **A `chat_template` value can be a POINTER** (`{% include 'chat_template.jinja' %}`): `chat.isIncludeStub` reads it
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
 - A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`
