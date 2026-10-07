@@ -2726,6 +2726,8 @@ pub const Generator = struct {
         eos_token_ids: []const u32,
         options_in: InitOptions,
     ) !Generator {
+        // The logits forward starts at the prompt's last token; there is none to index.
+        if (prompt_ids.len == 0) return error.EmptyPrompt;
         // Reserved-token suppression rides the sampling params from HERE —
         // the one chokepoint every init site funnels through — so every
         // sampling path (serial, PLD/drafter/MTP corrections, draft heads,
@@ -22422,6 +22424,19 @@ test "GLM short prompts and odd chunk widths still checkpoint only on pool bound
         try testing.expect(gen.ssm_checkpoints.items.len > 0);
         for (gen.ssm_checkpoints.items) |cp| try testing.expectEqual(@as(usize, 0), cp.pos % 4);
     }
+}
+
+test "an empty prompt is a typed error at the generator, never an index" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer xfm.deinit();
+    try testing.expectError(error.EmptyPrompt, Generator.initWithOptions(testing.io, a, &xfm, &tok, &.{}, 4, .{ .temperature = 0.0 }, &.{}, .{}));
 }
 
 fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {

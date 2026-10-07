@@ -16,8 +16,8 @@
 # --no-drafter). The MiMo EXL3 pack serves resident with its vision tower and MTP heads;
 # MIMO_SSD_BUDGET_GB adds --ssd-budget-gb for a streamed MiMo checkpoint, which skips mtp.
 # Per boot: chat non-stream/stream, thinking on/off, tools, json_schema,
-# logprobs, max_tokens cap, ignore_eos (completions: stream == non-stream; chat: 400), 2-way concurrency, /v1/completions,
-# /v1/messages (both modes), /v1/responses (both modes), /v1/models,
+# logprobs, max_tokens cap, ignore_eos (completions: stream == non-stream; chat: 400), 2-way concurrency,
+# /v1/completions (an empty prompt 400s), /v1/messages (both modes), /v1/responses (both modes), /v1/models,
 # /metrics.json. Prefix-cache reuse has its own live tests (test_prefix_cache_ssd_default.sh, test_prefix_cache_mem.sh).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -203,6 +203,11 @@ print(repr(t))' 2>/dev/null)
     # 8. /v1/completions
     r=$(post /v1/completions '{"model":"m","prompt":"The capital of France is","max_tokens":8,"temperature":0}')
     check "completions: text" "$([[ -n "$(echo "$r" | J 'd["choices"][0]["text"]')" ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 200)"
+    # An empty prompt tokenizes to nothing: a named 400 in both modes, and the server lives on (check 13).
+    for st in false true; do
+        r=$(curl -s -w '\n%{http_code}' --max-time 60 "$BASE/v1/completions" -H "Content-Type: application/json" -d "{\"model\":\"m\",\"prompt\":\"\",\"max_tokens\":4,\"stream\":$st}")
+        check "completions: empty prompt (stream=$st) is a 400 invalid_request_error" "$([[ "${r##*$'\n'}" == 400 && "$r" == *invalid_request_error* ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 200)"
+    done
 
     # 9. /v1/messages
     r=$(post /v1/messages "{\"model\":\"m\",\"max_tokens\":600,\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}]}")

@@ -6724,6 +6724,9 @@ fn memoryRefusalMessage(
 /// estimator the guard uses, re-asked after the hot cache gave back everything it could.
 const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
 
+/// The message `error.EmptyPrompt` sends: generation continues from the prompt's last token.
+const EMPTY_PROMPT_MSG = "The prompt tokenizes to zero tokens; send non-empty text to continue.";
+
 /// A generation failure as the wire sees it: one status, one message, both dialects' type.
 pub const GenErrorWire = struct {
     status_line: []const u8,
@@ -6755,6 +6758,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
             .message = if (context_refusal) |r| memoryContextRefusalMessage(buf, r) else PREFILL_NOFIT_MSG,
+        },
+        // Refused at submit, so every surface answers it the same way.
+        error.EmptyPrompt => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = EMPTY_PROMPT_MSG,
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -10046,6 +10057,11 @@ fn handleCompletions(
     // Tokenize prompt directly (no chat template).
     const prompt_ids = try tok.encode(allocator, prompt_text.?);
     defer allocator.free(prompt_ids);
+    if (prompt_ids.len == 0) {
+        log.warn("POST /v1/completions -> 400 (prompt tokenizes to zero tokens)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", EMPTY_PROMPT_MSG, 400);
+        return;
+    }
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Enforce context size limit
@@ -23676,6 +23692,51 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expect(std.mem.indexOf(u8, resp, "\"code\":\"server_error\"") != null);
         try t.expect(std.mem.indexOf(u8, resp, GEN_OOM_MSG) != null);
     }
+}
+
+test "an empty prompt refused at submit is a 400 invalid_request_error in both dialects" {
+    const t = std.testing;
+    var buf: [192]u8 = undefined;
+    const w = mapGenerationError(error.EmptyPrompt, &buf);
+    try t.expectEqual(@as(u32, 400), w.code);
+    try t.expectEqualStrings("400 Bad Request", w.status_line);
+    try t.expectEqualStrings("invalid_request_error", w.openai_type);
+    try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    try t.expectEqualStrings(EMPTY_PROMPT_MSG, w.message);
+}
+
+test "POST /v1/completions with a prompt that tokenizes to nothing answers 400 before any generation" {
+    const t = std.testing;
+    const a = t.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var cfg = model_mod.ModelConfig{ .num_hidden_layers = 0, .pinned_context = 4096 };
+    var lm: LoadedModel = undefined;
+    lm.config = &cfg;
+    lm.tokenizer = &tok;
+    lm.transformer = null;
+    lm.drafter = null;
+    lm.dflash = null;
+    lm.mtp = null;
+
+    var sv: [2]std.posix.fd_t = undefined;
+    try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0); // AF_UNIX, SOCK_STREAM
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    try handleCompletions(a, &conn, "{\"prompt\":\"\",\"max_tokens\":4}", &lm);
+    _ = std.c.close(sv[0]);
+
+    var buf: [4096]u8 = undefined;
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.read(sv[1], buf[got..].ptr, buf.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    try t.expect(std.mem.startsWith(u8, buf[0..got], "HTTP/1.1 400 Bad Request\r\n"));
+    try t.expect(std.mem.indexOf(u8, buf[0..got], "\"invalid_request_error\"") != null);
+    try t.expect(std.mem.indexOf(u8, buf[0..got], EMPTY_PROMPT_MSG) != null);
 }
 
 test "contextOverflowMessage: the 400 names both counts so a client can act on it" {

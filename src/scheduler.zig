@@ -1756,6 +1756,7 @@ pub const Scheduler = struct {
     }
 
     fn initSlot(self: *Scheduler, params: SubmitParams) !*Slot {
+        if ((params.full_prompt orelse params.prompt_ids).len == 0) return error.EmptyPrompt;
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
         const eff_kv_quant = params.kv_quant_config orelse
             transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
@@ -12348,6 +12349,37 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
     model.prefix_cache = null;
     const result = sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = transformer_mod.KVQuantConfig.affine(4) });
     try testing.expectError(error.GlmKvQuantUnsupported, result);
+}
+
+test "an empty prompt is refused at submit, before any slot reaches the inference thread" {
+    const allocator = testing.allocator;
+    var sch: Scheduler = undefined;
+    sch.allocator = allocator;
+    sch.io = testing.io;
+    sch.kv_quant_config = .dense;
+    sch.kv_quant_explicit = false;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.prefilling = .empty;
+    defer sch.pending.deinit(allocator);
+    defer sch.decoding.deinit(allocator);
+    defer sch.cleanup_queue.deinit(allocator);
+    defer sch.prefilling.deinit(allocator);
+    var cfg = ModelConfig{ .num_hidden_layers = 0 };
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.transformer = null;
+    model.prefix_cache = null;
+    const result = sch.submit(.{ .model = &model, .prompt_ids = &.{}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 4 });
+    try testing.expectError(error.EmptyPrompt, result);
+    try testing.expectEqual(@as(usize, 0), sch.pending.items.len);
 }
 
 test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
