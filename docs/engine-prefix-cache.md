@@ -200,6 +200,26 @@ restore points and GLM state ([GLM](#glm)) survive restart. Image-bearing entrie
 
 Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
 
+<a id="one-tier-per-root"></a>
+## One live tier per root
+
+- **A root has one live tier** (`DiskTier.root_lock`: an flock on `<root>/.lock` from `init` to `deinit`; the file is
+  never unlinked). Two processes on one pack (`sushi run X` beside `sushi serve X`) used to share the root, both
+  numbered entries from `e1`, and one restored the other's KV for its own prompt with an HTTP 200.
+- **A second tier keeps a private root** `<root>/p<pid>-<n>` and logs one `[disk-cache] ... private SSD tier` line. It
+  reuses its own turns, never the shared root's entries, has its own budget, and is removed at `deinit`. A crashed
+  one's is reaped (`reapPrivateRoots`) by the next tier or sweep on that fingerprint once its lock is free and its
+  files are 10 minutes old.
+- A new entry claims its id by creating `e<id>` (an existing directory is never adopted); staging files are
+  `<file>.<pid>.tmp`.
+- **A restore re-reads `tokens.bin` up to the restored length**: a record that differs from the index poisons the
+  entry and the request prefills cold (`DiskCacheTokenMismatch`).
+- `scan` drops an index-less entry with no age bar: the lock keeps every other writer out of the root. `sweepBase`
+  holds each sibling root's lock while it sweeps it and skips one a live tier holds (`rootIsLive`); `tierBytes`
+  counts nothing of a live tier's root.
+- A binary older than the lock takes none, so beside a newer one it still shares the root; only the token check
+  covers that.
+
 <a id="ssd-flush"></a>
 ## The SSD flush
 

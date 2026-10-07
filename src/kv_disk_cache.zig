@@ -527,9 +527,14 @@ pub const DiskTier = struct {
     chunks_loaded_last: u32 = 0,
     /// The entry the most recent append committed; null when it committed none.
     last_store_id: ?u64 = null,
+    /// `<root>/.lock`, flocked for the tier's lifetime: one live tier owns a root.
+    root_lock: ?std.Io.File = null,
+    /// `root` is a private root under the shared one, which another live tier owns; removed at deinit.
+    private_root: bool = false,
 
     /// Create the tier rooted at `<base>/<fingerprint>` and scan whatever
-    /// already exists there. Crash leftovers (no meta.json) are deleted.
+    /// already exists there. Crash leftovers (no meta.json) are deleted. When another live tier
+    /// (another process on the same pack) owns that root, this one keeps a private root under it.
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -539,9 +544,19 @@ pub const DiskTier = struct {
         chunk_tokens: u32,
     ) !DiskTier {
         if (base_dir.len == 0 or !std.fs.path.isAbsolute(base_dir)) return error.BadDiskCacheDir;
-        const root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fingerprint });
+        const shared = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fingerprint });
+        var root = shared;
+        defer if (root.ptr != shared.ptr) allocator.free(shared);
         errdefer allocator.free(root);
         try std.Io.Dir.cwd().createDirPath(io, root);
+        var lock = try lockRoot(io, shared);
+        if (lock == null) {
+            const own = try ownPrivateRoot(allocator, io, shared);
+            root = own.root;
+            lock = own.lock;
+            log.info("[disk-cache] {s} is in use by another sushi process: this one keeps a private SSD tier at {s}, removed at exit\n", .{ shared, root });
+        }
+        reapPrivateRoots(allocator, io, shared);
         var self: DiskTier = .{
             .allocator = allocator,
             .io = io,
@@ -553,6 +568,8 @@ pub const DiskTier = struct {
             .next_id = 1,
             .total_bytes = 0,
             .counter = 0,
+            .root_lock = lock,
+            .private_root = root.ptr != shared.ptr,
         };
         self.scan() catch |err| {
             log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
@@ -748,6 +765,10 @@ pub const DiskTier = struct {
             self.freeIndexEntryOwned(e);
         }
         self.entries.deinit(self.allocator);
+        // Removed under its lock, so no other tier reaps it mid-delete.
+        if (self.private_root) deleteTreeAbsolute(self.io, self.root);
+        if (self.root_lock) |f| f.close(self.io);
+        self.root_lock = null;
         self.allocator.free(self.root);
     }
 
@@ -1117,14 +1138,49 @@ pub const DiskTier = struct {
         return best;
     }
 
+    /// Does entry `e`'s `tokens.bin` still begin with the `n` tokens its index matched? The index
+    /// is read once, at scan or commit; the rows a restore serves must be the ones recorded for it.
+    fn tokenRecordMatches(self: *DiskTier, e: *const IndexEntry, n: u32) !bool {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/tokens.bin", .{ self.root, e.id });
+        defer self.allocator.free(path);
+        const f = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch return false;
+        defer f.close(self.io);
+        var rbuf: [16 * 1024]u8 = undefined;
+        var r = f.reader(self.io, &rbuf);
+        for (e.tokens[0..n]) |want| {
+            const got = r.interface.takeInt(u32, .little) catch return false;
+            if (got != want) return false;
+        }
+        return true;
+    }
+
+    /// A new entry's id, claimed by creating its `e<id>`: an existing directory is never adopted.
+    fn claimEntryId(self: *DiskTier) !u64 {
+        while (true) {
+            const id = self.next_id;
+            self.next_id += 1;
+            const dir = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, id });
+            defer self.allocator.free(dir);
+            std.Io.Dir.createDirAbsolute(self.io, dir, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            return id;
+        }
+    }
+
     /// Shared chunk-loading body: rebuild positions [0, limit) of entry `e`
     /// into `cache` (limit == e.kv_len for the plain-attention path; a
     /// checkpoint position for the hybrid path — the final chunk is sliced
     /// down so KV lands exactly at the checkpoint).
-    fn restoreKvInto(self: *DiskTier, cache: *KVCache, e: *const IndexEntry, limit: u32, s: mlx.mlx_stream) !void {
+    fn restoreKvInto(self: *DiskTier, cache: *KVCache, e: *IndexEntry, limit: u32, s: mlx.mlx_stream) !void {
         const quant = e.quant;
         if (!std.meta.eql(cache.config, quant)) return error.DiskCacheConfigMismatch;
         if (limit == 0 or limit > e.kv_len) return error.DiskCacheEmptyEntry;
+        if (!try self.tokenRecordMatches(e, limit)) {
+            self.poisonEntry(e, "token record differs from the index");
+            return error.DiskCacheTokenMismatch;
+        }
         const n_chunks: u32 = @intCast((@as(u64, limit) + self.chunk_tokens - 1) / self.chunk_tokens);
         if (n_chunks == 0) return error.DiskCacheEmptyEntry;
         self.chunks_loaded_last = n_chunks;
@@ -1710,11 +1766,7 @@ pub const DiskTier = struct {
 
         const sw = io_util.Stopwatch.init(self.io);
 
-        const id: u64 = if (extend_idx) |i| self.entries.items[i].id else blk: {
-            const nid = self.next_id;
-            self.next_id += 1;
-            break :blk nid;
-        };
+        const id: u64 = if (extend_idx) |i| self.entries.items[i].id else try self.claimEntryId();
         const dir_rel = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, id });
         defer self.allocator.free(dir_rel);
         try std.Io.Dir.cwd().createDirPath(self.io, dir_rel);
@@ -3491,7 +3543,7 @@ pub const DiskTier = struct {
             return;
         }
         defer self.allocator.free(final_path);
-        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json.tmp", .{ self.root, e.id });
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json.{d}.tmp", .{ self.root, e.id, std.c.getpid() });
         defer self.allocator.free(tmp_path);
         {
             const f = try std.Io.Dir.createFileAbsolute(self.io, tmp_path, .{});
@@ -3595,7 +3647,8 @@ pub const DiskTier = struct {
                     continue;
                 };
             } else {
-                // Crash leftover / corrupt — remove it.
+                // Crash leftover / corrupt — remove it. No age bar: `root_lock` keeps every other
+                // writer out of this root, so an index-less entry has no live writer.
                 log.info("  [disk-cache] dropping incomplete entry e{d}\n", .{id});
                 self.deleteEntryDir(id);
             }
@@ -3984,6 +4037,13 @@ pub fn sweepBase(
     }
     var total: u64 = 0;
     var strays: usize = 0;
+    // Each swept root's lock is held to the end: a root a live tier owns is skipped, and no tier
+    // can take one while its entries are being deleted.
+    var held = std.ArrayList(std.Io.File).empty;
+    defer {
+        for (held.items) |f| f.close(io);
+        held.deinit(allocator);
+    }
 
     var fps = base.iterate();
     while (fps.next(io) catch null) |fp| {
@@ -3991,6 +4051,12 @@ pub fn sweepBase(
         const fp_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fp.name }) catch continue;
         defer allocator.free(fp_abs);
         if (std.mem.eql(u8, fp_abs, keep_root)) continue; // the live tier owns its own
+        const lock = (lockRoot(io, fp_abs) catch continue) orelse continue;
+        held.append(allocator, lock) catch {
+            lock.close(io);
+            continue;
+        };
+        reapPrivateRoots(allocator, io, fp_abs);
 
         var fpd = std.Io.Dir.openDirAbsolute(io, fp_abs, .{ .iterate = true }) catch continue;
         defer fpd.close(io);
@@ -4049,6 +4115,64 @@ pub fn sweepBase(
     }
 }
 
+/// The flock that marks a tier root as owned by a live tier (`DiskTier.root_lock`).
+const ROOT_LOCK_NAME = ".lock";
+
+/// Distinguishes the private roots of several tiers in one process.
+var private_root_seq = std.atomic.Value(u32).init(0);
+
+/// Take `<root_abs>/.lock` without waiting; the returned file holds the lock until closed.
+/// Null when a live tier holds it. The lock file is never unlinked (a racing open would lock a
+/// second inode).
+fn lockRoot(io: std.Io, root_abs: []const u8) !?std.Io.File {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/" ++ ROOT_LOCK_NAME, .{root_abs});
+    return std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+        error.WouldBlock => null,
+        else => err,
+    };
+}
+
+/// Does a live tier own `root_abs`? A root without a lock file has none.
+pub fn rootIsLive(io: std.Io, root_abs: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/" ++ ROOT_LOCK_NAME, .{root_abs}) catch return true;
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |err|
+        return err != error.FileNotFound;
+    f.close(io);
+    return false;
+}
+
+/// Create and lock a private root `<shared>/p<pid>-<n>` for a tier whose shared root is owned.
+fn ownPrivateRoot(allocator: std.mem.Allocator, io: std.Io, shared: []const u8) !struct { root: []u8, lock: std.Io.File } {
+    for (0..8) |_| {
+        const root = try std.fmt.allocPrint(allocator, "{s}/p{d}-{d}", .{ shared, std.c.getpid(), private_root_seq.fetchAdd(1, .monotonic) });
+        errdefer allocator.free(root);
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        if (try lockRoot(io, root)) |lock| return .{ .root = root, .lock = lock };
+        allocator.free(root);
+    }
+    return error.DiskCacheRootBusy;
+}
+
+/// Remove the private roots under `root_abs` whose tier is gone (a crash skips `deinit`). A young
+/// one may belong to a tier between its mkdir and its lock.
+fn reapPrivateRoots(allocator: std.mem.Allocator, io: std.Io, root_abs: []const u8) void {
+    var d = std.Io.Dir.openDirAbsolute(io, root_abs, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'p') continue;
+        const sub = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_abs, dent.name }) catch continue;
+        defer allocator.free(sub);
+        const lock = (lockRoot(io, sub) catch continue) orelse continue;
+        defer lock.close(io);
+        if (dirYoungerThan(io, sub, STRAY_MIN_AGE_NS)) continue;
+        log.info("  [disk-cache] removing {s}, the private SSD tier of a process that is gone\n", .{sub});
+        d.deleteTree(io, dent.name) catch {};
+    }
+}
+
 /// How old an index-less entry directory must be before a sweep may treat it as a crash leftover.
 const STRAY_MIN_AGE_NS: i128 = 10 * 60 * @as(i128, std.time.ns_per_s);
 
@@ -4085,6 +4209,8 @@ fn reapStaleTmp(io: std.Io, dir_abs: []const u8) void {
 pub fn tierBytes(io: std.Io, base_dir: []const u8, fingerprint: []const u8) u64 {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = std.fmt.bufPrint(&root_buf, "{s}/{s}", .{ base_dir, fingerprint }) catch return 0;
+    // Another live tier's bytes: a tier loading beside it keeps a private root (`DiskTier.init`).
+    if (rootIsLive(io, root)) return 0;
     var d = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     var total: u64 = 0;
@@ -4434,7 +4560,8 @@ test "DiskTier: failed checkpoint manifest keeps index ownership" {
     const allocator = accounting.allocator();
     var tier = try DiskTier.init(allocator, io, base, "fp-owned", 0, 128);
     defer tier.deinit();
-    try tmp.dir.createDirPath(io, "fp-owned/e1/meta.json.tmp");
+    var staging: [64]u8 = undefined;
+    try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&staging, "fp-owned/e1/meta.json.{d}.tmp", .{std.c.getpid()}));
     const tokens = try allocator.alloc(u32, 600);
     @memset(tokens, 7);
     const positions = try allocator.dupe(u32, &.{512});
@@ -4473,7 +4600,6 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-test", 0, 128);
-    defer tier.deinit();
 
     // 600 tokens => 5 chunks at 128 (last partial: 88).
     var cache = try KVCache.init(testing.allocator, 3);
@@ -4487,6 +4613,7 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
 
     // Restore into a fresh cache (fresh tier too — proves the restart path).
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-test", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
@@ -4680,6 +4807,131 @@ test "DiskTier: scan drops crash leftovers (no meta.json)" {
     try testing.expect(statFile(io, leftover) == null);
     // next_id moved past the dropped id (no reuse of a dirty dir name).
     try testing.expect(tier2.next_id >= 10);
+}
+
+test "DiskTier: two live tiers on one root restore only their own entries" {
+    // Two processes on one pack resolve the same root, and each numbers its entries from 1.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier_a = try DiskTier.init(testing.allocator, io, base, "fp-two", 0, 128);
+    defer tier_a.deinit();
+    var cache_a = try KVCache.init(testing.allocator, 1);
+    defer cache_a.deinit();
+    try fillCache(&cache_a, s, 1, 600, 8, 0.0, .float32);
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache_b = try KVCache.init(testing.allocator, 1);
+    defer cache_b.deinit();
+    try fillCache(&cache_b, s, 1, 700, 8, 50_000.0, .float32);
+    var tokens_b: [700]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
+    {
+        var tier_b = try DiskTier.init(testing.allocator, io, base, "fp-two", 0, 128);
+        defer tier_b.deinit();
+        _ = try tier_a.appendCommit(cache_a.entries, cache_a.step, cache_a.config, &tokens_a, false, null, s);
+        _ = try tier_b.appendCommit(cache_b.entries, cache_b.step, cache_b.config, &tokens_b, false, null, s);
+        const tiers = [_]*DiskTier{ &tier_a, &tier_b };
+        const srcs = [_]*KVCache{ &cache_a, &cache_b };
+        const prompts = [_][]const u32{ &tokens_a, &tokens_b };
+        for (tiers, srcs, prompts) |tier, src, prompt| {
+            const m = tier.bestMatch(prompt, false, kv_quant.KVQuantConfig.dense) orelse return error.TestExpectedMatch;
+            var out = try KVCache.init(testing.allocator, 1);
+            defer out.deinit();
+            _ = try tier.restoreInto(&out, m.idx, s);
+            try testing.expectEqual(try cacheValueAt(src, 0, 300, 3, s), try cacheValueAt(&out, 0, 300, 3, s));
+        }
+    }
+    // The second tier's files leave with it.
+    var root = try tmp.dir.openDir(io, "fp-two", .{ .iterate = true });
+    defer root.close(io);
+    var it = root.iterate();
+    while (try it.next(io)) |dent| {
+        if (dent.kind == .directory) try testing.expectEqualStrings("e1", dent.name);
+    }
+}
+
+test "DiskTier: the root-wide sweep never deletes a root a live tier owns" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var held = try DiskTier.init(testing.allocator, io, base, "fp-held", 0, 128);
+    defer held.deinit();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try held.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const other = try std.fmt.allocPrint(testing.allocator, "{s}/fp-other", .{base});
+    defer testing.allocator.free(other);
+
+    sweepBase(testing.allocator, io, base, other, 0);
+    try testing.expect(tmp.dir.statFile(io, "fp-held/e1/meta.json", .{}) catch null != null);
+    try testing.expect(rootIsLive(io, held.root));
+    // A load beside the live tier keeps a private root: none of those bytes are its own.
+    try testing.expectEqual(@as(u64, 0), tierBytes(io, base, "fp-held"));
+}
+
+test "DiskTier: a token record that differs from the index poisons the entry and restores nothing" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ident", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    // Another writer's record of the same length, under the index this tier read.
+    var other: [600 * 4]u8 = undefined;
+    for (0..600) |i| std.mem.writeInt(u32, other[i * 4 ..][0..4], @intCast(i + 900_000), .little);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-ident/e1/tokens.bin", .data = &other });
+
+    var out = try KVCache.init(testing.allocator, 1);
+    defer out.deinit();
+    try testing.expectError(error.DiskCacheTokenMismatch, tier.restoreInto(&out, 0, s));
+    try testing.expect(tier.entries.items[0].poisoned);
+    try testing.expect(tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense) == null);
+}
+
+test "DiskTier: a new entry never adopts an existing entry directory" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-claim", 0, 128);
+    defer tier.deinit();
+    try tmp.dir.createDirPath(io, "fp-claim/e1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-claim/e1/c000000.safetensors", .data = "not ours" });
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+
+    try testing.expect(tier.entries.items[0].id != 1);
+    const kept = try tmp.dir.readFileAlloc(io, "fp-claim/e1/c000000.safetensors", testing.allocator, .limited(64));
+    defer testing.allocator.free(kept);
+    try testing.expectEqualStrings("not ours", kept);
 }
 
 test "DiskTier: affine-quant cache round-trips all six buffers" {
@@ -4952,7 +5204,6 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-hybrid", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
@@ -4986,6 +5237,7 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
 
     // Fresh tier (restart): both checkpoint positions survive the scan.
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-hybrid", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
@@ -5103,7 +5355,6 @@ test "DiskTier: QSA history bytes are O(rows), not O(checkpoints x rows)" {
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-once", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
@@ -5141,6 +5392,7 @@ test "DiskTier: QSA history bytes are O(rows), not O(checkpoints x rows)" {
     const one: u64 = 64 * 8 * 4;
     try testing.expectEqual(one, hq.aux + hq.pooled);
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-once", 0, 128);
     defer tier2.deinit();
     var cache2 = try KVCache.init(testing.allocator, 3);
@@ -5166,7 +5418,6 @@ test "DiskTier: a shorter pooled bank never replaces the longer one an entry's c
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
@@ -5203,6 +5454,7 @@ test "DiskTier: a shorter pooled bank never replaces the longer one an entry's c
     try testing.expectEqual(@as(usize, 3), tier.entries.items[0].ssm_positions.len);
     try testing.expectEqual(@as(u32, 2000), tier.entries.items[0].qsa_history_rows);
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
     defer tier2.deinit();
     for ([_]u32{ 1024, 2000 }) |pos| {
@@ -5229,7 +5481,6 @@ test "DiskTier: a mid-block checkpoint restore overlays the pooled bank onto its
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-mid", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
@@ -5254,6 +5505,7 @@ test "DiskTier: a mid-block checkpoint restore overlays the pooled bank onto its
     try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-mid", 0, 128);
     defer tier2.deinit();
     var cache2 = try KVCache.init(testing.allocator, 3);
@@ -6031,7 +6283,6 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
@@ -6061,8 +6312,8 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     try testing.expect(tier.entries.items[0].spec_bytes > 0);
 
     // Restart shape: a fresh tier over the same root re-reads the spec meta.
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
-    defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
     const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
 
@@ -6133,6 +6384,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
         try fw.interface.writeAll(rewritten.items);
         try fw.interface.flush();
     }
+    tier2.deinit();
     var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
     defer tier3.deinit();
     try testing.expectEqual(@as(usize, 2), tier3.entryCount());
@@ -6154,7 +6406,6 @@ test "DiskTier: a spec sidecar replaced before its manifest commits is declined,
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-crash", 0, 128);
-    defer tier.deinit();
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
     try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
@@ -6187,6 +6438,7 @@ test "DiskTier: a spec sidecar replaced before its manifest commits is declined,
     const res = try tier.writeSpecSidecar(dir, .{ .entries = new_win.entries, .step = new_win.step, .config = new_win.config, .base_pos = 200 }, null, s);
     try testing.expectEqual(old_bytes, res.bytes);
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec-crash", 0, 128);
     defer tier2.deinit();
     const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
@@ -6416,7 +6668,6 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
@@ -6458,6 +6709,7 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
         s,
     );
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
     defer tier2.deinit();
     const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
@@ -6506,7 +6758,6 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
@@ -6553,6 +6804,7 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
     try testing.expect(!mlx.errorPending());
 
     // A pooled bank without its raw history is not restorable: KV half only, head declined.
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
     defer tier2.deinit();
     const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
@@ -6742,7 +6994,6 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
@@ -6793,6 +7044,7 @@ test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without t
     );
 
     // A restart: the positions come back through meta.json, the rows through the sidecar.
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
     defer tier2.deinit();
     const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
@@ -6938,13 +7190,12 @@ test "DiskTier: an SSM checkpoint STAGES through the writer — no filesystem wr
     try transformer_mod.attachQsaHistoryToLatest(&cps, &src128, s);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-cpstage", 0, 128);
-    defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     tier.enableBackgroundWriter();
     try testing.expect(tier.writer != null);
     tier.writer.?.setPaused(true);
-    defer tier.writer.?.setPaused(false);
+    defer if (tier.writer) |w| w.setPaused(false);
 
     try testing.expectEqual(
         PersistOutcome.persisted,
@@ -6982,6 +7233,7 @@ test "DiskTier: an SSM checkpoint STAGES through the writer — no filesystem wr
     try testing.expectEqual(tier.entries.items[0].ssm_bytes[0], st.size);
 
     // Bar 3: a fresh tier reads the hand-rolled image back, `__metadata__` included.
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssd-cpstage", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
@@ -7070,14 +7322,13 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-writer", 0, 128);
-    defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     tier.enableBackgroundWriter();
     try testing.expect(tier.writer != null);
     try testing.expectEqual(FLUSH_PIECE_BYTES, tier.max_flush_bytes);
     tier.writer.?.setPaused(true);
-    defer tier.writer.?.setPaused(false);
+    defer if (tier.writer) |w| w.setPaused(false);
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
@@ -7108,6 +7359,7 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     try testing.expectEqual(@as(u64, 6), tier.writer.?.filesWritten());
 
     // The staged bytes are a real safetensors image: a fresh tier restores it.
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssd-writer", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
@@ -7252,11 +7504,10 @@ test "DiskTier: a multi-piece commit stages its spec sidecar once, through the w
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-spec-pieces", 0, 128);
-    defer tier.deinit();
     tier.enableBackgroundWriter();
     tier.max_flush_bytes = 1; // one chunk per piece: five pieces
     tier.writer.?.setPaused(true);
-    defer tier.writer.?.setPaused(false);
+    defer if (tier.writer) |w| w.setPaused(false);
     try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(
         cache.entries,
         cache.step,
@@ -7282,6 +7533,7 @@ test "DiskTier: a multi-piece commit stages its spec sidecar once, through the w
     tier.writer.?.setPaused(false);
     tier.drainWriter();
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-spec-pieces", 0, 128);
     defer tier2.deinit();
     const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
@@ -7702,7 +7954,6 @@ fn evictionDuringStoreRound(selected: usize, evicted: usize, ssm_only: bool) !vo
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-evict", 0, 128);
-    defer tier.deinit();
     tier.ssd_first = true;
     const roomy: u64 = 1024 * 1024 * 1024 * 1024;
     tier.armTestSpace(roomy, 2 * roomy);
@@ -7738,6 +7989,7 @@ fn evictionDuringStoreRound(selected: usize, evicted: usize, ssm_only: bool) !vo
     tier.drainWriter();
     try testing.expectEqual(@as(?u64, null), test_evict_id);
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-evict", 0, 128);
     defer tier2.deinit();
     for (0..3) |k| {
@@ -8108,7 +8360,6 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     chunk_share_override = true;
     defer chunk_share_override = null;
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-share", 0, 128);
-    defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
 
@@ -8139,10 +8390,12 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     try testing.expectEqual(heir.chunk_bytes[4] + 600 * 4, heir.bytes);
 
     // The heir restores through a fresh tier, and its bill survives the scan.
+    const total_bytes = tier.total_bytes;
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-share", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 2), tier2.entryCount());
-    try testing.expectEqual(tier.total_bytes, tier2.total_bytes);
+    try testing.expectEqual(total_bytes, tier2.total_bytes);
     const m = tier2.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(u32, 600), m.usable);
     var out = try KVCache.init(testing.allocator, 3);
@@ -8339,7 +8592,6 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     defer chunk_share_override = null;
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-landed", 0, 128);
-    defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     tier.enableBackgroundWriter();
@@ -8361,7 +8613,7 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     tier.drainWriter();
     try testing.expectEqual(@as(u32, 256), tier.entries.items[0].kv_len);
     tier.writer.?.setPaused(true);
-    defer tier.writer.?.setPaused(false);
+    defer if (tier.writer) |w| w.setPaused(false);
     _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, null, s, donor_bound);
     try testing.expectEqual(@as(u32, 384), tier.entries.items[0].kv_len);
     const donor_id = tier.entries.items[0].id;
@@ -8387,6 +8639,7 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     inline for (.{ 0, 1 }) |i| try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(chunkStat(io, base, "fp-landed", heir.id, i).?.nlink)));
     inline for (.{ 2, 3, 4 }) |i| try testing.expectEqual(@as(u64, 1), @as(u64, @intCast(chunkStat(io, base, "fp-landed", heir.id, i).?.nlink)));
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-landed", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 2), tier2.entryCount());
@@ -8445,7 +8698,6 @@ test "DiskTier: an ssm/spec-only append bills the SPEC sidecar's byte delta" {
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-specbill", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
@@ -8485,10 +8737,12 @@ test "DiskTier: an ssm/spec-only append bills the SPEC sidecar's byte delta" {
     try testing.expectEqual(nonChunkBytes(e) + own_chunks, e.bytes);
 
     // A rescan of the same root reaches the same total.
+    const total_bytes = tier.total_bytes;
+    tier.deinit();
     var rescanned = try DiskTier.init(testing.allocator, io, base, "fp-specbill", 0, 128);
     defer rescanned.deinit();
     try testing.expectEqual(@as(usize, 1), rescanned.entryCount());
-    try testing.expectEqual(tier.total_bytes, rescanned.total_bytes);
+    try testing.expectEqual(total_bytes, rescanned.total_bytes);
 }
 
 test "DiskTier: the manifest stamps the LOWEST version that describes the entry" {
@@ -8555,7 +8809,6 @@ test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING
     const base = try tmpRoot(&tmp, io, &buf);
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-v8", 0, 128);
-    defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
@@ -8607,6 +8860,7 @@ test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING
     try testing.expectEqual(@as(c_int, 256), loaded.layers[2].qsa_rows);
     try testing.expectEqual(@as(c_int, 256), mlx.getShape(loaded.layers[2].aux_state)[1]);
 
+    tier.deinit();
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-v8", 0, 128);
     defer tier2.deinit();
     var cache2 = try KVCache.init(testing.allocator, 3);
@@ -8633,7 +8887,7 @@ test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING
         .sub_path = "fp-qsa-v8/e9/meta.json",
         .data = "{\"v\":9,\"kv_len\":1,\"tokens\":0,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":0,\"chunk_tokens\":128,\"inherited_chunks\":0,\"bytes\":0,\"chunk_bytes\":[],\"ssm\":[]}",
     });
-    try testing.expect(tier.loadEntry(9) == null);
+    try testing.expect(tier2.loadEntry(9) == null);
 }
 
 test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {

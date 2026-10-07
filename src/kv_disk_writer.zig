@@ -476,22 +476,21 @@ pub const Writer = struct {
     }
 };
 
-/// `<path>.tmp` then rename.
+/// The staging file then rename.
 fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     return writePart(path, bytes, .whole);
 }
 
-fn tmpPathZ(buf: *[std.fs.max_path_bytes + 8]u8, path: []const u8) ![:0]const u8 {
-    if (path.len + 6 >= buf.len) return error.NameTooLong;
-    @memcpy(buf[0..path.len], path);
-    @memcpy(buf[path.len .. path.len + 4], ".tmp");
-    buf[path.len + 4] = 0;
-    return buf[0 .. path.len + 4 :0];
+const TmpBuf = [std.fs.max_path_bytes + 24]u8;
+
+/// `<path>.<pid>.tmp`: a staging name no other process writes.
+fn tmpPathZ(buf: *TmpBuf, path: []const u8) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}.{d}.tmp", .{ path, std.c.getpid() }, 0) catch error.NameTooLong;
 }
 
 /// Remove `path`'s staging file; a caller only does this once no part of it is queued or in flight.
 pub fn unlinkTmp(path: []const u8) void {
-    var tmp_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    var tmp_buf: TmpBuf = undefined;
     const tmp = tmpPathZ(&tmp_buf, path) catch return;
     _ = std.c.unlink(tmp.ptr);
 }
@@ -499,7 +498,7 @@ pub fn unlinkTmp(path: []const u8) void {
 /// One part of `path` (`Part`): a whole or first part truncates its `tmp`, the others append; a
 /// whole or last part renames it into place.
 fn writePart(path: []const u8, bytes: []const u8, part: Part) !void {
-    var tmp_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    var tmp_buf: TmpBuf = undefined;
     const tmp = try tmpPathZ(&tmp_buf, path);
     const fresh = part == .whole or part == .first;
     const fd = std.c.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = fresh, .TRUNC = fresh, .APPEND = !fresh }, @as(std.c.mode_t, 0o644));
@@ -562,10 +561,14 @@ test "kv_disk_writer: files land off-thread, in FIFO order, and atomically" {
         defer testing.allocator.free(got);
         try testing.expectEqual(@as(usize, 4096), got.len);
         try testing.expectEqual(@as(u8, @intCast(i)), got[0]);
-        var tname: [72]u8 = undefined;
-        const tn = try std.fmt.bufPrint(&tname, "f{d}.bin.tmp", .{i});
-        try testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, tn, .{}));
     }
+    try expectNoStagingFile(tmp.dir);
+}
+
+/// No staging file is left in `dir`, whatever its name.
+fn expectNoStagingFile(dir: std.Io.Dir) !void {
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |dent| try testing.expect(!std.mem.endsWith(u8, dent.name, ".tmp"));
 }
 
 test "kv_disk_writer: the epoch fence drops staged bytes instead of writing them" {
@@ -672,7 +675,7 @@ test "kv_disk_writer: a file staged in parts lands whole at its last part, and a
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, 48 * 1024), got.len);
     for (0..3) |i| try testing.expectEqual(@as(u8, @intCast(i + 1)), got[i * 16 * 1024]);
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "big.bin.tmp", .{}));
+    try expectNoStagingFile(tmp.dir);
     try testing.expectEqual(@as(u64, 1), w.filesWritten());
 
     // The first part fails like a full volume: the rest of the file is dropped, nothing lands.
@@ -684,7 +687,7 @@ test "kv_disk_writer: a file staged in parts lands whole at its last part, and a
     w.drain();
     try testing.expectEqual(@as(u64, 1), w.writeErrorCount());
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "broken.bin", .{}));
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "broken.bin.tmp", .{}));
+    try expectNoStagingFile(tmp.dir);
     // The same path written afresh lands.
     w.injectFailure(null, .write);
     const again = try std.fmt.allocPrint(testing.allocator, "{s}/broken.bin", .{root});
@@ -717,7 +720,7 @@ test "kv_disk_writer: a PAUSED writer deinits without blocking" {
 }
 
 test "kv_disk_writer: failed publication removes staged temporary bytes" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.createDir(testing.io, "blocked", .default_dir);
     var buf: [512]u8 = undefined;
@@ -726,7 +729,7 @@ test "kv_disk_writer: failed publication removes staged temporary bytes" {
     defer testing.allocator.free(path);
 
     try testing.expectError(error.RenameFailed, writeAtomic(path, "unpublished bytes"));
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "blocked.tmp", .{}));
+    try expectNoStagingFile(tmp.dir);
 }
 
 test "kv_disk_writer: queue allocation failure invalidates persistence" {
