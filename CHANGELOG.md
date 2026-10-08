@@ -13,6 +13,8 @@ earlier history is mlx-serve's, in that project's changelog.
   auto context keeps 93% of the memory ceiling on every model, and `--wired-margin-gib` defaults to 1 GiB.
 - **GLM-5.3-Flash**: DFlash2 drafting is about 6% faster per round and verification about 1% faster, with identical
   output.
+- **EXL3 packs**: expert rates from 1.5 bits per weight take the fast decode and prefill kernels on every served
+  architecture, including GLM-5.3-Flash's, with output identical to the reference readers.
 
 ---
 

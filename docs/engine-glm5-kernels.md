@@ -131,7 +131,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   three rows, and HC collapse emits the normalized branch input directly. The latter preserves the intermediate
   BF16 value and native RMS reduction order. Together with expert reuse/tiling, measured verification is
   [5.25–5.98% lower verification time](perf-baselines.md#glm-three-value-norm) than `f40fa548`; draft depth is unchanged.
-- **Shared-expert rows serve every even n 32–64** (`glm_group2.servesRate`) and every pack window, never one pack's
+- **Shared-expert rows serve every admitted n** (`glm_group2.servesRate`) and every pack window, never one pack's
   rate or window. The three-row, 24-slot lane path reuses each expert's decoded weights across up to three matching
   routes and computes two output tiles per threadgroup. Other widths retain two-member reuse and one output tile. Mixed gate/up and down
   rates are exact, and the engagement test runs `apply` at each rate. Together these changes save
