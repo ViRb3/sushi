@@ -2,11 +2,11 @@
 
 # SUSHI
 
-A detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve) that serves a few selected models on Apple
-Silicon with custom Sushi quants: EXL3 experts and affine trunks tuned for M5 Pro/Max, still good on M1-M4. Sushi runs
-stand-alone and also as a guest engine inside mlx-serve.
+A local AI server for low-bit, very high quality Sushi quants, using custom EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ is required.
 
 ## Model support list
+
+Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming-on-a-32-gb-mac))
 * [Qwen3.8-Flash-Next-Sushi-2.6bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw) (requires 64 GB+)
@@ -30,8 +30,9 @@ brew install beamivalice/tap/sushi
 
 Update with `brew upgrade sushi`.
 
-The server listens on `127.0.0.1:12345`. The model's own draft head (MTP for Qwen and MiMo, a DFlash2 assistant for
-GLM) and the 8-bit KV cache are on by default.
+* The server listens on `127.0.0.1:12345`.
+* Support speculative decoding: MTP for Qwen and MiMo, DFlash2 for GLM.
+* 8-bit KV cache are on by default.
 
 ## Memory
 
@@ -106,10 +107,6 @@ Community reports, using llmprobe `--bench-only`:
 | M5 Max | 128 GB | 4bpw | ~1,750 | ~90 |
 | M5 Max | 128 GB | MiMo 2.3bpw | ~1,130 | ~70 |
 | M5 Max | 128 GB | GLM 2.4bpw | ~860 | ~55 |
-
-## Usage
-
-See [recommended launch commands and coding agent usage](docs/usage.md).
 
 ## License
 
