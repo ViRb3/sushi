@@ -20,6 +20,7 @@ stand-alone and also as a guest engine inside mlx-serve.
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
 MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%) against the original MOPD checkpoint.
+GLM-5.3-Flash-Sushi-2.4bpw scores KLD 0.0742 (top-1 agreement 90.33%) against the BF16 model (4x512 tokens).
 
 ## Install
 
@@ -34,26 +35,26 @@ GLM) and the 8-bit KV cache are on by default.
 
 ## Memory
 
-GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on, `--mtp-head-kv-quant`). The
-prompt cache and the n-gram table stay on the SSD and are not counted.
+GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on with `--mtp-head-kv-quant`; GLM
+with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
 
-| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw |
-|---|---:|---:|---:|---:|
-| weights only | 35.0 | 44.0 | 63.7 | 83.6 |
-| 128k | 40.7 | 49.7 | 69.4 | 87.3 |
-| 256k | 43.6 | 52.6 | 72.3 | 89.2 |
-| 512k | 48.7 | 57.6 | 77.4 | 92.9 |
-| 1M | 58.8 | 67.8 | 87.5 | 100.4 |
+| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2.4bpw |
+|---|---:|---:|---:|---:|---:|
+| weights only | 35.0 | 44.0 | 63.7 | 83.6 | 90.0 |
+| 128k | 40.7 | 49.7 | 69.4 | 87.3 | 93.2 |
+| 256k | 43.6 | 52.6 | 72.3 | 89.2 | 94.3 |
+| 512k | 48.7 | 57.6 | 77.4 | 92.9 | 96.5 |
+| 1M | 58.8 | 67.8 | 87.5 | 100.4 | 101.0 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
-the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M:
+the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no 4-bit KV):
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw |
-|---|---|---|---|---|---|
-| 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — |
-| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | — | — |
-| 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 880k / 1M | — |
-| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M |
+| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2.4bpw |
+|---|---|---|---|---|---|---|
+| 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — | — |
+| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | — | — | — |
+| 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 880k / 1M | — | — |
+| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — |
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
