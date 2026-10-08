@@ -4790,6 +4790,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (params.config.isGlm5()) {
                 d.native_glm_serving = true;
                 log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
+                if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, xfm_ptr.glm5.?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
             } else d.bind(xfm_ptr) catch |err| {
                 d.deinit();
                 sch.allocator.destroy(d);
@@ -6809,6 +6810,26 @@ fn glmRowsUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").
     while (it.next()) |field| {
         const ctx = std.fmt.parseInt(usize, field, 10) catch continue;
         @import("glm5_rows_ubench.zig").run(alloc, target, latent_bits, ids, ctx, rounds) catch |err| log.warn("[glm-rows-ubench] failed: {s}\n", .{@errorName(err)});
+    }
+}
+
+/// DIAGNOSTIC (SUSHI_GLM_ROUND_UBENCH=N): `glm5_round_ubench.run` per `_CTX=<tokens>[,<tokens>...]`
+/// (default 8192) over `_TEXT=<abs path>`.
+fn glmRoundUbench(alloc: std.mem.Allocator, target: *@import("glm5_forward.zig").Model, assistant: *DflashModel, latent_bits: u8, tok: *Tokenizer) void {
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const rounds = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_GLM_ROUND_UBENCH").?, 0), 10) catch 64);
+    const ctxs: []const u8 = if (std.c.getenv("SUSHI_GLM_ROUND_UBENCH_CTX")) |r| std.mem.sliceTo(r, 0) else "8192";
+    var ids: []u32 = &.{};
+    defer alloc.free(ids);
+    if (std.c.getenv("SUSHI_GLM_ROUND_UBENCH_TEXT")) |path| blk: {
+        const text = std.Io.Dir.cwd().readFileAlloc(tio, std.mem.sliceTo(path, 0), alloc, .limited(64 << 20)) catch break :blk;
+        defer alloc.free(text);
+        ids = tok.encode(alloc, text) catch break :blk;
+    }
+    var it = std.mem.tokenizeScalar(u8, ctxs, ',');
+    while (it.next()) |field| {
+        const ctx = std.fmt.parseInt(usize, field, 10) catch continue;
+        @import("glm5_round_ubench.zig").run(alloc, target, assistant, latent_bits, ids, ctx, rounds) catch |err| log.warn("[glm-round-ubench] failed: {s}\n", .{@errorName(err)});
     }
 }
 
