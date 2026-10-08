@@ -1314,105 +1314,86 @@ pub fn fillWindow(fd: std.c.fd_t, window: []u8, start: u64, end: u64) !void {
 }
 
 /// Reads byte ranges around the file cache (aligned `F_NOCACHE` reads into page-aligned scratch)
-/// and copies them out; a range longer than one chunk is read on a second thread one chunk ahead
-/// of the copy, so the SSD and the copy overlap. One instance per load: its two scratch windows
-/// are allocated on first use and reused.
-pub const OverlappedReader = struct {
-    pub const default_chunk: usize = 64 << 20;
+/// and copies them out. A range longer than one chunk is split over `workers` threads, each
+/// reading its next chunk into its own scratch and copying it into place, so the SSD and the
+/// copies run in parallel. One instance per load: scratch is allocated on first use and reused.
+pub const ParallelReader = struct {
+    pub const default_chunk: usize = 16 << 20;
+    pub const default_workers: usize = 4;
+    const max_workers = 8;
 
     allocator: std.mem.Allocator,
     /// A multiple of the page size.
     chunk: usize,
-    scratch: [2][]align(align_bytes) u8 = .{ &.{}, &.{} },
+    workers: usize,
+    scratch: [max_workers][]align(align_bytes) u8 = @splat(&.{}),
 
-    pub fn init(allocator: std.mem.Allocator, chunk: usize) OverlappedReader {
-        return .{ .allocator = allocator, .chunk = chunk };
+    pub fn init(allocator: std.mem.Allocator, chunk: usize, workers: usize) ParallelReader {
+        return .{ .allocator = allocator, .chunk = chunk, .workers = std.math.clamp(workers, 1, max_workers) };
     }
 
-    pub fn deinit(self: *OverlappedReader) void {
-        for (self.scratch) |w| if (w.len != 0) self.allocator.free(w);
-        self.scratch = .{ &.{}, &.{} };
+    pub fn deinit(self: *ParallelReader) void {
+        for (&self.scratch) |*w| if (w.len != 0) {
+            self.allocator.free(w.*);
+            w.* = &.{};
+        };
     }
 
-    fn window(self: *OverlappedReader, slot: usize) ![]align(align_bytes) u8 {
+    fn window(self: *ParallelReader, slot: usize) ![]align(align_bytes) u8 {
         if (self.scratch[slot].len == 0) self.scratch[slot] = try self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(align_bytes), self.chunk);
         return self.scratch[slot];
     }
 
     /// `dst.len` bytes of `fd` at `offset` into `dst`.
-    pub fn fill(self: *OverlappedReader, fd: std.c.fd_t, dst: []u8, offset: u64) !void {
+    pub fn fill(self: *ParallelReader, fd: std.c.fd_t, dst: []u8, offset: u64) !void {
         if (dst.len == 0) return;
-        var pipe: Pipe = .{ .reader = self, .fd = fd, .start = pageRoundDown(offset), .end = offset + dst.len };
-        pipe.aligned_end = pageRoundUp(pipe.end);
-        pipe.chunks = std.math.divCeil(u64, pipe.aligned_end - pipe.start, self.chunk) catch unreachable;
-        _ = try self.window(0);
-        if (pipe.chunks == 1) {
-            try fillWindow(fd, self.scratch[0][0..@intCast(pipe.aligned_end - pipe.start)], pipe.start, pipe.end);
-            pipe.copyOut(0, 0, dst, offset);
-            return;
+        var job: Job = .{ .reader = self, .fd = fd, .dst = dst, .offset = offset, .start = pageRoundDown(offset), .end = offset + dst.len };
+        job.aligned_end = pageRoundUp(job.end);
+        job.chunks = std.math.divCeil(u64, job.aligned_end - job.start, self.chunk) catch unreachable;
+        const workers: usize = @intCast(@min(self.workers, job.chunks));
+        for (0..workers) |slot| _ = try self.window(slot);
+        var threads: [max_workers]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |th| th.join();
+        for (1..workers) |slot| {
+            threads[spawned] = std.Thread.spawn(.{}, Job.run, .{ &job, slot }) catch break;
+            spawned += 1;
         }
-        _ = try self.window(1);
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const thread = try std.Thread.spawn(.{}, Pipe.readAll, .{&pipe});
-        var failure: ?anyerror = null;
-        for (0..@intCast(pipe.chunks)) |k| {
-            const slot = k % 2;
-            pipe.mu.lockUncancelable(io);
-            while (!pipe.full[slot] and pipe.failure == null) pipe.cv.wait(io, &pipe.mu) catch {};
-            failure = pipe.failure;
-            pipe.mu.unlock(io);
-            if (failure != null) break;
-            pipe.copyOut(k, slot, dst, offset);
-            pipe.mu.lockUncancelable(io);
-            pipe.full[slot] = false;
-            pipe.cv.broadcast(io);
-            pipe.mu.unlock(io);
-        }
-        thread.join();
-        if (failure) |err| return err;
+        job.run(0);
+        for (threads[0..spawned]) |th| th.join();
+        spawned = 0;
+        if (job.failed.load(.acquire)) return job.failure;
     }
 
-    const Pipe = struct {
-        reader: *OverlappedReader,
+    const Job = struct {
+        reader: *ParallelReader,
         fd: std.c.fd_t,
+        dst: []u8,
+        offset: u64,
         start: u64,
         end: u64,
         aligned_end: u64 = 0,
         chunks: u64 = 0,
-        mu: std.Io.Mutex = .init,
-        cv: std.Io.Condition = .init,
-        full: [2]bool = .{ false, false },
-        failure: ?anyerror = null,
+        next: std.atomic.Value(u64) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        failure: anyerror = error.FillReadFailed,
 
-        fn range(self: *const Pipe, k: u64) [2]u64 {
-            const lo = self.start + k * self.reader.chunk;
-            return .{ lo, @min(lo + self.reader.chunk, self.aligned_end) };
-        }
-
-        fn copyOut(self: *const Pipe, k: u64, slot: usize, dst: []u8, offset: u64) void {
-            const r = self.range(k);
-            const lo = @max(r[0], offset);
-            const hi = @min(r[1], self.end);
-            const n: usize = @intCast(hi - lo);
-            @memcpy(dst[@intCast(lo - offset)..][0..n], self.reader.scratch[slot][@intCast(lo - r[0])..][0..n]);
-        }
-
-        fn readAll(self: *Pipe) void {
-            const io = std.Io.Threaded.global_single_threaded.io();
-            for (0..@intCast(self.chunks)) |k| {
-                const slot = k % 2;
-                self.mu.lockUncancelable(io);
-                while (self.full[slot] and self.failure == null) self.cv.wait(io, &self.mu) catch {};
-                const stop = self.failure != null;
-                self.mu.unlock(io);
-                if (stop) return;
-                const r = self.range(k);
-                const result = fillWindow(self.fd, self.reader.scratch[slot][0..@intCast(r[1] - r[0])], r[0], @min(r[1], self.end));
-                self.mu.lockUncancelable(io);
-                if (result) |_| self.full[slot] = true else |err| self.failure = err;
-                self.cv.broadcast(io);
-                self.mu.unlock(io);
-                if (self.failure != null) return;
+        /// Claims chunks until none are left or a worker failed; `slot` is this worker's scratch.
+        fn run(self: *Job, slot: usize) void {
+            const scratch = self.reader.scratch[slot];
+            while (!self.failed.load(.acquire)) {
+                const k = self.next.fetchAdd(1, .monotonic);
+                if (k >= self.chunks) return;
+                const lo = self.start + k * self.reader.chunk;
+                const hi = @min(lo + self.reader.chunk, self.aligned_end);
+                fillWindow(self.fd, scratch[0..@intCast(hi - lo)], lo, @min(hi, self.end)) catch |err| {
+                    if (self.failed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) self.failure = err;
+                    return;
+                };
+                const a = @max(lo, self.offset);
+                const b = @min(hi, self.end);
+                const n: usize = @intCast(b - a);
+                @memcpy(self.dst[@intCast(a - self.offset)..][0..n], scratch[@intCast(a - lo)..][0..n]);
             }
         }
     };
@@ -2001,7 +1982,7 @@ test "expert io import active memory counts an aliased slab once" {
     try t.expect(delta < 2 * bytes);
 }
 
-test "overlapped reader fills any range, across many chunks and up to a partial last page" {
+test "parallel reader fills any range, across many chunks and workers and up to a partial last page" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -2017,16 +1998,18 @@ test "overlapped reader fills any range, across many chunks and up to a partial 
     defer t.allocator.free(path);
     const fd = try openHinted(path, .{ .readahead_off = false });
     defer _ = std.c.close(fd);
-    // Two-page chunks: a 9-page file runs the threaded path five times over.
-    var reader = OverlappedReader.init(t.allocator, 2 * page);
-    defer reader.deinit();
-    for ([_][2]usize{ .{ 0, 10 }, .{ 5, page }, .{ page - 4, 20 }, .{ 1, size - 1 }, .{ 3 * page + 7, 5 * page }, .{ 9 * page + 50, 73 } }) |case| {
-        const dst = try t.allocator.alloc(u8, case[1]);
-        defer t.allocator.free(dst);
-        try reader.fill(fd, dst, case[0]);
-        try t.expectEqualSlices(u8, bytes[case[0]..][0..case[1]], dst);
+    // One-page chunks: a 9-page file splits into up to ten chunks over the workers.
+    for ([_]usize{ 1, 3 }) |workers| {
+        var reader = ParallelReader.init(t.allocator, page, workers);
+        defer reader.deinit();
+        for ([_][2]usize{ .{ 0, 10 }, .{ 5, page }, .{ page - 4, 20 }, .{ 1, size - 1 }, .{ 3 * page + 7, 5 * page }, .{ 9 * page + 50, 73 } }) |case| {
+            const dst = try t.allocator.alloc(u8, case[1]);
+            defer t.allocator.free(dst);
+            try reader.fill(fd, dst, case[0]);
+            try t.expectEqualSlices(u8, bytes[case[0]..][0..case[1]], dst);
+        }
+        const past = try t.allocator.alloc(u8, 3 * page);
+        defer t.allocator.free(past);
+        try t.expectError(error.FillShortRead, reader.fill(fd, past, size - page));
     }
-    const past = try t.allocator.alloc(u8, 3 * page);
-    defer t.allocator.free(past);
-    try t.expectError(error.FillShortRead, reader.fill(fd, past, size - page));
 }

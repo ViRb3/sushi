@@ -141,7 +141,7 @@ fn selectedBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8
 /// per shard, which exceeds a terminal's default limit on finely sharded packs.
 /// One descriptor and one temporary payload suffice here. Source E4M3 codes use
 /// U8 storage as in mimo_source; no tensor is converted or requantized.
-fn loadStoredShard(allocator: std.mem.Allocator, reader: *@import("expert_io.zig").OverlappedReader, path: [:0]const u8, file: []const u8, owners: std.json.ObjectMap, layers: usize, trunk_only: bool, vision: bool, result: *model.Weights, max_bytes: u64) !void {
+fn loadStoredShard(allocator: std.mem.Allocator, reader: *@import("expert_io.zig").ParallelReader, path: [:0]const u8, file: []const u8, owners: std.json.ObjectMap, layers: usize, trunk_only: bool, vision: bool, result: *model.Weights, max_bytes: u64) !void {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) {
         const code = std.c._errno().*;
@@ -267,7 +267,7 @@ pub fn loadWeightsBoundedWithVision(io: std.Io, allocator: std.mem.Allocator, mo
     if (expected == 0) return error.MissingIndexedGlmWeight;
     var result = model.Weights.init(allocator);
     errdefer result.deinit();
-    var reader = @import("expert_io.zig").OverlappedReader.init(allocator, @import("expert_io.zig").OverlappedReader.default_chunk);
+    var reader = @import("expert_io.zig").ParallelReader.init(allocator, @import("expert_io.zig").ParallelReader.default_chunk, @import("expert_io.zig").ParallelReader.default_workers);
     defer reader.deinit();
     var file_it = files.keyIterator();
     while (file_it.next()) |file| {

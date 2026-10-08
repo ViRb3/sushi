@@ -4730,7 +4730,7 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         }
     }
 
-    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
     var file_count: u32 = 0;
     var it = dir.iterate();
@@ -4840,7 +4840,7 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     load_vision: bool,
 ) !void {
-    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
     return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, null);
 }
@@ -4974,10 +4974,10 @@ pub const TensorArray = struct {
 const import_min_bytes: usize = 1 << 20;
 
 /// `len` bytes at `offset` as a `shape`/`dtype` array, read around the file cache with the read
-/// of each chunk overlapping the copy of the last (`expert_io.OverlappedReader`). A large tensor
+/// and copy of its chunks spread over several threads (`expert_io.ParallelReader`). A large tensor
 /// lands at offset 0 of an anonymous mapping MLX imports as its buffer: a view at an offset
 /// inside a buffer is not safe in this engine. Caller frees `array`.
-pub fn readTensorArray(reader: *expert_io.OverlappedReader, fd: std.c.fd_t, offset: u64, len: usize, shape: []const c_int, dtype: mlx.mlx_dtype) !TensorArray {
+pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset: u64, len: usize, shape: []const c_int, dtype: mlx.mlx_dtype) !TensorArray {
     if (len < import_min_bytes) {
         const host = try reader.allocator.alloc(u8, @max(len, 1));
         defer reader.allocator.free(host);
@@ -5020,7 +5020,7 @@ fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
 }
 
 /// One header entry's payload as an MLX array. Caller frees.
-fn readSafetensor(reader: *expert_io.OverlappedReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
+fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
     if (meta != .object) return error.InvalidSafetensorsTensor;
     const dtype_value = meta.object.get("dtype") orelse return error.InvalidSafetensorsTensor;
     const dims = meta.object.get("shape") orelse return error.InvalidSafetensorsTensor;
@@ -5042,7 +5042,7 @@ fn readSafetensor(reader: *expert_io.OverlappedReader, fd: std.c.fd_t, header: *
 
 fn loadSafetensorsFileMode(
     allocator: std.mem.Allocator,
-    reader: *expert_io.OverlappedReader,
+    reader: *expert_io.ParallelReader,
     weights: *Weights,
     path: [*:0]const u8,
     s: mlx.mlx_stream,
@@ -9897,7 +9897,7 @@ test "readTensorArray returns the file's tensor, imported without a copy when la
     defer a.free(path);
     const fd = try expert_io.openHinted(path, .{ .readahead_off = false });
     defer _ = std.c.close(fd);
-    var reader = expert_io.OverlappedReader.init(a, 4 * page);
+    var reader = expert_io.ParallelReader.init(a, page, 3);
     defer reader.deinit();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);

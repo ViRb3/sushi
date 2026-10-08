@@ -244,11 +244,14 @@ physical free-memory ceiling.
 GLM uploads only indexed payloads from one shard at a time, preserving their stored
 dtypes. It closes each shard before opening the next. Each tensor is read through a page-aligned
 window on an `F_NOCACHE` descriptor (`model.readTensorArray`; macOS ignores `F_NOCACHE` unless the file offset, length
-and buffer are all page-aligned). A second thread reads the next 64 MiB chunk while the last is copied out
-(`expert_io.OverlappedReader`); a tensor of 1 MiB or more lands at offset 0 of its own mapping, imported by MLX
+and buffer are all page-aligned). Four workers each read the next 16 MiB chunk into their own scratch and copy it
+into place (`expert_io.ParallelReader`); a tensor of 1 MiB or more lands at offset 0 of its own mapping, imported by MLX
 without a copy (a view at an offset inside a buffer gave NaN logits). Same settings, H N H N per pack, sequential aligned reads → the
 overlapped reader: GLM upload 13.6/13.9 → 9.0/8.8 s (listening 18.4/15.9 → 12.1/10.7 s), Qwen 4bpw 12.0/10.5 → 9.5/7.7 s
-(14.8/12.3 → 11.9/9.3 s); no compression or swap in any arm. Read
+(14.8/12.3 → 11.9/9.3 s); no compression or swap in any arm.
+Four workers instead of one read-ahead thread, file cache evicted before each arm: GLM upload 9.0/9.3 → 8.0/8.0 s
+(listening 11.7/10.9 → 10.4/9.5 s); Qwen 4bpw against `mlx_load_safetensors` 6.7/6.7 vs 7.0/7.2 s (listening 8.3/8.2
+vs 8.7/8.6 s), compressor +4.4/+5.5 GB vs 0. Read
 through the file cache, the ~90 GB upload filled it and macOS compressed the weights already uploaded (not yet wired)
 rather than drop it, then decompressed them when the wired limit applied: on a busier box, that compression is swap.
 Sushi-2.4bpw, `serve` defaults, `taskpolicy -a`, lock held, 2026-10-08, ~90 GB free at start: compressor +59.0 GB →

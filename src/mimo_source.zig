@@ -95,7 +95,7 @@ pub fn loadWeights(
     var weights = model.Weights.init(allocator);
     errdefer weights.deinit();
 
-    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
     var it = source.tensors.iterator();
     while (it.next()) |entry| {
@@ -127,7 +127,7 @@ pub fn loadMtpWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     var source = try loadSourceIndex(io, arena.allocator(), model_dir);
     var weights = model.Weights.init(allocator);
     errdefer weights.deinit();
-    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
     var it = source.tensors.iterator();
     while (it.next()) |entry| {
@@ -165,7 +165,7 @@ pub fn loadVisionWeightsInto(weights: *model.Weights, io: std.Io, allocator: std
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var source = try loadSourceIndex(io, arena.allocator(), model_dir);
-    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
     var it = source.tensors.iterator();
     while (it.next()) |entry| {
@@ -957,7 +957,7 @@ fn countResidentBytes(
 
 /// The tensor as an MLX array in its stored dtype (or `as`), read around the file cache
 /// (`model.readTensorArray`). Caller frees `.array`; `.bytes` lives as long.
-fn readDense(reader: *expert_io.OverlappedReader, model_dir: []const u8, meta: TensorMeta, as: ?mlx.mlx_dtype) !model.TensorArray {
+fn readDense(reader: *expert_io.ParallelReader, model_dir: []const u8, meta: TensorMeta, as: ?mlx.mlx_dtype) !model.TensorArray {
     const len_u64 = meta.data_end - meta.data_start;
     const len = std.math.cast(usize, len_u64) orelse return error.SafetensorsShapeOverflow;
     var shape: [4]c_int = undefined;
@@ -1014,7 +1014,7 @@ fn putWeight(weights: *model.Weights, allocator: Allocator, key: []const u8, arr
 /// The codes and their tile scales as stored, under `{base}.weight` and
 /// `{base}.scales`; a QKV keeps its rank-local rows (the forward splits them).
 fn loadFp8Weight(
-    reader: *expert_io.OverlappedReader,
+    reader: *expert_io.ParallelReader,
     weights: *model.Weights,
     allocator: Allocator,
     model_dir: []const u8,
