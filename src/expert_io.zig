@@ -1296,6 +1296,30 @@ pub fn readUncached(allocator: std.mem.Allocator, fd: std.c.fd_t, offset: u64, l
     return .{ .window = window, .bytes = window[@intCast(offset - start)..][0..len] };
 }
 
+/// A shard's parsed safetensors header; tensor payloads start at `data_start`.
+pub const SafetensorsHeader = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    data_start: u64,
+
+    pub fn read(allocator: std.mem.Allocator, fd: std.c.fd_t) !SafetensorsHeader {
+        var len_bytes: [8]u8 = undefined;
+        try readExact(fd, &len_bytes, 0);
+        const header_len = std.mem.readInt(u64, &len_bytes, .little);
+        if (header_len == 0 or header_len > 128 * 1024 * 1024) return error.InvalidSafetensorsHeader;
+        const header = try allocator.alloc(u8, @intCast(header_len));
+        defer allocator.free(header);
+        try readExact(fd, header, 8);
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, header, .{ .allocate = .alloc_always }) catch return error.InvalidSafetensorsHeader;
+        errdefer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSafetensorsHeader;
+        return .{ .parsed = parsed, .data_start = 8 + header_len };
+    }
+
+    pub fn deinit(self: *SafetensorsHeader) void {
+        self.parsed.deinit();
+    }
+};
+
 pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u8) !TensorRegion {
     var len_bytes: [8]u8 = undefined;
     try readExact(fd, &len_bytes, 0);
