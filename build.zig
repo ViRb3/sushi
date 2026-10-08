@@ -83,9 +83,8 @@ pub fn build(b: *std.Build) void {
     // stb_image for JPEG/PNG decoding in the vision pipeline
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("lib/volume_space.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
     mod.addIncludePath(b.path("lib"));
-
-    addAneSources(b, mod);
 
     // The staged MLX library path must precede Homebrew's.
     addMlxLib(b, mod);
@@ -140,8 +139,8 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     test_mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
+    test_mod.addCSourceFile(.{ .file = b.path("lib/volume_space.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
     test_mod.addIncludePath(b.path("lib"));
-    addAneSources(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     const exl3_test_mod = addExl3Module(b, test_mod, target, optimize);
@@ -206,18 +205,6 @@ fn addCHeaderModule(
     });
     translate.addIncludePath(include_dir);
     return translate.createModule();
-}
-
-/// ARC bridge to AppleNeuralEngine, dlopen'd and checked for availability at runtime.
-fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
-    const objc_flags = &[_][]const u8{
-        "-O3",
-        "-fobjc-arc",
-        "-Wno-deprecated-declarations",
-    };
-    module.addCSourceFile(.{ .file = b.path("lib/ane/ane_bridge.m"), .flags = objc_flags });
-    module.addCSourceFile(.{ .file = b.path("lib/ane/ane_mlp.m"), .flags = objc_flags });
-    module.addIncludePath(b.path("lib/ane"));
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

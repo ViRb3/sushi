@@ -878,7 +878,7 @@ test "VisionEncoder serves a MiMo config through the MiMo-ViT" {
     defer weights.deinit();
     var enc = try @import("vision.zig").VisionEncoder.init(testing.allocator, tinyConfig(), &weights);
     defer enc.deinit();
-    try testing.expect(enc.mimo != null and !enc.supportsAudio());
+    try testing.expect(enc.mimo != null);
     const pv = weights.get("fixture.pixel_values") orelse return error.MissingFixtureTensor;
     const out = try enc.forwardPatches(pv, 8, 12);
     defer _ = mlx.mlx_array_free(out);

@@ -22,7 +22,6 @@ const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const vision_mod = @import("vision.zig");
-const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
@@ -41,7 +40,6 @@ const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
-const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const DflashModel = dflash_mod.DflashModel;
 const mtp_mod = @import("mtp.zig");
@@ -211,10 +209,7 @@ pub const LoadedModel = struct {
     /// across model families.
     chat_config: ?*ChatConfig,
     vision_encoder: ?*VisionEncoder,
-    drafter: ?*DrafterModel,
-    /// DFlash block-drafter sidecar. Mutually exclusive with `drafter` by the
-    /// loader's config-contract probe; `drafter_path`/`drafter_block_size`
-    /// are shared between the two sidecar kinds.
+    /// DFlash block-drafter sidecar (`drafter_path`/`drafter_block_size` describe it).
     dflash: ?*DflashModel = null,
     /// Echoed in `/v1/models` so the Swift app can show the drafter checkpoint
     /// path; empty when no drafter is loaded. Allocator-owned dupe.
@@ -361,11 +356,6 @@ pub const LoadedModel = struct {
             }
             self.mtp = null;
         }
-        if (self.drafter) |d| {
-            d.deinit();
-            self.allocator.destroy(d);
-            self.drafter = null;
-        }
         if (self.dflash) |d| {
             d.deinit();
             self.allocator.destroy(d);
@@ -498,11 +488,6 @@ pub const LoadedModel = struct {
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
             }
             self.mtp = null;
-        }
-        if (self.drafter) |d| {
-            d.deinit();
-            self.allocator.destroy(d);
-            self.drafter = null;
         }
         if (self.dflash) |d| {
             d.deinit();
@@ -749,7 +734,6 @@ pub const ModelRegistry = struct {
             .tokenizer = null,
             .chat_config = null,
             .vision_encoder = null,
-            .drafter = null,
             .drafter_path = "",
             .drafter_block_size = 0,
             .prefix_cache = null,

@@ -15,9 +15,8 @@ stays off. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of dd
   verify the engine, they do not make packs. Converter knowledge (recipes, calibration data, research notes) never
   goes into a committed file: it goes to `docs/private/`, and committed files say only that it lives in the private
   repo.
-- Everything else in `src/` (other architectures' forwards and loaders in `transformer.zig`/`model.zig`, the dormant
-  ANE driver) is INHERITED upstream code: it builds, it is unreachable, and no doc covers it. The loader refuses any
-  other `model_type` by name (`model.served_model_types`, `ArchitectureUnsupported` → 503); an unsupported file
+- `src/` holds only the three served architectures (and their shared machinery): inherited forwards, loaders and the
+  ANE driver for other architectures were removed. The loader refuses any other `model_type` by name (`model.served_model_types`, `ArchitectureUnsupported` → 503); an unsupported file
   format is refused by name (`ModelFormatUnsupported` → 503; `--model` exits).
 
 <a id="docs-index"></a>

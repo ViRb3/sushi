@@ -936,7 +936,6 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         self.xfm.compileGelu();
         self.xfm.compileGeglu();
     }
-    if (self.config.final_logit_softcapping > 0.0) self.xfm.compileSoftcap();
     if (self.xfm.moe_layers != null) self.xfm.compileMoeRouting();
     if (self.config.linear_num_key_heads > 0) self.xfm.compileGdnGate();
     return self;
