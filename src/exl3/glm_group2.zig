@@ -252,7 +252,13 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: A
     return moeLayout(s, x, bank, indices, scores, dec, reduction, down, .natural);
 }
 pub fn moeLayout(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: Arr, scores: Arr, dec: @import("expert_exl3.zig").Decode, reduction: Reduction, down: Down, layout: Layout) !?Arr {
+    return moeLayoutShared(s, x, bank, indices, scores, dec, reduction, down, layout, null);
+}
+/// `moeLayout` plus `shared` (x's shape, BF16) added to the stored routed rows in the reduce,
+/// bit for bit the separate BF16 add.
+pub fn moeLayoutShared(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: Arr, scores: Arr, dec: @import("expert_exl3.zig").Decode, reduction: Reduction, down: Down, layout: Layout, shared: ?Arr) !?Arr {
     if (!mlx.streamIsGpu(s)) return null;
+    if (shared) |value| if (mlx.mlx_array_dtype(value) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(value), mlx.getShape(x))) return null;
     for ([_]Arr{ x, indices, scores, bank.gate.trellis, bank.gate.suh, bank.gate.svh, bank.up.trellis, bank.up.suh, bank.up.svh, bank.down.trellis, bank.down.suh, bank.down.svh }) |value| if (value.ctx == null) return null;
     const shape = mlx.getShape(x);
     const ids_shape = mlx.getShape(indices);
@@ -301,7 +307,12 @@ pub fn moeLayout(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indi
         break :blk if (down == .grouped) (try project(s, middle, bank.down.trellis, ids, reduction)) orelse return null else try base.indexedGemvCoopF16(s, middle, bank.down.trellis, ids);
     };
     defer _ = mlx.mlx_array_free(d);
-    const out = try base.downFinishReduce(s, d, bank.down.svh, ids, sc, h, r, top, .bfloat16);
+    const out = if (shared) |value| blk: {
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_reshape(&rows, value, &.{ r, h }, 2, s));
+        break :blk try base.downFinishReduceShared(s, d, bank.down.svh, ids, sc, h, r, top, .bfloat16, rows);
+    } else try base.downFinishReduce(s, d, bank.down.svh, ids, sc, h, r, top, .bfloat16);
     defer _ = mlx.mlx_array_free(out);
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
@@ -535,4 +546,39 @@ test "GLM group2 serves exactly the admitted rates its reader decodes" {
             try exact(try owned.own(try base.indexedGemvCoopF16(s, x, bank, ids)), value);
         }
     }
+}
+
+test "GLM group2 shared expert joined in the reduce equals the separate BF16 add" {
+    const s = mlx.gpuStream();
+    const dec: @import("expert_exl3.zig").Decode = .{ .codebook = .mcg, .window = .w14 };
+    defer base.setDecodeParams(.mul1);
+    const e: c_int = 12;
+    for ([_]c_int{ 36, 40 }) |rate| for ([_]c_int{ 3, 4 }) |rows| {
+        var owned: Owned = .{};
+        defer owned.deinit();
+        var projections: [3]@import("root.zig").Proj = undefined;
+        for (&projections, 0..) |*p, i| {
+            const k: c_int = if (i == 2) 2048 else 4096;
+            const n: c_int = if (i == 2) 4096 else 2048;
+            p.* = .{ .trellis = try owned.weights(e, k, n, rate, 700 + i), .suh = try owned.floats(&.{ e, k }, .float16, 710 + i, 0.4, s), .svh = try owned.floats(&.{ e, n }, .float16, 720 + i, 0.1, s) };
+        }
+        const bank = @import("root.zig").Bank{ .gate = projections[0], .up = projections[1], .down = projections[2] };
+        const x = try owned.floats(&.{ 1, rows, 4096 }, .bfloat16, 731, 2, s);
+        // Shared outputs at the routed magnitudes, so the sum rounds in both directions.
+        const shared = try owned.floats(&.{ 1, rows, 4096 }, .bfloat16, 733, 0.5, s);
+        var id_data: [32]u32 = undefined;
+        var score_data: [32]f32 = undefined;
+        for (&id_data, &score_data, 0..) |*id, *sc, i| {
+            id.* = @intCast((i / 8 + (i % 8) * 3) % 12);
+            sc.* = 0.05 * @as(f32, @floatFromInt(i % 8 + 1));
+        }
+        const ids = try owned.own(mlx.mlx_array_new_data(&id_data, &.{ 1, rows, 8 }, 3, .uint32));
+        const scores = try owned.own(mlx.mlx_array_new_data(&score_data, &.{ 1, rows, 8 }, 3, .float32));
+        const routed = try owned.own((try moeLayout(s, x, bank, ids, scores, dec, .serial, .grouped, .lane)) orelse return error.TestExpectedGroup2);
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_add(&want, routed, shared, s));
+        const got = try owned.own((try moeLayoutShared(s, x, bank, ids, scores, dec, .serial, .grouped, .lane, shared)) orelse return error.TestExpectedGroup2);
+        try exact(want, got);
+    };
 }

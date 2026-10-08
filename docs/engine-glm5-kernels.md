@@ -176,6 +176,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   projection keeps qmv_wide's per-vector order); the conv finish and its residual add are one kernel; the sliding mask
   is built once per (rows, context rows, anchor offset); the lattice's top-16 is two dispatches (per-stretch top-16,
   then a merge) equal to ArgPartition's last entries, ties to the higher index, NaN above every number.
+- **Verify chain trims** (exact): on the three/four-row lane path the shared expert's BF16 output is added inside the
+  routed reduce, after the routed rows' own BF16 rounding; the MLA attention rows stay joined into the value and output
+  projections; the 32-wide MLA index weights take the column GEMV batch; layer 0 is submitted before layer 1 is built.
 - At the end of prefill, latent and pooled capacity for input + max output + 3 is reserved once, so verification never
   grows a buffer. Every array a replay needs is an async dispatch output.
 - The reserve's ledger is the sequential peak (grown buffers keep their growth; the one in flight holds old rows, new
@@ -290,7 +293,8 @@ Decode and verify:
 - Assistant split-buffer block attention (port of MLX's two-pass vector SDPA reading context and block K/V in place):
   exact, +27% draft on the cropped cache; MLX's own kernel is far faster than the JIT port.
 - Draft readout through the multi-row affine tiles: no faster at 2 rows and not exact (MLX runs `qmv_wide`).
-- Async readout before the lattice, a second assistant submit per layer: 0.
+- KDA tree prework reading q/k/v separately, async readout before the lattice, a second assistant submit per layer,
+  the MCG multiply split into 16-bit halves (`mul24` equal, `ushort` +22%), larger MLX command buffers: 0.
 - Per-kernel attribution tools: synchronizing verifier markers (halve throughput), xctrace Metal System Trace (no
   shader names or intervals; 95.4% GPU busy overall) and private MLX timestamp hooks (only GPUTimestamp; overlapping
   command-buffer intervals). None attributes decode time by kernel.
