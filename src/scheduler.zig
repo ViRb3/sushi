@@ -1932,7 +1932,7 @@ pub const Scheduler = struct {
                 .drop_default, .off => {},
             }
             const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, self.expert_cache_bytes, settings_budget, coldLoadVision(owned.config, true));
-            break :blk expertStreamingGateBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
+            break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config, false), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
         else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
@@ -1945,7 +1945,6 @@ pub const Scheduler = struct {
                 mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config).on,
                 self.no_drafter,
                 coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
-                self.ane_prefill,
             )
         else
             null;
@@ -3419,23 +3418,11 @@ test "modelDiskBytes bills only the shards the index names (issue #274)" {
     try std.testing.expectEqual(@as(u64, 15), modelDiskBytes(io, dir));
 }
 
-/// Pure: would loading `weights_bytes` of model with `avail_bytes` free RAM risk
-/// a Metal OOM? Requires the weights plus ~1/12 (≈8%) + 0.25 GB headroom for the
-/// warmup KV cache + compute buffers. Deliberately lean: `avail_bytes` (active +
-/// wired + compressed subtracted) under-counts what macOS reclaims from file
-/// cache the moment MLX allocates, so a fat headroom wrongly refuses loads that
-/// fit. The guard's real job is the gross case (restart a 42 GB model into 44 GB
-/// free → hard process-killing OOM), which this still catches. Returns false
-/// (allow the load) when either figure is 0 — a failed memory query must never
-/// block a load.
 /// Set by `--skip-mem-preflight` (main.zig) to bypass the model-load memory
 /// pre-flight below. A module global, not a `LoadParams` field, so it applies
 /// uniformly to startup loads AND later hot-loads — matching the env var
 /// (`SUSHI_SKIP_MEM_PREFLIGHT`) it replaced.
 pub var skip_mem_preflight: bool = false;
-
-/// Explicit context's cache bill at the resolved KV width; null preserves flat headroom.
-pub var load_context_bytes: ?*const fn (*const model_mod.ModelConfig) ?u64 = null;
 
 /// The full requested-context bill and the largest context fitting the same budget.
 pub const LoadServingBill = struct {
@@ -3509,37 +3496,23 @@ const LoadDrafterDir = struct {
     }
 };
 
-/// The context term of the load preflight's requirement (`loadRequirementBytes`).
-fn preflightCtxBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, drafter_dir: []const u8, ane_prefill: bool, mtp_on: bool) ?u64 {
-    const mtp_sidecar = if (mtp_on) blk: {
-        var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch break :blk true;
-        defer dir.close(io);
-        break :blk mtp_mod.resolveMtpSidecarInDir(io, allocator, dir) != null;
-    } else false;
-    return loadContextBill(config, drafter_dir, ane_prefill, mtp_sidecar);
-}
-
 /// What a resident cold load reserves in the registry: the requirement its load preflight
 /// compares with free memory, so the gate and the preflight read one bill.
-fn residentColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, load_vision: bool, mtp_on: bool, no_drafter: bool, drafter_dir: []const u8, ane_prefill: bool) !u64 {
+fn residentColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, load_vision: bool, mtp_on: bool, no_drafter: bool, drafter_dir: []const u8) !u64 {
     var weights = if (model_mod.usesSushiQuantMemoryBill(config))
         try sushiResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on)
     else
         try mimoResidentLoadBytes(io, allocator, model_dir, config, load_vision, mtp_on);
     const drafter = LoadDrafterDir.resolve(io, allocator, no_drafter, drafter_dir, model_dir);
     defer drafter.deinit(allocator);
+    var context: u64 = 0;
     if (model_mod.usesSushiQuantMemoryBill(config)) {
         weights +|= try sushiAssistantLoadBytes(io, allocator, drafter.dir);
-        const serving = if (load_serving_bill) |bill| bill(config, std.math.maxInt(u64)) else null;
-        return weights +| @max(LOAD_WARMUP_BYTES, if (serving) |b| b.needed else 0);
+        if (load_serving_bill) |bill| if (bill(config, std.math.maxInt(u64))) |b| {
+            context = b.needed;
+        };
     }
-    return loadRequirementBytes(weights, preflightCtxBytes(io, allocator, config, model_dir, drafter.dir, ane_prefill, mtp_on));
-}
-
-fn loadContextBill(config: *const model_mod.ModelConfig, drafter_dir: []const u8, ane_prefill: bool, mtp_sidecar: bool) ?u64 {
-    // Sidecars and ANE allocations are outside the measured target warmup allowance.
-    if (drafter_dir.len > 0 or ane_prefill or mtp_sidecar) return null;
-    return if (load_context_bytes) |bill| bill(config) else null;
+    return loadRequirementBytes(config, weights, mtp_on, context);
 }
 
 test "a resident MiMo cold load reserves its load preflight's requirement" {
@@ -3551,26 +3524,9 @@ test "a resident MiMo cold load reserves its load preflight's requirement" {
     defer fixture.deinit();
     fixture.config.expert_layout = .mxfp4_individual;
     const weights = try mimoResidentLoadBytes(io, a, fixture.path, &fixture.config, false, false);
-    const preflight = loadRequirementBytes(weights, preflightCtxBytes(io, a, &fixture.config, fixture.path, "", false, false));
-    try testing.expectEqual(preflight, try residentColdLoadBillBytes(io, a, &fixture.config, fixture.path, false, false, false, "", false));
+    const preflight = loadRequirementBytes(&fixture.config, weights, false, 0);
+    try testing.expectEqual(preflight, try residentColdLoadBillBytes(io, a, &fixture.config, fixture.path, false, false, false, ""));
     try testing.expect(weights > 0);
-}
-
-test "sidecars and ANE keep the flat load headroom" {
-    const saved = load_context_bytes;
-    defer load_context_bytes = saved;
-    load_context_bytes = &struct {
-        fn bill(_: *const model_mod.ModelConfig) ?u64 {
-            return 1234;
-        }
-    }.bill;
-    const config = model_mod.ModelConfig{};
-    try testing.expectEqual(@as(?u64, 1234), loadContextBill(&config, "", false, false));
-    try testing.expectEqual(@as(?u64, null), loadContextBill(&config, "drafter", false, false));
-    try testing.expectEqual(@as(?u64, null), loadContextBill(&config, "", true, false));
-    try testing.expectEqual(@as(?u64, null), loadContextBill(&config, "", false, true));
-    load_context_bytes = null;
-    try testing.expectEqual(@as(?u64, null), loadContextBill(&config, "", false, false));
 }
 
 /// Which drafter directory a COLD load should use.
@@ -3971,7 +3927,7 @@ test "Sushi quant memory subtracts existing resident buffers from the GPU limit"
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {
     const GB: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(36 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB));
-    try std.testing.expect(memInsufficientForLoad(70 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB), null));
+    try std.testing.expect(memInsufficientForLoad(70 * GB, effectiveAvailableBytes(98 * GB, 0, 36 * GB), 71 * GB));
 }
 
 test "effectiveAvailableBytes prefers the per-process jetsam headroom when present" {
@@ -3981,48 +3937,37 @@ test "effectiveAvailableBytes prefers the per-process jetsam headroom when prese
     try std.testing.expectEqual(@as(u64, 0), effectiveAvailableBytes(0, 0, 0)); // both unknown → 0 (never blocks)
 }
 
-fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, ctx_bytes: ?u64) bool {
+/// Free memory a load keeps beyond everything it bills: allocator slack and pages macOS has not yet handed back.
+const LOAD_SAFETY_NET_BYTES: u64 = 1 << 30;
+
+/// What a load's warmup allocates above its billed weights: the measured peak over the billed bytes at
+/// each architecture's worst setting, rounded up (engine-memory-admission.md#load-warmup).
+fn loadWarmupBytes(config: *const ModelConfig, mtp_on: bool) u64 {
+    const gib: u64 = 1 << 30;
+    // GLM warms T=1 and T=8, then resets; its KDA state, rings and first latent rows exist from then on.
+    if (config.isGlm5()) return config.ssmCheckpointBytes() +| config.qsaRingBytes() +|
+        (config.kvBytesPerToken() +| config.qsaHistoryBytesPerToken()) *| 1024 +| gib * 3 / 8;
+    if (config.isMimo()) return gib / 4;
+    // Flash-Next: reading the MTP head peaks about a GiB above its resident bytes.
+    return gib / 8 +| (if (mtp_on) gib * 9 / 8 else 0);
+}
+
+/// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk.
+fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64) u64 {
+    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES;
+}
+
+/// Free memory a load demands: its billed weights, then the larger of the warmup transient and the requested
+/// context's admission bill (the warmup ends before any request allocates), then the safety net.
+pub fn loadRequirementBytes(config: *const ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
+    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, config.expert_fill_peak_bytes, config.expert_bounce_bytes);
+    return weights_bytes +| @max(loadWarmupBytes(config, mtp_on), context_bill) +| LOAD_SAFETY_NET_BYTES;
+}
+
+/// Unknown figures (a failed memory query, an unmeasurable size) never block a load.
+fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, required_bytes: u64) bool {
     if (weights_bytes == 0 or avail_bytes == 0) return false;
-    // Headroom over the weights for warmup compute buffers + a baseline KV cache.
-    // `avail_bytes` (status.getAvailableMemBytes) now excludes the resident anon
-    // set — an already-loaded model counts as used while file cache counts as free
-    // — so this margin can be generous without wrongly refusing a fresh load.
-    // The proportional term is CAPPED: headroom pays for warmup buffers and a
-    // baseline KV cache, and neither scales with a MoE's TOTAL weights (our
-    // 109.7 GB DeepSeek-V4 mirror activates 13B). Uncapped, weights/8 demanded
-    // 14.7 GB on that model — 124.4 GB total — which a 128 GB Mac cannot have,
-    // so the guard refused the flagship checkpoint on exactly the hardware its
-    // model card names, while --skip-mem-preflight booted it repeatedly and
-    // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
-    // margin for every model under 48 GB (where it was tuned) and stays inside
-    // the measured envelope above it.
-    return avail_bytes < loadRequirementBytes(weights_bytes, ctx_bytes);
-}
-
-/// Total free memory a load demands: the model's own peak plus the headroom the
-/// guard wants for warmup buffers and a baseline KV cache.
-/// A known context replaces flat headroom with warmup plus its cache bill, capped
-/// at the old requirement; request admission checks the full serving bill later.
-pub fn loadRequirementBytes(weights_bytes: u64, ctx_bytes: ?u64) u64 {
-    const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
-    const flat: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
-    const headroom = if (ctx_bytes) |bytes| @min(flat, LOAD_WARMUP_BYTES +| bytes) else flat;
-    return weights_bytes +| headroom;
-}
-
-/// Resident Flash-Next and MiMo EXL3 load/warmup scratch; measured envelope in engine-memory-admission.md.
-const LOAD_WARMUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-fn loadRequirementForConfig(config: *const ModelConfig, weights: u64, ctx_bytes: ?u64) u64 {
-    if (model_mod.usesSushiQuantMemoryBill(config)) return weights +| LOAD_WARMUP_BYTES;
-    if (!config.isGlm5()) return loadRequirementBytes(weights, ctx_bytes);
-    // Native serving warms T=1 and T=8, then resets. The requested context
-    // allocates later; billing a percentage of the expert banks at startup
-    // charged 7 GiB for scratch that does not grow with their resident size.
-    // Keep the 2 GiB runtime allowance plus the fixed FP32 KDA state and
-    // rounded latent/index buffers. Request admission bills the full context.
-    return weights +| LOAD_WARMUP_BYTES +| config.ssmCheckpointBytes() +|
-        config.qsaRingBytes() +| (config.kvBytesPerToken() +| config.qsaHistoryBytesPerToken()) *| 1024;
+    return avail_bytes < required_bytes;
 }
 
 fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, directory: []const u8) !u64 {
@@ -4049,7 +3994,7 @@ fn glmColdLoadBillBytes(io: std.Io, allocator: std.mem.Allocator, config: *Model
     const drafter = LoadDrafterDir.resolve(io, allocator, no_drafter, drafter_dir, model_dir);
     defer drafter.deinit(allocator);
     const weights = try @import("glm5_diagnostic.zig").residentBytesWithVision(io, allocator, model_dir, config.num_hidden_layers, load_vision and config.glm5_vision);
-    return loadRequirementForConfig(config, weights +| try glmDflashLoadBytes(io, allocator, config, model_dir, drafter.dir), null);
+    return loadRequirementBytes(config, weights +| try glmDflashLoadBytes(io, allocator, config, model_dir, drafter.dir), false, 0);
 }
 
 test "Sushi quant memory production pack CPU header audit" {
@@ -4065,58 +4010,69 @@ test "Sushi quant memory production pack CPU header audit" {
     const all = try sushiResidentLoadBytes(io, a, path, &cfg, true, true);
     try testing.expect(all > vision);
     try testing.expect(vision > text);
-    try testing.expectEqual(all + LOAD_WARMUP_BYTES, try residentColdLoadBillBytes(io, a, &cfg, path, true, true, true, "", false));
+    try testing.expectEqual(loadRequirementBytes(&cfg, all, true, 0), try residentColdLoadBillBytes(io, a, &cfg, path, true, true, true, ""));
     std.debug.print("Sushi memory audit {s}: text={d}, vision={d}, mtp={d}, all={d} bytes\n", .{ path, text, vision - text, all - vision, all });
 }
 
-test "Sushi quant memory retires legacy headroom only for resident EXL3 Qwen and MiMo" {
+const LoadBillFixtures = struct {
+    qwen: ModelConfig,
+    mimo: ModelConfig,
+    glm: ModelConfig,
+
+    fn init() !LoadBillFixtures {
+        const a = testing.allocator;
+        var qwen = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+        errdefer qwen.deinit(a);
+        var mimo = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/model-configs/mimo_v2.json"));
+        errdefer mimo.deinit(a);
+        return .{ .qwen = qwen, .mimo = mimo, .glm = try model_mod.parseConfigFromJson(a, @embedFile("fixtures/glm5_config.json")) };
+    }
+
+    fn deinit(self: *LoadBillFixtures) void {
+        self.qwen.deinit(testing.allocator);
+        self.mimo.deinit(testing.allocator);
+        self.glm.deinit(testing.allocator);
+    }
+};
+
+test "a load bills weights, the measured warmup or the context bill, and a 1 GiB net" {
     const gib: u64 = 1 << 30;
-    var cfg = ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4 };
-    try testing.expectEqual(@as(u64, 52 * gib), loadRequirementForConfig(&cfg, 50 * gib, null));
-    cfg.model_type = "mimo_v2";
-    try testing.expectEqual(@as(u64, 92 * gib), loadRequirementForConfig(&cfg, 90 * gib, 30 * gib));
-    cfg.expert_streaming = true;
-    try testing.expectEqual(loadRequirementBytes(90 * gib, null), loadRequirementForConfig(&cfg, 90 * gib, null));
-    cfg.expert_streaming = false;
-    cfg.expert_layout = .mxfp4_individual;
-    try testing.expectEqual(loadRequirementBytes(90 * gib, null), loadRequirementForConfig(&cfg, 90 * gib, null));
-    cfg.model_type = "llama";
-    cfg.expert_layout = .exl3_k4;
-    try testing.expectEqual(loadRequirementBytes(90 * gib, null), loadRequirementForConfig(&cfg, 90 * gib, null));
+    var f = try LoadBillFixtures.init();
+    defer f.deinit();
+    // Flash-Next's MTP head load peaks above its resident bytes, so only an MTP-on load pays for it.
+    try testing.expectEqual(44 * gib + gib / 8 + gib, loadRequirementBytes(&f.qwen, 44 * gib, false, 0));
+    try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 0));
+    try testing.expectEqual(90 * gib + gib / 4 + gib, loadRequirementBytes(&f.mimo, 90 * gib, true, 0));
+    const glm_state = f.glm.ssmCheckpointBytes() + f.glm.qsaRingBytes() + (f.glm.kvBytesPerToken() + f.glm.qsaHistoryBytesPerToken()) * 1024;
+    try testing.expect(glm_state > 0);
+    try testing.expectEqual(90 * gib + glm_state + gib * 3 / 8 + gib, loadRequirementBytes(&f.glm, 90 * gib, false, 0));
+    // A requested context's admission bill replaces the warmup once it is the larger; the net rides on either.
+    try testing.expectEqual(44 * gib + 6 * gib + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
+    try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, gib));
 }
 
-test "GLM serving load bills text weights and warmup instead of an unallocated context" {
-    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    const weights: u64 = 93295638776;
-    const wanted = loadRequirementForConfig(&cfg, weights, null);
-    cfg.ctx_override = 500000;
-    try testing.expectEqual(wanted, loadRequirementForConfig(&cfg, weights, 500000 * 11968));
-    try testing.expect(wanted < 90 * 1024 * 1024 * 1024);
-    cfg.model_type = "mimo_v2";
-    cfg.expert_layout = .bf16_individual;
-    try testing.expectEqual(loadRequirementBytes(weights, null), loadRequirementForConfig(&cfg, weights, null));
+test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {
+    const gib: u64 = 1 << 30;
+    const cfg = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
+    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib, loadRequirementBytes(&cfg, 6 * gib, true, 0));
+    try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2));
 }
 
-test "a refusal quotes the number it actually compared" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    const MB: u64 = 1024 * 1024;
-
-    // Live report 2026-08-08: FLUX.2-klein 4B refused with "generation peaks at
-    // ~4.3 GB but only 5.4 GB is free" — two numbers that say the load should
-    // have worked. The guard was right (it also wants ~1.5 GB of headroom for
-    // warmup buffers) but the message quoted the PEAK, so the user went looking
-    // for a problem that wasn't there and then tried the same prompt in the
-    // other pane. What a refusal must state is the TOTAL it demanded.
-    const peak: u64 = 4300 * MB;
-    const avail: u64 = 5400 * MB;
-    try std.testing.expect(memInsufficientForLoad(peak, avail, null));
-    try std.testing.expect(loadRequirementBytes(peak, null) > avail);
-
-    // The requirement IS the comparison — not a second formula that can drift
-    // from it. At exactly the requirement a load is allowed; a byte under is not.
-    try std.testing.expect(!memInsufficientForLoad(peak, loadRequirementBytes(peak, null), null));
-    try std.testing.expect(memInsufficientForLoad(peak, loadRequirementBytes(peak, null) - 1, null));
-    try std.testing.expect(!memInsufficientForLoad(42 * GB, loadRequirementBytes(42 * GB, null), null));
+test "the exact load bill admits a MiMo load the flat 7 GiB headroom refused" {
+    const gib: u64 = 1 << 30;
+    var f = try LoadBillFixtures.init();
+    defer f.deinit();
+    const weights = 90 * gib;
+    const available = 92 * gib;
+    // The retired headroom demanded weights + min(weights / 8, 6 GiB) + 1 GiB.
+    try testing.expect(memInsufficientForLoad(weights, available, weights + 7 * gib));
+    const exact = loadRequirementBytes(&f.mimo, weights, true, 0);
+    try testing.expect(!memInsufficientForLoad(weights, available, exact));
+    try testing.expect(!memInsufficientForLoad(weights, exact, exact));
+    try testing.expect(memInsufficientForLoad(weights, exact - 1, exact));
+    // Unknown figures (a failed memory query, an unmeasurable size) never block a load.
+    try testing.expect(!memInsufficientForLoad(0, available, exact));
+    try testing.expect(!memInsufficientForLoad(weights, 0, exact));
 }
 
 test "the eviction gate bills weights plus 10% headroom" {
@@ -4125,58 +4081,6 @@ test "the eviction gate bills weights plus 10% headroom" {
     // No bytes_on_disk → the layers × hidden × 16 fallback.
     const fallback: u64 = 32 * 4096 * 16;
     try testing.expectEqual(fallback + fallback / 10, gateEstimateBytes(null, 32, 4096));
-}
-
-test "memInsufficientForLoad: headroom + unknown-query guards" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    const MB: u64 = 1024 * 1024;
-    // A 6.9 GB 4-bit model with ~10 GB genuinely available — file cache is
-    // excluded from the new anon-aware available figure (computeAvailableBytes),
-    // so this is what a 16 GB Mac actually reports pre-load. Needs ~8.8 GB
-    // (weights + weights/8 + 1 GB for warmup + baseline KV) → loads.
-    try std.testing.expect(!memInsufficientForLoad(6900 * MB, 10 * GB, null));
-    // Restart-into-pressure: 42 GB weights, only 44 GB free → needs ~46, refuse.
-    try std.testing.expect(memInsufficientForLoad(42 * GB, 44 * GB, null));
-    // Plenty of headroom → allow.
-    try std.testing.expect(!memInsufficientForLoad(42 * GB, 86 * GB, null));
-    // Exactly weights, no headroom → refuse.
-    try std.testing.expect(memInsufficientForLoad(42 * GB, 42 * GB, null));
-    // Unknown figures (query failed / size unknown) → never block.
-    try std.testing.expect(!memInsufficientForLoad(0, 44 * GB, null));
-    try std.testing.expect(!memInsufficientForLoad(42 * GB, 0, null));
-
-    // A PROPORTIONAL margin becomes impossible at the top of the range. Our own
-    // DeepSeek-V4-Flash mirror is 109.7 GB of weights and a 128 GB Mac reports
-    // ~118 GB available with nothing else loaded — but weights/8 demanded 14.7
-    // GB of headroom, i.e. 124.4 GB, which that machine cannot have. The guard
-    // refused to load the flagship checkpoint on exactly the hardware its model
-    // card names, while `--skip-mem-preflight` booted it repeatedly and served
-    // 6.7K-token prefills with ~8.6 GB to spare. Headroom covers warmup
-    // buffers + a baseline KV cache, and neither scales with a MoE's total
-    // weights (13B active here) — so the proportional term is CAPPED.
-    try std.testing.expect(!memInsufficientForLoad(109_730 * MB, 118_330 * MB, null));
-    // Still refuses when the box genuinely cannot fit it.
-    try std.testing.expect(memInsufficientForLoad(109_730 * MB, 112 * GB, null));
-}
-
-test "the load check admits a short context with 53 GiB free" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    const MB: u64 = 1024 * 1024;
-    const weights: u64 = 50_514 * MB;
-    const ctx: u64 = 1248 * 16_640;
-    const flat = loadRequirementBytes(weights, null);
-    const small = loadRequirementBytes(weights, ctx);
-    try std.testing.expectEqual(weights + 7 * GB, flat);
-    try std.testing.expectEqual(weights + LOAD_WARMUP_BYTES + ctx, small);
-    try std.testing.expect(!memInsufficientForLoad(weights, 53 * GB, ctx));
-    try std.testing.expect(memInsufficientForLoad(weights, 53 * GB, null));
-    try std.testing.expect(!memInsufficientForLoad(weights, small, ctx));
-    try std.testing.expect(memInsufficientForLoad(weights, small - 1, ctx));
-    try std.testing.expectEqual(flat, loadRequirementBytes(weights, 20 * GB));
-    try std.testing.expectEqual(flat, loadRequirementBytes(weights, std.math.maxInt(u64)));
-    try std.testing.expectEqual(loadRequirementBytes(4300 * MB, null), loadRequirementBytes(4300 * MB, 1024));
-    try std.testing.expect(!memInsufficientForLoad(0, 53 * GB, ctx));
-    try std.testing.expect(!memInsufficientForLoad(weights, 0, ctx));
 }
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -4319,30 +4223,32 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
         var avail_bytes = reader.read();
-        const ctx_bytes = preflightCtxBytes(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.ane_prefill, mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on);
-        var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
-        var needed = @max(loadRequirementForConfig(params.config, weights_bytes, ctx_bytes), weights_bytes +| (if (serving) |b| b.needed else 0));
-        if (weights_bytes > 0 and avail_bytes > 0 and avail_bytes < needed) {
+        const mtp_on = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
+        var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes -| LOAD_SAFETY_NET_BYTES) else null;
+        var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
+        if (memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
             log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
                 @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
             avail_bytes = settleAvailableBytes(avail_bytes, needed, &reader);
-            serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
-            needed = @max(loadRequirementForConfig(params.config, weights_bytes, ctx_bytes), weights_bytes +| (if (serving) |b| b.needed else 0));
+            serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes -| LOAD_SAFETY_NET_BYTES) else null;
+            needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
         var active: usize = 0;
         if (reader.sushi) _ = mlx.mlx_get_active_memory(&active);
-        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB\n", .{
+        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup/context ~{d:.2} GB + {d:.2} GB net)\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(needed -| weights_bytes -| LOAD_SAFETY_NET_BYTES)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(LOAD_SAFETY_NET_BYTES)) / (1024.0 * 1024.0 * 1024.0),
         });
         const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
-        if (weights_bytes > 0 and ((avail_bytes > 0 and avail_bytes < needed) or gpu_exhausted)) {
+        if (weights_bytes > 0 and (memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             if (serving) |b| {
-                const maximum: u32 = if (avail_bytes < weights_bytes +| LOAD_WARMUP_BYTES) 0 else b.max_context;
+                const maximum: u32 = if (avail_bytes < loadRequirementBytes(params.config, weights_bytes, mtp_on, 0)) 0 else b.max_context;
                 sch.registry.mutex.lockUncancelable(sch.io);
                 const refusal = model_registry_mod.MemoryContextRefusal{ .requested = b.requested_context, .maximum = maximum, .needed = needed, .available = avail_bytes, .kv_bits = b.kv_bits, .chunk = b.chunk };
                 params.entry.memory_context_refusal = refusal;
@@ -4372,7 +4278,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             streaming_resident_bytes = streaming_resident_bytes.? -| cached_bytes +| bf16_bytes;
             if (!skip_mem_preflight) {
                 const available = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
-                const needed = loadRequirementForConfig(params.config, streaming_resident_bytes.?, null);
+                const needed = loadRequirementBytes(params.config, streaming_resident_bytes.?, false, 0);
                 log.info("[preflight] BF16 DFlash2 fallback: weights ~{d:.2} GiB, needs ~{d:.2} GiB, available {d:.2} GiB\n", .{ @as(f64, @floatFromInt(streaming_resident_bytes.?)) / (1 << 30), @as(f64, @floatFromInt(needed)) / (1 << 30), @as(f64, @floatFromInt(available)) / (1 << 30) });
                 if (available > 0 and needed > available) return error.InsufficientMemory;
             }

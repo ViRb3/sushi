@@ -4,6 +4,13 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **Memory**: the load check bills what each model allocates plus a 1 GiB safety net instead of a flat 7 GiB, the
+  auto context keeps 93% of the memory ceiling on every model, and `--wired-margin-gib` defaults to 1 GiB.
+
+---
+
 ## v1.2.1 — Safer prompt cache and server hardening
 
 - **Prompt cache**: two sushi processes on the same model no longer share one SSD cache folder, which could return

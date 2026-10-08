@@ -2031,8 +2031,6 @@ pub fn serve(
     defer configured_kv_quant = null;
     configured_mtp = model_settings.launchFlag(bool, load_params.mtp_enabled, load_params.mtp_explicit);
     defer configured_mtp = null;
-    scheduler_mod.load_context_bytes = &loadContextBytes;
-    defer scheduler_mod.load_context_bytes = null;
     scheduler_mod.load_serving_bill = &loadServingBill;
     defer scheduler_mod.load_serving_bill = null;
 
@@ -2197,13 +2195,13 @@ pub fn serve(
         log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, model_settings.sourceLabel(ctx.source, "--ctx-size") });
     } else {
         const memory_ctx = computeMemoryContext(config);
-        const memory_allows = safeAutoContextAt(memory_ctx, autoContextPct(config));
+        const memory_allows = safeAutoContext(memory_ctx);
         const rope_ctx = config.contextCap();
         if (rope_ctx > 0 and pinned >= rope_ctx) {
             // The checkpoint's own maximum binds; memory had room to spare.
             log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
         } else {
-            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, autoContextPct(config), memory_ctx });
+            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, auto_ctx_safety_pct, memory_ctx });
         }
     }
 
@@ -2854,14 +2852,7 @@ fn handleConnection(
 /// second model to load beside this one, or another app to take RAM — and the
 /// Metal OOM it would eventually hit is uncatchable (see the auto-context
 /// gotcha). Reserve headroom instead.
-const auto_ctx_safety_pct: u32 = 85;
-/// GLM's admission bills every request exactly and refuses past it, so its advertised context keeps a thinner
-/// margin: the smallest at which Sushi-2.5bpw at release defaults advertises 1,048,576 at 2048-row chunks.
-const glm_auto_ctx_safety_pct: u32 = 93;
-
-fn autoContextPct(config: *const model_mod.ModelConfig) u32 {
-    return if (config.isGlm5()) glm_auto_ctx_safety_pct else auto_ctx_safety_pct;
-}
+const auto_ctx_safety_pct: u32 = 93;
 
 /// PURE: apply the safety margin and round down to a 1024 boundary so the
 /// number reads sanely in logs and client configs. Never returns 0.
@@ -2869,14 +2860,10 @@ fn autoContextPct(config: *const model_mod.ModelConfig) u32 {
 /// Takes the MEMORY-derived ceiling only. The model's own `max_position_embeddings`
 /// is applied afterwards, un-margined: when the checkpoint's max is the binding
 /// constraint there is nothing to reserve memory headroom against, and shaving
-/// 15% off a 131,072-token model that comfortably fits in RAM just throws
+/// the margin off a 131,072-token model that comfortably fits in RAM just throws
 /// context away.
 fn safeAutoContext(raw: u32) u32 {
-    return safeAutoContextAt(raw, auto_ctx_safety_pct);
-}
-
-fn safeAutoContextAt(raw: u32, pct: u32) u32 {
-    const scaled: u64 = (@as(u64, raw) * pct) / 100;
+    const scaled: u64 = (@as(u64, raw) * auto_ctx_safety_pct) / 100;
     const rounded: u64 = (scaled / 1024) * 1024;
     if (rounded == 0) return @intCast(@max(scaled, 1));
     return @intCast(rounded);
@@ -2888,16 +2875,16 @@ fn safeAutoContextAt(raw: u32, pct: u32) u32 {
 /// a YaRN-scaled checkpoint — the same derivation vLLM applies to
 /// `max_model_len`, because a position past the scaled window aliases back
 /// inside the ramp rather than reading as a longer distance.
-/// The context the server advertises, from the largest context memory alone allows (85%
+/// The context the server advertises, from the largest context memory alone allows (93%
 /// margin on the memory number, checkpoint cap afterwards). Shared by the load-time session
 /// bill and the boot-time sizer so the two cannot spell the relation two ways.
-fn autoContextFrom(memory_ctx: u32, ctx_cap: u32, pct: u32) u32 {
-    const with_headroom = safeAutoContextAt(memory_ctx, pct);
+fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
+    const with_headroom = safeAutoContext(memory_ctx);
     return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
 }
 
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    return autoContextFrom(computeMemoryContext(config), config.contextCap(), autoContextPct(config));
+    return autoContextFrom(computeMemoryContext(config), config.contextCap());
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -3000,7 +2987,7 @@ fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system
 
 /// How far under the enforced wired limit a plan may reach: past the limit Metal returns
 /// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
-pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 4 << 30;
+pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 1 << 30;
 
 /// PURE: the floor an explicitly raised `iogpu.wired_limit_mb` puts under the ceiling; 0 when
 /// the sysctl is absent or at the macOS default (75% of RAM), which leaves the ceiling as is.
@@ -3017,7 +3004,7 @@ pub fn wiredLimitFloor(wired_limit: u64, total_ram: u64, margin: u64) u64 {
 
 pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
     const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidWiredMargin;
-    if (n < 2 or n > 32) return error.InvalidWiredMargin;
+    if (n < 1 or n > 32) return error.InvalidWiredMargin;
     return @as(u64, n) << 30;
 }
 
@@ -3638,7 +3625,7 @@ fn glmPrefillChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: 
 }
 
 fn glmAdvertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
-    return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap(), autoContextPct(config));
+    return autoContextFrom(memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk), config.contextCap());
 }
 
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
@@ -3673,15 +3660,6 @@ pub fn billedPrefillChunk(
 pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     if (manualContext(config) == 0) return 0;
     return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| slotRingBytes(config, kv_bits);
-}
-
-/// The explicit-context cache bill for the load preflight, or the flat-headroom fallback.
-pub fn loadContextBytes(config: *const model_mod.ModelConfig) ?u64 {
-    // Measured on resident Flash-Next and MiMo EXL3; any other arch or layout needs its own envelope.
-    const measured = std.mem.eql(u8, config.model_type, "qwen4_exp") or config.isMimo();
-    if (!measured or config.expert_layout != .exl3_k4 or config.expert_streaming) return null;
-    if (manualContext(config) == 0) return null;
-    return sizerCtxKvBytes(config, defaultKvBits(config));
 }
 
 /// The full-context admission bill at the width a requested launch can run.
@@ -3857,64 +3835,6 @@ test "Sushi quant memory rejects an oversized context with an exact maximum at K
     try std.testing.expectEqual(@as(?scheduler_mod.LoadServingBill, null), loadServingBill(&cfg, budget));
 }
 
-test "loadContextBytes reuses the sizer with launch and model settings precedence" {
-    const guard = qsaScoreFusedOffGuard();
-    defer guard.deinit();
-    const saved_ctx = server_config.max_context_size;
-    defer server_config.max_context_size = saved_ctx;
-    const saved_kv = configured_kv_quant;
-    defer configured_kv_quant = saved_kv;
-    var cfg = qwen4RequestTestConfig();
-    cfg.expert_layout = .exl3_k4;
-    server_config.max_context_size = 0;
-    configured_kv_quant = null;
-    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
-
-    cfg.ctx_override = 1248;
-    cfg.kv_quant_override = transformer_mod.KVQuantConfig.affine(4);
-    try std.testing.expectEqual(@as(?u64, sizerCtxKvBytes(&cfg, 4)), loadContextBytes(&cfg));
-    server_config.max_context_size = 4096;
-    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
-    try std.testing.expectEqual(@as(?u64, sizerCtxKvBytes(&cfg, 8)), loadContextBytes(&cfg));
-    try std.testing.expectEqual(
-        @as(?u64, sessionBytesPerToken(&cfg, 8) * 4096 + slotRingBytes(&cfg, 8)),
-        loadContextBytes(&cfg),
-    );
-
-    cfg.expert_streaming = true;
-    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
-    cfg.expert_streaming = false;
-    cfg.expert_layout = .bf16_fused;
-    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
-    cfg.expert_layout = .exl3_k4;
-    cfg.model_type = "mimo_v2";
-    try std.testing.expectEqual(@as(?u64, sizerCtxKvBytes(&cfg, 8)), loadContextBytes(&cfg));
-    cfg.expert_streaming = true;
-    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
-    cfg.expert_streaming = false;
-    cfg.model_type = "qwen3_moe";
-    try std.testing.expectEqual(@as(?u64, null), loadContextBytes(&cfg));
-}
-
-test "loadContextBytes honors --no-mtp before the scheduler is published" {
-    const saved_ctx = server_config.max_context_size;
-    defer server_config.max_context_size = saved_ctx;
-    const saved_mtp = configured_mtp;
-    defer configured_mtp = saved_mtp;
-    var cfg = qwen4RequestTestConfig();
-    cfg.expert_layout = .exl3_k4;
-    server_config.max_context_size = 1248;
-    cfg.mtp_override = false;
-    configured_mtp = null;
-    const without_head = loadContextBytes(&cfg);
-    cfg.mtp_override = true;
-    configured_mtp = false;
-    try std.testing.expectEqual(without_head, loadContextBytes(&cfg));
-    configured_mtp = true;
-    cfg.mtp_override = false;
-    try std.testing.expect(loadContextBytes(&cfg).? > without_head.?);
-}
-
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
 /// Must run BEFORE the auto-context sizer: the sizer bills this chunk's
 /// transient reserve, and `checkAttentionMemory` and
@@ -4076,7 +3996,6 @@ pub fn resolvedContextForLoad(
     transient_reserve: u64,
     per_tok: u64,
     ctx_cap: u32,
-    margin_pct: u32,
 ) u32 {
     if (explicit_ctx > 0) return explicit_ctx;
     if (pinned_ctx > 0) return pinned_ctx;
@@ -4086,7 +4005,7 @@ pub fn resolvedContextForLoad(
         cache_reserve +| transient_reserve,
         per_tok,
         0,
-    ), ctx_cap, margin_pct);
+    ), ctx_cap);
 }
 
 /// The SSD-first call site. Takes the static ceiling (the budget is a property of the machine),
@@ -4102,7 +4021,6 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
-        autoContextPct(config),
     );
 }
 
@@ -4181,7 +4099,6 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
-        autoContextPct(config),
     );
 }
 
@@ -5273,16 +5190,16 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
     const cap: u32 = cfg.contextCap();
 
     // The sizing reserve is a constant, so the answer cannot move with the ask.
-    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, auto_ctx_safety_pct);
-    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap, auto_ctx_safety_pct);
+    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
     try t.expectEqual(ctx_default, ctx_big_ask);
     try t.expect(ctx_default > 900_000); // a real context, not the floor
 
     // The defect, both spellings: sizing against the granted budget...
-    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap, auto_ctx_safety_pct);
+    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
     try t.expect(vs_granted <= 1024);
     // ...and against the raw ask, which saturates usable to zero.
-    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap, auto_ctx_safety_pct);
+    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
     try t.expect(vs_raw_ask <= 1024);
     try t.expect(ctx_default > vs_granted * 500);
 }
@@ -5373,7 +5290,6 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     const advertised = autoContextFrom(
         safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
         cfg.contextCap(),
-        auto_ctx_safety_pct,
     );
     try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
 }
@@ -5462,7 +5378,6 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const advertised = autoContextFrom(
         safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0),
         cfg.contextCap(),
-        auto_ctx_safety_pct,
     );
     const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
     try t.expectEqual(advertised, billed);
@@ -5470,7 +5385,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     // Shown on a tighter box where the checkpoint cap does not bind.
     const tight: u64 = active + 24_000 * MiB;
     const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
-    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap(), auto_ctx_safety_pct);
+    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
     try t.expect(old_billed > billed_t);
     try t.expect(billed > 500_000);
     try t.expect(billed_t > 300_000);
@@ -5599,7 +5514,7 @@ test "an explicit --ctx-size boot never consults the session reserve" {
     for ([_]u64{ 0, CTX_SIZING_CACHE_RESERVE, 99_000 * MiB }) |reserve| {
         try t.expectEqual(
             @as(u32, 262_144),
-            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap(), auto_ctx_safety_pct),
+            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap()),
         );
     }
 
@@ -5612,8 +5527,8 @@ test "an explicit --ctx-size keeps the load-time context byte-identical" {
     const t = std.testing;
     const MiB: u64 = 1 << 20;
     const per_tok: u64 = 20_736;
-    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144, auto_ctx_safety_pct));
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576, auto_ctx_safety_pct));
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576));
 }
 
 test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
@@ -20437,8 +20352,8 @@ test "safeAutoContext leaves headroom below the memory ceiling and rounds to 102
     // The raw ceiling is the largest context that FITS. Running at exactly that
     // leaves nothing for the prefix cache to grow into, a second model, or
     // another app — so admit only `auto_ctx_safety_pct` of it.
-    try testing.expectEqual(@as(u32, 79872), safeAutoContext(94729)); // 85% = 80519 -> 1024-floor
-    try testing.expectEqual(@as(u32, 27648), safeAutoContext(32768)); // 85% = 27852 -> 1024-floor
+    try testing.expectEqual(@as(u32, 88064), safeAutoContext(94729)); // 93% = 88098 -> 1024-floor
+    try testing.expectEqual(@as(u32, 29696), safeAutoContext(32768)); // 93% = 30474 -> 1024-floor
     // Never rounds down to zero on a tiny ceiling.
     try testing.expect(safeAutoContext(1000) > 0);
     try testing.expect(safeAutoContext(1) > 0);
@@ -20459,7 +20374,7 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
 
     // A tiny model whose `max_position_embeddings` is far below anything memory
     // could constrain: it must get its FULL declared context, un-margined.
-    // (Regression: applying 85% AFTER the model-max clamp shaved 15% off a
+    // (Regression: applying the margin AFTER the model-max clamp shaved context off a
     // 131,072-token checkpoint that fits in RAM with room to spare.)
     var small = model_mod.ModelConfig{};
     small.max_position_embeddings = 4096;
@@ -20476,7 +20391,23 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     unbounded.max_position_embeddings = 0;
     try testing.expect(autoContextFor(&unbounded) > 0);
     const memory_ctx = memoryContextAt(&unbounded, 96 << 30, 40 << 30);
-    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap(), auto_ctx_safety_pct));
+    try testing.expectEqual(safeAutoContext(memory_ctx), autoContextFrom(memory_ctx, unbounded.contextCap()));
+}
+
+test "every served model advertises 93% of the memory ceiling, capped at its own maximum" {
+    const t = testing;
+    var qwen = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer qwen.deinit(t.allocator);
+    var mimo = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/mimo_v2.json"));
+    defer mimo.deinit(t.allocator);
+    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
+    defer glm.deinit(t.allocator);
+    for ([_]*const model_mod.ModelConfig{ &qwen, &mimo, &glm }) |cfg| {
+        try t.expectEqual(@as(u32, 1_048_576), cfg.contextCap());
+        try t.expectEqual(@as(u32, 88064), autoContextFrom(94729, cfg.contextCap()));
+        try t.expectEqual(cfg.contextCap(), autoContextFrom(4_000_000, cfg.contextCap()));
+        try t.expectEqual(@as(u32, 974_848), autoContextFrom(1_048_576, cfg.contextCap()));
+    }
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
@@ -20613,8 +20544,8 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     defer wired_limit_mb_override = saved;
     wired_limit_mb_override = 120_000;
 
-    try t.expectEqual(@as(u64, 4 << 30), WIRED_LIMIT_MARGIN_BYTES);
-    try t.expectEqual(@as(u64, 115_904), wiredLimitFloor(120_000 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES) / mb);
+    try t.expectEqual(@as(u64, 1 << 30), WIRED_LIMIT_MARGIN_BYTES);
+    try t.expectEqual(@as(u64, 118_976), wiredLimitFloor(120_000 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES) / mb);
     // The macOS default (75% of RAM) and anything under it declares nothing; and however
     // absurd the sysctl, never plan within the margin of physical RAM.
     try t.expectEqual(@as(u64, 0), wiredLimitFloor(98_304 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES));
@@ -20655,17 +20586,18 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     try t.expectEqual(@as(u64, 11_388), needed / mb);
     try t.expect(needed > gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
     const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
-    try t.expectEqual(@as(u64, 28_182), (lifted -| footprint) / mb);
+    try t.expectEqual(@as(u64, 31_254), (lifted -| footprint) / mb);
     try t.expect(needed <= lifted -| footprint);
 }
 
-test "parseWiredMarginGib accepts 2..32 and names a bad value" {
+test "parseWiredMarginGib accepts 1..32 and names a bad value" {
     const t = std.testing;
+    try t.expectEqual(@as(u64, 1) << 30, try parseWiredMarginGib("1"));
     try t.expectEqual(@as(u64, 8) << 30, try parseWiredMarginGib("8"));
     try t.expectEqual(@as(u64, 6) << 30, try parseWiredMarginGib("6"));
     try t.expectEqual(@as(u64, 2) << 30, try parseWiredMarginGib("2"));
     try t.expectEqual(@as(u64, 32) << 30, try parseWiredMarginGib("32"));
-    try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("1"));
+    try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("0"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("33"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("nope"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib(""));
@@ -24648,7 +24580,7 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
 
     // Auto boot, nothing pinned: the session is what the machine can serve. `cache_reserve = 0`
     // is a test isolation.
-    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct);
+    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
     try t.expect(auto > 100_000);
     try t.expect(auto <= cap);
 
@@ -24669,9 +24601,9 @@ test "resolvedContextForLoad: an auto boot bills the session it will serve, not 
     try t.expect(fixed -| real_kv < (bogus -| placeholder_kv) / 2);
 
     // An explicit --ctx-size wins outright, and a pinned context is used as-is.
-    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
-    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
-    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap, auto_ctx_safety_pct));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap));
+    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
 }
 
 test "the advertised context does not move with the cache ask" {
@@ -24699,8 +24631,8 @@ test "the advertised context does not move with the cache ask" {
     try t.expect(vs_resolved <= 1024);
 
     // The pair agrees at the advertised number: both sides go through `autoContextFrom`.
-    const advertised = autoContextFrom(memory_ctx, cfg.contextCap(), auto_ctx_safety_pct);
-    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap(), auto_ctx_safety_pct);
+    const advertised = autoContextFrom(memory_ctx, cfg.contextCap());
+    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
     try t.expectEqual(advertised, clamp_ctx);
 }
 

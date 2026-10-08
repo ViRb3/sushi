@@ -323,7 +323,7 @@ fn printUsage(io: std.Io) void {
         \\                        prefix cache's byte budget.
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
-        \\                        reach (default: 4, integers 2..32).
+        \\                        reach (default: 1, integers 1..32).
         \\  --expert-pick-tolerance <n>
         \\                      LOSSY, streamed packs only (default: 0 = off,
         \\                        exact routing). A routed expert missing from the
@@ -905,7 +905,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
-                log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
+                log.err("--wired-margin-gib: expected an integer 1..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--expert-pick-tolerance") and i + 1 < args.len) {

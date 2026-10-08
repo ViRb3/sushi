@@ -68,14 +68,14 @@ Sushi-2bpw streams on a 32 GB Mac with MTP on, at about 20 tok/s decode:
 ```bash
 sudo sysctl iogpu.wired_limit_mb=27000
 sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-gb 18 --ctx-size 66000 \
-  --expert-pick-tolerance 0.3 --wired-margin-gib 2
+  --expert-pick-tolerance 0.3
 ```
 
 `--ssd-budget-gb 18` keeps 18 GiB resident (trunk, KV cache and an expert cache) and reads the remaining experts from
 the SSD. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert
 whose router probability is at least 0.7 of the missed one's, which saves an SSD read; leave it out for replies
-identical to a resident load. `--wired-margin-gib 2` lets the plan come within 2 GiB of the GPU limit (4 by default).
-The GPU limit resets at reboot.
+identical to a resident load. The plan may come within 1 GiB of the GPU limit
+(`--wired-margin-gib N`, 1 to 32). The GPU limit resets at reboot.
 
 ## Benchmarks
 
