@@ -247,7 +247,8 @@ window on an `F_NOCACHE` descriptor (`expert_io.readUncached`; macOS ignores `F_
 through the file cache, the ~90 GB upload filled it and macOS compressed the weights already uploaded (not yet wired)
 rather than drop it, then decompressed them when the wired limit applied: on a busier box, that compression is swap.
 Sushi-2.4bpw, `serve` defaults, `taskpolicy -a`, lock held, 2026-10-08, ~90 GB free at start: compressor +59.0 GB →
-+0.6 GB, file cache peak 64.2 → 21.7 GB, listening 22 → 15 s, warmup 5.6 → 0.16 s (the loader at `3f3ff7bc` → the aligned read). MLX lazy safetensor Load nodes
++0.6 GB, file cache peak 64.2 → 21.7 GB, listening 22 → 15 s, warmup 5.6 → 0.16 s (the loader at `3f3ff7bc` → the aligned read). MiMo's
+source trunk (`mimo_source.readTensor`) reads the same way. MLX lazy safetensor Load nodes
 kept one descriptor per shard alive until evaluation, so the 566-shard affine pack
 exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from

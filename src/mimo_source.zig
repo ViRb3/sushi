@@ -11,6 +11,7 @@ const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const expert_exl3 = @import("sushi_exl3").format;
 const expert_quant = @import("expert_quant.zig");
+const expert_io = @import("expert_io.zig");
 const fp8_block = @import("fp8_block.zig");
 
 const Allocator = std.mem.Allocator;
@@ -105,8 +106,9 @@ pub fn loadWeights(
             .skipped, .fp8_scale => {},
             .resident, .routed_expert => |kind| {
                 if (kind == .routed_expert and config.expert_streaming) continue;
-                const raw = try readTensor(allocator, model_dir, meta);
-                defer allocator.free(raw);
+                const raw_read = try readTensor(allocator, model_dir, meta);
+                defer allocator.free(raw_read.window);
+                const raw = raw_read.bytes;
                 var arr = try uploadDense(raw, meta, stream);
                 errdefer _ = mlx.mlx_array_free(arr);
                 try putWeight(&weights, allocator, key, arr);
@@ -138,8 +140,9 @@ pub fn loadMtpWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             try loadFp8Weight(&weights, allocator, model_dir, key, meta, &source);
             continue;
         }
-        const raw = try readTensor(allocator, model_dir, meta);
-        defer allocator.free(raw);
+        const raw_read = try readTensor(allocator, model_dir, meta);
+        defer allocator.free(raw_read.window);
+        const raw = raw_read.bytes;
         const arr = try uploadDense(raw, meta, .{ .ctx = null });
         errdefer _ = mlx.mlx_array_free(arr);
         try putWeight(&weights, allocator, key, arr);
@@ -177,8 +180,9 @@ pub fn loadVisionWeightsInto(weights: *model.Weights, io: std.Io, allocator: std
             flat = .{ meta.shape[0], try shapeProduct(meta.shape[1..]) };
             meta.shape = &flat;
         }
-        const raw = try readTensor(allocator, model_dir, meta);
-        defer allocator.free(raw);
+        const raw_read = try readTensor(allocator, model_dir, meta);
+        defer allocator.free(raw_read.window);
+        const raw = raw_read.bytes;
         const arr = try uploadDense(raw, meta, .{ .ctx = null });
         errdefer _ = mlx.mlx_array_free(arr);
         try putWeight(weights, allocator, key, arr);
@@ -957,20 +961,19 @@ fn countResidentBytes(
     return total;
 }
 
-fn readTensor(allocator: Allocator, model_dir: []const u8, meta: TensorMeta) ![]u8 {
+/// The tensor's bytes, read around the file cache (`expert_io.readUncached`). Caller frees `.window`.
+fn readTensor(allocator: Allocator, model_dir: []const u8, meta: TensorMeta) !expert_io.UncachedRead {
     const len_u64 = meta.data_end - meta.data_start;
     const len = std.math.cast(usize, len_u64) orelse return error.SafetensorsShapeOverflow;
-    const out = try allocator.alloc(u8, len);
-    errdefer allocator.free(out);
     const path = try shardPath(allocator, model_dir, meta.file);
     defer allocator.free(path);
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.MissingMimoShard;
     defer _ = std.c.close(fd);
+    expert_io.applyReadHints(fd, .{ .readahead_off = false });
     const absolute = std.math.add(u64, meta.data_base, meta.data_start) catch
         return error.InvalidSafetensorsHeader;
-    try preadExact(fd, out, absolute);
-    return out;
+    return expert_io.readUncached(allocator, fd, absolute, len);
 }
 
 fn shapeForUpload(meta: TensorMeta, shape: *[4]c_int) ![]const c_int {
@@ -1036,10 +1039,12 @@ fn loadFp8Weight(
     const scale_name = try scaleKey(allocator, key);
     defer allocator.free(scale_name);
     const scale_meta = source.tensors.get(scale_name) orelse return error.MissingFp8Scale;
-    const raw = try readTensor(allocator, model_dir, meta);
-    defer allocator.free(raw);
-    const scale_raw = try readTensor(allocator, model_dir, scale_meta);
-    defer allocator.free(scale_raw);
+    const raw_read = try readTensor(allocator, model_dir, meta);
+    defer allocator.free(raw_read.window);
+    const raw = raw_read.bytes;
+    const scale_raw_read = try readTensor(allocator, model_dir, scale_meta);
+    defer allocator.free(scale_raw_read.window);
+    const scale_raw = scale_raw_read.bytes;
     try validateFp8Payload(raw, scale_raw);
 
     var shape: [4]c_int = undefined;
