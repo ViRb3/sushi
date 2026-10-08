@@ -1536,6 +1536,27 @@ fn convFinish(
     return groupedDynConv(sub_out, finish_dyn, base1, group_size, s);
 }
 
+/// `out = residual + convFinish(...)`, in one dispatch where the fused convolution serves the shape.
+fn convFinishAdd(
+    out: *mlx.mlx_array,
+    conv: *const DynConv,
+    sub_out: mlx.mlx_array,
+    finish_dyn: mlx.mlx_array,
+    group_size: u32,
+    residual: mlx.mlx_array,
+    s: mlx.mlx_stream,
+) !void {
+    const base1 = try baseKernelHalf(conv.base_kernel, 1, s);
+    defer _ = mlx.mlx_array_free(base1);
+    if (try @import("dflash_conv.zig").applyAdd(s, sub_out, finish_dyn, base1, group_size, residual)) |fused| {
+        defer _ = mlx.mlx_array_free(fused);
+        return mlx.check(mlx.mlx_array_set(out, fused));
+    }
+    const fin = try groupedDynConv(sub_out, finish_dyn, base1, group_size, s);
+    defer _ = mlx.mlx_array_free(fin);
+    try mlx.check(mlx.mlx_add(out, residual, fin, s));
+}
+
 /// `base_kernel[half]` → `[ksize, H]`.
 fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const bsh = mlx.getShape(base_kernel); // [2, ksize, H]
@@ -1949,6 +1970,28 @@ pub fn forwardBlockPrefix(model: *const DflashModel, ctx: *DflashCtx, noise_embe
     return forwardBlockMode(model, ctx, noise_embeds, anchor_pos, blockTailEligible(model, ctx, noise_embeds), rows);
 }
 
+var tail_mask: ?mlx.mlx_array = null;
+var tail_mask_shape: [4]usize = .{ 0, 0, 0, 0 };
+
+/// The sliding mask depends only on positions relative to the first context key (`relative` is
+/// the anchor's), so one evaluated copy serves every draft of that geometry; the caller owns the
+/// returned reference.
+fn tailMask(q_len: u32, ctx_len: usize, relative: usize, window: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (relative + q_len - 1 < window) return null;
+    const shape = [4]usize{ q_len, ctx_len, relative, window };
+    if (tail_mask == null or !std.mem.eql(usize, &shape, &tail_mask_shape)) {
+        const built = (try buildBlockMask(.sliding_attention, 0, ctx_len, relative, q_len, window, s)) orelse return null;
+        errdefer _ = mlx.mlx_array_free(built);
+        try mlx.check(mlx.mlx_array_eval(built));
+        if (tail_mask) |old| _ = mlx.mlx_array_free(old);
+        tail_mask = built;
+        tail_mask_shape = shape;
+    }
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&out, tail_mask.?));
+    return out;
+}
+
 fn blockTailEligible(model: *const DflashModel, ctx: *const DflashCtx, noise: mlx.mlx_array) bool {
     if (!model.native_glm_serving or model.layers.len != 5 or model.config.block_size != 8 or model.config.sliding_window != 2048 or ctx.cache.config.scheme != .off or ctx.cache.step < 2048 or mlx.getShape(noise)[1] != 8) return false;
     for (model.layers, ctx.cache.entries) |layer, entry| {
@@ -1971,7 +2014,10 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         _ = mlx.mlx_array_free(mask);
     };
     for (model.layers) |layer| if (layer.layer_type == .sliding_attention) {
-        sliding_mask = try buildBlockMask(.sliding_attention, ctx.base_pos + dropped, tail_len, anchor_pos, q_len, cfg.sliding_window, s);
+        sliding_mask = if (model.native_glm_serving)
+            try tailMask(q_len, tail_len, anchor_pos - (ctx.base_pos + dropped), cfg.sliding_window, s)
+        else
+            try buildBlockMask(.sliding_attention, ctx.base_pos + dropped, tail_len, anchor_pos, q_len, cfg.sliding_window, s);
         break;
     };
     const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
@@ -2039,20 +2085,12 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
         const o_out = try lw.o.apply(attn_flat, s);
         defer _ = mlx.mlx_array_free(o_out);
-        var attn_fin: mlx.mlx_array = .{ .ctx = null };
-        defer if (attn_fin.ctx != null) {
-            _ = mlx.mlx_array_free(attn_fin);
-        };
-        var attn_add = o_out;
-        if (lw.attention_conv) |*cv| {
-            const finish_dyn = if (rows < q_len_c) try tail_ops.slice(attn_prep.?.finish_dyn, 1, 0, rows) else attn_prep.?.finish_dyn;
-            attn_fin = try convFinish(cv, o_out, finish_dyn, cfg.conv_group_size, s);
-            attn_add = attn_fin;
-        }
-
         var h_new = mlx.mlx_array_new();
         const residual = if (rows < q_len_c) try tail_ops.slice(x, 1, 0, rows) else x;
-        try mlx.check(mlx.mlx_add(&h_new, residual, attn_add, s));
+        if (lw.attention_conv) |*cv| {
+            const finish_dyn = if (rows < q_len_c) try tail_ops.slice(attn_prep.?.finish_dyn, 1, 0, rows) else attn_prep.?.finish_dyn;
+            try convFinishAdd(&h_new, cv, o_out, finish_dyn, cfg.conv_group_size, residual, s);
+        } else try mlx.check(mlx.mlx_add(&h_new, residual, o_out, s));
         _ = mlx.mlx_array_free(x);
         x = h_new;
 
@@ -2067,28 +2105,28 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
             _ = mlx.mlx_array_free(cp.finish_dyn);
         };
         const mlp_in = if (mlp_prep) |*cp| cp.hidden else ff_normed;
-        const gate = try lw.gate.apply(mlp_in, s);
-        defer _ = mlx.mlx_array_free(gate);
-        const up = try lw.up.apply(mlp_in, s);
-        defer _ = mlx.mlx_array_free(up);
-        const act = try swiglu(gate, up, s);
+        const act = if (try @import("dflash_qmv.zig").gateUpAct(s, mlp_in, .{ lw.gate.w, lw.gate.scales, lw.gate.biases }, .{ lw.up.w, lw.up.scales, lw.up.biases })) |fused| fused else blk: {
+            const gate = try lw.gate.apply(mlp_in, s);
+            defer _ = mlx.mlx_array_free(gate);
+            const up = try lw.up.apply(mlp_in, s);
+            defer _ = mlx.mlx_array_free(up);
+            break :blk try swiglu(gate, up, s);
+        };
         defer _ = mlx.mlx_array_free(act);
         const down = try lw.down.apply(act, s);
         defer _ = mlx.mlx_array_free(down);
-        var mlp_fin: mlx.mlx_array = .{ .ctx = null };
-        defer if (mlp_fin.ctx != null) {
-            _ = mlx.mlx_array_free(mlp_fin);
-        };
-        var mlp_add = down;
-        if (lw.mlp_conv) |*cv| {
-            mlp_fin = try convFinish(cv, down, mlp_prep.?.finish_dyn, cfg.conv_group_size, s);
-            mlp_add = mlp_fin;
-        }
-
         var h_next = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&h_next, x, mlp_add, s));
+        if (lw.mlp_conv) |*cv| {
+            try convFinishAdd(&h_next, cv, down, mlp_prep.?.finish_dyn, cfg.conv_group_size, x, s);
+        } else try mlx.check(mlx.mlx_add(&h_next, x, down, s));
         _ = mlx.mlx_array_free(x);
         x = h_next;
+        // The GPU runs each finished layer while the host builds the next one.
+        if (model.native_glm_serving and li + 1 < model.layers.len) {
+            const pending = mlx.mlx_vector_array_new_value(x);
+            defer _ = mlx.mlx_vector_array_free(pending);
+            try mlx.check(mlx.mlx_async_eval(pending));
+        }
     }
 
     // Evict the block K/V — the context cache must be exactly as it was.
@@ -3830,6 +3868,26 @@ test "GLM assistant bounded block tail preserves visible keys and masks" {
             try testing.expectEqualSlices(u16, a[q * (ctx_len + q_len) + dropped .. (q + 1) * (ctx_len + q_len)], b[q * (window - 1 + q_len) .. (q + 1) * (window - 1 + q_len)]);
         }
     }
+}
+
+test "GLM assistant cached sliding mask equals the mask built at any absolute position" {
+    const s = mlx.gpuStream();
+    const window = 2048;
+    for ([_]u32{ 8, 3 }) |q_len| for ([_]usize{ 0, 6145, 1_040_000 }) |base| for ([_]usize{ window - 1, 2040 }) |ctx_len| {
+        // `ctx_len` rows ending one before the anchor, as the cropped serving context and the tail view hold them.
+        const built = (try buildBlockMask(.sliding_attention, base, ctx_len, base + ctx_len, q_len, window, s)) orelse {
+            try testing.expect((try tailMask(q_len, ctx_len, ctx_len, window, s)) == null);
+            continue;
+        };
+        defer _ = mlx.mlx_array_free(built);
+        const cached = (try tailMask(q_len, ctx_len, ctx_len, window, s)).?;
+        defer _ = mlx.mlx_array_free(cached);
+        try mlx.check(mlx.mlx_array_eval(built));
+        try mlx.check(mlx.mlx_array_eval(cached));
+        try testing.expectEqualSlices(c_int, mlx.getShape(built), mlx.getShape(cached));
+        const n = mlx.mlx_array_size(built);
+        try testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(built).?[0..n], mlx.mlx_array_data_bfloat16(cached).?[0..n]);
+    };
 }
 
 test "GLM serving DFlash2 trims physical window and preserves absolute append positions" {

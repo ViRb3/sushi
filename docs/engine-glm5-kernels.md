@@ -169,7 +169,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - **Assistant**: only draft positions 1–2 reach the vocab head, since N2 visits depths 0–1 (exact, −58% readout);
   the temporary 8-row block attends a read-only slice of the last 2047 context rows (assistant forward 11.4 → 4.6 ms at
   32K; assistant rounding changes, target exact); the next context is cropped to 2047 rows before accepted captures
-  append (50 MiB bound at any length; commit 4.27 → 0.73 ms at 32K; exact).
+  append (50 MiB bound at any length; commit 4.27 → 0.73 ms at 32K; exact). Once cropped, the 2047-row context is
+  below the block-tail gate, so serving drafts append the block to the cache and attend its view.
+- **Assistant pipeline** (all exact; [measurement](perf-baselines.md#glm-round-levers)): every layer but the last is
+  submitted as soon as it is built; gate, up and the BF16 SiLU product run as one A4 g64 kernel at 8 and 3 rows (each
+  projection keeps qmv_wide's per-vector order); the conv finish and its residual add are one kernel; the sliding mask
+  is built once per (rows, context rows, anchor offset); the lattice's top-16 is two dispatches (per-stretch top-16,
+  then a merge) equal to ArgPartition's last entries, ties to the higher index, NaN above every number.
 - At the end of prefill, latent and pooled capacity for input + max output + 3 is reserved once, so verification never
   grows a buffer. Every array a replay needs is an async dispatch output.
 - The reserve's ledger is the sequential peak (grown buffers keep their growth; the one in flight holds old rows, new
@@ -281,6 +287,10 @@ Decode and verify:
   arms rotated every 16 rounds in one request, contended box); N2 beats a serial step above ~1.1 accepted per round.
 - Wider trees: N3 with every T4 kernel optimized 40.44 vs N2 40.22 tok/s at 8192 IDs (`e1597cc2`, 1.46% drift);
   N4 31.4 vs N2 42.4 tok/s at 512/64. Verify per round grows faster than acceptance.
+- Assistant split-buffer block attention (port of MLX's two-pass vector SDPA reading context and block K/V in place):
+  exact, +27% draft on the cropped cache; MLX's own kernel is far faster than the JIT port.
+- Draft readout through the multi-row affine tiles: no faster at 2 rows and not exact (MLX runs `qmv_wide`).
+- Async readout before the lattice, a second assistant submit per layer: 0.
 - Per-kernel attribution tools: synchronizing verifier markers (halve throughput), xctrace Metal System Trace (no
   shader names or intervals; 95.4% GPU busy overall) and private MLX timestamp hooks (only GPUTimestamp; overlapping
   command-buffer intervals). None attributes decode time by kernel.

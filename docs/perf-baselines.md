@@ -1324,6 +1324,30 @@ The exact arm matches the recorded 819b4751 streamed cell (5.5, 5.3-5.9). Per to
 on the router ids and ~100 ms filling misses at ~11 GB/s; the pick turns ~9% of routed ids into cached substitutes and
 cuts the fill by 40% (means over the logged decode forwards). KLD: [quality-kld](quality-kld.md#lossy-expert-pick-mimo).
 
+<a id="glm-round-levers"></a>
+## GLM DFlash2: draft pipelining and fusions
+
+2026-10-08, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2.4bpw (MCG W14), A4 g64 DFlash2, kv8 latent, default flags, greedy.
+Baseline is `3f3ff7bc` (v1.2.1). Interactive QoS (`taskpolicy -a`), maximum fans, GPU lock `opt-dflash`, AC power.
+Every change is exact: proposals, targets, logits, captures and replay tapes matched bit for bit in every interleaved
+round (0 mismatched of 192 per context).
+
+In-process rounds (`SUSHI_GLM_ROUND_UBENCH`, one load, 96 rounds per arm, arms rotated per round on one state; the
+build carried lever switches, SHA256 prefix `f07816a786d346e6`; medians per round, A/A control 0.1-0.2%):
+
+| Context | Arm | Draft ms | Verify ms |
+|---|---|---:|---:|
+| 8192 | `3f3ff7bc` path | 4.403 | 39.765 |
+| 8192 | draft changes | 4.114 (-6.6%) | 39.819 |
+| 32768 | `3f3ff7bc` path | 4.420 | 41.082 |
+| 32768 | draft changes | 4.159 (-5.9%) | 41.138 |
+
+Single-lever arms on the same harness (paired means): layer pipelining -2.5%, fused gate/up/SiLU -1.6% to -2.5%,
+conv finish + residual -0.9%, two-pass top-16 -1.2% to -1.6%, cached sliding mask -0.6% to -0.8% of the draft.
+
+The -8% draft target was not reached. The draft is a chain of about 85 dependent dispatches over 5 layers (3.0 ms
+forward, 1.1 ms readout at the head's bandwidth, 0.3 ms lattice).
+
 <a id="glm-draft-ten-percent"></a>
 ## GLM DFlash2: faster fixed-depth drafting
 
