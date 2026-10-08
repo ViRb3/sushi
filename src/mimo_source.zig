@@ -95,9 +95,8 @@ pub fn loadWeights(
     var weights = model.Weights.init(allocator);
     errdefer weights.deinit();
 
-    const stream = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(stream);
-
+    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    defer reader.deinit();
     var it = source.tensors.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
@@ -106,15 +105,12 @@ pub fn loadWeights(
             .skipped, .fp8_scale => {},
             .resident, .routed_expert => |kind| {
                 if (kind == .routed_expert and config.expert_streaming) continue;
-                const raw_read = try readTensor(allocator, model_dir, meta);
-                defer allocator.free(raw_read.window);
-                const raw = raw_read.bytes;
-                var arr = try uploadDense(raw, meta, stream);
+                var arr = (try readDense(&reader, model_dir, meta, null)).array;
                 errdefer _ = mlx.mlx_array_free(arr);
                 try putWeight(&weights, allocator, key, arr);
                 arr = .{};
             },
-            .fp8_weight => try loadFp8Weight(&weights, allocator, model_dir, key, meta, &source),
+            .fp8_weight => try loadFp8Weight(&reader, &weights, allocator, model_dir, key, meta, &source),
         }
     }
 
@@ -131,19 +127,18 @@ pub fn loadMtpWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     var source = try loadSourceIndex(io, arena.allocator(), model_dir);
     var weights = model.Weights.init(allocator);
     errdefer weights.deinit();
+    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    defer reader.deinit();
     var it = source.tensors.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const meta = entry.value_ptr.*;
         if (!isMtpKey(key) or std.mem.endsWith(u8, key, ".weight_scale_inv")) continue;
         if (meta.dtype == .fp8_e4m3) {
-            try loadFp8Weight(&weights, allocator, model_dir, key, meta, &source);
+            try loadFp8Weight(&reader, &weights, allocator, model_dir, key, meta, &source);
             continue;
         }
-        const raw_read = try readTensor(allocator, model_dir, meta);
-        defer allocator.free(raw_read.window);
-        const raw = raw_read.bytes;
-        const arr = try uploadDense(raw, meta, .{ .ctx = null });
+        const arr = (try readDense(&reader, model_dir, meta, null)).array;
         errdefer _ = mlx.mlx_array_free(arr);
         try putWeight(&weights, allocator, key, arr);
     }
@@ -170,6 +165,8 @@ pub fn loadVisionWeightsInto(weights: *model.Weights, io: std.Io, allocator: std
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var source = try loadSourceIndex(io, arena.allocator(), model_dir);
+    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    defer reader.deinit();
     var it = source.tensors.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
@@ -180,10 +177,7 @@ pub fn loadVisionWeightsInto(weights: *model.Weights, io: std.Io, allocator: std
             flat = .{ meta.shape[0], try shapeProduct(meta.shape[1..]) };
             meta.shape = &flat;
         }
-        const raw_read = try readTensor(allocator, model_dir, meta);
-        defer allocator.free(raw_read.window);
-        const raw = raw_read.bytes;
-        const arr = try uploadDense(raw, meta, .{ .ctx = null });
+        const arr = (try readDense(&reader, model_dir, meta, null)).array;
         errdefer _ = mlx.mlx_array_free(arr);
         try putWeight(weights, allocator, key, arr);
     }
@@ -961,19 +955,30 @@ fn countResidentBytes(
     return total;
 }
 
-/// The tensor's bytes, read around the file cache (`expert_io.readUncached`). Caller frees `.window`.
-fn readTensor(allocator: Allocator, model_dir: []const u8, meta: TensorMeta) !expert_io.UncachedRead {
+/// The tensor as an MLX array in its stored dtype (or `as`), read around the file cache
+/// (`model.readTensorArray`). Caller frees `.array`; `.bytes` lives as long.
+fn readDense(reader: *expert_io.OverlappedReader, model_dir: []const u8, meta: TensorMeta, as: ?mlx.mlx_dtype) !model.TensorArray {
     const len_u64 = meta.data_end - meta.data_start;
     const len = std.math.cast(usize, len_u64) orelse return error.SafetensorsShapeOverflow;
-    const path = try shardPath(allocator, model_dir, meta.file);
-    defer allocator.free(path);
+    var shape: [4]c_int = undefined;
+    const shape_slice = try shapeForUpload(meta, &shape);
+    const dtype: mlx.mlx_dtype = as orelse switch (meta.dtype) {
+        .bf16 => .bfloat16,
+        .f16 => .float16,
+        .f32 => .float32,
+        .u16 => .uint16,
+        .u32 => .uint32,
+        else => return error.MimoTensorDtypeMismatch,
+    };
+    const path = try shardPath(reader.allocator, model_dir, meta.file);
+    defer reader.allocator.free(path);
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.MissingMimoShard;
     defer _ = std.c.close(fd);
     expert_io.applyReadHints(fd, .{ .readahead_off = false });
     const absolute = std.math.add(u64, meta.data_base, meta.data_start) catch
         return error.InvalidSafetensorsHeader;
-    return expert_io.readUncached(allocator, fd, absolute, len);
+    return model.readTensorArray(reader, fd, absolute, len, shape_slice, dtype);
 }
 
 fn shapeForUpload(meta: TensorMeta, shape: *[4]c_int) ![]const c_int {
@@ -983,26 +988,6 @@ fn shapeForUpload(meta: TensorMeta, shape: *[4]c_int) ![]const c_int {
         shape[i] = std.math.cast(c_int, dim) orelse return error.MimoTensorShapeMismatch;
     }
     return shape[0..meta.shape.len];
-}
-
-fn uploadDense(raw: []const u8, meta: TensorMeta, stream: mlx.mlx_stream) !mlx.mlx_array {
-    var shape: [4]c_int = undefined;
-    const shape_slice = try shapeForUpload(meta, &shape);
-    const dtype: mlx.mlx_dtype = switch (meta.dtype) {
-        .bf16 => .bfloat16,
-        .f16 => .float16,
-        .f32 => .float32,
-        .u16 => .uint16,
-        .u32 => .uint32,
-        else => return error.MimoTensorDtypeMismatch,
-    };
-    _ = stream;
-    return mlx.mlx_array_new_data(
-        @ptrCast(raw.ptr),
-        shape_slice.ptr,
-        @intCast(shape_slice.len),
-        dtype,
-    );
 }
 
 /// A NaN code, or a scale whose largest product leaves bf16 (the prefill
@@ -1029,6 +1014,7 @@ fn putWeight(weights: *model.Weights, allocator: Allocator, key: []const u8, arr
 /// The codes and their tile scales as stored, under `{base}.weight` and
 /// `{base}.scales`; a QKV keeps its rank-local rows (the forward splits them).
 fn loadFp8Weight(
+    reader: *expert_io.OverlappedReader,
     weights: *model.Weights,
     allocator: Allocator,
     model_dir: []const u8,
@@ -1039,22 +1025,20 @@ fn loadFp8Weight(
     const scale_name = try scaleKey(allocator, key);
     defer allocator.free(scale_name);
     const scale_meta = source.tensors.get(scale_name) orelse return error.MissingFp8Scale;
-    const raw_read = try readTensor(allocator, model_dir, meta);
-    defer allocator.free(raw_read.window);
-    const raw = raw_read.bytes;
-    const scale_raw_read = try readTensor(allocator, model_dir, scale_meta);
-    defer allocator.free(scale_raw_read.window);
-    const scale_raw = scale_raw_read.bytes;
-    try validateFp8Payload(raw, scale_raw);
+    const codes = try readDense(reader, model_dir, meta, .uint8);
+    var w = codes.array;
+    errdefer if (w.ctx != null) {
+        _ = mlx.mlx_array_free(w);
+    };
+    const scales = try readDense(reader, model_dir, scale_meta, null);
+    var sc = scales.array;
+    errdefer if (sc.ctx != null) {
+        _ = mlx.mlx_array_free(sc);
+    };
+    try validateFp8Payload(codes.bytes, scales.bytes);
 
-    var shape: [4]c_int = undefined;
-    const w_shape = try shapeForUpload(meta, &shape);
-    var w = mlx.mlx_array_new_data(@ptrCast(raw.ptr), w_shape.ptr, @intCast(w_shape.len), .uint8);
-    errdefer _ = mlx.mlx_array_free(w);
     try putWeight(weights, allocator, key, w);
     w = .{};
-    var sc = try uploadDense(scale_raw, scale_meta, .{ .ctx = null });
-    errdefer _ = mlx.mlx_array_free(sc);
     const sc_key = try std.fmt.allocPrint(allocator, "{s}.scales", .{fp8Base(key)});
     defer allocator.free(sc_key);
     try putWeight(weights, allocator, sc_key, sc);

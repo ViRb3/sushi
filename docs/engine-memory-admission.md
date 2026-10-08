@@ -243,13 +243,20 @@ physical free-memory ceiling.
 
 GLM uploads only indexed payloads from one shard at a time, preserving their stored
 dtypes. It closes each shard before opening the next. Each tensor is read through a page-aligned
-window on an `F_NOCACHE` descriptor (`expert_io.readUncached`; macOS ignores `F_NOCACHE` on unaligned reads). Read
+window on an `F_NOCACHE` descriptor (`model.readTensorArray`; macOS ignores `F_NOCACHE` unless the file offset, length
+and buffer are all page-aligned). A second thread reads the next 64 MiB chunk while the last is copied out
+(`expert_io.OverlappedReader`); a tensor of 1 MiB or more lands at offset 0 of its own mapping, imported by MLX
+without a copy (a view at an offset inside a buffer gave NaN logits). Same settings, H N H N per pack, sequential aligned reads → the
+overlapped reader: GLM upload 13.6/13.9 → 9.0/8.8 s (listening 18.4/15.9 → 12.1/10.7 s), Qwen 4bpw 12.0/10.5 → 9.5/7.7 s
+(14.8/12.3 → 11.9/9.3 s); no compression or swap in any arm. Read
 through the file cache, the ~90 GB upload filled it and macOS compressed the weights already uploaded (not yet wired)
 rather than drop it, then decompressed them when the wired limit applied: on a busier box, that compression is swap.
 Sushi-2.4bpw, `serve` defaults, `taskpolicy -a`, lock held, 2026-10-08, ~90 GB free at start: compressor +59.0 GB →
 +0.6 GB, file cache peak 64.2 → 21.7 GB, listening 22 → 15 s, warmup 5.6 → 0.16 s (the loader at `3f3ff7bc` → the aligned read). MiMo's
 source trunk (`mimo_source.readTensor`) and every `model.loadSafetensorsFile` shard (Qwen, streamed trunks) read the
-same way; the latter no longer goes through `mlx_load_safetensors`, whose descriptor cannot take `F_NOCACHE`. MLX lazy safetensor Load nodes
+same way; the latter no longer goes through `mlx_load_safetensors`, whose descriptor cannot take `F_NOCACHE`. Qwen3.8-Flash-Next-Sushi-4bpw
+(64 GB resident), same settings, A F A F: compressor +5.7/+4.3 GB → +0.0/+0.0 GB, no swap either way, listening 12/8 s →
+13/10 s (`mlx_load_safetensors` → sushi's own aligned reader). MLX lazy safetensor Load nodes
 kept one descriptor per shard alive until evaluation, so the 566-shard affine pack
 exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from

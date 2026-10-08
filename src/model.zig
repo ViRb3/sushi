@@ -4730,6 +4730,8 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         }
     }
 
+    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    defer reader.deinit();
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -4750,7 +4752,7 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 
         log.info("Loading {s}...\n", .{entry.name});
         const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .present = &present, .file = entry.name } else null;
-        try loadSafetensorsFileMode(allocator, &weights, path, s, load_vision, streaming, shard);
+        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, shard);
         file_count += 1;
     }
 
@@ -4838,7 +4840,9 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     load_vision: bool,
 ) !void {
-    return loadSafetensorsFileMode(allocator, weights, path, s, load_vision, null, null);
+    var reader = expert_io.OverlappedReader.init(allocator, expert_io.OverlappedReader.default_chunk);
+    defer reader.deinit();
+    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, null);
 }
 
 fn qwen4NormFold(key: []const u8) bool {
@@ -4957,8 +4961,66 @@ fn safetensorsDtype(name: []const u8) ?struct { mlx.mlx_dtype, u64 } {
     return null;
 }
 
+pub const TensorArray = struct {
+    array: mlx.mlx_array,
+    /// The array's own bytes; valid as long as `array`.
+    bytes: []const u8,
+    /// The imported destination, when the tensor was large enough to import.
+    mapped: ?[*]const u8 = null,
+};
+
+/// From this size a tensor is read into its own mapping that MLX imports without a copy;
+/// below it, the scratch copy into a fresh MLX buffer costs less than a page per tensor.
+const import_min_bytes: usize = 1 << 20;
+
+/// `len` bytes at `offset` as a `shape`/`dtype` array, read around the file cache with the read
+/// of each chunk overlapping the copy of the last (`expert_io.OverlappedReader`). A large tensor
+/// lands at offset 0 of an anonymous mapping MLX imports as its buffer: a view at an offset
+/// inside a buffer is not safe in this engine. Caller frees `array`.
+pub fn readTensorArray(reader: *expert_io.OverlappedReader, fd: std.c.fd_t, offset: u64, len: usize, shape: []const c_int, dtype: mlx.mlx_dtype) !TensorArray {
+    if (len < import_min_bytes) {
+        const host = try reader.allocator.alloc(u8, @max(len, 1));
+        defer reader.allocator.free(host);
+        try reader.fill(fd, host[0..len], offset);
+        const array = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype);
+        if (array.ctx == null) return error.OutOfMemory;
+        errdefer _ = mlx.mlx_array_free(array);
+        try mlx.check(mlx.mlx_array_eval(array));
+        return .{ .array = array, .bytes = if (len == 0) &.{} else mlx.mlx_array_data_uint8(array).?[0..len] };
+    }
+    const size: usize = @intCast(expert_io.pageRoundUp(len));
+    const mapped = std.c.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (mapped == std.c.MAP_FAILED) return error.OutOfMemory;
+    const region = std.heap.c_allocator.create(MappedRegion) catch {
+        _ = std.c.munmap(@alignCast(mapped), size);
+        return error.OutOfMemory;
+    };
+    region.* = .{ .ptr = @ptrCast(@alignCast(mapped)), .len = size };
+    reader.fill(fd, region.ptr[0..len], offset) catch |err| {
+        unmapRegion(region);
+        return err;
+    };
+    const array = mlx.mlx_array_new_data_managed_payload(region.ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
+    if (array.ctx == null) {
+        unmapRegion(region);
+        return error.OutOfMemory;
+    }
+    errdefer _ = mlx.mlx_array_free(array);
+    try mlx.check(mlx.mlx_array_eval(array));
+    // MLX copies when it cannot import (and releases the mapping); the bytes are the array's either way.
+    return .{ .array = array, .bytes = mlx.mlx_array_data_uint8(array).?[0..len], .mapped = region.ptr };
+}
+
+const MappedRegion = struct { ptr: [*]align(std.heap.page_size_min) u8, len: usize };
+
+fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
+    const region: *MappedRegion = @ptrCast(@alignCast(payload.?));
+    _ = std.c.munmap(region.ptr, region.len);
+    std.heap.c_allocator.destroy(region);
+}
+
 /// One header entry's payload as an MLX array. Caller frees.
-fn readSafetensor(allocator: std.mem.Allocator, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
+fn readSafetensor(reader: *expert_io.OverlappedReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
     if (meta != .object) return error.InvalidSafetensorsTensor;
     const dtype_value = meta.object.get("dtype") orelse return error.InvalidSafetensorsTensor;
     const dims = meta.object.get("shape") orelse return error.InvalidSafetensorsTensor;
@@ -4975,15 +5037,12 @@ fn readSafetensor(allocator: std.mem.Allocator, fd: std.c.fd_t, header: *const e
     const lo = offsets.array.items[0];
     const hi = offsets.array.items[1];
     if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != bytes) return error.InvalidSafetensorsTensor;
-    const read = try expert_io.readUncached(allocator, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes));
-    defer allocator.free(read.window);
-    const value = mlx.mlx_array_new_data(read.bytes.ptr, &shape, @intCast(dims.array.items.len), dtype);
-    if (value.ctx == null) return error.OutOfMemory;
-    return value;
+    return (try readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype)).array;
 }
 
 fn loadSafetensorsFileMode(
     allocator: std.mem.Allocator,
+    reader: *expert_io.OverlappedReader,
     weights: *Weights,
     path: [*:0]const u8,
     s: mlx.mlx_stream,
@@ -4996,7 +5055,7 @@ fn loadSafetensorsFileMode(
     // ships every resident tensor in its serving layout already.
     const fused_streaming = streaming != null and streaming.?.layout == .bf16_fused;
     // Read here rather than through MLX's loader, whose descriptor cannot take F_NOCACHE:
-    // filtered tensors are never read, kept ones bypass the file cache (`expert_io.readUncached`).
+    // filtered tensors are never read, kept ones bypass the file cache (`readTensorArray`).
     const fd = try expert_io.openHinted(std.mem.span(path), .{ .readahead_off = false });
     defer _ = std.c.close(fd);
     var header = try expert_io.SafetensorsHeader.read(allocator, fd);
@@ -5015,7 +5074,7 @@ fn loadSafetensorsFileMode(
             key_str_raw;
 
         if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and !streaming.?.keep_mtp and streamingDropsWeightKey(key_str))) continue;
-        const value = try readSafetensor(allocator, fd, &header, entry.value_ptr.*);
+        const value = try readSafetensor(reader, fd, &header, entry.value_ptr.*);
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's
         // ndim is a use-after-free, not a zero.
@@ -9815,5 +9874,62 @@ test "loadSafetensorsFile returns what MLX's own safetensors loader returns, dty
         var same = false;
         try mlx.check(mlx.mlx_array_item_bool(&same, eq));
         try t.expect(same);
+    }
+}
+
+test "readTensorArray returns the file's tensor, imported without a copy when large" {
+    const t = std.testing;
+    const a = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const page = expert_io.pageSize();
+    const size = (2 << 20) + 3 * page + 77;
+    const bytes = try a.alloc(u8, size);
+    defer a.free(bytes);
+    for (bytes, 0..) |*b, i| b.* = @truncate(i *% 13 +% i / 509);
+    for (bytes, 0..) |*b, i| if (i % 2 == 1) {
+        b.* &= 0x3f; // finite BF16/F32 elements
+    };
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "t.safetensors", .data = bytes });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(t.io, &path_buf);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/t.safetensors", .{path_buf[0..path_len]}, 0);
+    defer a.free(path);
+    const fd = try expert_io.openHinted(path, .{ .readahead_off = false });
+    defer _ = std.c.close(fd);
+    var reader = expert_io.OverlappedReader.init(a, 4 * page);
+    defer reader.deinit();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const Case = struct { offset: usize, shape: []const c_int, dtype: mlx.mlx_dtype, item: usize, imported: bool };
+    for ([_]Case{
+        .{ .offset = 100, .shape = &.{ 3, 5 }, .dtype = .bfloat16, .item = 2, .imported = false },
+        .{ .offset = page - 8, .shape = &.{ 64, 64 }, .dtype = .uint32, .item = 4, .imported = false },
+        .{ .offset = 777, .shape = &.{ 512, 1024 }, .dtype = .float32, .item = 4, .imported = true },
+        .{ .offset = size - (1 << 20) - 1, .shape = &.{ 1 << 20, 1 }, .dtype = .uint8, .item = 1, .imported = true },
+    }) |case| {
+        var count: usize = 1;
+        for (case.shape) |d| count *= @intCast(d);
+        const len = count * case.item;
+        const got = try readTensorArray(&reader, fd, case.offset, len, case.shape, case.dtype);
+        defer _ = mlx.mlx_array_free(got.array);
+        try t.expectEqualSlices(u8, bytes[case.offset..][0..len], got.bytes);
+        try t.expectEqual(case.dtype, mlx.mlx_array_dtype(got.array));
+        try t.expectEqualSlices(c_int, case.shape, mlx.getShape(got.array));
+        const want = mlx.mlx_array_new_data(bytes[case.offset..].ptr, case.shape.ptr, @intCast(case.shape.len), case.dtype);
+        defer _ = mlx.mlx_array_free(want);
+        for ([_]mlx.mlx_stream{ cpu, mlx.gpuStream() }) |s| {
+            var copy = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(copy);
+            try mlx.check(mlx.mlx_copy(&copy, got.array, s));
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, want, copy, true, cpu));
+            try mlx.check(mlx.mlx_array_eval(eq));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            try t.expect(same);
+        }
+        if (case.imported) try t.expectEqual(@intFromPtr(got.bytes.ptr), @intFromPtr(got.mapped.?));
     }
 }

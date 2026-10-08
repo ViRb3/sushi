@@ -1274,28 +1274,6 @@ pub fn readExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
     }
 }
 
-pub const UncachedRead = struct { window: []align(align_bytes) u8, bytes: []u8 };
-
-/// `len` bytes at `offset`, read through a page-aligned window: macOS honours `F_NOCACHE` only
-/// for aligned reads, and a resident load that fills the file cache makes macOS compress the
-/// weights it just uploaded. The window may stop short at end of file. Caller frees `window`.
-pub fn readUncached(allocator: std.mem.Allocator, fd: std.c.fd_t, offset: u64, len: usize) !UncachedRead {
-    const start = pageRoundDown(offset);
-    const window = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(align_bytes), @intCast(pageRoundUp(offset + len) - start));
-    errdefer allocator.free(window);
-    var done: usize = 0;
-    while (start + done < offset + len) {
-        const got = std.c.pread(fd, window[done..].ptr, window.len - done, @intCast(start + done));
-        if (got < 0) {
-            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
-            return error.FillReadFailed;
-        }
-        if (got == 0) return error.FillShortRead;
-        done += @intCast(got);
-    }
-    return .{ .window = window, .bytes = window[@intCast(offset - start)..][0..len] };
-}
-
 /// A shard's parsed safetensors header; tensor payloads start at `data_start`.
 pub const SafetensorsHeader = struct {
     parsed: std.json.Parsed(std.json.Value),
@@ -1318,6 +1296,126 @@ pub const SafetensorsHeader = struct {
     pub fn deinit(self: *SafetensorsHeader) void {
         self.parsed.deinit();
     }
+};
+
+/// Fills `window` (page-aligned, starting at the page-aligned file offset `start`) until file
+/// offset `end` is covered; the read may stop short of the last page at end of file.
+pub fn fillWindow(fd: std.c.fd_t, window: []u8, start: u64, end: u64) !void {
+    var done: usize = 0;
+    while (start + done < end) {
+        const got = std.c.pread(fd, window[done..].ptr, window.len - done, @intCast(start + done));
+        if (got < 0) {
+            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
+            return error.FillReadFailed;
+        }
+        if (got == 0) return error.FillShortRead;
+        done += @intCast(got);
+    }
+}
+
+/// Reads byte ranges around the file cache (aligned `F_NOCACHE` reads into page-aligned scratch)
+/// and copies them out; a range longer than one chunk is read on a second thread one chunk ahead
+/// of the copy, so the SSD and the copy overlap. One instance per load: its two scratch windows
+/// are allocated on first use and reused.
+pub const OverlappedReader = struct {
+    pub const default_chunk: usize = 64 << 20;
+
+    allocator: std.mem.Allocator,
+    /// A multiple of the page size.
+    chunk: usize,
+    scratch: [2][]align(align_bytes) u8 = .{ &.{}, &.{} },
+
+    pub fn init(allocator: std.mem.Allocator, chunk: usize) OverlappedReader {
+        return .{ .allocator = allocator, .chunk = chunk };
+    }
+
+    pub fn deinit(self: *OverlappedReader) void {
+        for (self.scratch) |w| if (w.len != 0) self.allocator.free(w);
+        self.scratch = .{ &.{}, &.{} };
+    }
+
+    fn window(self: *OverlappedReader, slot: usize) ![]align(align_bytes) u8 {
+        if (self.scratch[slot].len == 0) self.scratch[slot] = try self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(align_bytes), self.chunk);
+        return self.scratch[slot];
+    }
+
+    /// `dst.len` bytes of `fd` at `offset` into `dst`.
+    pub fn fill(self: *OverlappedReader, fd: std.c.fd_t, dst: []u8, offset: u64) !void {
+        if (dst.len == 0) return;
+        var pipe: Pipe = .{ .reader = self, .fd = fd, .start = pageRoundDown(offset), .end = offset + dst.len };
+        pipe.aligned_end = pageRoundUp(pipe.end);
+        pipe.chunks = std.math.divCeil(u64, pipe.aligned_end - pipe.start, self.chunk) catch unreachable;
+        _ = try self.window(0);
+        if (pipe.chunks == 1) {
+            try fillWindow(fd, self.scratch[0][0..@intCast(pipe.aligned_end - pipe.start)], pipe.start, pipe.end);
+            pipe.copyOut(0, 0, dst, offset);
+            return;
+        }
+        _ = try self.window(1);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const thread = try std.Thread.spawn(.{}, Pipe.readAll, .{&pipe});
+        var failure: ?anyerror = null;
+        for (0..@intCast(pipe.chunks)) |k| {
+            const slot = k % 2;
+            pipe.mu.lockUncancelable(io);
+            while (!pipe.full[slot] and pipe.failure == null) pipe.cv.wait(io, &pipe.mu) catch {};
+            failure = pipe.failure;
+            pipe.mu.unlock(io);
+            if (failure != null) break;
+            pipe.copyOut(k, slot, dst, offset);
+            pipe.mu.lockUncancelable(io);
+            pipe.full[slot] = false;
+            pipe.cv.broadcast(io);
+            pipe.mu.unlock(io);
+        }
+        thread.join();
+        if (failure) |err| return err;
+    }
+
+    const Pipe = struct {
+        reader: *OverlappedReader,
+        fd: std.c.fd_t,
+        start: u64,
+        end: u64,
+        aligned_end: u64 = 0,
+        chunks: u64 = 0,
+        mu: std.Io.Mutex = .init,
+        cv: std.Io.Condition = .init,
+        full: [2]bool = .{ false, false },
+        failure: ?anyerror = null,
+
+        fn range(self: *const Pipe, k: u64) [2]u64 {
+            const lo = self.start + k * self.reader.chunk;
+            return .{ lo, @min(lo + self.reader.chunk, self.aligned_end) };
+        }
+
+        fn copyOut(self: *const Pipe, k: u64, slot: usize, dst: []u8, offset: u64) void {
+            const r = self.range(k);
+            const lo = @max(r[0], offset);
+            const hi = @min(r[1], self.end);
+            const n: usize = @intCast(hi - lo);
+            @memcpy(dst[@intCast(lo - offset)..][0..n], self.reader.scratch[slot][@intCast(lo - r[0])..][0..n]);
+        }
+
+        fn readAll(self: *Pipe) void {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            for (0..@intCast(self.chunks)) |k| {
+                const slot = k % 2;
+                self.mu.lockUncancelable(io);
+                while (self.full[slot] and self.failure == null) self.cv.wait(io, &self.mu) catch {};
+                const stop = self.failure != null;
+                self.mu.unlock(io);
+                if (stop) return;
+                const r = self.range(k);
+                const result = fillWindow(self.fd, self.reader.scratch[slot][0..@intCast(r[1] - r[0])], r[0], @min(r[1], self.end));
+                self.mu.lockUncancelable(io);
+                if (result) |_| self.full[slot] = true else |err| self.failure = err;
+                self.cv.broadcast(io);
+                self.mu.unlock(io);
+                if (self.failure != null) return;
+            }
+        }
+    };
 };
 
 pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u8) !TensorRegion {
@@ -1903,26 +2001,32 @@ test "expert io import active memory counts an aliased slab once" {
     try t.expect(delta < 2 * bytes);
 }
 
-test "uncached read returns any byte range through its page-aligned window, up to a partial last page" {
+test "overlapped reader fills any range, across many chunks and up to a partial last page" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const page = pageSize();
-    const size = 3 * page + 100;
+    const size = 9 * page + 123;
     const bytes = try t.allocator.alloc(u8, size);
     defer t.allocator.free(bytes);
-    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% i / 251);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 11 +% i / 263);
     try tmp.dir.writeFile(t.io, .{ .sub_path = "shard.safetensors", .data = bytes });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(t.io, &path_buf);
     const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/shard.safetensors", .{path_buf[0..path_len]}, 0);
     defer t.allocator.free(path);
-    const fd = try openHinted(path, .{});
+    const fd = try openHinted(path, .{ .readahead_off = false });
     defer _ = std.c.close(fd);
-    for ([_][2]usize{ .{ 0, 10 }, .{ 5, page }, .{ page - 4, 20 }, .{ 1, size - 1 }, .{ 3 * page + 50, 50 } }) |case| {
-        const read = try readUncached(t.allocator, fd, case[0], case[1]);
-        defer t.allocator.free(read.window);
-        try t.expectEqualSlices(u8, bytes[case[0]..][0..case[1]], read.bytes);
+    // Two-page chunks: a 9-page file runs the threaded path five times over.
+    var reader = OverlappedReader.init(t.allocator, 2 * page);
+    defer reader.deinit();
+    for ([_][2]usize{ .{ 0, 10 }, .{ 5, page }, .{ page - 4, 20 }, .{ 1, size - 1 }, .{ 3 * page + 7, 5 * page }, .{ 9 * page + 50, 73 } }) |case| {
+        const dst = try t.allocator.alloc(u8, case[1]);
+        defer t.allocator.free(dst);
+        try reader.fill(fd, dst, case[0]);
+        try t.expectEqualSlices(u8, bytes[case[0]..][0..case[1]], dst);
     }
-    try t.expectError(error.FillShortRead, readUncached(t.allocator, fd, size - 10, 20));
+    const past = try t.allocator.alloc(u8, 3 * page);
+    defer t.allocator.free(past);
+    try t.expectError(error.FillShortRead, reader.fill(fd, past, size - page));
 }
