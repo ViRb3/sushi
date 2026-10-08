@@ -154,8 +154,10 @@ fn loadStoredShard(allocator: std.mem.Allocator, path: [:0]const u8, file: []con
         };
     }
     defer _ = std.c.close(fd);
+    const expert_io = @import("expert_io.zig");
+    expert_io.applyReadHints(fd, .{ .readahead_off = false });
     var size: [8]u8 = undefined;
-    const readExact = @import("expert_io.zig").readExact;
+    const readExact = expert_io.readExact;
     try readExact(fd, &size, 0);
     const len = std.mem.readInt(u64, &size, .little);
     if (len == 0 or len > 128 * 1024 * 1024) return error.InvalidSafetensorsHeader;
@@ -195,9 +197,9 @@ fn loadStoredShard(allocator: std.mem.Allocator, path: [:0]const u8, file: []con
         if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != expected) return error.InvalidSafetensorsTensor;
         bytes = try std.math.add(u64, bytes, expected);
         if (bytes > max_bytes) return error.GlmResidentBudgetExceeded;
-        const raw = try allocator.alignedAlloc(u8, .@"16", @intCast(expected));
-        defer allocator.free(raw);
-        try readExact(fd, raw, try std.math.add(u64, len + 8, @intCast(lo.integer)));
+        const read = try expert_io.readUncached(allocator, fd, try std.math.add(u64, len + 8, @intCast(lo.integer)), @intCast(expected));
+        defer allocator.free(read.window);
+        const raw = read.bytes;
         if (isFp8Dtype(dtype.string)) {
             for (raw) |code| if (code & 0x7f == 0x7f) return error.InvalidFp8Value;
         } else if (std.mem.endsWith(u8, name, ".weight_scale_inv")) {

@@ -242,7 +242,12 @@ same configurable 8 GiB reserve as Qwen and MiMo. An unchanged system limit reta
 physical free-memory ceiling.
 
 GLM uploads only indexed payloads from one shard at a time, preserving their stored
-dtypes. It closes each shard before opening the next. MLX lazy safetensor Load nodes
+dtypes. It closes each shard before opening the next. Each tensor is read through a page-aligned
+window on an `F_NOCACHE` descriptor (`expert_io.readUncached`; macOS ignores `F_NOCACHE` on unaligned reads). Read
+through the file cache, the ~90 GB upload filled it and macOS compressed the weights already uploaded (not yet wired)
+rather than drop it, then decompressed them when the wired limit applied: on a busier box, that compression is swap.
+Sushi-2.4bpw, `serve` defaults, `taskpolicy -a`, lock held, 2026-10-08, ~90 GB free at start: compressor +59.0 GB →
++0.6 GB, file cache peak 64.2 → 21.7 GB, listening 22 → 15 s, warmup 5.6 → 0.16 s (the loader at `3f3ff7bc` → the aligned read). MLX lazy safetensor Load nodes
 kept one descriptor per shard alive until evaluation, so the 566-shard affine pack
 exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from

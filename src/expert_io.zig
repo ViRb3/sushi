@@ -1274,6 +1274,28 @@ pub fn readExact(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
     }
 }
 
+pub const UncachedRead = struct { window: []align(align_bytes) u8, bytes: []u8 };
+
+/// `len` bytes at `offset`, read through a page-aligned window: macOS honours `F_NOCACHE` only
+/// for aligned reads, and a resident load that fills the file cache makes macOS compress the
+/// weights it just uploaded. The window may stop short at end of file. Caller frees `window`.
+pub fn readUncached(allocator: std.mem.Allocator, fd: std.c.fd_t, offset: u64, len: usize) !UncachedRead {
+    const start = pageRoundDown(offset);
+    const window = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(align_bytes), @intCast(pageRoundUp(offset + len) - start));
+    errdefer allocator.free(window);
+    var done: usize = 0;
+    while (start + done < offset + len) {
+        const got = std.c.pread(fd, window[done..].ptr, window.len - done, @intCast(start + done));
+        if (got < 0) {
+            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
+            return error.FillReadFailed;
+        }
+        if (got == 0) return error.FillShortRead;
+        done += @intCast(got);
+    }
+    return .{ .window = window, .bytes = window[@intCast(offset - start)..][0..len] };
+}
+
 pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u8) !TensorRegion {
     var len_bytes: [8]u8 = undefined;
     try readExact(fd, &len_bytes, 0);
@@ -1855,4 +1877,28 @@ test "expert io import active memory counts an aliased slab once" {
     errdefer benchPrint("[expert-io] aliased import active memory delta {d} for {d} bytes\n", .{ delta, bytes });
     try t.expect(operand.aliased);
     try t.expect(delta < 2 * bytes);
+}
+
+test "uncached read returns any byte range through its page-aligned window, up to a partial last page" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const page = pageSize();
+    const size = 3 * page + 100;
+    const bytes = try t.allocator.alloc(u8, size);
+    defer t.allocator.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% i / 251);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "shard.safetensors", .data = bytes });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(t.io, &path_buf);
+    const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/shard.safetensors", .{path_buf[0..path_len]}, 0);
+    defer t.allocator.free(path);
+    const fd = try openHinted(path, .{});
+    defer _ = std.c.close(fd);
+    for ([_][2]usize{ .{ 0, 10 }, .{ 5, page }, .{ page - 4, 20 }, .{ 1, size - 1 }, .{ 3 * page + 50, 50 } }) |case| {
+        const read = try readUncached(t.allocator, fd, case[0], case[1]);
+        defer t.allocator.free(read.window);
+        try t.expectEqualSlices(u8, bytes[case[0]..][0..case[1]], read.bytes);
+    }
+    try t.expectError(error.FillShortRead, readUncached(t.allocator, fd, size - 10, 20));
 }
