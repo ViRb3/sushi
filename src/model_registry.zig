@@ -1400,6 +1400,7 @@ pub const ModelRegistry = struct {
 // covered by integration tests once Phase D lands.
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 fn makeReadyStub(reg: *ModelRegistry, id: []const u8, bytes: u64) !*LoadedModel {
     const stub = try reg.registerStub(id, id, bytes);
@@ -1422,8 +1423,8 @@ test "ModelRegistry: registerStub + setDefault" {
     _ = try reg.registerStub("foo", "/path/to/foo", 1024);
     try reg.setDefault("foo");
     try testing.expectEqualStrings("foo", reg.default_id);
-    try testing.expectError(error.DuplicateId, reg.registerStub("foo", "/path/to/foo", 1024));
-    try testing.expectError(error.UnknownModelId, reg.setDefault("bar"));
+    try expectError(error.DuplicateId, reg.registerStub("foo", "/path/to/foo", 1024));
+    try expectError(error.UnknownModelId, reg.setDefault("bar"));
 }
 
 test "ModelRegistry: registerStubWithArch keeps the discovery arch hint" {
@@ -1481,8 +1482,8 @@ test "ModelRegistry: registerByPath rejects a nonexistent directory" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
-    try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model"));
-    try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/"));
+    try expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model"));
+    try expectError(error.InvalidModelPath, reg.registerByPath(io, "/"));
 }
 
 test "LoadedModel: a reload frees the CPU state the previous load left behind" {
@@ -1667,8 +1668,8 @@ test "ModelRegistry: ensureLoaded fails on unloaded stub" {
     defer reg.deinit();
     _ = try reg.registerStub("foo", "/path/to/foo", 1024);
     try reg.setDefault("foo");
-    try testing.expectError(error.NotLoaded, reg.ensureLoaded("foo"));
-    try testing.expectError(error.UnknownModelId, reg.ensureLoaded("bar"));
+    try expectError(error.NotLoaded, reg.ensureLoaded("foo"));
+    try expectError(error.UnknownModelId, reg.ensureLoaded("bar"));
 }
 
 test "ModelRegistry: ensureLoaded + release refcount math" {
@@ -1734,7 +1735,7 @@ test "ModelRegistry: ensureLoaded fails when no default and id empty" {
     defer reg.deinit();
     _ = try makeReadyStub(reg, "foo", 1024);
     // default_id never set
-    try testing.expectError(error.NoDefaultModel, reg.ensureLoaded(""));
+    try expectError(error.NoDefaultModel, reg.ensureLoaded(""));
 }
 
 test "ModelRegistry: ensureLoaded reports error_state" {
@@ -1745,7 +1746,7 @@ test "ModelRegistry: ensureLoaded reports error_state" {
     reg.mutex.lockUncancelable(reg.io);
     reg.markErrorLocked(stub, "MissingVisionWeights");
     reg.mutex.unlock(reg.io);
-    try testing.expectError(error.LoadFailed, reg.ensureLoaded("broken"));
+    try expectError(error.LoadFailed, reg.ensureLoaded("broken"));
     try testing.expect(stub.error_name != null);
     try testing.expectEqualStrings("MissingVisionWeights", stub.error_name.?);
 }
@@ -1761,14 +1762,14 @@ test "ModelRegistry: memory-refused loads keep their identity, other failures ex
     reg.mutex.lockUncancelable(reg.io);
     reg.markErrorLocked(stub, "InsufficientMemory");
     reg.mutex.unlock(reg.io);
-    try testing.expectError(error.InsufficientMemory, reg.ensureLoaded("krea"));
+    try expectError(error.InsufficientMemory, reg.ensureLoaded("krea"));
 
     // Any other failure stays LoadFailed, with the stored name readable for
     // the "Model load failed: <name>" message.
     reg.mutex.lockUncancelable(reg.io);
     reg.markErrorLocked(stub, "FileNotFound");
     reg.mutex.unlock(reg.io);
-    try testing.expectError(error.LoadFailed, reg.ensureLoaded("krea"));
+    try expectError(error.LoadFailed, reg.ensureLoaded("krea"));
     const name = reg.loadErrorNameDupe(testing.allocator, "krea");
     defer if (name) |n| testing.allocator.free(n);
     try testing.expectEqualStrings("FileNotFound", name.?);
@@ -1882,9 +1883,9 @@ test "ModelRegistry: peek does not refcount" {
     defer reg.deinit();
     const lm = try makeReadyStub(reg, "foo", 1024);
     const peeked = reg.peek("foo").?;
-    try testing.expectEqual(lm, peeked);
+    try testing.expect(lm == peeked);
     try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
-    try testing.expectEqual(@as(?*LoadedModel, null), reg.peek("nope"));
+    try testing.expect(reg.peek("nope") == null);
 }
 
 /// Attach a decode-capable tokenizer whose vocabulary is `tokens` (id → piece)

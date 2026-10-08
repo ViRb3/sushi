@@ -13776,6 +13776,7 @@ fn argmax(last_logits: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
 // ── Tests ──
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 test "SamplingParams defaults" {
     const params = SamplingParams{};
@@ -19251,7 +19252,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
         .livecost = false,
         .round_watch = undefined,
     };
-    try testing.expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
+    try expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
 }
 
 test "batched MTP state includes the last row activated by round begin" {
@@ -19965,7 +19966,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
         try L11PlainReplay.tick(&xfm, &reference, true);
         try L11PlainReplay.tick(&xfm, &planned, false);
     }
-    for (planned) |slot| try testing.expectError(error.MtpHiddenStale, slot.gen.?.mtpRoundBegin(a));
+    for (planned) |slot| try expectError(error.MtpHiddenStale, slot.gen.?.mtpRoundBegin(a));
     try L11PlainReplay.tick(&xfm, &reference, true);
     try L11PlainReplay.tick(&xfm, &planned, true);
     for (reference, planned) |ref, candidate| {
@@ -21056,7 +21057,7 @@ test "an empty prompt is a typed error at the generator, never an index" {
     const cfg = try glmGeneratorFixture(&weights);
     var xfm = try Transformer.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
-    try testing.expectError(error.EmptyPrompt, Generator.initWithOptions(testing.io, a, &xfm, &tok, &.{}, 4, .{ .temperature = 0.0 }, &.{}, .{}));
+    try expectError(error.EmptyPrompt, Generator.initWithOptions(testing.io, a, &xfm, &tok, &.{}, 4, .{ .temperature = 0.0 }, &.{}, .{}));
 }
 
 fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {

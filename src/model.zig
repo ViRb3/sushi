@@ -3210,6 +3210,7 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
 // ── Tests ──
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 test "ModelConfig defaults" {
     const config = ModelConfig{};
@@ -4074,7 +4075,7 @@ test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
         \\  "quantization": {"bits": 1, "group_size": 128}
         \\}
     ;
-    try testing.expectError(error.UnsupportedQuantBits, parseConfigFromJson(testing.allocator, json_1bit));
+    try expectError(error.UnsupportedQuantBits, parseConfigFromJson(testing.allocator, json_1bit));
 
     const json_7bit =
         \\{
@@ -4083,7 +4084,7 @@ test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
         \\  "quantization": {"bits": 7, "group_size": 64}
         \\}
     ;
-    try testing.expectError(error.UnsupportedQuantBits, parseConfigFromJson(testing.allocator, json_7bit));
+    try expectError(error.UnsupportedQuantBits, parseConfigFromJson(testing.allocator, json_7bit));
 }
 
 test "parseConfigFromJson nvfp4 quantization mode" {
@@ -4128,7 +4129,7 @@ test "parseConfigFromJson unknown quantization mode → error" {
         \\  "quantization": {"group_size": 32, "bits": 4, "mode": "fp99"}
         \\}
     ;
-    try testing.expectError(error.UnsupportedQuantMode, parseConfigFromJson(testing.allocator, json));
+    try expectError(error.UnsupportedQuantMode, parseConfigFromJson(testing.allocator, json));
 }
 
 test "shouldKeepWeightKey drops DiffusionGemma encoder vision tower (text-only v1)" {
@@ -4199,7 +4200,7 @@ test "pooling: config.json pooling_mode key parses; unknown value rejected at pa
     // vectors are harder to detect than a refused load.
     const bad = try std.fmt.allocPrint(testing.allocator, base, .{"weighted_mean"});
     defer testing.allocator.free(bad);
-    try testing.expectError(error.UnsupportedPoolingMode, parseConfigFromJson(testing.allocator, bad));
+    try expectError(error.UnsupportedPoolingMode, parseConfigFromJson(testing.allocator, bad));
 }
 
 test "pooling: sentence-transformers 1_Pooling sidecar parses all three modes" {
@@ -4685,7 +4686,7 @@ test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fa
     setConfigOverrides(
         \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0}}}
     );
-    try testing.expectError(
+    try expectError(
         error.YarnRopeNeedsOriginalMaxPos,
         parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
     );
@@ -4694,7 +4695,7 @@ test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fa
         \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":0.0,
         \\  "original_max_position_embeddings":262144}}}
     );
-    try testing.expectError(
+    try expectError(
         error.InvalidRopeScalingFactor,
         parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
     );
@@ -4779,7 +4780,7 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
     setConfigOverrides(
         \\[1,2,3]
     );
-    try testing.expectError(
+    try expectError(
         error.ConfigOverridesMustBeObject,
         parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
     );
@@ -4839,64 +4840,64 @@ test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load er
     try testing.expectEqual(@as(u32, 3), good.ngram_size);
     try testing.expectEqual(@as(u32, 8), good.heads_per_ngram);
 
-    try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
+    try expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":9,\"heads_per_ngram\":8"),
     ));
-    try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
+    try expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":1,\"heads_per_ngram\":8"),
     ));
-    try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
+    try expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":0"),
     ));
-    try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
+    try expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":5,\"heads_per_ngram\":16"),
     ));
-    try testing.expectError(error.InvalidQwen4NgramVocab, parseConfigFromJson(
+    try expectError(error.InvalidQwen4NgramVocab, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"make_ngram_vocab_size_divisible_by\":0"),
     ));
 }
 
 test "n-gram head count overflow is refused by the config" {
-    try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
+    try expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":2147483656"),
     ));
 }
 
 test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a silent default" {
-    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+    try expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":-1"),
     ));
-    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+    try expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":\"3\""),
     ));
-    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+    try expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"heads_per_ngram\":3.5"),
     ));
-    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+    try expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_compress_ratio\":-4"),
     ));
 }
 
 test "qwen4_exp config: an armed QSA indexer must carry a usable budget and ratio" {
-    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048"),
     ));
-    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2,\"indexer_compress_ratio\":4"),
     ));
-    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_budget\":2048,\"indexer_compress_ratio\":4"),
     ));
@@ -4909,27 +4910,27 @@ test "qwen4_exp config: an armed QSA indexer must carry a usable budget and rati
 }
 
 test "qwen4_exp config: the PLE layer id must name exactly one layer that exists" {
-    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ngram_size\":3"),
     ));
-    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[0]"),
     ));
-    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[49]"),
     ));
-    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2,5]"),
     ));
-    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[]"),
     ));
-    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+    try expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":2"),
     ));
@@ -5114,7 +5115,7 @@ test "mimo_v2 config refuses a MiMo-ViT whose block tables disagree with its dep
     for (cases) |tables| {
         const json = try std.mem.replaceOwned(u8, testing.allocator, MIMO_V2_VISION_JSON, "\"fullatt_block_indexes\": [0, 3], \"vit_window_attn_types\": [-1, 0, 1, -1]", tables);
         defer testing.allocator.free(json);
-        try testing.expectError(error.UnsupportedMimoV2Config, parseConfigFromJson(testing.allocator, json));
+        try expectError(error.UnsupportedMimoV2Config, parseConfigFromJson(testing.allocator, json));
     }
 }
 
@@ -5170,7 +5171,7 @@ test "mimo_v2 config rejects unsupported routing and malformed layer geometry" {
     }) |override| {
         const json = try mergeConfigJson(testing.allocator, base, override);
         defer testing.allocator.free(json);
-        try testing.expectError(error.UnsupportedMimoV2Config, parseConfigFromJson(testing.allocator, json));
+        try expectError(error.UnsupportedMimoV2Config, parseConfigFromJson(testing.allocator, json));
     }
     const fused_json = try mergeConfigJson(testing.allocator, base,
         \\{"attention_projection_layout":"fused_qkv","routed_scaling_factor":2.5,
@@ -5197,7 +5198,7 @@ test "mimo_v2 refuses a config asking to quantize trunk linears at load" {
         \\{"trunk_quant":{"o_proj":{"mode":"affine","bits":8,"group_size":64}}}
     );
     defer testing.allocator.free(json);
-    try testing.expectError(error.UnsupportedMimoV2Config, parseConfigFromJson(testing.allocator, json));
+    try expectError(error.UnsupportedMimoV2Config, parseConfigFromJson(testing.allocator, json));
 }
 
 test "layer value width and sink placement preserve existing defaults" {
@@ -5499,7 +5500,7 @@ test "parseConfig releases owned paths when an EXL3 pack is refused" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
     var path: [std.fs.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(testing.io, &path);
-    try testing.expectError(error.ExpertLayoutUnsupported, parseConfig(testing.io, testing.allocator, path[0..len]));
+    try expectError(error.ExpertLayoutUnsupported, parseConfig(testing.io, testing.allocator, path[0..len]));
 }
 
 test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default" {
@@ -5538,7 +5539,7 @@ test "parseConfigFromJson: a wrong-typed or out-of-range field is a named error,
         qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":-1}"),
         qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"original_max_position_embeddings\":262144,\"factor\":\"4\"}"),
     }) |doc| {
-        try t.expectError(error.InvalidConfigField, parseConfigFromJson(t.allocator, doc));
+        try expectError(error.InvalidConfigField, parseConfigFromJson(t.allocator, doc));
     }
 }
 
@@ -5553,7 +5554,7 @@ test "qwen4_exp config: a geometry the forward divides by or indexes with is a n
         "{" ++ base ++ ",\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":5,\"num_experts\":512,\"num_experts_per_tok\":10}",
         "{" ++ base ++ ",\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":2,\"num_experts\":8,\"num_experts_per_tok\":10}",
     }) |doc| {
-        try t.expectError(error.InvalidQwen4Geometry, parseConfigFromJson(t.allocator, doc));
+        try expectError(error.InvalidQwen4Geometry, parseConfigFromJson(t.allocator, doc));
     }
 }
 
@@ -5866,5 +5867,5 @@ test "GLM raw FP8 config identifies source storage without changing native KV" {
     try std.testing.expect((try parseConfigFromJson(std.testing.allocator, release)).glm_fp8_trunk);
     const other_block = try std.fmt.allocPrint(std.testing.allocator, "{{\"quantization_config\":{{\"quant_method\":\"fp8\",\"fmt\":\"e4m3\",\"weight_block_size\":[64,64]}},{s}", .{source[1..]});
     defer std.testing.allocator.free(other_block);
-    try std.testing.expectError(error.UnsupportedGlmConfig, parseConfigFromJson(std.testing.allocator, other_block));
+    try expectError(error.UnsupportedGlmConfig, parseConfigFromJson(std.testing.allocator, other_block));
 }
