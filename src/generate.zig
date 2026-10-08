@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -19403,7 +19404,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const coarse_before = transformer_mod.mtp_coarse_pair_dispatches;
-    const hc_prepared_before = transformer_mod.mtp_verify_hc_prepared_calls;
+    const hc_prepared_before = qwen4_forward.mtp_verify_hc_prepared_calls;
     const verify_kernel_before = transformer_mod.mtp_verify_kernel_calls;
     var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |path| a.free(path);
@@ -19521,8 +19522,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     if (transformer_mod.verifySharedHardware()) {
         try testing.expect(transformer_mod.mtp_coarse_pair_dispatches > coarse_before);
         {
-            try testing.expect(transformer_mod.mtp_verify_hc_prepared_calls > hc_prepared_before);
-            std.debug.print("[prepared HC] calls={d}\n", .{transformer_mod.mtp_verify_hc_prepared_calls - hc_prepared_before});
+            try testing.expect(qwen4_forward.mtp_verify_hc_prepared_calls > hc_prepared_before);
+            std.debug.print("[prepared HC] calls={d}\n", .{qwen4_forward.mtp_verify_hc_prepared_calls - hc_prepared_before});
         }
         inline for (.{ .dense_tiles, .hc_rows, .route_pack }, 0..) |lever, i| {
             {

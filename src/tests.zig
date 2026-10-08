@@ -30,6 +30,7 @@ test {
     _ = @import("transformer.zig");
     _ = @import("vision.zig");
     _ = @import("qwen_vision.zig");
+    _ = @import("vision_common.zig");
     _ = @import("mimo_vision.zig");
     _ = @import("glm5_vision.zig");
     _ = @import("mrope.zig");

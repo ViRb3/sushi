@@ -55,7 +55,7 @@ pub const VisionEncoder = struct {
     }
 
     /// Encode one VIDEO: `patches` holds `grid_t` temporal-patch groups'
-    /// pixel_values concatenated (see `qwen_vision.buildPixelValuesVideo`).
+    /// pixel_values concatenated (see `vision_common.buildPixelValuesVideo`).
     /// Only Qwen3-VL-family and GLM checkpoints have a video path.
     pub fn forwardVideoPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         if (self.qwen) |*qv| return qv.forwardVideo(patches, grid_t, grid_h, grid_w);

@@ -35,6 +35,8 @@ const std = @import("std");
 pub var slot_vision_free_test_hook: ?*const fn (mlx.mlx_array) void = null;
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const mimo_forward = @import("mimo_forward.zig");
+const qwen4_qsa = @import("qwen4_qsa.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
@@ -1042,7 +1044,7 @@ pub const VisionImagePixels = struct {
 };
 
 /// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
-/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo`). Borrowed;
+/// groups, concatenated (see `vision_common.buildPixelValuesVideo`). Borrowed;
 /// must outlive the encodeVision call.
 pub const VisionVideoPixels = struct {
     pixels: []const u8,
@@ -2623,7 +2625,7 @@ const UbenchArm = struct {
     /// Arms the block and zeroes the fused-launch count it reports.
     fn apply(self: UbenchArm, ctx: *ForwardCtx) void {
         ctx.verify_rows = self.verify_rows;
-        transformer_mod.qsa_pool_rope_fused_override = self.qsa_pool;
+        qwen4_qsa.qsa_pool_rope_fused_override = self.qsa_pool;
         transformer_mod.qsa_pool_rope_dispatches = 0;
     }
 
@@ -4392,11 +4394,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS=1: each width runs A B B A, A the composed QSA
             // pooled-key chain and B the fused kernel; each arm logs its fused launches.
             const pool_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS");
-            defer transformer_mod.qsa_pool_rope_fused_override = null;
+            defer qwen4_qsa.qsa_pool_rope_fused_override = null;
             // SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1: MiMo's composed rope + kv8 quantize (off) and
             // the one-dispatch prep (on) as off, on, on, off passes.
             const qkv_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS");
-            defer transformer_mod.mimo_qkv_prep_override = null;
+            defer mimo_forward.mimo_qkv_prep_override = null;
             // SUSHI_DECODE_FWD_UBENCH_LMHEAD_ARMS=1: argmax-only forwards on the full lm_head (off) and
             // the coarse shortlist (on) as off, on, on, off passes; the heads load later, so it builds
             // its own coarse copy for the meter.
@@ -4404,7 +4406,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // SUSHI_DECODE_FWD_UBENCH_GLOBAL_ROWS_ARMS=1: MiMo global verify rows one dispatch each (off)
             // and in row groups sharing one page walk each (on) as off, on, on, off passes.
             const rows_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GLOBAL_ROWS_ARMS");
-            defer transformer_mod.mimo_global_rows_override = null;
+            defer mimo_forward.mimo_global_rows_override = null;
             const lm_built = lm_arms and xfm_ptr.lm_head_coarse == null;
             if (lm_built) xfm_ptr.lm_head_coarse = mtp_mod.buildRerankCoarse(mlx.gpuStream(), xfm_ptr, mimo_mtp.rerankBits());
             defer if (lm_arms) {
@@ -4422,10 +4424,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const no_arms: []const ?bool = &.{null};
             for (if (qkv_arms) abba2 else if (gdn_arms or fold_arms or lm_arms or rows_arms) abba else no_arms) |gdn_arm| {
             transformer_mod.gdn_decode_recur_override = if (fold_arms) true else if (qkv_arms or lm_arms or rows_arms) null else gdn_arm;
-            transformer_mod.mimo_global_rows_override = if (rows_arms) gdn_arm else null;
+            mimo_forward.mimo_global_rows_override = if (rows_arms) gdn_arm else null;
             if (lm_arms) transformer_mod.lmhead_shortlist_override = gdn_arm;
             transformer_mod.gdn_verify_fold_override = if (fold_arms) gdn_arm else null;
-            transformer_mod.mimo_qkv_prep_override = if (qkv_arms) gdn_arm else null;
+            mimo_forward.mimo_qkv_prep_override = if (qkv_arms) gdn_arm else null;
             transformer_mod.gdn_verify_fold_calls = 0;
             if (gdn_arm) |on| log.info("[fwd-ubench] {s} arm: {s}\n", .{ if (rows_arms) "global rows" else if (lm_arms) "lm_head shortlist" else if (qkv_arms) "qkv prep" else if (fold_arms) "gdn fold" else "gdn recur", if (on) "on" else "off" });
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));

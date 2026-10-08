@@ -15,6 +15,7 @@ const expert_stream_mod = @import("expert_stream.zig");
 const fp8_block = @import("fp8_block.zig");
 const model_mod = @import("model.zig");
 const qwen_vision = @import("qwen_vision.zig");
+const vision_common = @import("vision_common.zig");
 const mimo_vision = @import("mimo_vision.zig");
 const glm5_vision = @import("glm5_vision.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
@@ -14358,7 +14359,7 @@ pub fn largestImageEncodeBytes(config: *const model_mod.ModelConfig) u64 {
     const patches: u64 = if (vp.mode == .glm5)
         @as(u64, vp.max_tokens) * merge * merge
     else
-        qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / @max(@as(u64, vp.patch) * vp.patch, 1);
+        vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels).max / @max(@as(u64, vp.patch) * vp.patch, 1);
     const largest = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
     return visionEncodeBill(config, &largest, &.{}, @intCast(patches / (merge * merge))).bytes;
 }
@@ -14723,7 +14724,7 @@ var vision_pixel_clamp_logged: bool = false;
 fn logVisionPixelClamp(declared: u32) void {
     if (vision_pixel_clamp_logged) return;
     vision_pixel_clamp_logged = true;
-    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ qwen_vision.ENGINE_MAX_PIXELS, declared });
+    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ vision_common.ENGINE_MAX_PIXELS, declared });
 }
 
 test "visionPreprocFromConfig threads each tower's processor bounds" {
@@ -15031,7 +15032,7 @@ pub fn appendImageUrlContent(
 
 /// The resample filter belongs to the arch's reference processor; every served
 /// patch-grid tower resizes bicubic.
-fn resampleFilterFor(vp: chat_mod.VisionPreproc) qwen_vision.Filter {
+fn resampleFilterFor(vp: chat_mod.VisionPreproc) vision_common.Filter {
     _ = vp;
     return .bicubic;
 }
@@ -15080,13 +15081,13 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
 }
 
 /// The pixel size a patch-grid tower's processor resizes an `src_h` x `src_w` image to.
-fn imageResize(vp: chat_mod.VisionPreproc, factor: u32, src_h: u32, src_w: u32) qwen_vision.Resized {
-    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+fn imageResize(vp: chat_mod.VisionPreproc, factor: u32, src_h: u32, src_w: u32) vision_common.Resized {
+    const bounds = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
     if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
     return switch (vp.mode) {
         .mimo => mimo_vision.smartResize(src_h, src_w, factor, bounds.min, bounds.max),
         .glm5 => glm5_vision.smartResize(vp.tps, src_h, src_w, vp.tps, factor, vp.min_tokens, vp.max_tokens),
-        else => qwen_vision.smartResizeImage(src_h, src_w, factor, bounds.min, bounds.max),
+        else => vision_common.smartResizeImage(src_h, src_w, factor, bounds.min, bounds.max),
     };
 }
 
@@ -15124,7 +15125,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             mimo_vision.resizeNormalizedChw(chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
         } else if (vp.mode == .glm5) {
             glm5_vision.resizeNormalizedChw(allocator, chw, px[0..source_len], src_h, src_w, rh, rw, vp.tps, vp.tps, factor, vp.min_tokens) catch return null;
-        } else qwen_vision.resizeRgbNormalizedChw(
+        } else vision_common.resizeRgbNormalizedChw(
             allocator,
             chw,
             px[0..source_len],
@@ -15138,7 +15139,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
         switch (vp.mode) {
-            else => qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge),
+            else => vision_common.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge),
         }
         log.info("  Decoded {d}x{d} image → {s} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, @tagName(vp.mode), gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
         return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
@@ -15208,7 +15209,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         };
     }
 
-    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+    const bounds = vision_common.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
     const min_pixels = bounds.min;
     const max_pixels = bounds.max;
     if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
@@ -15217,7 +15218,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
     const rs = if (vp.mode == .glm5)
         glm5_vision.smartResize(@intCast(frame_urls.len), first.h, first.w, vp.tps, factor, vp.min_tokens, vp.max_video_tokens)
     else
-        qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
+        vision_common.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
     const rh = rs.h;
     const rw = rs.w;
     const C: u32 = 3;
@@ -15238,7 +15239,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         const resize = if (vp.mode == .glm5)
             glm5_vision.resizeNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, @intCast(frame_urls.len), vp.tps, factor, vp.min_tokens)
         else
-            qwen_vision.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp));
+            vision_common.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp));
         resize catch {
             allocator.free(chw);
             return null;
@@ -15264,7 +15265,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
             group_frames[k] = frames_chw.items[idx];
         }
         const out_slice = pv_f32[g * n_per_group * feat ..][0 .. n_per_group * feat];
-        qwen_vision.buildPixelValuesVideo(out_slice, group_frames[0..vp.tps], C, rh, rw, vp.patch, vp.merge);
+        vision_common.buildPixelValuesVideo(out_slice, group_frames[0..vp.tps], C, rh, rw, vp.patch, vp.merge);
     }
 
     log.info("  Decoded {d} frames → {s} video grid_t={d} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{

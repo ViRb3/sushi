@@ -58,7 +58,7 @@ pub const AudioData = struct {
 };
 
 /// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
-/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo` /
+/// groups, concatenated (see `vision_common.buildPixelValuesVideo` /
 /// `QwenVision.forwardVideo`) — the video-equivalent of `ImageData.pixels`'s
 /// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
 /// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`
