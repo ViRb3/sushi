@@ -8,6 +8,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **Memory**: the load check bills what each model allocates plus a 1 GiB safety net instead of a flat 7 GiB, the
   auto context keeps 93% of the memory ceiling on every model, and `--wired-margin-gib` defaults to 1 GiB.
+- **GLM-5.3-Flash**: DFlash2 drafting is about 6% faster per round and verification about 1% faster, with identical
+  output.
 
 ---
 
