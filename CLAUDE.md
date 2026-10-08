@@ -220,7 +220,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
-- Restore QoS for agent-launched timed jobs (`taskpolicy -a`); state the QoS, lock and baseline beside every number.
+- Run every CPU-heavy agent-launched job (builds, tests, conversions, timings) under `taskpolicy -a`: inherited QoS never
+  reaches the Super cores. State the QoS, lock and baseline beside every number.
 - Bench thermal protocol: under heavy GPU workload AND with a die sensor over 90 °C, fans to max and 3 min idle before
   the bench starts; otherwise fans to max and a 10 s wait. Fans back to auto when the bench ends. Nothing else runs meanwhile.
   Under it one A then one B suffices; A B B A only when the expected difference is within a few percent.
