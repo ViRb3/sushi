@@ -77,7 +77,18 @@ The GPU limit resets at reboot.
 
 ## Benchmarks
 
-Reported speed using llmprobe `--bench-only`:
+| Sushi 🍣 1.2.1 | M5 Max | 2k | 4k | 8k | 16k | 32k | 64k | 128k |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **GLM 5.3 Flash-2.4bpw** | Prefill | 922 | 822 | 809 | 805 | 807 | 756 | 673 |
+| | Decode | 48.0 | 46.2 | 46.9 | 45.9 | 45.7 | 47.2 | 45.5 |
+| **MiMo V2.6 Flash-2.3bpw** | Prefill | 1,221 | 1,209 | 1,205 | 1,143 | 1,037 | 901 | 712 |
+| | Decode | 49.1 | 54.4 | 59.3 | 62.4 | 64.9 | 56.2 | 51.5 |
+| **Qwen 3.8 Flash-Next-2.6bpw** | Prefill | 1,932 | 2,116 | 2,180 | 2,165 | 2,149 | 2,123 | 2,003 |
+| | Decode | 92.1 | 95.5 | 91.9 | 90.4 | 85.3 | 85.7 | 70.5 |
+| **Qwen 3.8 Flash-Next-4bpw** | Prefill | 1,954 | 2,312 | 2,305 | 2,340 | 2,395 | 2,275 | 2,115 |
+| | Decode | 78.5 | 89.4 | 84.3 | 86.1 | 82.1 | 81.0 | 73.4* |
+
+Community reports, using llmprobe `--bench-only`:
 
 | Class | Typical RAM | Pack | Prefill tok/s | Gen tok/s |
 |---|---|---|---:|---:|
@@ -94,20 +105,6 @@ Reported speed using llmprobe `--bench-only`:
 ## Usage
 
 See [recommended launch commands and coding agent usage](docs/usage.md).
-
-## Speed
-
-Sushi-3bpw on an M5 Max 128 GB, sushi v1.0.0 release candidate (build 725b76ca): `--ctx-size 1048576 --kv-quant 8 --mtp`, llmprobe `--bench-only`, quiet box.
-
-<p align="center"><img src="docs/assets/perf-sushi3bpw-1m.png" alt="decode and prefill vs context" width="100%"></p>
-
-Smaller Macs have less memory bandwidth, so expect lower numbers. Chips before M5 also lack the neural accelerators:
-a user reported about 400 tok/s prefill at 2-16k tokens and 38.6 tok/s decode on an M2 Max 64 GB running v1.0.4
-([numbers](docs/perf-baselines.md#m2max-64gb)).
-
-MiMo-V2.6-Flash-Sushi-2.3bpw on the same Mac:
-
-<p align="center"><img src="docs/assets/perf-mimo-2.3bpw.png" alt="MiMo decode and prefill vs context" width="100%"></p>
 
 ## License
 
