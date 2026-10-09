@@ -4965,7 +4965,7 @@ pub const TensorArray = struct {
     array: mlx.mlx_array,
     /// The array's own bytes; valid as long as `array`.
     bytes: []const u8,
-    /// The imported destination, when the tensor was large enough to import.
+    /// The mapping MLX imported as the array's buffer; null when it copied instead.
     mapped: ?[*]const u8 = null,
 };
 
@@ -5000,15 +5000,18 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
         unmapRegion(region);
         return err;
     };
-    const array = mlx.mlx_array_new_data_managed_payload(region.ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
+    // When Metal refuses the mapping MLX copies it and runs `unmapRegion` before returning:
+    // `region` is not touched after this call.
+    const ptr = region.ptr;
+    const array = mlx.mlx_array_new_data_managed_payload(ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
     if (array.ctx == null) {
         unmapRegion(region);
         return error.OutOfMemory;
     }
     errdefer _ = mlx.mlx_array_free(array);
     try mlx.check(mlx.mlx_array_eval(array));
-    // MLX copies when it cannot import (and releases the mapping); the bytes are the array's either way.
-    return .{ .array = array, .bytes = mlx.mlx_array_data_uint8(array).?[0..len], .mapped = region.ptr };
+    const data = mlx.mlx_array_data_uint8(array).?;
+    return .{ .array = array, .bytes = data[0..len], .mapped = if (data == ptr) ptr else null };
 }
 
 const MappedRegion = struct { ptr: [*]align(std.heap.page_size_min) u8, len: usize };
@@ -9907,6 +9910,8 @@ test "readTensorArray returns the file's tensor, imported without a copy when la
         .{ .offset = page - 8, .shape = &.{ 64, 64 }, .dtype = .uint32, .item = 4, .imported = false },
         .{ .offset = 777, .shape = &.{ 512, 1024 }, .dtype = .float32, .item = 4, .imported = true },
         .{ .offset = size - (1 << 20) - 1, .shape = &.{ 1 << 20, 1 }, .dtype = .uint8, .item = 1, .imported = true },
+        // Large but not a page multiple: Metal may import it or refuse it (MLX then copies and frees the mapping).
+        .{ .offset = 5, .shape = &.{ (1 << 20) + 3, 1 }, .dtype = .uint8, .item = 1, .imported = false },
     }) |case| {
         var count: usize = 1;
         for (case.shape) |d| count *= @intCast(d);
@@ -9930,6 +9935,7 @@ test "readTensorArray returns the file's tensor, imported without a copy when la
             try mlx.check(mlx.mlx_array_item_bool(&same, eq));
             try t.expect(same);
         }
-        if (case.imported) try t.expectEqual(@intFromPtr(got.bytes.ptr), @intFromPtr(got.mapped.?));
+        if (case.imported) try t.expect(got.mapped != null);
+        if (got.mapped) |m| try t.expectEqual(@intFromPtr(got.bytes.ptr), @intFromPtr(m));
     }
 }
